@@ -87,9 +87,15 @@ def dismiss_dialogs(pid):
             return True
 
         u.EnumChildWindows(top, EnumProc(ccb), 0)
-        if radios and not any(u.SendMessageW(r, 0x00F0, 0, 0) for r in radios):  # BM_GETCHECK
+        # "Design ready for construction" (TdlgEventAnswer radios: Go to the build screen / Not now / Rework the
+        # design): always answer "Not now"; the others open the build tab or the modal ship designer.
+        not_now = [r for r in radios if window_text(r).replace('&', '').strip().lower() == 'not now']
+        if not_now:
+            if not u.SendMessageW(not_now[0], 0x00F0, 0, 0):  # BM_GETCHECK
+                u.SendMessageW(not_now[0], 0x00F5, 0, 0)  # BM_CLICK selects it
+        elif radios and not any(u.SendMessageW(r, 0x00F0, 0, 0) for r in radios):
             u.SendMessageW(radios[0], 0x00F5, 0, 0)  # choose the first answer
-        pref = ['OK', 'Ok', 'Close', 'Continue', 'Yes', 'Exit', 'Done']
+        pref = ['OK', 'Ok', 'Close', 'Continue', 'Yes', 'Exit', 'Done', 'Not now']
         target = None
         for want in pref:
             for t, h in buttons:
@@ -101,8 +107,9 @@ def dismiss_dialogs(pid):
         if not target and buttons:
             target = buttons[0]
         if target:
+            sel = next((window_text(r).replace('&', '') for r in radios if u.SendMessageW(r, 0x00F0, 0, 0)), '')
             u.PostMessageW(target[1], 0x00F5, 0, 0)  # BM_CLICK
-            clicked.append(f'{class_name(top)}:"{window_text(top)[:40]}"->{target[0]}')
+            clicked.append(f'{class_name(top)}:"{window_text(top)[:40]}"->{target[0]}' + (f' [{sel}]' if sel else ''))
     return clicked
 
 

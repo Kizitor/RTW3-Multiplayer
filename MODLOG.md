@@ -158,3 +158,25 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Verified with tools\diplomacy_test.py (two instances, posted messages + bridge, ~2 min of game time): 52/52 checks
   (alliances host<->player and player<->player, war declarations through month end, real button clicks with
   confirmations, withdraw/decline, AI peace kept away from player wars, restore at month end, DoPeace path).
+
+## Fix 2026-10-05: joined players' design studies never advanced (v0.2.1)
+- Report (play test on another PC): a joined player could design a ship, but the design study never progressed.
+- Cause: `TDesignShip.ReadyForBuild` = months left in the design study (0 = can be built, MAXINT = no study),
+  saved in `DesignFiles<K>.des` (TDesignShip.SaveMeToBigFile) and merged to the host each turn. The game's
+  `TfrmBuildCamp.AdvanceDesignStudies` (called from DoEndOfTurn and from TfrmMain.FormClose after a battle) walks
+  only `PlayerNation.DesignList`, i.e. the host's nation 0. Per design and month: Random(100)==0 -> "technical
+  issues" delay; a 2..7 % committee review event (dialog, may delay or cost prestige); CV / BB-BC Air Force events
+  in some years; else `dec ReadyForBuild`; at 0 "Our latest design ... is ready for construction" (dialog with
+  Go to build screen / Rework / Not now). `TfrmBuildCamp.DesignStudyList` (TDesignStudy) is unused legacy
+  (loaded, never saved or advanced).
+- Fix: hook AdvanceDesignStudies; after the game's routine, once per session month (`g_seq`), every human nation
+  K>0 gets the countdown with the 1 % technical delay (no dialog events). Lines `design study nation K 'class':
+  a -> b` in the host log; the player gets private chat lines (`notice=1` flashes the window; older clients ignore
+  the key). Host-only change; protocol unchanged (2), so 0.2.0 clients work with a 0.2.1 host.
+- Bridge: `designs <nation>`, `setready <nation> <index> <months>`.
+- Testing now goes through the regression agent (`.github/agents/rtw3-regression.agent.md`) and
+  `tools/regression.py` (one launch, all scenarios, saves restored).
+- Test gotchas: the runner never polls the host's bridge during a month (bridge calls wait for the busy main
+  thread and give up after 120 s); list replies arrive stripped, so their last entry ends in
+  `;`; the host's own study reaching 0 asks (TdlgEventAnswer radios) "Go to the build screen / Not now / Rework the
+  design" and the tests select "Not now" before OK.

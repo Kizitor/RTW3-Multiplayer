@@ -125,6 +125,10 @@ nation, then:
   - Joined players don't fight tactical battles yet.
 - **Decided by the game for joined nations:** events, diplomacy with AI nations, and new aircraft
   types. Diplomacy between players is decided with the buttons.
+- **Design studies of joined players** count down every month on the host, including the game's
+  occasional one-month "technical issues" delay, and the player is told in the Multiplayer chat when a
+  design is ready for construction. The game's random committee and Air Force events about design
+  studies only happen for the host's nation.
 - **Not transferred from joined players:** officers, divisions, and changes to air units (1920s+).
   Ships, designs, budget, research, training, doctrine, deployments, forts and base improvements are
   transferred.
@@ -148,6 +152,11 @@ nation, then:
 Requires Visual Studio 2022 Build Tools (C++ x86). Run `build.bat`; the output goes to `dist\`.
 `tools\` holds the developer test bridge scripts. The bridge is only enabled when
 `RTW3MP_BRIDGE_PORT` is set and listens on 127.0.0.1 only.
+
+Regression tests: `python tools\regression.py` launches a host and a client copy of the game, runs every
+scenario (session, turn merge, design studies, diplomacy) without touching your mouse or keyboard, and
+restores save slot 1 afterwards. The rules and test catalog for the project's regression-testing agent are
+in `.github/agents/rtw3-regression.agent.md`.
 
 ## Credits
 - Rule the Waves 3 is by NWS / Matrix Games. This is an unofficial fan mod and ships no game files.

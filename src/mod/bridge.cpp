@@ -10,24 +10,41 @@
 #include <thread>
 #include <condition_variable>
 
-static std::string RunSync(std::function<std::string()> fn) {
+static std::string ExecuteOnMain(const std::string& line);
+
+// Runs a command on the game's main thread and waits for the reply. The job owns a copy of the line and shares
+// its state with the waiter, so a job that only starts after the waiter gave up is skipped safely.
+struct SyncJob {
     std::mutex mx;
     std::condition_variable cv;
-    bool done = false;
+    bool done = false, cancelled = false;
     std::string result;
-    RunOnMainThread([&] {
-        try {
-            result = fn();
-        } catch (...) {
-            result = "error exception";
+};
+
+static std::string RunSync(const std::string& line) {
+    auto job = std::make_shared<SyncJob>();
+    RunOnMainThread([job, line] {
+        {
+            std::lock_guard<std::mutex> lk(job->mx);
+            if (job->cancelled) return;
         }
-        std::lock_guard<std::mutex> lk(mx);
-        done = true;
-        cv.notify_one();
+        std::string r;
+        try {
+            r = ExecuteOnMain(line);
+        } catch (...) {
+            r = "error exception";
+        }
+        std::lock_guard<std::mutex> lk(job->mx);
+        job->result = r;
+        job->done = true;
+        job->cv.notify_one();
     });
-    std::unique_lock<std::mutex> lk(mx);
-    if (!cv.wait_for(lk, std::chrono::seconds(120), [&] { return done; })) return "error timeout (main thread busy)";
-    return result;
+    std::unique_lock<std::mutex> lk(job->mx);
+    if (!job->cv.wait_for(lk, std::chrono::seconds(120), [&] { return job->done; })) {
+        job->cancelled = true;
+        return "error timeout (main thread busy)";
+    }
+    return job->result;
 }
 
 static BOOL CALLBACK ListWin(HWND h, LPARAM l) {
@@ -66,7 +83,14 @@ static std::string Execute(const std::string& line) {
         EnumWindows(ListWin, (LPARAM)&out);
         return "ok " + out;
     }
-    return RunSync([&]() -> std::string {
+    return RunSync(line);
+}
+
+static std::string ExecuteOnMain(const std::string& line) {
+    auto args = Split(Trim(line), ' ');
+    const std::string& cmd = args[0];
+    auto arg = [&](size_t i, const std::string& def = "") { return i < args.size() ? args[i] : def; };
+    {
         std::string err;
         if (cmd == "status") {
             mp::View v = mp::GetView();
@@ -134,6 +158,20 @@ static std::string Execute(const std::string& line) {
             return why.empty() ? "ok" : "error " + why;
         }
         if (cmd == "reserve") return mp::DebugReserve(atoi(arg(1).c_str()), arg(2, "Bot")), "ok";
+        if (cmd == "designs") {  // designs <nation>: index:class name:ReadyForBuild (months left in the design study)
+            int n = atoi(arg(1).c_str());
+            std::string s;
+            for (int i = 0; i < game::DesignCount(n); i++)
+                s += std::to_string(i) + ":" + W2U(game::DesignName(n, i)) + ":" +
+                     std::to_string(game::DesignReadyForBuild(n, i)) + "; ";
+            return "ok " + s;
+        }
+        if (cmd == "setready") {  // setready <nation> <design index> <months>
+            int n = atoi(arg(1).c_str()), i = atoi(arg(2).c_str());
+            if (game::DesignReadyForBuild(n, i) < 0) return "error no such design";
+            game::SetDesignReadyForBuild(n, i, atoi(arg(3).c_str()));
+            return "ok " + std::to_string(game::DesignReadyForBuild(n, i));
+        }
         if (cmd == "settension") {  // settension <a> <b> <value>: raw write, as the game's own routines would
             game::SetTensionRaw(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3).c_str()));
             return "ok";
@@ -190,7 +228,7 @@ static std::string Execute(const std::string& line) {
                    " status=" + std::to_string(dl::At<uint8_t>(ship, dl::Field("TCampaignShip", "Status")));
         }
         return "error unknown command";
-    });
+    }
 }
 
 static void BridgeThread(uint16_t port, std::string token) {

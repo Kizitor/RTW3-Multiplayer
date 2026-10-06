@@ -26,6 +26,9 @@ struct Api {
     int **recYearCell = nullptr, **recMonthCell = nullptr;  // monthly history record: form + Y*1200 + M*100 + disp
     int recDisp = 0;
     bool diplomacy = false;
+    // ship designs
+    int fDesignList = -1, fReadyForBuild = -1, fShipName = -1;
+    void* mAdvanceDesignStudies = nullptr;
 } A;
 
 static void* g_buildCamp = nullptr;
@@ -161,6 +164,12 @@ bool Resolve() {
         if (!A.mAIMoves) Log("WARNING: AI strategic move routine not found; human fleets may be moved by AI");
     }
     ResolveDiplomacy();
+    A.fDesignList = dl::Field("TBuilderNation", "DesignList");
+    A.fReadyForBuild = dl::Field("TDesignShip", "ReadyForBuild");
+    A.fShipName = dl::Field("Tship", "Name");
+    A.mAdvanceDesignStudies = dl::Method("TfrmBuildCamp", "AdvanceDesignStudies");
+    if (A.fDesignList < 0 || A.fReadyForBuild < 0 || A.fShipName < 0 || !A.mAdvanceDesignStudies)
+        Log("WARNING: design study fields not found; joined players' design studies won't advance");
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -260,6 +269,33 @@ int PlayerIndex() { return NationIndex(PlayerNation()); }
 
 int ShipCount(void* nation) { return nation ? dl::ListCount(dl::At<void*>(nation, A.fShipList)) : 0; }
 void* Ship(void* nation, int i) { return nation ? dl::ListItem(dl::At<void*>(nation, A.fShipList), i) : nullptr; }
+
+static void* DesignAt(int nationIdx, int i) {
+    void* n = Nation(nationIdx);
+    if (!n || A.fDesignList < 0 || A.fReadyForBuild < 0) return nullptr;
+    void* d = dl::ListItem(dl::At<void*>(n, A.fDesignList), i);
+    return d && dl::IsInstanceOf(d, "TDesignShip") ? d : nullptr;
+}
+
+int DesignCount(int nationIdx) {
+    void* n = Nation(nationIdx);
+    return n && A.fDesignList >= 0 ? dl::ListCount(dl::At<void*>(n, A.fDesignList)) : 0;
+}
+
+std::wstring DesignName(int nationIdx, int i) {
+    void* d = DesignAt(nationIdx, i);
+    return d && A.fShipName >= 0 ? dl::ReadUStr(dl::At<void*>(d, A.fShipName)) : L"";
+}
+
+int DesignReadyForBuild(int nationIdx, int i) {
+    void* d = DesignAt(nationIdx, i);
+    return d ? dl::At<int>(d, A.fReadyForBuild) : -1;
+}
+
+void SetDesignReadyForBuild(int nationIdx, int i, int months) {
+    void* d = DesignAt(nationIdx, i);
+    if (d) dl::At<int>(d, A.fReadyForBuild) = months;
+}
 
 std::vector<ShipSnap> SnapshotShips(int nationIdx) {
     std::vector<ShipSnap> out;
@@ -534,6 +570,7 @@ extern "C" void* o_ResignClick = nullptr;
 extern "C" void* o_EndOfTurn = nullptr;
 extern "C" void* o_AIMoves = nullptr;
 extern "C" void* o_AIPeace = nullptr;
+extern "C" void* o_DesignStudies = nullptr;
 
 void RunOriginalTurn() {
     void* f = BuildCamp();
@@ -589,6 +626,23 @@ extern "C" void __stdcall CB_AfterAIPeace() {
     try {
         hookcb::OnAfterAIPeace();
     } catch (...) {
+    }
+}
+extern "C" void __stdcall CB_AfterDesignStudies(void* self) {
+    try {
+        hookcb::OnAfterDesignStudies(self);
+    } catch (...) {
+        Log("exception in OnAfterDesignStudies");
+    }
+}
+
+// AdvanceDesignStudies(Self=EAX): run the game's routine, then the callback with Self.
+extern "C" __declspec(naked) void d_DesignStudies() {
+    __asm {
+        push eax
+        call dword ptr [o_DesignStudies]
+        call CB_AfterDesignStudies
+        ret
     }
 }
 
@@ -771,6 +825,8 @@ bool InstallHooks() {
     ok &= Hook(A.mDoEndOfTurn, (void*)&d_EndOfTurn, &o_EndOfTurn, "DoEndOfTurn");
     if (A.mAIMoves) Hook(A.mAIMoves, (void*)&d_AIMoves, &o_AIMoves, "AIStrategicMoves");
     if (A.diplomacy && A.mHandleAIPeace) Hook(A.mHandleAIPeace, (void*)&d_AIPeace, &o_AIPeace, "HandleAIPeace");
+    if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
+        Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     for (int i = 0; i < (int)(sizeof(g_skips) / sizeof(g_skips[0])); i++) {
         void* target = dl::Method(g_skips[i].cls, g_skips[i].method);
         void* thunk = target ? EmitSkipThunk(i) : nullptr;

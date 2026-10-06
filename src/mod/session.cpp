@@ -4,6 +4,8 @@
 #include "saveio.h"
 #include <iterator>
 #include <tuple>
+#include <climits>
+#include <random>
 
 namespace mp {
 
@@ -76,6 +78,11 @@ static std::set<std::pair<int, int>> g_pactAllies, g_pactWars;  // host: agreeme
 static std::vector<std::tuple<int, int, int>> g_peaceMask;   // host: wars hidden from the AI peace routine
 static DipSnap g_cSnap;                                   // client: as broadcast by the host
 static const int kPactMonths = 60;
+
+// Design studies of joined players (host): the game only counts down the host's own nation.
+static int g_designSeq = -1;                              // month (g_seq) whose studies were advanced
+static std::map<int, std::vector<std::string>> g_designNews;  // nation -> lines for its player
+static std::mt19937 g_rng((unsigned)(GetTickCount() ^ (GetCurrentProcessId() << 16)));
 
 static std::pair<int, int> PairKey(int a, int b) { return {std::min(a, b), std::max(a, b)}; }
 
@@ -729,6 +736,39 @@ static void BroadcastState() {
     BroadcastLobby();
     BroadcastStatus("Planning " + DateStr(y, m) + ": make your decisions, then press Turn / Submit.");
     AddChat("* New month: " + DateStr(y, m));
+    // News about each player's design studies goes to that player only (after the month, so it is the last line).
+    for (auto& kv : g_players) {
+        Player& p = kv.second;
+        auto it = g_designNews.find(p.nation);
+        if (it == g_designNews.end() || !p.connected || !p.welcomed) continue;
+        for (auto& line : it->second) {
+            KV c;
+            c["from"] = "*";
+            c["text"] = line;
+            c["notice"] = "1";
+            net::Send(p.peer, net::MSG_CHAT, KVEncode(c));
+        }
+    }
+    g_designNews.clear();
+}
+
+// Host: the monthly countdown of a joined player's design studies, as the game does it for the host's nation
+// (AdvanceDesignStudies): one month less, except for a 1-in-100 technical delay. The game's committee and Air
+// Force events about design studies need an answer on the host's screen and are left out for joined players.
+static void AdvanceDesignStudiesFor(int n) {
+    for (int i = 0; i < game::DesignCount(n); i++) {
+        int left = game::DesignReadyForBuild(n, i);
+        if (left <= 0 || left >= INT_MAX) continue;
+        std::string cls = W2U(game::DesignName(n, i));
+        if (std::uniform_int_distribution<int>(0, 99)(g_rng) == 0) {
+            Log("design study nation %d '%s': delayed (technical issues)", n, cls.c_str());
+            g_designNews[n].push_back("Design study: technical issues have delayed the " + cls + " class by a month.");
+            continue;
+        }
+        game::SetDesignReadyForBuild(n, i, left - 1);
+        Log("design study nation %d '%s': %d -> %d", n, cls.c_str(), left, left - 1);
+        if (left == 1) g_designNews[n].push_back("Design study: the " + cls + " class is ready for construction.");
+    }
 }
 
 static bool AllSubmitted(std::string* missing) {
@@ -1147,6 +1187,7 @@ static void ClientOnMessage(net::Msg& m) {
             KV kv = KVDecode(m.data);
             std::string from = KVStr(kv, "from");
             AddChat(from == "*" ? "* " + KVStr(kv, "text") : from + ": " + KVStr(kv, "text"));
+            if (KVInt(kv, "notice") && g_onNotice) g_onNotice(KVStr(kv, "text"));  // flash the window
             break;
         }
         case net::MSG_STATE:
@@ -1228,6 +1269,7 @@ void Leave() {
     g_pactAllies.clear();
     g_pactWars.clear();
     g_cSnap = DipSnap();
+    g_designNews.clear();
     g_submissions.clear();
     g_haveState = g_submitted = false;
     g_pendingState.clear();
@@ -1737,6 +1779,20 @@ void OnAfterAIPeace() {
     if (g_peaceDepth > 0) return;
     for (auto& m : mp::g_peaceMask) game::SetTensionRaw(std::get<0>(m), std::get<1>(m), std::get<2>(m));
     mp::g_peaceMask.clear();
+}
+
+// The game just counted down the host nation's design studies (end of month, or after a battle): do the same
+// for the joined players' nations, once per month.
+void OnAfterDesignStudies(void* self) {
+    using namespace mp;
+    if (g_role != Role::Host || g_phase == Phase::Lobby) return;
+    if (g_designSeq == g_seq) {
+        Log("design studies: already advanced this month");
+        return;
+    }
+    g_designSeq = g_seq;
+    for (int n = 1; n <= 8 && n < game::NationCount(); n++)
+        if (IsHumanRemoteNation(n)) AdvanceDesignStudiesFor(n);
 }
 
 static void ResetPeaceMask() {  // in case the game's routine was left by an exception

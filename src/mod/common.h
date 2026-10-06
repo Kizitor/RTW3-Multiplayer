@@ -14,7 +14,7 @@
 #include <deque>
 #include <functional>
 
-#define MP_MOD_VERSION "0.2.0"
+#define MP_MOD_VERSION "0.2.1"
 #define MP_PROTOCOL 2
 #define MP_DEFAULT_PORT 47624
 

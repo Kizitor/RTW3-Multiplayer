@@ -44,6 +44,13 @@ void SetTurnButtonCaption(const std::wstring& caption);
 int ShipCount(void* nation);
 void* Ship(void* nation, int i);
 
+// Ship designs of a nation (TDesignShip). ReadyForBuild = months left in the design study (0 = can be built,
+// MAXINT = not a study). The game's monthly AdvanceDesignStudies only counts down the host's own nation.
+int DesignCount(int nationIdx);
+std::wstring DesignName(int nationIdx, int i);
+int DesignReadyForBuild(int nationIdx, int i);  // -1 if there is no such design
+void SetDesignReadyForBuild(int nationIdx, int i, int months);
+
 // Ship orders the AI strategic-move routine may overwrite (restored for human nations).
 struct ShipSnap {
     void* ship;
@@ -84,4 +91,5 @@ void OnBeforeAIMoves(void* self);
 void OnAfterAIMoves(void* self);
 bool OnBeforeAIPeace(int nationIdx, bool badLoss);  // true => skip the game's AI peace for this nation
 void OnAfterAIPeace();
+void OnAfterDesignStudies(void* self);  // the game advanced the host nation's design studies
 }  // namespace hookcb
