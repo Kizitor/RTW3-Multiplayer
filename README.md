@@ -23,7 +23,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.0-win32.zip` from the
+2. Download `RTW3MP-0.2.1-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
