@@ -23,13 +23,16 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Copy `version.dll` and `RTW3MP.dll` from `dist\` into the game folder, next to `RTW3.exe`.
+2. Download `RTW3MP-0.2.0-win32.zip` from the
+   [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
+   into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
+   from `dist\` instead.)
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
 3. Start the game normally from Steam. The title screen gets a **Multiplayer** button above *Exit*. You
    can also press **Ctrl+Shift+M** anywhere in the game.
 
-Uninstall by deleting `version.dll` and `RTW3MP.dll` from the game folder. The mod never modifies
-`RTW3.exe`, the Steam DRM, or your normal save slots.
+Uninstall by deleting `version.dll`, `RTW3MP.dll` and the other `RTW3MP_*` files from the game folder. The
+mod never modifies `RTW3.exe`, the Steam DRM, or your normal save slots.
 
 ## Network setup (Hamachi example)
 1. Every player installs LogMeIn Hamachi. The host creates a network; everyone else joins it.
@@ -79,7 +82,8 @@ player "Captain".
 4. Plan your month and press **Submit**. You can keep changing orders and submit again until the host
    processes the turn.
 
-To test on one PC, run two copies of the game and join `127.0.0.1`. Both copies share one settings
+To test on one PC, run two copies of the game and join `127.0.0.1` (`RTW3MP_SecondCopy.bat` from the
+release starts the second copy). Both copies share one settings
 file, so the joining copy gets a numbered name (e.g. "Friend 2").
 
 ## Diplomacy between players
@@ -134,6 +138,9 @@ nation, then:
 ## Troubleshooting
 - Log: `Documents\My Games\Rule the Waves 3\RTW3MP\rtw3mp.log`.
 - If you see "different game version than the host", update both games through Steam.
+- If there is no **Multiplayer** button, check that `version.dll` and `RTW3MP.dll` are both next to
+  `RTW3.exe`. Some antivirus programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name);
+  restore it or add an exception for the game folder.
 - If you can't connect, check that you're in the same Hamachi network and that the firewall allows
   `RTW3.exe`. Then test with the host's 25.x.x.x IP.
 

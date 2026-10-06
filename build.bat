@@ -15,7 +15,8 @@ cd /d "%ROOT%build"
 
 set CFLAGS=/nologo /O2 /MT /W3 /Zi /Zc:threadSafeInit- /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS
 
-cl %CFLAGS% /LD "%ROOT%src\proxy\version_proxy.cpp" /Fe"%ROOT%dist\version.dll" /link /DEF:"%ROOT%src\proxy\version.def" /DEBUG /OPT:REF /PDB:"%ROOT%build\version.pdb" user32.lib kernel32.lib || exit /b 1
+rem /PDBALTPATH keeps the build folder (and the user's name) out of the released DLLs.
+cl %CFLAGS% /LD "%ROOT%src\proxy\version_proxy.cpp" /Fe"%ROOT%dist\version.dll" /link /DEF:"%ROOT%src\proxy\version.def" /DEBUG /OPT:REF /PDB:"%ROOT%build\version.pdb" /PDBALTPATH:%%_PDB%% user32.lib kernel32.lib || exit /b 1
 
 cl %CFLAGS% /EHsc /std:c++17 /LD ^
   "%ROOT%src\mod\main.cpp" "%ROOT%src\mod\util.cpp" "%ROOT%src\mod\delphi.cpp" "%ROOT%src\mod\game.cpp" ^
@@ -23,7 +24,7 @@ cl %CFLAGS% /EHsc /std:c++17 /LD ^
   "%ROOT%src\mod\bridge.cpp" ^
   "%ROOT%third_party\minhook\src\buffer.c" "%ROOT%third_party\minhook\src\hook.c" ^
   "%ROOT%third_party\minhook\src\trampoline.c" "%ROOT%third_party\minhook\src\hde\hde32.c" ^
-  /Fe"%ROOT%dist\RTW3MP.dll" /link /DEBUG /OPT:REF /PDB:"%ROOT%build\RTW3MP.pdb" ^
+  /Fe"%ROOT%dist\RTW3MP.dll" /link /DEBUG /OPT:REF /PDB:"%ROOT%build\RTW3MP.pdb" /PDBALTPATH:%%_PDB%% ^
   ws2_32.lib iphlpapi.lib user32.lib gdi32.lib comctl32.lib shell32.lib advapi32.lib || exit /b 1
 
 del /q "%ROOT%dist\*.exp" "%ROOT%dist\*.lib" 2>nul
