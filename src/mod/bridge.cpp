@@ -172,6 +172,10 @@ static std::string ExecuteOnMain(const std::string& line) {
             game::SetDesignReadyForBuild(n, i, atoi(arg(3).c_str()));
             return "ok " + std::to_string(game::DesignReadyForBuild(n, i));
         }
+        if (cmd == "intel") {  // intel: entries in the in-memory intel report list and distinct non-empty ones
+            int unique = 0, count = game::IntelReportCount(&unique);
+            return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count) + " unique=" + std::to_string(unique);
+        }
         if (cmd == "settension") {  // settension <a> <b> <value>: raw write, as the game's own routines would
             game::SetTensionRaw(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3).c_str()));
             return "ok";

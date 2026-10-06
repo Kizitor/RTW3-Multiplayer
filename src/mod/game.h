@@ -51,6 +51,9 @@ std::wstring DesignName(int nationIdx, int i);
 int DesignReadyForBuild(int nationIdx, int i);  // -1 if there is no such design
 void SetDesignReadyForBuild(int nationIdx, int i, int months);
 
+// Entries in the campaign's intel report list (-1 if unavailable); `unique` = distinct non-empty entries.
+int IntelReportCount(int* unique = nullptr);
+
 // Ship orders the AI strategic-move routine may overwrite (restored for human nations).
 struct ShipSnap {
     void* ship;

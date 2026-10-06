@@ -707,7 +707,14 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     h["year"] = std::to_string(y);
     h["month"] = std::to_string(m);
     h["remaining"] = std::to_string(RemainingSec());
-    net::Send(p.peer, net::MSG_STATE, PackHB(KVEncode(h), b.Pack()));
+    std::string payload = PackHB(KVEncode(h), b.Pack());
+    if (payload.size() > net::MaxMessageBytes()) {
+        Notice("The month is too large to send to " + p.name + " (" + std::to_string(payload.size() >> 20) +
+               " MB). Please report this with the RTW3MP log.");
+        Log("state seq %d for %s NOT sent: %u bytes", g_seq, p.name.c_str(), (unsigned)payload.size());
+        return;
+    }
+    net::Send(p.peer, net::MSG_STATE, payload);
     p.hasState = true;
     Log("state seq %d -> %s (nation %d, %u bytes)", g_seq, p.name.c_str(), p.nation, (unsigned)b.TotalBytes());
 }

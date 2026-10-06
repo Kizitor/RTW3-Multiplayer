@@ -46,7 +46,11 @@ PROCS = []  # the game copies this run started (Popen)
 class Ctx:
     def __init__(self):
         self.hp = self.cp = None
+        self.selected = []
         self.months = []  # (label, from date, to date, seconds)
+        self.intel_hist = []  # snapshots: session start, then one per processed month
+        self.intel_prev = None  # the latest snapshot (baseline of the per-month checks)
+        self.fixture = None  # [IntelReports] of the slot 1 save on disk before the run
 
 
 def log(*a):
@@ -250,6 +254,122 @@ def mp_ctl(pid, key):
     return u.GetDlgItem(w[0], IDC[key]) if w else None
 
 
+# ---------------------------------------------------------------- intel reports, saves, month package, memory
+
+INTEL_GROWTH_MAX = 30  # new intel reports per month
+PACKAGE_GROWTH_MAX = 0.25  # month package for the client, month over month
+
+
+def intel(port):
+    """(entries, distinct non-empty entries) of the in-memory intel report list, or (None, None)."""
+    m = re.match(r'^ok count=(-?\d+) unique=(-?\d+)', cmd(port, 'intel'))
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+
+def intel_clean(c):
+    return c[0] is not None and c[0] == c[1] and c[1] > 0
+
+
+def save_path(slot):
+    return os.path.join(SAVE, f'Game{slot}', f'RTWGame{slot}.bcs')
+
+
+def saved_intel(path):
+    """[IntelReports] of a saved .bcs: ReportNo, IntelN keys, empty / repeated entries, distinct non-empty ones."""
+    try:
+        with open(path, 'rb') as f:
+            txt = f.read().decode('utf-8-sig', errors='replace')
+    except OSError:
+        return None
+    m = re.search(r'^\[IntelReports\][^\n]*\n(.*?)(?=^\[|\Z)', txt, re.S | re.M)
+    if not m:
+        return None
+    report_no, vals = None, []
+    for ln in m.group(1).splitlines():
+        k, sep, v = ln.partition('=')
+        if not sep:
+            continue
+        if k == 'ReportNo':
+            report_no = int(v) if v.strip().lstrip('-').isdigit() else None
+        elif re.fullmatch(r'Intel\d+', k):
+            vals.append(v)
+    nonempty = [v for v in vals if v]
+    distinct = len(set(nonempty))
+    return dict(ReportNo=report_no, keys=len(vals), empty=len(vals) - len(nonempty), repeated=len(nonempty) - distinct,
+                distinct=distinct)
+
+
+def saved_clean(s):
+    """No empty or repeated entries: ReportNo == the number of distinct non-empty entries."""
+    return bool(s) and s['ReportNo'] == s['distinct'] == s['keys'] and s['empty'] == 0 and s['repeated'] == 0
+
+
+class _PMC(ctypes.Structure):
+    _fields_ = [('cb', wt.DWORD), ('PageFaultCount', wt.DWORD)] + \
+               [(n, ctypes.c_size_t) for n in ('PeakWorkingSetSize', 'WorkingSetSize', 'QuotaPeakPagedPoolUsage',
+                                               'QuotaPagedPoolUsage', 'QuotaPeakNonPagedPoolUsage',
+                                               'QuotaNonPagedPoolUsage', 'PagefileUsage', 'PeakPagefileUsage',
+                                               'PrivateUsage')]
+
+
+def private_mb(pid):
+    """Private memory (GetProcessMemoryInfo PrivateUsage) of a process in MB, or None."""
+    k = ctypes.windll.kernel32
+    k.OpenProcess.restype = wt.HANDLE
+    k.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    k.K32GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(_PMC), wt.DWORD]
+    k.CloseHandle.argtypes = [wt.HANDLE]
+    if not pid:
+        return None
+    h = k.OpenProcess(0x1000 | 0x0010, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+    if not h:
+        return None
+    try:
+        pmc = _PMC()
+        pmc.cb = ctypes.sizeof(pmc)
+        return round(pmc.PrivateUsage / 2 ** 20, 1) if k.K32GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb) else None
+    finally:
+        k.CloseHandle(h)
+
+
+def intel_snapshot(ctx, mark, label):
+    """Intel lists (host, client), saved [IntelReports] (Game1, Game77), the month package the host logged for the
+    client since `mark` (`state seq N -> name (nation 1, B bytes)`) and both copies' private memory."""
+    txt = log_since(H, mark)
+    sent = re.findall(r'state seq (\d+) -> .+? \(nation 1, (\d+) bytes\)', txt)
+    s = dict(label=label, host=intel(H), client=intel(C), host_file=saved_intel(save_path(HOST_SLOT)),
+             client_file=saved_intel(save_path(CLIENT_SLOT)), pkg=int(sent[-1][1]) if sent else None,
+             not_sent=log_lines(txt, r'NOT sent|too large'), cmem=private_mb(ctx.cp), hmem=private_mb(ctx.hp))
+    log(f'  intel [{label}]: host {s["host"]}, client {s["client"]} (count, unique); saved host {s["host_file"]}, '
+        f'client {s["client_file"]}; package {s["pkg"]} bytes; private memory client {s["cmem"]} MB, '
+        f'host {s["hmem"]} MB')
+    ctx.intel_hist.append(s)
+    return s
+
+
+def month_checks(ctx, label, mark):
+    """After every processed month: no duplicated intel reports in memory or in the saves, few new reports, and a
+    month package that does not grow (it doubled every month before 0.2.2)."""
+    prev, s = ctx.intel_prev, intel_snapshot(ctx, mark, label)
+    check(f'{label}: host intel list has no empty or repeated entries', intel_clean(s['host']), s['host'])
+    check(f'{label}: client intel list has no empty or repeated entries', intel_clean(s['client']), s['client'])
+    gh = s['host'][0] - prev['host'][0] if prev and None not in (s['host'][0], prev['host'][0]) else None
+    gc = s['client'][0] - prev['client'][0] if prev and None not in (s['client'][0], prev['client'][0]) else None
+    check(f'{label}: intel reports grow by at most {INTEL_GROWTH_MAX} a month',
+          gh is not None and gc is not None and gh <= INTEL_GROWTH_MAX and gc <= INTEL_GROWTH_MAX,
+          f'host {prev and prev["host"][0]} -> {s["host"][0]}, client {prev and prev["client"][0]} -> {s["client"][0]}')
+    check(f'{label}: host save [IntelReports] has no empty or repeated entries', saved_clean(s['host_file']),
+          s['host_file'])
+    check(f'{label}: client save [IntelReports] has no empty or repeated entries', saved_clean(s['client_file']),
+          s['client_file'])
+    pp, pn = prev and prev['pkg'], s['pkg']
+    grow = f'{(pn / pp - 1) * 100:+.1f} %' if pp and pn else '?'
+    check(f'{label}: the month package for the client grows by at most {PACKAGE_GROWTH_MAX:.0%}',
+          pp and pn and pn <= pp * (1 + PACKAGE_GROWTH_MAX) and not s['not_sent'],
+          f'{pp} -> {pn} bytes ({grow}) {s["not_sent"]}')
+    ctx.intel_prev = s
+
+
 def click(pid, key):
     u.PostMessageW(mp_ctl(pid, key), 0x00F5, 0, 0)  # BM_CLICK
     time.sleep(1.0)
@@ -270,8 +390,10 @@ def confirm(pid, title, timeout=5):
 def run_month(ctx, label):
     """Process one month: the client submits, the host waits for everyone, presses Turn and its dialogs (and the
     client's) are answered until the client plans the new month. Never polls the host's bridge meanwhile: its
-    calls run on the game's main thread, which is busy with the month."""
+    calls run on the game's main thread, which is busy with the month. Then the per-month checks (intel reports,
+    saved files, month package size) run."""
     date0 = ctl.status(C).get('date')
+    mark = log_mark(H)
     war = rel(0, 1).get('warCounter', '0')
     if war.lstrip('-').isdigit() and int(war) > 0:
         log(f'  WARNING: the host nation is at war (warCounter={war}); the month may start a tactical battle')
@@ -294,6 +416,7 @@ def run_month(ctx, label):
                 dt = time.time() - t0
                 ctx.months.append((label, date0, st.get('date'), dt))
                 log(f'month processed ({label}): {date0} -> {st.get("date")} in {dt:.0f} s')
+                month_checks(ctx, label, mark)
                 return st.get('date')
         except OSError:
             pass
@@ -319,12 +442,15 @@ def wait_month_chat(pid, before, settle=3, timeout=20):
 
 def scenario_session(ctx):
     st = ctl.status(H)
+    mark, loaded = log_mark(H), False
     if st.get('slot') != str(HOST_SLOT) or st.get('playerIdx') != '0' or st.get('startBuild') != '2':
-        cmd(H, f'load {HOST_SLOT} 0')
+        loaded = cmd(H, f'load {HOST_SLOT} 0') == 'ok'
         st = wait(H, lambda s: s.get('playerIdx') == '0' and s.get('startBuild') == '2', 90, 'host campaign',
                   pids=(ctx.hp,))
     check('host has the slot 1 campaign open as nation 0',
           st.get('slot') == str(HOST_SLOT) and st.get('playerIdx') == '0' and st.get('startBuild') == '2', st)
+    if 'intel_reports' in ctx.selected:  # before hosting: the session start saves slot 1
+        intel_load_checks(ctx, mark, loaded)
     r = cmd(H, f'host Admiral {MP_PORT} 0')
     check('host opens the session', r == 'ok' and ctl.status(H).get('role') == 'host', r)
     rj = cmd(C, f'join Captain 127.0.0.1 {MP_PORT}')
@@ -333,10 +459,13 @@ def scenario_session(ctx):
     time.sleep(1.5)
     check('client joins and claims nation 1', rj == 'ok' and rc == 'ok' and ctl.status(C).get('role') == 'client',
           f'join {rj}, claim {rc}')
+    mark = log_mark(H)
     cmd(H, 'start')
     st = wait(C, lambda s: s.get('phase') == 'planning' and s.get('playerIdx') == '1' and
               s.get('slot') == str(CLIENT_SLOT), 120, 'client planning as nation 1', pids=(ctx.hp, ctx.cp))
     check('client plans nation 1 in slot 77', True, st.get('date'))
+    time.sleep(1)
+    ctx.intel_prev = intel_snapshot(ctx, mark, 'session start')  # baseline of the per-month checks
     r = cmd(H, f'reserve {STANDIN} Bot')
     time.sleep(1.5)
     r2 = row(H, STANDIN)
@@ -345,6 +474,53 @@ def scenario_session(ctx):
     time.sleep(1.5)
     check('client Multiplayer window open (chat log readable)', mp_window(ctx.cp) is not None)
     log('month:', st.get('date'), '| nations:', cmd(H, 'nations')[3:160])
+
+
+def intel_load_checks(ctx, mark, loaded):
+    """`intel_reports`, part 1 (called by `session` before hosting, so slot 1 is not saved yet): the bloated slot 1
+    fixture is repaired on load, and loading it twice more into the same form does not grow the list."""
+    outer, _scenario[0] = _scenario[0], 'intel_reports'
+    try:
+        fx = ctx.fixture
+        log(f'slot 1 fixture on disk: {fx}' + ('' if fx and not saved_clean(fx) else ' (NOT bloated: the repair is '
+                                                                                  'not exercised)'))
+        c = intel(H)
+        check('repair on load: the host\'s intel list has no empty or repeated entries', intel_clean(c),
+              f'(count, unique) {c}')
+        rep = log_lines(log_since(H, mark), r'intel reports: \d+ entries -> \d+')
+        check('repair on load: host log has the "intel reports: N entries -> M" line', loaded and rep,
+              rep or ('no line' if loaded else 'the campaign was already open, no load'))
+        log('  ', rep[:1])
+        for n in (2, 3):
+            m2 = log_mark(H)
+            r = cmd(H, f'load {HOST_SLOT} 0')
+            wait(H, lambda s: s.get('playerIdx') == '0' and s.get('startBuild') == '2', 90, 'host campaign',
+                 pids=(ctx.hp,))
+            c2 = intel(H)
+            check(f'load {n} of slot 1: the intel list keeps its size', r == 'ok' and c2 == c and intel_clean(c2),
+                  f'{c} -> {c2}; {log_lines(log_since(H, m2), r"intel reports:")[:1]}')
+    finally:
+        _scenario[0] = outer
+
+
+def scenario_intel_reports(ctx):
+    """Part 2 (part 1 runs inside `session`): the state the session started with. The host saved slot 1 at the
+    start and sent it to the client; both saves and both lists must be free of empty and repeated entries. Every
+    processed month then repeats these checks (`month_checks`)."""
+    s = ctx.intel_hist[0] if ctx.intel_hist else None
+    if not check('session start: intel snapshot taken', s, s['label'] if s else 'no snapshot (the session did not start?)'):
+        return
+    check('session start: the client\'s intel list has no empty or repeated entries', intel_clean(s['client']),
+          s['client'])
+    check('session start: host save [IntelReports] has no empty or repeated entries (saved at the start)',
+          saved_clean(s['host_file']), s['host_file'])
+    check('session start: client save [IntelReports] has no empty or repeated entries', saved_clean(s['client_file']),
+          s['client_file'])
+    check('session start: month package for the client sent and logged', s['pkg'] and not s['not_sent'],
+          f'{s["pkg"]} bytes {s["not_sent"]}')
+    quiet = log_lines(log_since(C), r'intel reports:')  # the game's own trailing empty entry is not worth a line
+    check('session start: the client\'s load of the clean save logs no repair line', not quiet, quiet[:2])
+    log(f'  session start: package {s["pkg"]} bytes; private memory client {s["cmem"]} MB, host {s["hmem"]} MB')
 
 
 def scenario_merge(ctx):
@@ -590,6 +766,10 @@ def scenario_diplomacy(ctx):
 SCENARIOS = [  # name, months processed, what it guards, function
     ('session', 0, 'host/join/claim/start; the client plans nation 1 in slot 77; nation 2 reserved as the stand-in '
                    'player "Bot"; client Multiplayer window open', scenario_session),
+    ('intel_reports', 0, 'the bloated slot 1 fixture is repaired on load and two more loads keep the intel list size '
+                         '(run inside session, before hosting); clean lists and saves at the session start. Every '
+                         'processed month also checks intel lists, saves and month package size (run_month)',
+     scenario_intel_reports),
     ('merge', 1, 'client research % and a ship order survive the host\'s month; AI suppressed for nation 1 only',
      scenario_merge),
     ('design_study', 2, 'a joined player\'s design study counts down on the host and reaches "ready for '
@@ -720,6 +900,7 @@ def remove_client_slot():
 
 
 def run_scenarios(ctx, names):
+    ctx.selected = list(names)
     aborted = None
     for name in names:
         _scenario[0] = name
@@ -739,7 +920,7 @@ def run_scenarios(ctx, names):
                 log(f'  log {port} tail:\n    ' + '\n    '.join(log_since(port).splitlines()[-12:]))
 
 
-def summary(names, open_s, months, saves_ok, left):
+def summary(names, open_s, ctx, saves_ok, left):
     print()
     log('==== summary ====')
     for name in names:
@@ -749,8 +930,15 @@ def summary(names, open_s, months, saves_ok, left):
     failed = [r for r in results if not r[2]]
     for sc, name, _, detail in failed:
         print(f'  FAIL [{sc}] {name}: {detail}')
-    for label, d0, d1, dt in months:
+    for label, d0, d1, dt in ctx.months:
         print(f'  month {label}: {d0} -> {d1}, {dt:.0f} s')
+    if ctx.intel_hist:
+        print(f'  {"after":<16}{"intel host":>12}{"intel client":>14}{"saved host":>12}{"saved client":>14}'
+              f'{"package B":>11}{"client MB":>11}{"host MB":>9}')
+        for s in ctx.intel_hist:
+            print(f'  {s["label"]:<16}{str(s["host"][0]):>12}{str(s["client"][0]):>14}'
+                  f'{str((s["host_file"] or {}).get("ReportNo")):>12}{str((s["client_file"] or {}).get("ReportNo")):>14}'
+                  f'{str(s["pkg"]):>11}{str(s["cmem"]):>11}{str(s["hmem"]):>9}')
     print(f'  game open: {open_s:.0f} s; saves {"restored" if saves_ok else "NOT RESTORED (see above)"}; '
           + (f'still running: {left}' if left else 'no started copy left running'))
     n = len(results)
@@ -785,6 +973,7 @@ def main(argv=None):
     shutil.copytree(g1, BACKUP)
     log('backed up save slot', HOST_SLOT, '| scenarios:', ', '.join(names))
     ctx, procs, t_open = Ctx(), PROCS, time.time()
+    ctx.fixture = saved_intel(save_path(HOST_SLOT))
     saves_ok, left = False, []
     try:
         procs.append(launch(H))
@@ -814,7 +1003,7 @@ def main(argv=None):
             log(f'!! could not restore save slot {HOST_SLOT} ({err}); the backup is kept at {BACKUP}')
         if not remove_client_slot():
             log(f'!! could not remove Game{CLIENT_SLOT}')
-    passed = summary(names, open_s, ctx.months, saves_ok, left)
+    passed = summary(names, open_s, ctx, saves_ok, left)
     return 0 if passed and saves_ok and not left else 1
 
 

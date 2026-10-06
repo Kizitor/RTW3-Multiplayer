@@ -29,6 +29,9 @@ struct Api {
     // ship designs
     int fDesignList = -1, fReadyForBuild = -1, fShipName = -1;
     void* mAdvanceDesignStudies = nullptr;
+    // intel reports (TStringList the game appends to on every load and never clears)
+    int fIntelReports = -1, fSLList = -1, fSLCount = -1;
+    void *mSLClear = nullptr, *mSLAdd = nullptr;
 } A;
 
 static void* g_buildCamp = nullptr;
@@ -170,6 +173,13 @@ bool Resolve() {
     A.mAdvanceDesignStudies = dl::Method("TfrmBuildCamp", "AdvanceDesignStudies");
     if (A.fDesignList < 0 || A.fReadyForBuild < 0 || A.fShipName < 0 || !A.mAdvanceDesignStudies)
         Log("WARNING: design study fields not found; joined players' design studies won't advance");
+    A.fIntelReports = dl::Field("TfrmBuildCamp", "IntelReports");
+    A.fSLList = dl::Field("TStringList", "FList");
+    A.fSLCount = dl::Field("TStringList", "FCount");
+    A.mSLClear = dl::Method("TStringList", "Clear");
+    A.mSLAdd = dl::Method("TStringList", "Add");
+    if (A.fIntelReports < 0 || A.fSLList < 0 || A.fSLCount < 0 || !A.mSLClear || !A.mSLAdd)
+        Log("WARNING: intel report list not found; reloading a campaign will duplicate its intel reports");
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -295,6 +305,63 @@ int DesignReadyForBuild(int nationIdx, int i) {
 void SetDesignReadyForBuild(int nationIdx, int i, int months) {
     void* d = DesignAt(nationIdx, i);
     if (d) dl::At<int>(d, A.fReadyForBuild) = months;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Intel reports. LoadBuildCampaign appends the save's [IntelReports] (plus one empty line) to the list without
+// clearing it. The game itself always loads into a fresh strategic screen, but the mod reloads the campaign every
+// month (client: the new month; host: after merging the players' turns), so the list doubled every month and
+// bloated the save until it no longer fit in memory or in a network message.
+
+static void* IntelList(void* form) {
+    if (!form || A.fIntelReports < 0 || A.fSLList < 0 || A.fSLCount < 0 || !A.mSLClear || !A.mSLAdd) return nullptr;
+    void* l = dl::At<void*>(form, A.fIntelReports);
+    const char* cls = l ? dl::ClassNameOf(l) : nullptr;
+    return cls && strcmp(cls, "TStringList") == 0 ? l : nullptr;
+}
+
+static void ClearIntelReports(void* form) {
+    void* l = IntelList(form);
+    if (l && dl::At<int>(l, A.fSLCount) > 0) dl::Call(A.mSLClear, (uint32_t)(uintptr_t)l);
+}
+
+// Removes empty and repeated entries (keeps the first of each), which also repairs campaigns saved before the fix.
+static void DedupIntelReports(void* form) {
+    void* l = IntelList(form);
+    if (!l) return;
+    int count = dl::At<int>(l, A.fSLCount);
+    void** items = dl::At<void**>(l, A.fSLList);  // TStringItem = {FString, FObject}
+    if (count <= 0 || !items) return;
+    std::vector<std::wstring> keep;
+    std::set<std::wstring> seen;
+    for (int i = 0; i < count; i++) {
+        std::wstring s = dl::ReadUStr(items[i * 2]);
+        if (!s.empty() && seen.insert(s).second) keep.push_back(s);
+    }
+    if ((int)keep.size() == count) return;
+    dl::Call(A.mSLClear, (uint32_t)(uintptr_t)l);
+    for (auto& s : keep) {
+        dl::ConstUStr u(s);
+        dl::Call(A.mSLAdd, (uint32_t)(uintptr_t)l, u.ptr());
+    }
+    if (count - (int)keep.size() > 1)  // the game itself adds one empty entry on every load
+        Log("intel reports: %d entries -> %d (empty and repeated entries removed)", count, (int)keep.size());
+}
+
+int IntelReportCount(int* unique) {
+    void* l = IntelList(BuildCamp());
+    if (!l) return -1;
+    int count = dl::At<int>(l, A.fSLCount);
+    if (unique) {
+        std::set<std::wstring> u;
+        void** items = dl::At<void**>(l, A.fSLList);
+        for (int i = 0; items && i < count; i++) {
+            std::wstring s = dl::ReadUStr(items[i * 2]);
+            if (!s.empty()) u.insert(s);
+        }
+        *unique = (int)u.size();
+    }
+    return count;
 }
 
 std::vector<ShipSnap> SnapshotShips(int nationIdx) {
@@ -571,6 +638,7 @@ extern "C" void* o_EndOfTurn = nullptr;
 extern "C" void* o_AIMoves = nullptr;
 extern "C" void* o_AIPeace = nullptr;
 extern "C" void* o_DesignStudies = nullptr;
+extern "C" void* o_Load = nullptr;
 
 void RunOriginalTurn() {
     void* f = BuildCamp();
@@ -642,6 +710,40 @@ extern "C" __declspec(naked) void d_DesignStudies() {
         push eax
         call dword ptr [o_DesignStudies]
         call CB_AfterDesignStudies
+        ret
+    }
+}
+
+extern "C" void __stdcall CB_BeforeLoad(void* self) {
+    try {
+        ClearIntelReports(self);
+    } catch (...) {
+        Log("exception clearing intel reports");
+    }
+}
+extern "C" void __stdcall CB_AfterLoad(void* self) {
+    try {
+        DedupIntelReports(self);
+    } catch (...) {
+        Log("exception repairing intel reports");
+    }
+}
+
+// LoadBuildCampaign(Self=EAX, aFileName=EDX): Boolean in AL.
+extern "C" __declspec(naked) void d_Load() {
+    __asm {
+        push eax
+        push edx
+        push eax
+        call CB_BeforeLoad
+        pop edx
+        mov eax, [esp]
+        call dword ptr [o_Load]
+        push eax
+        push dword ptr [esp + 4]
+        call CB_AfterLoad
+        pop eax
+        add esp, 4
         ret
     }
 }
@@ -827,6 +929,8 @@ bool InstallHooks() {
     if (A.diplomacy && A.mHandleAIPeace) Hook(A.mHandleAIPeace, (void*)&d_AIPeace, &o_AIPeace, "HandleAIPeace");
     if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
+    if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
+        Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
     for (int i = 0; i < (int)(sizeof(g_skips) / sizeof(g_skips[0])); i++) {
         void* target = dl::Method(g_skips[i].cls, g_skips[i].method);
         void* thunk = target ? EmitSkipThunk(i) : nullptr;

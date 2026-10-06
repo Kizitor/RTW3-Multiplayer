@@ -81,12 +81,18 @@ static void DropPeer(int id, const char* why) {
     Post(std::move(m));
 }
 
-static void HandleFrames(Peer& p, std::vector<Msg>& outMsgs, bool& bad) {
+static void HandleFrames(Peer& p, std::vector<Msg>& outMsgs, std::string& bad) {
     while (p.in.size() >= 6) {
         uint32_t len;
         memcpy(&len, p.in.data(), 4);
         if (len < 2 || len > kMaxFrame) {
-            bad = true;
+            char why[96];
+            if (len > kMaxFrame)
+                snprintf(why, sizeof(why), "message too large (%u MB, limit %u MB)", len >> 20, kMaxFrame >> 20);
+            else
+                snprintf(why, sizeof(why), "protocol error (bad frame length %u)", len);
+            Log("net: peer %d: %s, %u bytes buffered", p.id, why, (unsigned)p.in.size());
+            bad = why;
             return;
         }
         if (p.in.size() < 4 + (size_t)len) return;
@@ -181,25 +187,31 @@ static void ThreadMain() {
             auto it = g_peers.find(ps.first);
             if (it == g_peers.end()) continue;
             Peer& p = it->second;
-            if (nready > 0 && FD_ISSET(ps.second, &rd)) {
-                char buf[65536];
-                while (true) {
-                    int n = recv(p.s, buf, sizeof(buf), 0);
-                    if (n > 0) {
-                        p.in.append(buf, n);
-                        p.lastRecv = now;
-                        continue;
+            try {
+                if (nready > 0 && FD_ISSET(ps.second, &rd)) {
+                    char buf[65536];
+                    while (true) {
+                        int n = recv(p.s, buf, sizeof(buf), 0);
+                        if (n > 0) {
+                            p.in.append(buf, n);
+                            p.lastRecv = now;
+                            continue;
+                        }
+                        if (n == 0) {
+                            drops.emplace_back(p.id, "closed by remote");
+                        } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                            drops.emplace_back(p.id, "receive error " + std::to_string(WSAGetLastError()));
+                        }
+                        break;
                     }
-                    if (n == 0) {
-                        drops.emplace_back(p.id, "closed by remote");
-                    } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                        drops.emplace_back(p.id, "receive error " + std::to_string(WSAGetLastError()));
-                    }
-                    break;
+                    std::string bad;
+                    HandleFrames(p, received, bad);
+                    if (!bad.empty()) drops.emplace_back(p.id, bad);
                 }
-                bool bad = false;
-                HandleFrames(p, received, bad);
-                if (bad) drops.emplace_back(p.id, "protocol error");
+            } catch (const std::bad_alloc&) {
+                Log("net: peer %d: out of memory receiving (%u bytes buffered)", p.id, (unsigned)p.in.size());
+                std::string().swap(p.in);
+                drops.emplace_back(p.id, "out of memory while receiving");
             }
             if (!p.out.empty()) {
                 int n = send(p.s, p.out.data(), (int)std::min<size_t>(p.out.size(), 1 << 20), 0);
@@ -351,6 +363,8 @@ void Send(int peer, uint16_t type, const std::string& data) {
     auto it = g_peers.find(peer);
     if (it != g_peers.end()) Frame(it->second.out, type, data);
 }
+
+size_t MaxMessageBytes() { return kMaxFrame - 2; }
 
 void SendAll(uint16_t type, const std::string& data) {
     std::lock_guard<std::mutex> lk(g_mx);

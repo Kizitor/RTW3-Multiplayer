@@ -180,3 +180,29 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   thread and give up after 120 s); list replies arrive stripped, so their last entry ends in
   `;`; the host's own study reaching 0 asks (TdlgEventAnswer radios) "Go to the build screen / Not now / Rework the
   design" and the tests select "Not now" before OK.
+
+## Fix 2026-10-05: intel reports doubled every month -> "no memory" and "protocol error" (v0.2.2)
+- Report (0.2.0, another PC): a joined player got an "... Error no memory" game error around month 20 of an
+  1890 campaign; after rejoining, the end of the next month gave "Disconnected from host: protocol error".
+- Cause: `TfrmBuildCamp.LoadBuildCampaign` appends the save's `[IntelReports]` (`Intel0..Intel<ReportNo>`, the
+  last one doesn't exist, so one empty entry more) to `TfrmBuildCamp.IntelReports` (TStringList +0x320c) and nothing
+  but FormDestroy ever clears it. The game always loads into a fresh strategic screen; the mod reloads into the same
+  one every month (client: new month; host: after merging), so the host's list doubled each month (save -> reload
+  -> save ...). The save and the month package grew exponentially: out of memory in the 32-bit game (RTW3.exe is
+  not large-address-aware: 2 GB) and frames over the 96 MB limit (the receiver's length check -> "protocol error").
+  Measured: 6 reloads multiplied the list by 6; the slot-1 test campaign had 3420 entries, 6 distinct.
+- Not the cause: per reload the game also leaks ~2.5 MB private memory and ~12 GDI objects (USER objects and
+  handles stay flat); documented as a long-session limitation.
+- Fix: hook LoadBuildCampaign: clear IntelReports before, drop empty/repeated entries after (repairs bloated
+  campaigns in memory; the next save is clean). Uses TStringList FList/FCount (read without refcounting), Clear,
+  Add via RTTI. Network: precise drop reasons (`message too large`, `protocol error (bad frame length N)`),
+  bad_alloc in the receive path drops the peer instead of crashing, the host refuses to send an oversized month.
+- Bridge: `intel` (count / distinct entries in memory).
+## Testing 2026-10-05: intel-report regression coverage (v0.2.2)
+- `tools/regression.py`: scenario `intel_reports` (repair on load of the bloated slot 1 fixture, two more loads
+  before hosting, clean saves at the session start) and 6 checks after every processed month (`intel` count ==
+  unique on host and client, <= 30 new reports a month, clean `[IntelReports]` in Game1/Game77, client month
+  package <= +25 % per month); client and host private memory is reported per month.
+- Gotchas: the slot 1 fixture stays bloated on purpose (ReportNo=3420) so every run exercises the repair; never
+  send `save` (or anything that saves) outside a run that backed up the slot: a diagnostic `save` rewrote slot 1
+  once. The load checks run before `host`/`start` because the session start saves slot 1.

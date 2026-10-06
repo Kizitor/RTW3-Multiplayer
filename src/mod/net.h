@@ -38,6 +38,7 @@ bool Active();
 bool IsHost();
 void Send(int peer, uint16_t type, const std::string& data);
 void SendAll(uint16_t type, const std::string& data);
+size_t MaxMessageBytes();  // larger messages are refused by the receiver
 void Kick(int peer);
 bool Pop(Msg& m);
 std::string PeerAddress(int peer);

@@ -23,7 +23,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.1-win32.zip` from the
+2. Download `RTW3MP-0.2.2-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -137,10 +137,17 @@ nation, then:
   other players.
 - **Version and slots:** the host and every player must run the same game build and mod version (the mod
   checks this; 0.1 and 0.2 can't play together). Joined players use save slot 77.
+- **Memory over long sessions:** the game's memory use grows by about 3 MB per processed month (the game
+  doesn't fully free a campaign when it's reloaded, and multiplayer reloads it every month). The game is
+  limited to 2 GB, so after a few hundred months in one sitting, save, close the game and rejoin.
 - **Hosting video:** it shows the Multiplayer window of version 0.1, before the Diplomacy list was added.
 
 ## Troubleshooting
 - Log: `Documents\My Games\Rule the Waves 3\RTW3MP\rtw3mp.log`.
+- If a joined player gets an "out of memory" error, or "Disconnected from host: protocol error" / "message
+  too large" at the end of a month, the host and players are on 0.2.1 or older. Those versions duplicated
+  the campaign's intelligence reports every month until the save no longer fit in memory. Update everyone to
+  0.2.2 or newer; loading the campaign with 0.2.2 repairs it automatically.
 - If you see "different game version than the host", update both games through Steam.
 - If there is no **Multiplayer** button, check that `version.dll` and `RTW3MP.dll` are both next to
   `RTW3.exe`. Some antivirus programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name);

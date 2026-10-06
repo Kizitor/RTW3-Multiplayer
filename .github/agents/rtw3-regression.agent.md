@@ -31,8 +31,17 @@ notes, gotchas) before changing tests. Source: `src/mod/*.cpp`, tests: `tools/`.
 5. **Protect the saves.** Back up `<Documents>\My Games\Rule the Waves 3\Save\Game1` before launching and
    restore it afterwards, also when the run fails; delete `Game77` (the client slot). Find Documents with
    `rtw3ctl.SAVE_DIR` (handles OneDrive redirection). The suite runner does this; keep it that way.
-6. **Never modify `RTW3.exe`, the Steam DRM stub, or game data files.**
-7. **No personal data in the repo** (no absolute user paths, IPs, names). The repo is public.
+6. **Never save outside a backed-up run.** Don't send the bridge `save` command, or anything else that saves
+   (`start`, a processed month, `submit` on a client, claims while hosting), to a game copy unless it runs
+   inside `tools/regression.py` (or another run that backed up the slot first). A diagnostic `save` once
+   rewrote slot 1. When diagnosing by hand, use read-only commands only (`status`, `intel`, `designs`, `rel`,
+   `diploview`, ...).
+7. **Keep the slot 1 fixture as it is, bloated.** Its `[IntelReports]` holds `ReportNo=3420` with only a handful
+   of distinct non-empty entries (saved by 0.2.0-0.2.1, which doubled the list on every reload). It is
+   intentional: every run exercises the 0.2.2 repair on load. Don't "clean" or replace it; the runner's
+   backup/restore keeps it exactly as it is.
+8. **Never modify `RTW3.exe`, the Steam DRM stub, or game data files.**
+9. **No personal data in the repo** (no absolute user paths, IPs, names). The repo is public.
 
 ## Environment
 - Windows, PowerShell, Python 3 (ctypes), Visual Studio 2022 Build Tools (x86).
@@ -43,17 +52,22 @@ notes, gotchas) before changing tests. Source: `src/mod/*.cpp`, tests: `tools/`.
   `RTW3MP_BRIDGE_PORT` (47701 host, 47702 client), `RTW3MP_LOG_TAG=<port>`, client also
   `RTW3MP_CLIENT_SLOT=77`; cwd = game folder.
 - Logs: `<Documents>\My Games\Rule the Waves 3\RTW3MP\rtw3mp_<port>.log` (one per instance). Read them
-  for evidence (`AI suppressed`, `merge nation`, `diplomacy:`, `design study`, exceptions).
-- Save slot 1 must hold a campaign past its setup steps (host = nation 0). Clients use slot 77.
+  for evidence (`AI suppressed`, `merge nation`, `diplomacy:`, `design study`, `intel reports:`,
+  `state seq N -> <name> (nation K, B bytes)`, `NOT sent`, `net:`, exceptions).
+- Save slot 1 must hold a campaign past its setup steps (host = nation 0); it is the intentionally bloated
+  fixture (safety rule 7). Clients use slot 77.
 
 ## Bridge commands (see `src/mod/bridge.cpp`)
 `ping`, `status` (role, phase, date, slot, playerIdx, startBuild, busy, battle, campaignReady, submitted),
 `nations`, `host <name> <port> <limitMin>`, `join <name> <ip> <port>`, `claim <name|index>`, `start`,
-`submit`, `turn`, `advance`, `leave`, `load <slot> <player>`, `save`, `mpwindow`, `windows`,
+`submit`, `turn`, `advance`, `leave`, `load <slot> <player>`, `save` (writes the slot: safety rule 6),
+`mpwindow`, `windows`,
 `nfield <nation> <IntegerField> [value]`, `areas`, `shipinfo/shiporder`, diplomacy: `diplo <action> <n>`,
 `diploas <from> <action> <n>` (host), `reserve <n> <player>` (host: stand-in human nation), `rel <a> <b>`,
 `diploview`, `settension`, `aipeace` (async), `applydiplo` (async), design studies:
-`designs <nation>` (index, class name, ReadyForBuild for each design), `setready <nation> <index> <months>`.
+`designs <nation>` (index, class name, ReadyForBuild for each design), `setready <nation> <index> <months>`,
+intel reports: `intel` -> `ok count=<entries> unique=<distinct non-empty>` (host or client, the campaign in
+memory; a clean list has count == unique).
 Commands that may open modal game dialogs must be async on the bridge side; answer the dialogs from the test.
 
 ## Known traps for tests
@@ -92,18 +106,28 @@ per-scenario results, the processed months with their duration, the game-open ti
 Exit code 0 = all passed and saves restored, 1 = a check failed (or saves not restored), 2 = not started.
 Keep total game-open time low (each processed month costs ~15-25 s). Shared helpers in the runner:
 `run_month` (submit -> host "All players are ready" -> `turn` -> answer dialogs on both PIDs until the client
-plans the new month, 240 s timeout), `answer_dialogs`, `chat`, `designs`, `rel`/`row`, `log_mark`/`log_since`
-(per-month slices of the host log). `tools/diplomacy_test.py` is a thin wrapper (`--only session,diplomacy`).
+plans the new month, 240 s timeout, then `month_checks`), `answer_dialogs`, `chat`, `designs`, `rel`/`row`,
+`intel`/`saved_intel`/`private_mb`/`intel_snapshot`, `log_mark`/`log_since` (per-month slices of the host log).
+`tools/diplomacy_test.py` is a thin wrapper (`--only session,diplomacy`).
+
+**Per-month checks (`month_checks`, 6 after every processed month, counted in the scenario that processed
+it):** host and client `intel` count == unique; intel reports grow by at most 30 a month (host and client);
+the saved `[IntelReports]` of `Game1\RTWGame1.bcs` and `Game77\RTWGame77.bcs` have no empty or repeated entries
+(ReportNo == IntelN keys == distinct non-empty entries); the client's month package (`state seq N -> <name>
+(nation 1, B bytes)` in the host log) grows by at most 25 % over the previous month (baseline: the session
+start) and no `NOT sent`. Reported, not asserted: private memory (GetProcessMemoryInfo PrivateUsage) of client
+and host after the session start and after each month (summary table).
 
 ### Test catalog (keep this table current)
 | Scenario | What it guards | Checks | Months | Notes |
 |---|---|---|---|---|
-| `session` | both bridges up, host loads slot 1 as nation 0, host/join/claim nation 1/start, client plans nation 1 in slot 77, nation 2 reserved as stand-in player "Bot", client Multiplayer window open | 7 | 0 | always first |
-| `merge` | client research % and a ship order survive the host's month (host and client); `merge nation 1` and `AI suppressed ... for nation 1` in the host log; no AI suppression for AI nation 3 | 9 | 1 | from `tools/e2e_test.py` |
-| `design_study` | a joined player's study (set to 2 on the client, submitted) counts down 2 -> 1 -> 0 on the host, host and client agree, one `design study nation 1` log line per month, client chat "ready for construction" (or the 1 % "technical issues" line with the value kept); the host's own study (2) still advances in the game's routine (0 or 1 after two months) with no `design study nation 0` lines; AI nation 3's designs unchanged and no countdown lines for AI nations | 15 | 2 | added for the design-study fix (0.2.1); fails without the fix |
-| `diplomacy` | offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from player wars, Diplomacy buttons via posted clicks | 52 (51 if the host is at war in month B) | 2 | moved from `tools/diplomacy_test.py` |
+| `session` | both bridges up, host loads slot 1 as nation 0, host/join/claim nation 1/start, client plans nation 1 in slot 77, nation 2 reserved as stand-in player "Bot", client Multiplayer window open; records the intel baseline at the start | 7 | 0 | always first |
+| `intel_reports` | 0.2.2 intel-report fix. Part 1 runs inside `session`, after the first load and before hosting (nothing saved yet): the bloated fixture is repaired on load (host `intel` count == unique > 0, `intel reports: N entries -> M` in the host log), and two more `load 1 0` keep the count. Part 2: at the session start the client's list and both saves (host saved slot 1 at the start) are clean, the month package was sent, and the client's load of that clean save logs no repair line (the game's own trailing empty entry is dropped quietly) | 10 | 0 | fails without the fix; needs the bloated fixture (safety rule 7) |
+| `merge` | client research % and a ship order survive the host's month (host and client); `merge nation 1` and `AI suppressed ... for nation 1` in the host log; no AI suppression for AI nation 3 | 9 + 6 | 1 | from `tools/e2e_test.py` |
+| `design_study` | a joined player's study (set to 2 on the client, submitted) counts down 2 -> 1 -> 0 on the host, host and client agree, one `design study nation 1` log line per month, client chat "ready for construction" (or the 1 % "technical issues" line with the value kept); the host's own study (2) still advances in the game's routine (0 or 1 after two months) with no `design study nation 0` lines; AI nation 3's designs unchanged and no countdown lines for AI nations | 15 + 12 | 2 | added for the design-study fix (0.2.1); fails without the fix |
+| `diplomacy` | offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from player wars, Diplomacy buttons via posted clicks | 52 + 12 (51 + 12 if the host is at war in month B) | 2 | moved from `tools/diplomacy_test.py` |
 
-Full run: 83 checks, 5 processed months.
+Full run: 123 checks (122 if the host is at war in month B), 5 processed months (~2.5-3 min of game time).
 
 Standalone (not in the default run): `tools/realmouse_test.py` (real mouse, needs consent),
 `tools/record_hosting.py` (records the docs video), `tools/live_lobby_test.py`, `tools/repro_issues.py`.
