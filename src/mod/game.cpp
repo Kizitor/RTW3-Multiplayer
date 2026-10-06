@@ -32,6 +32,11 @@ struct Api {
     // intel reports (TStringList the game appends to on every load and never clears)
     int fIntelReports = -1, fSLList = -1, fSLCount = -1;
     void *mSLClear = nullptr, *mSLAdd = nullptr;
+    // pending doctrine changes (counted down by ReduceTimeLimits for the host's nation only)
+    int fTraining = -1, fPendingTraining = -1, fPendingTrainingTime = -1;
+    int fMissileStorage = -1, fPendingMissileStorage = -1, fMissileStorageTime = -1;
+    void* mReduceTimeLimits = nullptr;
+    bool doctrine = false;
 } A;
 
 static void* g_buildCamp = nullptr;
@@ -180,6 +185,17 @@ bool Resolve() {
     A.mSLAdd = dl::Method("TStringList", "Add");
     if (A.fIntelReports < 0 || A.fSLList < 0 || A.fSLCount < 0 || !A.mSLClear || !A.mSLAdd)
         Log("WARNING: intel report list not found; reloading a campaign will duplicate its intel reports");
+    A.fTraining = dl::Field("TBuilderNation", "TrainingPriorities");
+    A.fPendingTraining = dl::Field("TBuilderNation", "PendingTrainingPriorities");
+    A.fPendingTrainingTime = dl::Field("TBuilderNation", "PendingTrainingTime");
+    A.fMissileStorage = dl::Field("TBuilderNation", "MissileStorage");
+    A.fPendingMissileStorage = dl::Field("TBuilderNation", "PendingMissileStorage");
+    A.fMissileStorageTime = dl::Field("TBuilderNation", "MissileStorageTime");
+    A.mReduceTimeLimits = dl::Method("TfrmBuildCamp", "ReduceTimeLimits");
+    A.doctrine = A.fTraining >= 0 && A.fPendingTraining == A.fTraining + 4 && A.fPendingTrainingTime == A.fTraining + 8 &&
+                 A.fMissileStorage >= 0 && A.fPendingMissileStorage >= 0 && A.fMissileStorageTime >= 0 &&
+                 A.mReduceTimeLimits;
+    if (!A.doctrine) Log("WARNING: doctrine fields not found; joined players' doctrine changes won't take effect");
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -362,6 +378,70 @@ int IntelReportCount(int* unique) {
         *unique = (int)u.size();
     }
     return count;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Doctrine (TdlgDoctrine): new training priorities and missile storage policies wait in Pending* fields for a
+// number of months. The game's ReduceTimeLimits counts them down and applies them for the host's nation only.
+
+bool DoctrineAvailable() { return A.doctrine && BuildCamp(); }
+
+DoctrineState GetDoctrine(int nationIdx) {
+    DoctrineState d;
+    void* n = Nation(nationIdx);
+    if (!A.doctrine || !n) return d;
+    d.valid = true;
+    for (int i = 0; i < 4; i++) {
+        d.training[i] = dl::At<uint8_t>(n, A.fTraining + i);
+        d.pending[i] = dl::At<uint8_t>(n, A.fPendingTraining + i);
+    }
+    d.pendingMonths = dl::At<int>(n, A.fPendingTrainingTime);
+    d.missileStorage = dl::At<int>(n, A.fMissileStorage);
+    d.pendingMissileStorage = dl::At<int>(n, A.fPendingMissileStorage);
+    d.missileMonths = dl::At<int>(n, A.fMissileStorageTime);
+    return d;
+}
+
+void SetPendingTraining(int nationIdx, const uint8_t pending[4], int months) {
+    void* n = Nation(nationIdx);
+    if (!A.doctrine || !n) return;
+    for (int i = 0; i < 4; i++) dl::At<uint8_t>(n, A.fPendingTraining + i) = pending[i] ? 1 : 0;
+    dl::At<int>(n, A.fPendingTrainingTime) = months;
+}
+
+void SetPendingMissileStorage(int nationIdx, int policy, int months) {
+    void* n = Nation(nationIdx);
+    if (!A.doctrine || !n) return;
+    dl::At<int>(n, A.fPendingMissileStorage) = policy;
+    dl::At<int>(n, A.fMissileStorageTime) = months;
+}
+
+// One month of the game's own countdown (ReduceTimeLimits), for any nation.
+DoctrineChange AdvanceDoctrine(int nationIdx) {
+    DoctrineChange c;
+    void* n = Nation(nationIdx);
+    if (!A.doctrine || !n) return c;
+    int& trainingTime = dl::At<int>(n, A.fPendingTrainingTime);
+    if (trainingTime == 1) {
+        bool any = false;
+        for (int i = 0; i < 4; i++) any |= dl::At<uint8_t>(n, A.fPendingTraining + i) != 0;
+        if (any) {
+            for (int i = 0; i < 4; i++) {
+                dl::At<uint8_t>(n, A.fTraining + i) = dl::At<uint8_t>(n, A.fPendingTraining + i);
+                dl::At<uint8_t>(n, A.fPendingTraining + i) = 0;
+            }
+            c.trainingApplied = true;
+        }
+    }
+    if (trainingTime > 0) trainingTime--;
+    int& missileTime = dl::At<int>(n, A.fMissileStorageTime);
+    if (missileTime == 1) {
+        dl::At<int>(n, A.fMissileStorage) = dl::At<int>(n, A.fPendingMissileStorage);
+        dl::At<int>(n, A.fPendingMissileStorage) = 0;
+        c.missilesApplied = true;
+    }
+    if (missileTime > 0) missileTime--;
+    return c;
 }
 
 std::vector<ShipSnap> SnapshotShips(int nationIdx) {
@@ -639,6 +719,7 @@ extern "C" void* o_AIMoves = nullptr;
 extern "C" void* o_AIPeace = nullptr;
 extern "C" void* o_DesignStudies = nullptr;
 extern "C" void* o_Load = nullptr;
+extern "C" void* o_ReduceTimeLimits = nullptr;
 
 void RunOriginalTurn() {
     void* f = BuildCamp();
@@ -710,6 +791,24 @@ extern "C" __declspec(naked) void d_DesignStudies() {
         push eax
         call dword ptr [o_DesignStudies]
         call CB_AfterDesignStudies
+        ret
+    }
+}
+
+extern "C" void __stdcall CB_AfterReduceTimeLimits(void* self) {
+    try {
+        hookcb::OnAfterReduceTimeLimits(self);
+    } catch (...) {
+        Log("exception in OnAfterReduceTimeLimits");
+    }
+}
+
+// ReduceTimeLimits(Self=EAX): run the game's routine, then the callback with Self.
+extern "C" __declspec(naked) void d_ReduceTimeLimits() {
+    __asm {
+        push eax
+        call dword ptr [o_ReduceTimeLimits]
+        call CB_AfterReduceTimeLimits
         ret
     }
 }
@@ -931,6 +1030,7 @@ bool InstallHooks() {
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
         Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
+    if (A.doctrine) Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");
     for (int i = 0; i < (int)(sizeof(g_skips) / sizeof(g_skips[0])); i++) {
         void* target = dl::Method(g_skips[i].cls, g_skips[i].method);
         void* thunk = target ? EmitSkipThunk(i) : nullptr;

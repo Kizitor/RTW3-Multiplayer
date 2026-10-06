@@ -36,6 +36,10 @@ BACKUP = os.path.join(tempfile.gettempdir(), 'rtw3mp_regression_backup_Game1')
 u = ctypes.windll.user32
 u.GetDlgItem.restype = wt.HWND
 u.GetDlgItem.argtypes = [wt.HWND, ctypes.c_int]
+u.GetParent.restype = wt.HWND
+u.GetParent.argtypes = [wt.HWND]
+u.GetDlgCtrlID.argtypes = [wt.HWND]
+u.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 IDC = dict(label=1080, list=1081, war=1082, ally=1083, peace=1084, leave=1085, cancel=1086, chatlog=IDS['chatlog'])
 
 results = []  # (scenario, check, ok, detail)
@@ -51,6 +55,7 @@ class Ctx:
         self.intel_hist = []  # snapshots: session start, then one per processed month
         self.intel_prev = None  # the latest snapshot (baseline of the per-month checks)
         self.fixture = None  # [IntelReports] of the slot 1 save on disk before the run
+        self.month_hooks = []  # callables (ctx, label) run after each processed month; scenarios that share months
 
 
 def log(*a):
@@ -367,6 +372,12 @@ def month_checks(ctx, label, mark):
     check(f'{label}: the month package for the client grows by at most {PACKAGE_GROWTH_MAX:.0%}',
           pp and pn and pn <= pp * (1 + PACKAGE_GROWTH_MAX) and not s['not_sent'],
           f'{pp} -> {pn} bytes ({grow}) {s["not_sent"]}')
+    hlog = log_since(H, mark)
+    bad = log_lines(hlog, r'NOT applied|rejected|write .* FAILED')
+    check(f'{label}: no rejected turn or failed write in the host log', not bad, bad[:3])
+    retried = log_lines(hlog, r'write .*: (succeeded after \d+ retries|replaced in place)')
+    if retried:
+        log(f'  {label}: transient file locks handled:', retried[:3])
     ctx.intel_prev = s
 
 
@@ -417,6 +428,8 @@ def run_month(ctx, label):
                 ctx.months.append((label, date0, st.get('date'), dt))
                 log(f'month processed ({label}): {date0} -> {st.get("date")} in {dt:.0f} s')
                 month_checks(ctx, label, mark)
+                for hook in list(ctx.month_hooks):
+                    hook(ctx, label)
                 return st.get('date')
         except OSError:
             pass
@@ -523,6 +536,93 @@ def scenario_intel_reports(ctx):
     log(f'  session start: package {s["pkg"]} bytes; private memory client {s["cmem"]} MB, host {s["hmem"]} MB')
 
 
+LOCK_FILE = 'rtw3mp_locktest.tmp'  # throwaway file in the client slot folder; never a real save file
+
+
+def lock_file(path):
+    """Open `path` with share mode 0 (as a scanner holding a fresh save would): a handle, or None."""
+    k = ctypes.windll.kernel32
+    k.CreateFileW.restype = wt.HANDLE
+    k.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE]
+    k.CloseHandle.argtypes = [wt.HANDLE]
+    h = k.CreateFileW(path, 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, no sharing, OPEN_EXISTING
+    return None if h in (None, ctypes.c_void_p(-1).value) else h
+
+
+def writetest_while_locked(path, hold_s, nbytes):
+    """`writetest` on the client while Python holds `path` locked: released after `hold_s` seconds, or only after the
+    call returned (hold_s None). Returns (reply, seconds the lock was held)."""
+    import threading
+    h = lock_file(path)
+    if not h:
+        return f'cannot lock {os.path.basename(path)}', 0
+    out, t0 = {}, time.time()
+    th = threading.Thread(target=lambda: out.update(r=ctl.cmd(C, f'writetest {CLIENT_SLOT} {LOCK_FILE} {nbytes}', 60)),
+                          daemon=True)
+    try:
+        th.start()
+        th.join(hold_s if hold_s is not None else 30)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+        held = time.time() - t0
+    th.join(30)
+    return out.get('r', 'no reply'), held
+
+
+def parse_writetest(r):
+    m = re.match(r'^ok ms=(\d+)$|^error write failed \((\d+)\) ms=(\d+)$', r or '')
+    if not m:
+        return None, None
+    return (None, int(m[1])) if m[1] else (int(m[2]), int(m[3]))
+
+
+def scenario_file_lock(ctx):
+    """WriteFileBytes (every save write of the mod) survives a short lock by another process and reports a long one,
+    with the client's `writetest` into its own slot folder and a throwaway file locked from Python."""
+    folder = os.path.join(SAVE, f'Game{CLIENT_SLOT}')
+    path = os.path.join(folder, LOCK_FILE)
+    n = 4096
+    try:
+        mark = log_mark(C)
+        r = cmd(C, f'writetest {CLIENT_SLOT} {LOCK_FILE} 100')
+        err, ms = parse_writetest(r)
+        quiet = not log_lines(log_since(C, mark), re.escape(LOCK_FILE))
+        check('writetest without a lock: ok at once, no retry line', err is None and ms is not None and ms < 1000
+              and quiet and os.path.exists(path) and os.path.getsize(path) == 100, f'{r}; log lines: {not quiet}')
+        mark = log_mark(C)
+        r, held = writetest_while_locked(path, 1.2, n)
+        err, ms = parse_writetest(r)
+        size = os.path.getsize(path) if os.path.exists(path) else None
+        check('lock released after ~1.2 s: the write succeeds after retries (~1-3 s)',
+              err is None and ms is not None and 800 <= ms < 3000 and size == n,
+              f'{r} (lock held {held:.1f} s, file {size} bytes)')
+        ln = log_lines(log_since(C, mark), re.escape(LOCK_FILE) + r': succeeded after \d+ retries')
+        check('client log: "write ...: succeeded after N retries"', ln, ln or 'no line')
+        log('  ', [x.split('] ', 1)[-1].replace(SAVE, '<Save>') for x in ln[:1]])
+        mark = log_mark(C)
+        r, held = writetest_while_locked(path, None, 2 * n)
+        err, ms = parse_writetest(r)
+        check('lock held for the whole call: the write fails with error 32 or 5 after >= 3 s',
+              err in (32, 5) and ms is not None and ms >= 2900, f'{r} (lock held {held:.1f} s)')
+        ln = log_lines(log_since(C, mark), re.escape(LOCK_FILE) + r' FAILED: error \d+ \(in place: \d+\)')
+        check('client log: "write ... FAILED: error E (in place: E2)"', ln, ln or 'no line')
+        log('  ', [x.split('] ', 1)[-1].replace(SAVE, '<Save>') for x in ln[:1]])
+        left = [f for f in os.listdir(folder) if f.endswith('.mptmp')]
+        size = os.path.getsize(path) if os.path.exists(path) else None
+        check('after the failed write the file is unchanged and no .mptmp file is left', size == n and not left,
+              f'file {size} bytes (want {n}), .mptmp files {left}')
+    finally:
+        for f in (path, path + '.mptmp'):
+            for _ in range(10):
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                    break
+                except OSError:
+                    time.sleep(0.3)
+    check('test file deleted', not os.path.exists(path) and not os.path.exists(path + '.mptmp'), path)
+
+
 def scenario_merge(ctx):
     rp0 = value(cmd(C, 'nfield 1 ResearchPct'))
     rp_new = 13 if rp0 != '13' else 14
@@ -557,6 +657,226 @@ def scenario_merge(ctx):
     log('  e.g.', sup[:3])
     other = log_lines(hlog, rf'AI suppressed: .* for nation {AI_NATION}\b')
     check(f'host log: the AI still runs AI nation {AI_NATION}', not other, other[:3])
+
+
+def doctrine(port, nation):
+    """`doctrine <nation>` as a dict (training/pending as 4-tuples), or None."""
+    m = re.match(r'^ok training=([\d,]+) pending=([\d,]+) months=(-?\d+) missiles=(-?\d+) pendingMissiles=(-?\d+) '
+                 r'missileMonths=(-?\d+)', cmd(port, f'doctrine {nation}'))
+    if not m:
+        return None
+    four = lambda s: tuple(int(x) for x in s.split(','))
+    return dict(training=four(m[1]), pending=four(m[2]), months=int(m[3]), missiles=int(m[4]),
+                pendingMissiles=int(m[5]), missileMonths=int(m[6]))
+
+
+def other_flags(t):
+    """Training flags that differ from `t` and are not all 0 (all 0 means "nothing pending")."""
+    f = list(t)
+    i = f.index(0) if 0 in f else len(f) - 1
+    f[i] = 1 - f[i]
+    return tuple(f)
+
+
+def children(top):
+    out = []
+    u.EnumChildWindows(top, e2e_test.EnumProc(lambda h, l: out.append(h) or True), 0)
+    return out
+
+
+def caption(h):
+    return e2e_test.window_text(h).replace('&', '').strip()
+
+
+def wait_window(pid, klass, timeout, gone=False):
+    end = time.time() + timeout
+    while time.time() < end:
+        w = [h for h in windows_of(pid, klass) if u.IsWindowVisible(h)]
+        if gone and not w:
+            return True
+        if w and not gone:
+            return w[0]
+        time.sleep(0.3)
+    return None
+
+
+def answer_confirmations(pid, timeout, who='client'):
+    """Message boxes (TMessageForm, #32770) that a dialog's button opened: Yes / OK."""
+    seen, end = [], time.time() + timeout
+    while time.time() < end:
+        for top in [h for k in ('TMessageForm', '#32770') for h in windows_of(pid, k) if u.IsWindowVisible(h)]:
+            btn = next((h for h in children(top) if caption(h).lower() in ('yes', 'ok')), None)
+            if btn and top not in seen:
+                seen.append(top)
+                u.PostMessageW(btn, 0x00F5, 0, 0)  # BM_CLICK
+                log(f'  {who} confirmation answered: {e2e_test.class_name(top)}:"{caption(top)}"->{caption(btn)}')
+        time.sleep(0.4)
+    return seen
+
+
+def toggle_checkbox(box, parent, was):
+    """Toggle a VCL TCheckBox in another process without the real mouse. A posted BM_CLICK is tried first; with the
+    game's VCL styles the check box's style hook ignores it (it wants the real cursor over the box), so the parent
+    then gets the notification a real click produces (WM_COMMAND BN_CLICKED + the box's handle), which VCL turns into
+    CN_COMMAND -> Toggle -> OnClick. BM_SETCHECK would only change the picture, not the VCL state."""
+    for how in ('BM_CLICK', 'WM_COMMAND BN_CLICKED to the parent'):
+        if how == 'BM_CLICK':
+            u.PostMessageW(box, 0x00F5, 0, 0)
+        else:
+            u.PostMessageW(parent, 0x0111, u.GetDlgCtrlID(box) & 0xFFFF, box)  # BN_CLICKED (0) << 16 | id
+        end = time.time() + 1.5
+        while time.time() < end:
+            time.sleep(0.25)
+            if int(u.SendMessageW(box, 0x00F0, 0, 0)) != was:  # BM_GETCHECK
+                return how
+    return 'neither BM_CLICK nor WM_COMMAND BN_CLICKED'
+
+
+def doctrine_dialog_apply(ctx):
+    """The player's path: the strategic screen's 'Doctrine' button (TBitBtn btbnTraining) -> TdlgDoctrine -> toggle
+    one 'Training priorities' check box -> that group's Apply (bnApply; the other Apply is the missile policy's) ->
+    Close. Posted clicks only; the client's dialogs are not auto-answered meanwhile (dismiss_dialogs would close
+    TdlgDoctrine). Returns (dialog opened, what was done)."""
+    cp = ctx.cp
+    btn = next((h for top in windows_of(cp, 'TfrmBuildCamp') for h in children(top)
+                if e2e_test.class_name(h) == 'TBitBtn' and caption(h) == 'Doctrine'), None)
+    if not btn:
+        return False, 'no "Doctrine" TBitBtn on the client\'s TfrmBuildCamp'
+    state = f'button visible {bool(u.IsWindowVisible(btn))} enabled {bool(u.IsWindowEnabled(btn))}'
+    u.PostMessageW(btn, 0x00F5, 0, 0)  # BM_CLICK
+    dlg = wait_window(cp, 'TdlgDoctrine', 8)
+    if not dlg:
+        return False, f'{state}; no TdlgDoctrine; windows: {describe_windows(cp)}'
+    try:
+        kids = children(dlg)
+        group = next((h for h in kids if e2e_test.class_name(h) == 'TGroupBox' and caption(h) == 'Training priorities'),
+                     None)
+        inner = children(group) if group else []
+        boxes = [h for h in inner if e2e_test.class_name(h) == 'TCheckBox']
+        apply = next((h for h in inner if e2e_test.class_name(h) in ('TButton', 'TBitBtn') and caption(h) == 'Apply'),
+                     None)
+        before = [(caption(h), int(u.SendMessageW(h, 0x00F0, 0, 0))) for h in boxes]  # BM_GETCHECK
+        log('  doctrine dialog: training check boxes', before, '| Apply', 'found' if apply else 'MISSING')
+        if not boxes or not apply:
+            return True, f'training group {bool(group)}, check boxes {len(boxes)}, Apply {bool(apply)}'
+        target = next((h for h in boxes if not u.SendMessageW(h, 0x00F0, 0, 0)), boxes[-1])
+        was = int(u.SendMessageW(target, 0x00F0, 0, 0))
+        how = toggle_checkbox(target, group, was)
+        toggled = int(u.SendMessageW(target, 0x00F0, 0, 0))
+        log(f'  doctrine dialog: "{caption(target)}" {was} -> {toggled} ({how}); Apply enabled '
+            f'{bool(u.IsWindowEnabled(apply))}')
+        if toggled == was:
+            return True, f'"{caption(target)}" did not toggle ({how}); Apply not pressed'
+        u.PostMessageW(apply, 0x00F5, 0, 0)
+        answer_confirmations(cp, 3)
+        return True, f'toggled "{caption(target)}" to {toggled} ({how}), applied'
+    finally:
+        close = next((h for h in children(dlg) if e2e_test.class_name(h) in ('TButton', 'TBitBtn')
+                      and caption(h) == 'Close' and u.GetParent(h) == dlg), None)
+        if close:
+            u.PostMessageW(close, 0x00F5, 0, 0)
+        if not wait_window(cp, 'TdlgDoctrine', 3, gone=True):
+            answer_confirmations(cp, 2)
+            if not wait_window(cp, 'TdlgDoctrine', 3, gone=True):
+                log('  doctrine dialog did not close with "Close"; sending WM_CLOSE')
+                u.PostMessageW(dlg, 0x0010, 0, 0)  # WM_CLOSE
+                wait_window(cp, 'TdlgDoctrine', 5, gone=True)
+
+
+def scenario_doctrine(ctx):
+    """A joined player's training priorities and missile storage policy take effect on the host. Set up in the
+    planning month before `design_study`, checked after design_study's two months (month hook), so no extra months
+    are processed (the scenario processes its own two months if design_study is not selected)."""
+    t0 = time.time()
+    cd0, hd0, n2 = doctrine(C, 1), doctrine(H, 0), doctrine(H, STANDIN)
+    log('  doctrine before: client nation 1', cd0, '| host nation 0', hd0, '| nation 2', n2)
+    if not check('doctrine readable on host and client', cd0 and hd0, f'client {cd0}, host {hd0}'):
+        return
+    opened, what = doctrine_dialog_apply(ctx)
+    check('client: the Doctrine button opens the doctrine dialog', opened, what)
+    closed = not [h for h in windows_of(ctx.cp, 'TdlgDoctrine') if u.IsWindowVisible(h)]
+    check('client: the doctrine dialog is closed again', closed, describe_windows(ctx.cp))
+    ui = doctrine(C, 1)
+    ui_ok = ui and ui['months'] == 12 and any(ui['pending']) and ui['pending'] != cd0['training']
+    check('client: Apply in the dialog makes a pending training change (12 months)', ui_ok, f'{what}; {ui}')
+    if ui_ok:
+        changed = [i for i in range(4) if ui['pending'][i] != cd0['training'][i]]
+        log(f'  dialog Apply: training {cd0["training"]} -> pending {ui["pending"]} (flag index {changed} changed)')
+    flags = ui['pending'] if ui_ok else other_flags(cd0['training'])  # fall back to `settraining` (as the dialog)
+    fs = ' '.join(map(str, flags))
+    cmd(C, f'settraining 1 {fs} 2')
+    d = doctrine(C, 1)
+    check('client: the training change shortened to 2 months', d and d['pending'] == flags and d['months'] == 2, d)
+    policy = 2 if cd0['missiles'] != 2 else 1
+    cmd(C, f'setmissiles 1 {policy} 2')
+    d = doctrine(C, 1)
+    check(f'client: missile storage policy {policy} pending for 2 months',
+          d and d['pendingMissiles'] == policy and d['missileMonths'] == 2, d)
+    hflags = other_flags(hd0['training'])
+    cmd(H, f'settraining 0 {" ".join(map(str, hflags))} 2')
+    d = doctrine(H, 0)
+    check('host: its own training change pending for 2 months', d and d['pending'] == hflags and d['months'] == 2, d)
+    allowed = {'1'} | ({str(STANDIN)} if n2 and (n2['months'] > 0 or n2['missileMonths'] > 0) else set())
+    st = dict(n=0, mark=log_mark(H), before=None, done=False)
+    log(f'  doctrine set up in {time.time() - t0:.0f} s: nation 1 pending {flags} + missiles {policy}, nation 0 '
+        f'pending {hflags}; checked after the next two months')
+
+    def hook(ctx, label):
+        outer, _scenario[0] = _scenario[0], 'doctrine'
+        try:
+            st['n'] += 1
+            hd, cd = doctrine(H, 1), doctrine(C, 1)
+            log(f'  doctrine after {label}: host nation 1 {hd} | client {cd} | host nation 0 {doctrine(H, 0)}')
+            if st['n'] == 1:
+                want = dict(training=cd0['training'], pending=flags, months=1)
+                for who, dd in (('host', hd), ('client', cd)):
+                    check(f'doctrine month 1 ({label}): {who} has nation 1\'s training change at 1 month, not applied',
+                          dd and all(dd[k] == v for k, v in want.items()), f'{dd}, want {want}')
+                check(f'doctrine month 1 ({label}): missile policy at 1 month (host and client)',
+                      hd and cd and all(x['missileMonths'] == 1 and x['pendingMissiles'] == policy and
+                                        x['missiles'] == cd0['missiles'] for x in (hd, cd)), f'host {hd}, client {cd}')
+                ln = log_lines(log_since(H, st['mark']), r'doctrine nation 1: ')
+                check(f'doctrine month 1 ({label}): host log "doctrine nation 1: training 2 -> 1 months, missile '
+                      f'storage 2 -> 1 months"', len(ln) == 1 and ln[0].endswith(
+                          'doctrine nation 1: training 2 -> 1 months, missile storage 2 -> 1 months'), ln)
+                st['before'] = chat(ctx.cp)
+                return
+            ctx.month_hooks.remove(hook)
+            st['done'] = True
+            check(f'doctrine month 2 ({label}): nation 1\'s training applied (host and client)',
+                  hd and cd and all(x['training'] == flags and x['pending'] == (0, 0, 0, 0) and x['months'] == 0
+                                    for x in (hd, cd)), f'host {hd}, client {cd}, want training {flags}')
+            check(f'doctrine month 2 ({label}): nation 1\'s missile policy applied (host and client)',
+                  hd and cd and all(x['missiles'] == policy and x['pendingMissiles'] == 0 and x['missileMonths'] == 0
+                                    for x in (hd, cd)), f'host {hd}, client {cd}, want missiles {policy}')
+            lines = ['* Doctrine: new training applied. Crews are now deemed proficient in the new tactics!',
+                     '* Doctrine: missile stocks are now adapted to the new missile storage policy.']
+            end, txt = time.time() + 20, chat(ctx.cp)
+            while time.time() < end and not all(txt.count(x) > st['before'].count(x) for x in lines):
+                time.sleep(0.5)
+                txt = chat(ctx.cp)
+            got = [txt.count(x) - st['before'].count(x) for x in lines]
+            check(f'doctrine month 2 ({label}): client chat has both Doctrine lines', got == [1, 1],
+                  f'{got}; last lines {txt.strip().splitlines()[-4:]}')
+            dlog = log_since(H, st['mark'])
+            ln = log_lines(dlog, r'doctrine nation 1: ')
+            want = 'doctrine nation 1: training 1 -> 0 months (applied), missile storage 1 -> 0 months (applied)'
+            check(f'doctrine month 2 ({label}): host log has "(applied)" for training and missile storage',
+                  len(ln) == 2 and ln[1].endswith(want), ln)
+            h0 = doctrine(H, 0)
+            check(f'doctrine month 2 ({label}): host\'s own training applied by the game ({hflags})',
+                  h0 and h0['training'] == hflags and h0['months'] == 0, h0)
+            other = [x for x in log_lines(dlog, r'doctrine nation \d+: ')
+                     if re.search(r'doctrine nation (\d+): ', x).group(1) not in allowed]
+            check('doctrine: no countdown lines for AI nations in the host log', not other, other[:3])
+        finally:
+            _scenario[0] = outer
+
+    hook.scenario, hook.state = 'doctrine', st
+    ctx.month_hooks.append(hook)
+    if 'design_study' not in ctx.selected:  # no shared months: process two here
+        run_month(ctx, 'doctrine 1')
+        run_month(ctx, 'doctrine 2')
 
 
 def scenario_design_study(ctx):
@@ -770,8 +1090,17 @@ SCENARIOS = [  # name, months processed, what it guards, function
                          '(run inside session, before hosting); clean lists and saves at the session start. Every '
                          'processed month also checks intel lists, saves and month package size (run_month)',
      scenario_intel_reports),
+    ('file_lock', 0, 'the mod\'s save writes (WriteFileBytes, via the client\'s `writetest` into slot 77) survive a '
+                     '~1 s lock by another process (retries, log line) and report a lock held > 3 s (error 32/5, '
+                     'FAILED log line, file unchanged, no .mptmp left); throwaway file, deleted afterwards',
+     scenario_file_lock),
     ('merge', 1, 'client research % and a ship order survive the host\'s month; AI suppressed for nation 1 only',
      scenario_merge),
+    ('doctrine', 0, 'the player\'s Doctrine dialog (real button, posted clicks) makes a pending training change; a '
+                    'joined nation\'s training and missile storage policy take effect on the host after their months '
+                    '(chat + host log); the host\'s own change still applies; no countdown for AI nations. Checked '
+                    'after design_study\'s two months (2 own months if design_study is not selected)',
+     scenario_doctrine),
     ('design_study', 2, 'a joined player\'s design study counts down on the host and reaches "ready for '
                         'construction" (chat + host log); the host\'s own study still advances; AI designs untouched',
      scenario_design_study),
@@ -918,6 +1247,10 @@ def run_scenarios(ctx, names):
                 log(f'  {who} windows:', describe_windows(pid))
             for port in (H, C):
                 log(f'  log {port} tail:\n    ' + '\n    '.join(log_since(port).splitlines()[-12:]))
+    for hook in ctx.month_hooks:  # a scenario that shares later months never got them
+        _scenario[0] = hook.scenario
+        check(f'{hook.scenario}: its checks after the shared months ran', False,
+              f'only {hook.state["n"]} of 2 months processed after its setup')
 
 
 def summary(names, open_s, ctx, saves_ok, left):

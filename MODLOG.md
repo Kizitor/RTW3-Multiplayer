@@ -206,3 +206,47 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Gotchas: the slot 1 fixture stays bloated on purpose (ReportNo=3420) so every run exercises the repair; never
   send `save` (or anything that saves) outside a run that backed up the slot: a diagnostic `save` rewrote slot 1
   once. The load checks run before `host`/`start` because the session start saves slot 1.
+
+## Fix 2026-10-05: joined players' doctrine/training never took effect (v0.2.3)
+- Report (0.2.0): the joined player "can't set doctrine and/or training".
+- Cause: the Doctrine button (`btbnTrainingClick`) opens `TdlgDoctrine` for PlayerNation (the client's own nation,
+  fine). Apply stores the new priorities in `TBuilderNation.PendingTrainingPriorities` (4 flags) with
+  `PendingTrainingTime = 12`; the budget's "Extra training" is their cost (GetTotalMonthlyTrainingCost). The monthly
+  `TfrmBuildCamp.ReduceTimeLimits` counts it down and at 1 copies Pending -> `TrainingPriorities` ("New training
+  applied...") for PlayerNation only, i.e. the host's nation 0. Same for `PendingMissileStorage` /
+  `MissileStorageTime` -> `MissileStorage`. A scan of ReduceTimeLimits for other PlayerNation-only writes found only
+  one-off host events (budget grant, build constraint). Fleet Exercise runs immediately on the client (merged
+  with its ships).
+- Fix: hook ReduceTimeLimits; after the game's routine, once per session month, every human nation K>0 gets the
+  same countdown; host log `doctrine nation K: training a -> b months (applied)...`; the player gets chat lines.
+  Bridge: `doctrine`, `settraining`, `setmissiles`.
+
+## Fix 2026-10-05: a player's turn could be dropped when a save file was briefly locked (v0.2.3)
+- Found by the regression agent (1 of 2 runs): `* Could not apply Captain's turn: cannot write map data`, only in
+  the client's chat; the month ran without that player's orders. WriteFileBytes (temp file + MoveFileEx) had no
+  retry; right after the game's own save, antivirus / OneDrive can hold the file for a moment.
+- Fix: WriteFileBytes retries create/rename for ~3 s on sharing/lock/access errors, then tries an in-place write,
+  and logs the Windows error. MergeSubmission prepares all files first and restores already-written ones if a
+  later write fails (all-or-nothing). A rejected turn is now in the host log and a host notice.
+  Bridge: `writetest <slot> <file> <bytes>` for the lock test.
+## Testing 2026-10-05: doctrine regression coverage (v0.2.3)
+- Scenario `doctrine`: the real Doctrine button and TdlgDoctrine (posted messages; layout read from the form
+  resource `TDLGDOCTRINE` in RTW3.exe, opened read-only as a data file) make the pending change; nation 1
+  training + missile policy (2 months, merged on submit) and the host's own change are checked after
+  design_study's two months through a `run_month` hook (no extra months).
+- Gotchas: VCL-styled check boxes ignore a posted `BM_CLICK` (the style hook wants the real cursor); post
+  `WM_COMMAND`/`BN_CLICKED` with the box's handle to its parent instead. Apply asks "Confirm" (OK).
+- Found while testing (intermittent, 1 of 2 runs): the host rejected a player's whole turn with `* Could not
+  apply Captain's turn: cannot write map data` (chat only, nothing in the log file). `WriteFileBytes` renames
+  its temp file over `MapData1.dat` once, right after the game's own save wrote that file; a short-lived lock by
+  another process (antivirus scan; Documents under OneDrive here) makes `MoveFileExW` fail. The bcs and designs
+  were already rewritten, but nothing was reloaded, so the month ran without the player's orders.
+
+## Testing 2026-10-05: file-lock regression coverage (v0.2.3)
+- Scenario `file_lock` (no months): the client's `writetest 77 rtw3mp_locktest.tmp <bytes>` while Python holds
+  that throwaway file with `CreateFileW` share mode 0 (lock released after ~1.2 s -> ok after retries; held for
+  the whole call -> `error write failed (5|32)` after ~3 s, file unchanged, no `.mptmp` left; file deleted).
+- Every processed month now fails on a `NOT applied` / `rejected` / `write ... FAILED` line in the host log, so a
+  dropped turn always shows up as a failure with the log line.
+- Gotcha: with a share-mode-0 handle open, `MoveFileExW` onto the file fails with error 5 (access denied), the
+  in-place `CreateFileW` with 32 (sharing violation); both are retried by the mod.

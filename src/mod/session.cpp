@@ -79,9 +79,10 @@ static std::vector<std::tuple<int, int, int>> g_peaceMask;   // host: wars hidde
 static DipSnap g_cSnap;                                   // client: as broadcast by the host
 static const int kPactMonths = 60;
 
-// Design studies of joined players (host): the game only counts down the host's own nation.
-static int g_designSeq = -1;                              // month (g_seq) whose studies were advanced
-static std::map<int, std::vector<std::string>> g_designNews;  // nation -> lines for its player
+// Monthly countdowns the game only runs for the host's nation, done here for the joined players' nations (host).
+static int g_designSeq = -1;                              // month (g_seq) whose design studies were advanced
+static int g_doctrineSeq = -1;                            // month (g_seq) whose doctrine changes were advanced
+static std::map<int, std::vector<std::string>> g_playerNews;  // nation -> lines for its player
 static std::mt19937 g_rng((unsigned)(GetTickCount() ^ (GetCurrentProcessId() << 16)));
 
 static std::pair<int, int> PairKey(int a, int b) { return {std::min(a, b), std::max(a, b)}; }
@@ -746,8 +747,8 @@ static void BroadcastState() {
     // News about each player's design studies goes to that player only (after the month, so it is the last line).
     for (auto& kv : g_players) {
         Player& p = kv.second;
-        auto it = g_designNews.find(p.nation);
-        if (it == g_designNews.end() || !p.connected || !p.welcomed) continue;
+        auto it = g_playerNews.find(p.nation);
+        if (it == g_playerNews.end() || !p.connected || !p.welcomed) continue;
         for (auto& line : it->second) {
             KV c;
             c["from"] = "*";
@@ -756,7 +757,7 @@ static void BroadcastState() {
             net::Send(p.peer, net::MSG_CHAT, KVEncode(c));
         }
     }
-    g_designNews.clear();
+    g_playerNews.clear();
 }
 
 // Host: the monthly countdown of a joined player's design studies, as the game does it for the host's nation
@@ -769,12 +770,12 @@ static void AdvanceDesignStudiesFor(int n) {
         std::string cls = W2U(game::DesignName(n, i));
         if (std::uniform_int_distribution<int>(0, 99)(g_rng) == 0) {
             Log("design study nation %d '%s': delayed (technical issues)", n, cls.c_str());
-            g_designNews[n].push_back("Design study: technical issues have delayed the " + cls + " class by a month.");
+            g_playerNews[n].push_back("Design study: technical issues have delayed the " + cls + " class by a month.");
             continue;
         }
         game::SetDesignReadyForBuild(n, i, left - 1);
         Log("design study nation %d '%s': %d -> %d", n, cls.c_str(), left, left - 1);
-        if (left == 1) g_designNews[n].push_back("Design study: the " + cls + " class is ready for construction.");
+        if (left == 1) g_playerNews[n].push_back("Design study: the " + cls + " class is ready for construction.");
     }
 }
 
@@ -828,10 +829,14 @@ static void RunHostTurn() {
         auto it = g_players.find(s.first);
         if (it == g_players.end()) continue;
         std::string err;
-        if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err))
+        if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err)) {
             merged++;
-        else
+        } else {
+            Log("host turn: %s's turn NOT applied: %s", it->second.name.c_str(), err.c_str());
             AddChat("* Could not apply " + it->second.name + "'s turn: " + err);
+            Notice(it->second.name + "'s turn could not be applied (" + err + "). Their nation keeps last month's "
+                   "orders this month.");
+        }
     }
     g_submissions.clear();
     if (merged > 0 && !game::LoadCampaign(g_hostSlot, 0)) {
@@ -1276,7 +1281,7 @@ void Leave() {
     g_pactAllies.clear();
     g_pactWars.clear();
     g_cSnap = DipSnap();
-    g_designNews.clear();
+    g_playerNews.clear();
     g_submissions.clear();
     g_haveState = g_submitted = false;
     g_pendingState.clear();
@@ -1800,6 +1805,31 @@ void OnAfterDesignStudies(void* self) {
     g_designSeq = g_seq;
     for (int n = 1; n <= 8 && n < game::NationCount(); n++)
         if (IsHumanRemoteNation(n)) AdvanceDesignStudiesFor(n);
+}
+
+// The game just counted down the host nation's pending doctrine changes (training priorities, missile storage
+// policy): do the same for the joined players' nations, once per month, and tell them when a change takes effect.
+void OnAfterReduceTimeLimits(void* self) {
+    using namespace mp;
+    if (g_role != Role::Host || g_phase == Phase::Lobby || !game::DoctrineAvailable()) return;
+    if (g_doctrineSeq == g_seq) {
+        Log("doctrine: already advanced this month");
+        return;
+    }
+    g_doctrineSeq = g_seq;
+    for (int n = 1; n <= 8 && n < game::NationCount(); n++) {
+        if (!IsHumanRemoteNation(n)) continue;
+        game::DoctrineState before = game::GetDoctrine(n);
+        game::DoctrineChange c = game::AdvanceDoctrine(n);
+        if (before.pendingMonths > 0 || before.missileMonths > 0)
+            Log("doctrine nation %d: training %d -> %d months%s, missile storage %d -> %d months%s", n,
+                before.pendingMonths, game::GetDoctrine(n).pendingMonths, c.trainingApplied ? " (applied)" : "",
+                before.missileMonths, game::GetDoctrine(n).missileMonths, c.missilesApplied ? " (applied)" : "");
+        if (c.trainingApplied)
+            g_playerNews[n].push_back("Doctrine: new training applied. Crews are now deemed proficient in the new tactics!");
+        if (c.missilesApplied)
+            g_playerNews[n].push_back("Doctrine: missile stocks are now adapted to the new missile storage policy.");
+    }
 }
 
 static void ResetPeaceMask() {  // in case the game's routine was left by an exception

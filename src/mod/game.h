@@ -54,6 +54,23 @@ void SetDesignReadyForBuild(int nationIdx, int i, int months);
 // Entries in the campaign's intel report list (-1 if unavailable); `unique` = distinct non-empty entries.
 int IntelReportCount(int* unique = nullptr);
 
+// Doctrine (Doctrine button): training priorities and the missile storage policy change only after a number of
+// months (Pending* values). The game's monthly ReduceTimeLimits applies them for the host's nation only.
+struct DoctrineState {
+    bool valid = false;
+    uint8_t training[4] = {}, pending[4] = {};
+    int pendingMonths = 0;
+    int missileStorage = 0, pendingMissileStorage = 0, missileMonths = 0;
+};
+struct DoctrineChange {
+    bool trainingApplied = false, missilesApplied = false;
+};
+bool DoctrineAvailable();
+DoctrineState GetDoctrine(int nationIdx);
+void SetPendingTraining(int nationIdx, const uint8_t pending[4], int months);  // as the dialog's Apply (tests)
+void SetPendingMissileStorage(int nationIdx, int policy, int months);          // tests
+DoctrineChange AdvanceDoctrine(int nationIdx);  // one month of the game's countdown
+
 // Ship orders the AI strategic-move routine may overwrite (restored for human nations).
 struct ShipSnap {
     void* ship;
@@ -95,4 +112,5 @@ void OnAfterAIMoves(void* self);
 bool OnBeforeAIPeace(int nationIdx, bool badLoss);  // true => skip the game's AI peace for this nation
 void OnAfterAIPeace();
 void OnAfterDesignStudies(void* self);  // the game advanced the host nation's design studies
+void OnAfterReduceTimeLimits(void* self);  // the game counted down the host nation's pending changes this month
 }  // namespace hookcb

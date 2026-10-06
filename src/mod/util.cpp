@@ -101,18 +101,53 @@ bool ReadFileBytes(const std::wstring& path, std::string& out) {
     return ok && got == out.size();
 }
 
-bool WriteFileBytes(const std::wstring& path, const std::string& data) {
-    std::wstring tmp = path + L".mptmp";
-    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD put = 0;
-    BOOL ok = data.empty() ? TRUE : WriteFile(h, data.data(), (DWORD)data.size(), &put, nullptr);
-    CloseHandle(h);
-    if (!ok || put != data.size()) {
-        DeleteFileW(tmp.c_str());
+// Antivirus scanners, OneDrive or search indexing can hold a freshly written save file open for a moment, which
+// makes opening or replacing it fail with a sharing error. Such errors are retried for a few seconds.
+static bool TransientFileError(DWORD e) {
+    return e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION || e == ERROR_ACCESS_DENIED ||
+           e == ERROR_USER_MAPPED_FILE;
+}
+
+static bool WriteWhole(const std::wstring& path, const std::string& data, DWORD& err) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        err = GetLastError();
         return false;
     }
-    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    DWORD put = 0;
+    BOOL ok = data.empty() ? TRUE : WriteFile(h, data.data(), (DWORD)data.size(), &put, nullptr);
+    err = ok ? 0 : GetLastError();
+    CloseHandle(h);
+    if (ok && put != data.size()) err = ERROR_WRITE_FAULT;
+    return ok && put == data.size();
+}
+
+bool WriteFileBytes(const std::wstring& path, const std::string& data) {
+    std::wstring tmp = path + L".mptmp";
+    DWORD err = 0;
+    const DWORD kDeadline = GetTickCount() + 3000;
+    for (int attempt = 0;; attempt++) {
+        if (WriteWhole(tmp, data, err)) {
+            if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                if (attempt) Log("write %s: succeeded after %d retries", W2U(path).c_str(), attempt);
+                return true;
+            }
+            err = GetLastError();
+        }
+        if (!TransientFileError(err) || (int)(GetTickCount() - kDeadline) >= 0) break;
+        Sleep(attempt < 5 ? 50 : 200);
+    }
+    // Last resort: write the file in place (works when the other program allows shared writing).
+    DWORD direct = 0;
+    if (WriteWhole(path, data, direct)) {
+        DeleteFileW(tmp.c_str());
+        Log("write %s: replaced in place after error %lu", W2U(path).c_str(), err);
+        return true;
+    }
+    DeleteFileW(tmp.c_str());
+    Log("write %s FAILED: error %lu (in place: %lu)", W2U(path).c_str(), err, direct);
+    SetLastError(err);
+    return false;
 }
 
 bool FileExists(const std::wstring& path) {

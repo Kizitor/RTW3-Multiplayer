@@ -369,15 +369,21 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
     long long cliStart = atoll(cli.Get("General", "IDNoStart", "0").c_str());
     // Clients allocate ids from their own range; only move the counter if the client used any.
     if (cliId > cliStart && cliId > hostId) host.Set("General", "IDNo", std::to_string(cliId));
-    if (!WriteFileBytes(bcsPath, WriteIni(host))) {
-        err = "cannot write host save";
-        return false;
-    }
+
+    // All new file contents first, then write them; if one write fails, the files already written get their old
+    // contents back, so a turn is either merged completely or not at all.
+    struct Out {
+        std::wstring path;
+        std::string data, original;
+        bool hadOriginal;
+        const char* what;
+    };
+    std::vector<Out> outs;
+    outs.push_back({bcsPath, WriteIni(host), hostBytes, true, "host save"});
     if (const std::string* des = sub.Get("designs.des")) {
-        if (!WriteFileBytes(slotDir + L"DesignFiles" + std::to_wstring(nationIdx) + L".des", *des)) {
-            err = "cannot write designs";
-            return false;
-        }
+        Out o{slotDir + L"DesignFiles" + std::to_wstring(nationIdx) + L".des", *des, "", false, "designs"};
+        o.hadOriginal = ReadFileBytes(o.path, o.original);
+        outs.push_back(o);
     }
     int poss = 0;
     if (const std::string* md = sub.Get("mapdata.dat")) {
@@ -388,11 +394,20 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
             IniDoc cm = ParseIni(*md);
             std::string owner = host.Get("Nation" + std::to_string(nationIdx), "Name");
             poss = MergePossessions(hm, cm, owner);
-            if (poss && !WriteFileBytes(mapPath, WriteIni(hm))) {
-                err = "cannot write map data";
-                return false;
-            }
+            if (poss) outs.push_back({mapPath, WriteIni(hm), hostMap, true, "map data"});
         }
+    }
+    for (size_t i = 0; i < outs.size(); i++) {
+        if (WriteFileBytes(outs[i].path, outs[i].data)) continue;
+        DWORD e = GetLastError();
+        for (size_t j = 0; j < i; j++) {
+            bool restored = outs[j].hadOriginal ? WriteFileBytes(outs[j].path, outs[j].original)
+                                                : DeleteFileW(outs[j].path.c_str()) != 0;
+            if (!restored) Log("merge nation %d: could not restore %s", nationIdx, outs[j].what);
+        }
+        err = std::string("cannot write ") + outs[i].what + " (Windows error " + std::to_string(e) + ")";
+        Log("merge nation %d rejected: %s", nationIdx, err.c_str());
+        return false;
     }
     Log("merge nation %d: %d sections, %d possession fields, IDNo %lld/%lld", nationIdx, replaced, poss, hostId, cliId);
     return replaced > 0;

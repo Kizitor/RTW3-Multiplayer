@@ -176,6 +176,38 @@ static std::string ExecuteOnMain(const std::string& line) {
             int unique = 0, count = game::IntelReportCount(&unique);
             return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count) + " unique=" + std::to_string(unique);
         }
+        if (cmd == "doctrine") {  // doctrine <nation>: training priorities, pending ones, months left; missile storage
+            game::DoctrineState d = game::GetDoctrine(atoi(arg(1).c_str()));
+            if (!d.valid) return "error unavailable";
+            auto four = [](const uint8_t* b) {
+                return std::to_string(b[0]) + "," + std::to_string(b[1]) + "," + std::to_string(b[2]) + "," + std::to_string(b[3]);
+            };
+            return "ok training=" + four(d.training) + " pending=" + four(d.pending) + " months=" +
+                   std::to_string(d.pendingMonths) + " missiles=" + std::to_string(d.missileStorage) + " pendingMissiles=" +
+                   std::to_string(d.pendingMissileStorage) + " missileMonths=" + std::to_string(d.missileMonths);
+        }
+        if (cmd == "settraining") {  // settraining <nation> <p0> <p1> <p2> <p3> <months>: as the Doctrine dialog's Apply
+            uint8_t p[4];
+            for (int i = 0; i < 4; i++) p[i] = (uint8_t)(atoi(arg(2 + i).c_str()) != 0);
+            game::SetPendingTraining(atoi(arg(1).c_str()), p, atoi(arg(6, "12").c_str()));
+            return "ok";
+        }
+        if (cmd == "setmissiles") {  // setmissiles <nation> <policy> <months>: a pending missile storage policy
+            game::SetPendingMissileStorage(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3, "2").c_str()));
+            return "ok";
+        }
+        if (cmd == "writetest") {  // writetest <slot> <file name> <bytes>: WriteFileBytes into a save slot folder
+            std::string name = arg(2);
+            if (name.empty() || name.find_first_of("\\/:") != std::string::npos || name.find("..") != std::string::npos)
+                return "error bad file name";
+            std::wstring dir = game::SaveDir(atoi(arg(1).c_str()));
+            if (dir.empty()) return "error no save folder";
+            DWORD t0 = GetTickCount();
+            bool ok = WriteFileBytes(dir + U2W(name), std::string((size_t)atoi(arg(3, "16").c_str()), 'x'));
+            DWORD e = ok ? 0 : GetLastError();
+            return (ok ? "ok" : "error write failed (" + std::to_string(e) + ")") + std::string(" ms=") +
+                   std::to_string(GetTickCount() - t0);
+        }
         if (cmd == "settension") {  // settension <a> <b> <value>: raw write, as the game's own routines would
             game::SetTensionRaw(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3).c_str()));
             return "ok";

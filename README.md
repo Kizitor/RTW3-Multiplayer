@@ -23,7 +23,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.2-win32.zip` from the
+2. Download `RTW3MP-0.2.3-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -129,6 +129,8 @@ nation, then:
   occasional one-month "technical issues" delay, and the player is told in the Multiplayer chat when a
   design is ready for construction. The game's random committee and Air Force events about design
   studies only happen for the host's nation.
+- **Doctrine changes of joined players** (new training priorities, missile storage policy) take effect after
+  the same number of months as in single player, and the player is told in the Multiplayer chat.
 - **Not transferred from joined players:** officers, divisions, and changes to air units (1920s+).
   Ships, designs, budget, research, training, doctrine, deployments, forts and base improvements are
   transferred.
@@ -148,6 +150,9 @@ nation, then:
   too large" at the end of a month, the host and players are on 0.2.1 or older. Those versions duplicated
   the campaign's intelligence reports every month until the save no longer fit in memory. Update everyone to
   0.2.2 or newer; loading the campaign with 0.2.2 repairs it automatically.
+- If the host sees "<player>'s turn could not be applied", another program (usually antivirus or OneDrive) held
+  a save file for more than 3 seconds; that nation keeps last month's orders. If it happens repeatedly, exclude
+  `Documents\My Games\Rule the Waves 3\Save` from scanning/syncing.
 - If you see "different game version than the host", update both games through Steam.
 - If there is no **Multiplayer** button, check that `version.dll` and `RTW3MP.dll` are both next to
   `RTW3.exe`. Some antivirus programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name);

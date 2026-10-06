@@ -67,7 +67,12 @@ notes, gotchas) before changing tests. Source: `src/mod/*.cpp`, tests: `tools/`.
 `diploview`, `settension`, `aipeace` (async), `applydiplo` (async), design studies:
 `designs <nation>` (index, class name, ReadyForBuild for each design), `setready <nation> <index> <months>`,
 intel reports: `intel` -> `ok count=<entries> unique=<distinct non-empty>` (host or client, the campaign in
-memory; a clean list has count == unique).
+memory; a clean list has count == unique), doctrine: `doctrine <nation>` -> `ok training=a,b,c,d pending=a,b,c,d
+months=N missiles=M pendingMissiles=P missileMonths=T`, `settraining <nation> <p0> <p1> <p2> <p3> <months>` (as the
+dialog's Apply, with a chosen month count), `setmissiles <nation> <policy> <months>` (0 Minimum, 1 Adequate,
+2 Plentiful), file writes: `writetest <slot> <file name> <bytes>` -> `ok ms=N` or `error write failed (E) ms=N`
+(writes <bytes> 'x' through the mod's `WriteFileBytes` into that slot's save folder, on the main thread; use a
+throwaway name, never a real save file).
 Commands that may open modal game dialogs must be async on the bridge side; answer the dialogs from the test.
 
 ## Known traps for tests
@@ -95,7 +100,31 @@ Commands that may open modal game dialogs must be async on the bridge side; answ
   others open the build tab or the modal ship designer). The committee-review event uses the same class; any
   answer is fine there.
 - The client's Multiplayer window only exists after `mpwindow` (the `session` scenario opens it); its chat log
-  (control 1070) is where a player's private lines (design studies, diplomacy) show up.
+  (control 1070) is where a player's private lines (design studies, doctrine, diplomacy) show up.
+- Game dialogs can be driven with posted messages once you know their layout. Read it from the game's own form
+  resource instead of guessing: load `RTW3.exe` as a data file (`LoadLibraryExW(..., LOAD_LIBRARY_AS_DATAFILE)`,
+  read-only), `FindResourceW(<FORM CLASS IN CAPS>, RT_RCDATA)` and parse the binary DFM (`TPF0`): class, name,
+  caption and parent of every control. Never run `dismiss_dialogs` on a copy while you drive one of its
+  `Tdlg*` dialogs yourself (it would answer that dialog too).
+- `TdlgDoctrine` (strategic screen button `btbnTraining`, a `TBitBtn` "Doctrine"): group box "Training
+  priorities" with 4 `TCheckBox` (Gunnery, Night fighting, Torpedo warfare, Damage control), its own "Apply"
+  (`bnApply`) and "Stop training"; a second "Apply" outside it belongs to the missile storage `TRadioGroup`
+  (Minimum/Adequate/Plentiful), so pick the Apply inside the training group. "Close" (`bnClose`, mrOK) closes
+  it. Toggle a check box by posting the parent (the group box) `WM_COMMAND` with `BN_CLICKED` and the box's
+  handle as lParam (what a real click produces; VCL turns it into `CN_COMMAND` -> Toggle -> OnClick). A posted
+  `BM_CLICK` does NOT toggle it: the game's VCL style hook wants the real cursor over the box (push buttons such
+  as Apply/Close do work with `BM_CLICK`). `BM_SETCHECK` only changes the picture. Read state with `BM_GETCHECK`.
+  Apply opens a "Confirm" `TMessageForm` (OK) and makes the pending change with 12 months; "Damage control" is
+  training flag index 3. Tests then shorten it with `settraining`.
+- A rejected submission: since the 0.2.3 fix the host logs `host turn: <name>'s turn NOT applied: <why>` and
+  `merge nation K rejected: cannot write <what> (Windows error E)`, keeps the chat line `* Could not apply
+  <player>'s turn: <why>` and shows a Notice; the merge is all-or-nothing. Every processed month asserts there
+  is no `NOT applied` / `rejected` / `write ... FAILED` line (`month_checks`), and logs `write <path>: succeeded
+  after N retries` / `replaced in place` lines (transient locks that were handled). Background: a 0.2.3 run lost
+  a player's whole month to `cannot write map data`, a short lock on `MapData1.dat` right after the game's own
+  save (antivirus; Documents under OneDrive).
+- File locks for tests: open the file from Python with `CreateFileW(..., share mode 0, OPEN_EXISTING)`. A rename
+  over it (`MoveFileExW`) then fails with error 5, an in-place write with 32.
 
 ## Regression suite
 Runner: `python tools/regression.py [--only <name,...>] [--list]`. It refuses to start while `RTW3.exe` runs,
@@ -110,24 +139,29 @@ plans the new month, 240 s timeout, then `month_checks`), `answer_dialogs`, `cha
 `intel`/`saved_intel`/`private_mb`/`intel_snapshot`, `log_mark`/`log_since` (per-month slices of the host log).
 `tools/diplomacy_test.py` is a thin wrapper (`--only session,diplomacy`).
 
-**Per-month checks (`month_checks`, 6 after every processed month, counted in the scenario that processed
+**Per-month checks (`month_checks`, 7 after every processed month, counted in the scenario that processed
 it):** host and client `intel` count == unique; intel reports grow by at most 30 a month (host and client);
 the saved `[IntelReports]` of `Game1\RTWGame1.bcs` and `Game77\RTWGame77.bcs` have no empty or repeated entries
 (ReportNo == IntelN keys == distinct non-empty entries); the client's month package (`state seq N -> <name>
 (nation 1, B bytes)` in the host log) grows by at most 25 % over the previous month (baseline: the session
-start) and no `NOT sent`. Reported, not asserted: private memory (GetProcessMemoryInfo PrivateUsage) of client
-and host after the session start and after each month (summary table).
+start) and no `NOT sent`; no rejected turn or failed write in the host log for that month. Reported, not
+asserted: private memory (GetProcessMemoryInfo PrivateUsage) of client and host after the session start and
+after each month (summary table), and handled transient file locks.
 
 ### Test catalog (keep this table current)
 | Scenario | What it guards | Checks | Months | Notes |
 |---|---|---|---|---|
 | `session` | both bridges up, host loads slot 1 as nation 0, host/join/claim nation 1/start, client plans nation 1 in slot 77, nation 2 reserved as stand-in player "Bot", client Multiplayer window open; records the intel baseline at the start | 7 | 0 | always first |
 | `intel_reports` | 0.2.2 intel-report fix. Part 1 runs inside `session`, after the first load and before hosting (nothing saved yet): the bloated fixture is repaired on load (host `intel` count == unique > 0, `intel reports: N entries -> M` in the host log), and two more `load 1 0` keep the count. Part 2: at the session start the client's list and both saves (host saved slot 1 at the start) are clean, the month package was sent, and the client's load of that clean save logs no repair line (the game's own trailing empty entry is dropped quietly) | 10 | 0 | fails without the fix; needs the bloated fixture (safety rule 7) |
-| `merge` | client research % and a ship order survive the host's month (host and client); `merge nation 1` and `AI suppressed ... for nation 1` in the host log; no AI suppression for AI nation 3 | 9 + 6 | 1 | from `tools/e2e_test.py` |
-| `design_study` | a joined player's study (set to 2 on the client, submitted) counts down 2 -> 1 -> 0 on the host, host and client agree, one `design study nation 1` log line per month, client chat "ready for construction" (or the 1 % "technical issues" line with the value kept); the host's own study (2) still advances in the game's routine (0 or 1 after two months) with no `design study nation 0` lines; AI nation 3's designs unchanged and no countdown lines for AI nations | 15 + 12 | 2 | added for the design-study fix (0.2.1); fails without the fix |
-| `diplomacy` | offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from player wars, Diplomacy buttons via posted clicks | 52 + 12 (51 + 12 if the host is at war in month B) | 2 | moved from `tools/diplomacy_test.py` |
+| `file_lock` | 0.2.3 write-retry fix: the client's `writetest` into slot 77 with a throwaway file (`rtw3mp_locktest.tmp`) locked from Python. Unlocked: ok at once, no retry line. Lock released after ~1.2 s: ok after ~1-3 s, file written, `write ...: succeeded after N retries` in the client log. Lock held for the whole call: `error write failed (32 or 5)` after >= 3 s, `write ... FAILED: error E (in place: E2)`, file unchanged, no `.mptmp` left; test file deleted | 7 | 0 | never lock a real save file |
+| `merge` | client research % and a ship order survive the host's month (host and client); `merge nation 1` and `AI suppressed ... for nation 1` in the host log; no AI suppression for AI nation 3 | 9 + 7 | 1 | from `tools/e2e_test.py` |
+| `doctrine` | 0.2.3 doctrine fix. Player path on the client: real "Doctrine" button -> `TdlgDoctrine` -> toggle a training check box -> Apply -> Close gives a pending change with 12 months (falls back to `settraining` if the dialog can't be driven). Then nation 1 training shortened to 2 months + missile policy pending 2 months (client, merged on submit) and the host's own training change (2 months). After month 1: host and client at 1 month, not applied, one `doctrine nation 1: training 2 -> 1 months, missile storage 2 -> 1 months` line. After month 2: training and missiles applied on host and client, both Doctrine chat lines, `(applied)` line, host's own change applied by the game, no countdown lines for AI nations | 17 | 0 (shares `design_study`'s 2; processes 2 itself if `design_study` is not selected) | setup in the planning month before `design_study`; month checks run as a `run_month` hook |
+| `design_study` | a joined player's study (set to 2 on the client, submitted) counts down 2 -> 1 -> 0 on the host, host and client agree, one `design study nation 1` log line per month, client chat "ready for construction" (or the 1 % "technical issues" line with the value kept); the host's own study (2) still advances in the game's routine (0 or 1 after two months) with no `design study nation 0` lines; AI nation 3's designs unchanged and no countdown lines for AI nations | 15 + 14 | 2 | added for the design-study fix (0.2.1); fails without the fix |
+| `diplomacy` | offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from player wars, Diplomacy buttons via posted clicks | 52 + 14 (51 + 14 if the host is at war in month B) | 2 | moved from `tools/diplomacy_test.py` |
 
-Full run: 123 checks (122 if the host is at war in month B), 5 processed months (~2.5-3 min of game time).
+Full run: 152 checks (151 if the host is at war in month B), 5 processed months (~2.5-3 min of game time).
+Scenarios may share months: `ctx.month_hooks` callables run after every `run_month` (the `doctrine` scenario
+sets up, then checks after the next two months); a hook that never got its months fails at the end.
 
 Standalone (not in the default run): `tools/realmouse_test.py` (real mouse, needs consent),
 `tools/record_hosting.py` (records the docs video), `tools/live_lobby_test.py`, `tools/repro_issues.py`.
