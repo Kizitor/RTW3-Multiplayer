@@ -23,7 +23,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.3-win32.zip` from the
+2. Download `RTW3MP-0.2.4-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -123,14 +123,21 @@ nation, then:
   - Wars between a joined player's nation and an AI nation are resolved by the game's AI-vs-AI
     battle model.
   - Joined players don't fight tactical battles yet.
-- **Decided by the game for joined nations:** events, diplomacy with AI nations, and new aircraft
-  types. Diplomacy between players is decided with the buttons.
+- **Decided by the game for joined nations:** diplomacy with AI nations and new aircraft types. Diplomacy
+  between players is decided with the buttons.
 - **Design studies of joined players** count down every month on the host, including the game's
   occasional one-month "technical issues" delay, and the player is told in the Multiplayer chat when a
   design is ready for construction. The game's random committee and Air Force events about design
   studies only happen for the host's nation.
 - **Doctrine changes of joined players** (new training priorities, missile storage policy) take effect after
   the same number of months as in single player, and the player is told in the Multiplayer chat.
+- **Random events of joined players** ("Event - <month>" dialogs) appear on the joined player's own screen at
+  the start of a month, about one month in three, and the player answers them as in single player. The
+  answer changes their own nation (budget, prestige, unrest, …) and their relations with the other nations.
+  Events about the host's own war (peace offers, army offensives), arms-control treaties, colonial rebellions
+  and sabotage of another navy's ships only happen for the host's nation. While their nation is at war, the
+  game only has war events, so joined players at war get no random events. Officer, intelligence and other
+  monthly messages also stay with the host.
 - **Not transferred from joined players:** officers, divisions, and changes to air units (1920s+).
   Ships, designs, budget, research, training, doctrine, deployments, forts and base improvements are
   transferred.

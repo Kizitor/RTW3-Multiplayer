@@ -21,6 +21,7 @@ struct Player {
     bool welcomed = false;
     bool submitted = false;
     bool hasState = false;
+    int eventMonth = 0;  // Year*12+Month of the last random event applied for this player
 };
 
 // The ten nations of the game, offered for lobby picks before the host has a campaign.
@@ -102,6 +103,15 @@ static std::vector<NationView> g_lobbyNations;
 static std::vector<PlayerView> g_lobbyPlayers;
 static bool g_remoteCampaignReady = false, g_remoteCampaignLoaded = false;
 static std::string g_myWant;
+
+// Random events of the joined player's nation (rolled on this PC when a new month arrives).
+static int g_eventRollSeq = -1;        // month (seq) whose event roll is still due
+static int g_evUsed[100] = {};         // this nation's event cooldowns (months), like the game's own
+static std::string g_evUsedKey;        // campaign + nation the cooldowns belong to
+static int g_evUsedMonth = 0;          // Year*12+Month the cooldowns were last counted down to
+static int g_evRolledMonth = 0;        // Year*12+Month whose event roll was made (one roll per month)
+static int g_eventChancePct = 33;      // chance of an event in a month (the game's own roll is about 1 in 3)
+static std::string g_lastEvent;        // summary of the last event (tests and log)
 
 static const int kIdStride = 20000;
 
@@ -694,6 +704,71 @@ static void ApplyDiplomacy() {
     }
 }
 
+// Host: results of a joined player's random event (answered on the player's PC). Relation changes go to the
+// pairs of the player's nation; tension never crosses into war here (the game's own checks decide wars), and
+// alliances with other players are left to the Diplomacy buttons. The nation's own changes are applied right
+// away so they count even if the player doesn't submit; a submitted turn carries the same values.
+static std::string g_lastHostEvent;
+
+static void HostApplyEvent(Player& p, const KV& kv) {
+    int K = KVInt(kv, "nation", -1);
+    if (K != p.nation || K < 1 || K > 8 || KVInt(kv, "seq", -1) != g_seq || g_phase != Phase::Planning ||
+        !game::DiplomacyAvailable()) {
+        Log("event from %s ignored (nation %d, seq %d, current seq %d)", p.name.c_str(), K, KVInt(kv, "seq", -1), g_seq);
+        return;
+    }
+    int y = 0, mo = 0;
+    int month = saveio::ReadDate(game::SaveDir(g_hostSlot), g_hostSlot, y, mo) ? y * 12 + mo : 0;
+    if (month > 0 && p.eventMonth == month) {
+        Log("second event of %s in %s ignored (one per month)", p.name.c_str(), DateStr(y, mo).c_str());
+        return;
+    }
+    p.eventMonth = month;
+    std::string applied;
+    for (auto& e : Split(KVStr(kv, "tension"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2) continue;
+        int j = atoi(f[0].c_str()), d = atoi(f[1].c_str());
+        if (j < 0 || j > 8 || j == K || d == 0) continue;
+        int cur = game::Tension(K, j);
+        if (cur > 40) continue;  // already at war
+        int now = std::max(0, std::min(40, cur + std::max(-20, std::min(20, d))));
+        game::SetTensionRaw(K, j, now);
+        applied += " tension " + std::to_string(K) + "-" + std::to_string(j) + " " + std::to_string(cur) + "->" +
+                   std::to_string(now);
+    }
+    for (auto& e : Split(KVStr(kv, "alliance"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2) continue;
+        int j = atoi(f[0].c_str()), months = std::max(0, std::min(120, atoi(f[1].c_str())));
+        if (j < 0 || j > 8 || j == K) continue;
+        if (IsHumanNation(j)) {
+            applied += " alliance with player nation " + std::to_string(j) + " skipped";
+            continue;
+        }
+        if (game::AtWar(K, j)) continue;
+        game::SetAlliance(K, j, months);
+        applied += " alliance " + std::to_string(K) + "-" + std::to_string(j) + "=" + std::to_string(months);
+    }
+    static const std::set<std::string> kDelta = {"Prestige", "BudgetModifier", "BaseResources", "Funds",
+                                                 "UnrestLevel", "TechLeakRisk", "Corruption"};
+    static const std::set<std::string> kSet = {"BuildConstraint", "BuildConstraintTime", "BuildConstraintType"};
+    for (auto& e : Split(KVStr(kv, "delta"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() == 2 && kDelta.count(f[0]) && game::AdjustNationField(K, f[0], atoi(f[1].c_str()), true))
+            applied += " " + f[0] + (atoi(f[1].c_str()) > 0 ? "+" : "") + f[1];
+    }
+    for (auto& e : Split(KVStr(kv, "set"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() == 2 && kSet.count(f[0]) && game::AdjustNationField(K, f[0], atoi(f[1].c_str()), false))
+            applied += " " + f[0] + "=" + f[1];
+    }
+    g_lastHostEvent = "nation=" + std::to_string(K) + " event=" + KVStr(kv, "event") + applied;
+    Log("event of %s (nation %d, #%s '%s'):%s", p.name.c_str(), K, KVStr(kv, "event").c_str(),
+        KVStr(kv, "caption").substr(0, 60).c_str(), applied.empty() ? " no effects" : applied.c_str());
+    BroadcastLobby();
+}
+
 static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     Bundle b;
     std::string err;
@@ -1031,6 +1106,9 @@ static void HostOnMessage(net::Msg& m) {
             }
             break;
         }
+        case net::MSG_EVENT:
+            if (p && p->welcomed) HostApplyEvent(*p, KVDecode(m.data));
+            break;
         case net::MSG_ACK:
             break;
         case net::MSG_BYE:
@@ -1081,6 +1159,125 @@ static void ClientApplyPendingState() {
     net::Send(0, net::MSG_ACK, KVEncode(a));
     Notice("New month " + g_date + ": you command " + KVStr(h, "nationName") +
            ". Press Submit when your orders are ready.");
+    g_eventRollSeq = seq;  // this month's event roll happens as soon as the game is idle
+}
+
+// ---------------------------------------------------------------------------------------------
+// Client: random events. The game only rolls them for the host's nation; a joined player's events are rolled and
+// answered here, and the host applies the results (game::RunClientEvent explains how).
+
+static std::wstring EventCooldownFile() {
+    uint32_t h = 2166136261u;
+    for (char c : g_evUsedKey) h = (h ^ (uint8_t)c) * 16777619u;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "events_%08x.ini", h);
+    return ModDataDir() + U2W(buf);
+}
+
+static void SaveEventCooldowns() {
+    KV kv;
+    kv["campaign"] = g_evUsedKey;
+    kv["month"] = std::to_string(g_evUsedMonth);
+    kv["rolled"] = std::to_string(g_evRolledMonth);
+    std::string used;
+    for (int u : g_evUsed) used += std::to_string(u) + ",";
+    kv["used"] = used;
+    WriteFileBytes(EventCooldownFile(), KVEncode(kv));
+}
+
+static int ClientMonth() {
+    int y = 0, m = 0;
+    return saveio::ReadDate(game::SaveDir(g_clientSlot), g_clientSlot, y, m) ? y * 12 + m : 0;
+}
+
+// Loads this nation's cooldowns for the open campaign and counts them down to `month`.
+static void UpdateEventCooldowns(int month) {
+    std::string key = CampaignKey() + "|nation" + std::to_string(g_myNation);
+    if (key != g_evUsedKey) {
+        g_evUsedKey = key;
+        memset(g_evUsed, 0, sizeof(g_evUsed));
+        g_evUsedMonth = month;
+        g_evRolledMonth = 0;
+        std::string s;
+        if (ReadFileBytes(EventCooldownFile(), s)) {
+            KV kv = KVDecode(s);
+            if (KVStr(kv, "campaign") == key) {
+                auto f = Split(KVStr(kv, "used"), ',');
+                for (size_t i = 0; i < f.size() && i < 100; i++) g_evUsed[i] = atoi(f[i].c_str());
+                g_evUsedMonth = KVInt(kv, "month", month);
+                g_evRolledMonth = KVInt(kv, "rolled", 0);
+            }
+        }
+    }
+    int elapsed = month - g_evUsedMonth;
+    if (elapsed > 0 && elapsed < 1200)
+        for (int& u : g_evUsed) u = std::max(0, u - elapsed);
+    g_evUsedMonth = month;
+}
+
+// forcedIdx >= 0: that event now (tests). Otherwise this month's roll: once per calendar month, even if the month
+// is sent again (rejoin, nation pick, a turn that didn't advance).
+static void ClientRunEvent(int forcedIdx) {
+    if (g_role != Role::Client || g_myNation <= 0 || !g_haveState || game::EventActive()) return;
+    int month = ClientMonth();
+    if (month <= 0) {
+        Log("event: cannot read the date; no roll this time");
+        return;
+    }
+    UpdateEventCooldowns(month);
+    if (forcedIdx < 0) {
+        if (g_evRolledMonth == month) {
+            Log("event: this month was already rolled");
+            return;
+        }
+        g_evRolledMonth = month;
+        SaveEventCooldowns();
+        if (std::uniform_int_distribution<int>(0, 99)(g_rng) >= g_eventChancePct) {
+            g_lastEvent = "none";
+            Log("event: no event this month");
+            return;
+        }
+    } else {
+        g_evRolledMonth = month;
+    }
+    int seq = g_clientSeq;
+    game::ClientEventResult r = game::RunClientEvent(g_myNation, forcedIdx, g_evUsed);
+    SaveEventCooldowns();
+    if (!r.error.empty()) {
+        g_lastEvent = "error " + r.error;
+        Log("event: %s", r.error.c_str());
+        return;
+    }
+    if (!r.shown) {
+        g_lastEvent = "none";
+        Log("event: no event this month");
+        return;
+    }
+    KV kv;
+    kv["seq"] = std::to_string(seq);
+    kv["nation"] = std::to_string(g_myNation);
+    kv["event"] = std::to_string(r.eventIdx);
+    std::string cap = W2U(r.caption);
+    if (cap.size() > 160) cap.resize(160);
+    for (char& c : cap)
+        if (c == '\n' || c == '\r') c = ' ';
+    kv["caption"] = cap;
+    std::string ten, ally, delta, set;
+    for (int i = 0; i < 9; i++) {
+        if (r.tension[i]) ten += std::to_string(i) + ":" + std::to_string(r.tension[i]) + ";";
+        if (r.alliance[i] >= 0) ally += std::to_string(i) + ":" + std::to_string(r.alliance[i]) + ";";
+    }
+    for (auto& d : r.fieldDelta) delta += d.first + ":" + std::to_string(d.second) + ";";
+    for (auto& s : r.fieldSet) set += s.first + ":" + std::to_string(s.second) + ";";
+    kv["tension"] = ten;
+    kv["alliance"] = ally;
+    kv["delta"] = delta;
+    kv["set"] = set;
+    net::Send(0, net::MSG_EVENT, KVEncode(kv));
+    g_lastEvent = "event=" + std::to_string(r.eventIdx) + " tension=" + ten + " alliance=" + ally + " delta=" + delta +
+                  " set=" + set;
+    Log("event %d for nation %d: %s | %s", r.eventIdx, g_myNation, cap.substr(0, 60).c_str(), g_lastEvent.c_str());
+    game::RefreshUI();
 }
 
 static void ParseLobby(const KV& kv) {
@@ -1228,6 +1425,8 @@ void Init() {
         int s = atoi(buf);
         if (s >= 50 && s < 1000) g_clientSlot = s;
     }
+    if (GetEnvironmentVariableA("RTW3MP_EVENT_CHANCE", buf, sizeof(buf)) > 0)
+        g_eventChancePct = std::max(0, std::min(100, atoi(buf)));
 }
 
 bool Host(const std::string& name, int port, const std::string& password, int turnLimitMin, std::string& err) {
@@ -1282,6 +1481,7 @@ void Leave() {
     g_pactWars.clear();
     g_cSnap = DipSnap();
     g_playerNews.clear();
+    g_eventRollSeq = -1;
     g_submissions.clear();
     g_haveState = g_submitted = false;
     g_pendingState.clear();
@@ -1529,6 +1729,17 @@ void DebugApplyDiplomacy() {
     BroadcastLobby();
 }
 
+void DebugEvent(int forcedIdx) {
+    if (g_role == Role::Client && !game::EventActive()) {
+        g_eventRollSeq = -1;  // replaces this month's random roll
+        ClientRunEvent(forcedIdx);
+    }
+}
+
+void DebugEventChance(int pct) { g_eventChancePct = std::max(0, std::min(100, pct)); }
+
+std::string DebugLastEvent() { return g_role == Role::Host ? g_lastHostEvent : g_lastEvent; }
+
 void OnNet() {
     net::Msg m;
     while (net::Pop(m)) {
@@ -1596,6 +1807,12 @@ void Tick() {
     } else if (g_role == Role::Client) {
         if (!g_pendingState.empty()) ClientApplyPendingState();
         if (g_forceSubmitPending && !g_submitted && g_haveState && !game::IsBusy()) SubmitTurn();
+        // This month's event roll (once per calendar month, see ClientRunEvent).
+        if (g_eventRollSeq >= 0 && g_eventRollSeq == g_clientSeq && g_haveState && g_phase == Phase::Planning &&
+            !g_submitted && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive()) {
+            g_eventRollSeq = -1;
+            ClientRunEvent(-1);
+        }
     }
 }
 

@@ -21,6 +21,7 @@ enum : uint16_t {
     MSG_BYE,
     MSG_ACK,
     MSG_DIPLO,
+    MSG_EVENT,
     EV_CONNECTED = 0xFF00,
     EV_DISCONNECTED = 0xFF01,
 };

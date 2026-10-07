@@ -86,6 +86,9 @@ std::string Diplomacy(const std::string& action, int targetNation);
 std::string DebugDiplomacyAs(int fromNation, const std::string& action, int targetNation);  // tests (host)
 void DebugReserve(int nation, const std::string& player);                                    // tests (host)
 void DebugApplyDiplomacy();  // tests (host): run the month-end diplomacy step now
+void DebugEvent(int forcedIdx);  // tests (client): roll this month's event now (-1 = random, else that event)
+void DebugEventChance(int pct);  // tests (client): chance of an event per month (default 33)
+std::string DebugLastEvent();    // tests: last event sent (client) or applied (host)
 
 View GetView();
 const std::vector<std::string>& Chat();

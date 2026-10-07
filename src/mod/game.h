@@ -71,6 +71,26 @@ void SetPendingTraining(int nationIdx, const uint8_t pending[4], int months);  /
 void SetPendingMissileStorage(int nationIdx, int policy, int months);          // tests
 DoctrineChange AdvanceDoctrine(int nationIdx);  // one month of the game's countdown
 
+// Random events for a joined player's nation K, rolled on the player's PC with K seen as "the player"
+// (everything is put back afterwards). `used` = the player's own event cooldowns (in/out). The relation and
+// nation-field changes are returned for the host to apply.
+struct ClientEventResult {
+    bool shown = false;
+    int eventIdx = -1;
+    std::wstring caption;
+    std::string error;
+    int tension[9] = {};  // change of the relation between K and nation i
+    int alliance[9];      // new alliance months between K and nation i, -1 = unchanged
+    std::map<std::string, int> fieldDelta;  // changes of K's own fields (Prestige, Funds, ...)
+    std::map<std::string, int> fieldSet;    // new values (BuildConstraint, BuildConstraintTime, BuildConstraintType)
+};
+bool EventsAvailable();
+bool EventActive();  // an event dialog for a joined player is open (nation list reordered: don't load/save)
+bool GetEventInfo(int idx, int& cond, std::wstring& caption, bool& hostOnly);  // false if the slot is empty
+ClientEventResult RunClientEvent(int playerNation, int forcedIdx, int used[100]);  // forcedIdx -1 = random
+bool AdjustNationField(int nationIdx, const std::string& field, int value, bool isDelta);
+int NationIntField(int nationIdx, const std::string& field);  // INT_MIN if unknown
+
 // Ship orders the AI strategic-move routine may overwrite (restored for human nations).
 struct ShipSnap {
     void* ship;

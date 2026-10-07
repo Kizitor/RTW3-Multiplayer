@@ -1,5 +1,7 @@
 #include "game.h"
 #include "../../third_party/minhook/include/MinHook.h"
+#include <climits>
+#include <random>
 
 namespace game {
 
@@ -37,6 +39,10 @@ struct Api {
     int fMissileStorage = -1, fPendingMissileStorage = -1, fMissileStorageTime = -1;
     void* mReduceTimeLimits = nullptr;
     bool doctrine = false;
+    // random events (TfrmBuildCamp.Events: 100 records of 100 bytes, loaded from Data\Events.dat)
+    int fEvents = -1, fTechSharing = -1;
+    void *mHandleEvent = nullptr, *mLikelihood = nullptr;
+    bool events = false;
 } A;
 
 static void* g_buildCamp = nullptr;
@@ -196,6 +202,12 @@ bool Resolve() {
                  A.fMissileStorage >= 0 && A.fPendingMissileStorage >= 0 && A.fMissileStorageTime >= 0 &&
                  A.mReduceTimeLimits;
     if (!A.doctrine) Log("WARNING: doctrine fields not found; joined players' doctrine changes won't take effect");
+    A.fEvents = dl::Field("TfrmBuildCamp", "Events");
+    A.fTechSharing = dl::Field("TBuilderNation", "TechSharing");
+    A.mHandleEvent = dl::Method("TfrmBuildCamp", "HandleEvent");
+    A.mLikelihood = dl::Method("TfrmBuildCamp", "EventLikelihoodCheck");
+    A.events = A.diplomacy && A.fEvents >= 0 && A.fTechSharing >= 0 && A.mHandleEvent && A.mLikelihood;
+    if (!A.events) Log("WARNING: event data not found; joined players won't get random events");
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -444,6 +456,210 @@ DoctrineChange AdvanceDoctrine(int nationIdx) {
     return c;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Random events (the "Event - <month>" dialogs). The game rolls them for the host's nation only and treats
+// nation 0 as "the player": effects change the player's own fields, and each other nation's `Tension`/`Allied`/
+// `TechSharing` (its relation with nation 0). To run an event for a joined player's nation K on the player's PC,
+// the nation list is temporarily reordered so K is at index 0 (and nation 0 at index K), and every nation's
+// relation fields temporarily hold its relation with K. Afterwards everything is put back and the relation
+// changes are returned, for the host to apply to the K pairs.
+
+static const int kEventSlots = 100, kEventRecSize = 100;
+static const int kEvCond = 0x50, kEvUsed = 0x54, kEvAnswer = 8, kEvAnswerSize = 24, kEvAnswerCond = 0x14;
+
+static uint8_t* EventRec(void* form, int i) { return (uint8_t*)form + A.fEvents + i * kEventRecSize; }
+
+bool EventsAvailable() { return A.events && BuildCamp() && NationCount() >= 9 && A.warVar; }
+
+// Events whose outcome depends on the host's own war, on campaign-wide treaties or on other nations' ships and
+// colonies cannot be resolved on a joined player's PC.
+static bool EventNeedsHost(void* form, int i) {
+    uint8_t* r = EventRec(form, i);
+    int cond = *(int*)(r + kEvCond);
+    if (cond == 25 || (cond >= 30 && cond <= 40)) return true;
+    for (int a = 0; a < 3; a++) {
+        int c = *(int*)(r + kEvAnswer + a * kEvAnswerSize + kEvAnswerCond);
+        if (c == 20 || c == 25 || c == 26 || c == 27 || c == 40 || c == 41 || (c >= 50 && c <= 56) || c == 60 ||
+            c == 61 || c == 65)
+            return true;
+    }
+    return false;
+}
+
+bool GetEventInfo(int i, int& cond, std::wstring& caption, bool& hostOnly) {
+    void* f = BuildCamp();
+    if (!A.events || !f || i < 0 || i >= kEventSlots) return false;
+    uint8_t* r = EventRec(f, i);
+    caption = dl::ReadUStr(*(void**)r);
+    if (caption.empty()) return false;
+    cond = *(int*)(r + kEvCond);
+    hostOnly = EventNeedsHost(f, i);
+    return true;
+}
+
+static bool g_evActive = false;  // a joined player's event is being rolled (likelihood veto active)
+
+struct EvState {
+    void** arr;
+    void* obj[9];
+    int K;
+    int origT[9], origA[9], origTS[9];
+    int war;
+    int hostUsed[kEventSlots];
+    bool swapped;
+};
+static EvState g_ev;
+
+bool EventActive() { return g_ev.swapped; }
+
+static void EvRestore() {
+    if (!g_ev.swapped) return;
+    g_ev.arr[0] = g_ev.obj[0];
+    g_ev.arr[g_ev.K] = g_ev.obj[g_ev.K];
+    for (int i = 0; i < 9; i++) {
+        dl::At<int>(g_ev.obj[i], A.fTension) = g_ev.origT[i];
+        dl::At<int>(g_ev.obj[i], A.fAllied) = g_ev.origA[i];
+        dl::At<int>(g_ev.obj[i], A.fTechSharing) = g_ev.origTS[i];
+    }
+    *A.warVar = g_ev.war;
+    void* f = BuildCamp();
+    for (int j = 0; f && j < kEventSlots; j++) *(int*)(EventRec(f, j) + kEvUsed) = g_ev.hostUsed[j];
+    g_ev.swapped = false;
+    g_evActive = false;
+}
+
+// Runs the game's HandleEvent; if a game exception unwinds through here, the nation list is put back first.
+static int EvRollGuarded(void* form, int forced, const int* order, int n) {
+    int shown = -1;
+    __try {
+        if (forced >= 0) {
+            if (dl::Call(A.mHandleEvent, (uint32_t)(uintptr_t)form, (uint32_t)forced, 1) & 0xFF) shown = forced;
+        } else {
+            for (int t = 0; t < n && shown < 0; t++)
+                if (dl::Call(A.mHandleEvent, (uint32_t)(uintptr_t)form, (uint32_t)order[t], 0) & 0xFF) shown = order[t];
+        }
+    } __finally {
+        if (AbnormalTermination()) EvRestore();
+    }
+    return shown;
+}
+
+// Player-nation fields an event answer may change (all saved in the player's [NationK] section).
+static const char* kEvDeltaFields[] = {"Prestige", "BudgetModifier", "BaseResources", "Funds",
+                                       "UnrestLevel", "TechLeakRisk", "Corruption"};
+static const char* kEvSetFields[] = {"BuildConstraint", "BuildConstraintTime"};
+
+ClientEventResult RunClientEvent(int K, int forcedIdx, int used[100]) {
+    ClientEventResult res;
+    void* f = BuildCamp();
+    void* list = NationList();
+    if (!EventsAvailable() || !f || !list || K < 1 || K > 8 || PlayerNation() != Nation(K) || g_ev.swapped) {
+        res.error = "events unavailable";
+        return res;
+    }
+    if (forcedIdx >= 0) {
+        int cond;
+        std::wstring cap;
+        bool hostOnly;
+        if (!GetEventInfo(forcedIdx, cond, cap, hostOnly)) {
+            res.error = "no such event";
+            return res;
+        }
+        if (hostOnly) {
+            res.error = "event needs the host";
+            return res;
+        }
+    }
+    g_ev.arr = dl::At<void**>(list, 4);
+    g_ev.K = K;
+    int tmpT[9], tmpA[9];
+    bool kAtWar = false;
+    for (int i = 0; i < 9; i++) {
+        g_ev.obj[i] = g_ev.arr[i];
+        g_ev.origT[i] = dl::At<int>(g_ev.obj[i], A.fTension);
+        g_ev.origA[i] = dl::At<int>(g_ev.obj[i], A.fAllied);
+        g_ev.origTS[i] = dl::At<int>(g_ev.obj[i], A.fTechSharing);
+        tmpT[i] = i == K ? 0 : Tension(K, i);
+        tmpA[i] = i == K ? 0 : AllianceMonths(K, i);
+        if (i != K && tmpT[i] > 40) kAtWar = true;
+    }
+    g_ev.war = *A.warVar;
+    for (int j = 0; j < kEventSlots; j++) g_ev.hostUsed[j] = *(int*)(EventRec(f, j) + kEvUsed);
+    std::map<std::string, int> before;
+    for (const char* n : kEvDeltaFields) before[n] = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
+    for (const char* n : kEvSetFields) before[n] = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
+    int fType = dl::Field("TBuilderNation", "BuildConstraintType");
+    int typeBefore = fType >= 0 ? dl::At<uint8_t>(g_ev.obj[K], fType) : 0;
+
+    // The player's view: relations with K, K's war state, K's own event cooldowns, K at index 0.
+    for (int i = 0; i < 9; i++) {
+        dl::At<int>(g_ev.obj[i], A.fTension) = tmpT[i];
+        dl::At<int>(g_ev.obj[i], A.fAllied) = tmpA[i];
+        dl::At<int>(g_ev.obj[i], A.fTechSharing) = 0;
+    }
+    *A.warVar = kAtWar ? (g_ev.war > 0 ? g_ev.war : 1) : (g_ev.war > 0 ? -12 : g_ev.war);
+    for (int j = 0; j < kEventSlots; j++) *(int*)(EventRec(f, j) + kEvUsed) = used[j];
+    g_ev.swapped = true;
+    g_ev.arr[0] = g_ev.obj[K];
+    g_ev.arr[K] = g_ev.obj[0];
+    g_evActive = true;
+
+    static std::mt19937 rng((unsigned)(GetTickCount() * 2654435761u));
+    int order[101];
+    for (int& o : order) o = std::uniform_int_distribution<int>(0, kEventSlots - 1)(rng);
+    int shown = EvRollGuarded(f, forcedIdx, order, 101);
+
+    int afterT[9], afterA[9];
+    for (int i = 0; i < 9; i++) {
+        afterT[i] = dl::At<int>(g_ev.obj[i], A.fTension);
+        afterA[i] = dl::At<int>(g_ev.obj[i], A.fAllied);
+    }
+    for (int j = 0; j < kEventSlots; j++) used[j] = *(int*)(EventRec(f, j) + kEvUsed);
+    EvRestore();
+
+    res.shown = shown >= 0;
+    res.eventIdx = shown;
+    if (shown >= 0) res.caption = dl::ReadUStr(*(void**)EventRec(f, shown));
+    for (int i = 0; i < 9; i++) {
+        res.alliance[i] = -1;
+        if (i == K) {
+            if (afterT[i] != tmpT[i]) Log("event: own relation entry changed by %d (ignored)", afterT[i] - tmpT[i]);
+            continue;
+        }
+        res.tension[i] = afterT[i] - tmpT[i];
+        if (afterA[i] != tmpA[i]) res.alliance[i] = afterA[i];
+    }
+    for (const char* n : kEvDeltaFields) {
+        int d = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n)) - before[n];
+        if (d) res.fieldDelta[n] = d;
+    }
+    for (const char* n : kEvSetFields) {
+        int v = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
+        if (v != before[n]) res.fieldSet[n] = v;
+    }
+    if (fType >= 0 && dl::At<uint8_t>(g_ev.obj[K], fType) != typeBefore)
+        res.fieldSet["BuildConstraintType"] = dl::At<uint8_t>(g_ev.obj[K], fType);
+    return res;
+}
+
+bool AdjustNationField(int nationIdx, const std::string& field, int value, bool isDelta) {
+    void* n = Nation(nationIdx);
+    int off = dl::Field("TBuilderNation", field.c_str());
+    if (!n || off < 0) return false;
+    if (field == "BuildConstraintType")
+        dl::At<uint8_t>(n, off) = (uint8_t)(isDelta ? dl::At<uint8_t>(n, off) + value : value);
+    else
+        dl::At<int>(n, off) = isDelta ? dl::At<int>(n, off) + value : value;
+    return true;
+}
+
+int NationIntField(int nationIdx, const std::string& field) {
+    void* n = Nation(nationIdx);
+    int off = dl::Field("TBuilderNation", field.c_str());
+    if (!n || off < 0) return INT_MIN;
+    return field == "BuildConstraintType" ? dl::At<uint8_t>(n, off) : dl::At<int>(n, off);
+}
+
 std::vector<ShipSnap> SnapshotShips(int nationIdx) {
     std::vector<ShipSnap> out;
     void* n = Nation(nationIdx);
@@ -607,6 +823,10 @@ std::wstring SaveDir(int slot) {
 bool SaveGame() {
     void* f = BuildCamp();
     if (!f) return false;
+    if (EventActive()) {
+        Log("SaveGame refused: an event dialog is open");
+        return false;
+    }
     uint32_t beforeBattle = 0;
     dl::Call(A.mSave, (uint32_t)(uintptr_t)f, 0xFFFFFFFFu, 0, 1, &beforeBattle);
     return true;
@@ -629,7 +849,7 @@ void RefreshUI() {
 void SetPlayerNation(int idx) {
     void* f = BuildCamp();
     void* n = Nation(idx);
-    if (!f || !n) return;
+    if (!f || !n || EventActive()) return;
     dl::At<void*>(f, A.fPlayerNation) = n;
     Log("PlayerNation -> %d (%s)", idx, W2U(NationName(idx)).c_str());
     RefreshUI();
@@ -639,6 +859,10 @@ bool LoadCampaign(int slot, int playerIdx) {
     void* f = BuildCamp();
     if (!f) {
         Log("LoadCampaign: no frmBuildCamp");
+        return false;
+    }
+    if (EventActive()) {
+        Log("LoadCampaign refused: an event dialog is open");
         return false;
     }
     std::wstring path = SaveDir(slot) + L"RTWGame" + std::to_wstring(slot) + L".bcs";
@@ -720,6 +944,38 @@ extern "C" void* o_AIPeace = nullptr;
 extern "C" void* o_DesignStudies = nullptr;
 extern "C" void* o_Load = nullptr;
 extern "C" void* o_ReduceTimeLimits = nullptr;
+extern "C" void* o_Likelihood = nullptr;
+
+// EventLikelihoodCheck(Self, EventIndex, AffectedNation): while a joined player's event is rolled, events that
+// need the host are never picked. Returns 1 to veto.
+extern "C" BOOL __stdcall CB_Likelihood(void* self, int idx, int affected) {
+    __try {
+        return g_evActive && idx >= 0 && idx < kEventSlots && EventNeedsHost(self, idx) ? TRUE : FALSE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+extern "C" __declspec(naked) void d_Likelihood() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push ecx
+        push edx
+        push eax
+        call CB_Likelihood
+        test eax, eax
+        pop edx
+        pop ecx
+        pop eax
+        jnz veto
+        jmp dword ptr [o_Likelihood]
+    veto:
+        xor eax, eax
+        ret
+    }
+}
 
 void RunOriginalTurn() {
     void* f = BuildCamp();
@@ -1031,6 +1287,7 @@ bool InstallHooks() {
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
         Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
     if (A.doctrine) Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");
+    if (A.events) Hook(A.mLikelihood, (void*)&d_Likelihood, &o_Likelihood, "EventLikelihoodCheck");
     for (int i = 0; i < (int)(sizeof(g_skips) / sizeof(g_skips[0])); i++) {
         void* target = dl::Method(g_skips[i].cls, g_skips[i].method);
         void* thunk = target ? EmitSkipThunk(i) : nullptr;

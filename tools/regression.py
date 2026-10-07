@@ -8,6 +8,8 @@ in order, then both copies are closed and the save slots restored.
 Requires Steam running, the mod installed in the game folder (env RTW3_DIR, see rtw3ctl.py) and a campaign in
 save slot 1 that is past its setup steps (the host plays nation 0). Refuses to start while RTW3.exe runs.
 Host bridge 47701, client bridge 47702 (client save slot 77); nation 2 is reserved for a stand-in player "Bot".
+The client runs with RTW3MP_EVENT_CHANCE=0 (no random events unless a test asks for one); the client's event
+cooldown files (events_*.ini in the RTW3MP data folder) are deleted before and after the run.
 The game is driven only through the test bridge and posted window messages: the user's mouse and keyboard are
 never used and the screen is never captured. Exit code: 0 = every check passed, 1 = a check failed or the saves
 could not be restored, 2 = not started (precondition).
@@ -56,6 +58,11 @@ class Ctx:
         self.intel_prev = None  # the latest snapshot (baseline of the per-month checks)
         self.fixture = None  # [IntelReports] of the slot 1 save on disk before the run
         self.month_hooks = []  # callables (ctx, label) run after each processed month; scenarios that share months
+        self.pre_month_hooks = []  # callables (ctx, label, n) run before month n (1-based) of the run is submitted
+        self.months_planned = 0  # months the selected scenarios process
+        self.event_chance = 0  # the client's random-event chance in % (RTW3MP_EVENT_CHANCE=0 at launch)
+        self.month_marks = (0, 0)  # host and client log sizes when the latest month was submitted
+        self.roll = None  # the client's event roll of the latest month (wait_event_roll)
 
 
 def log(*a):
@@ -352,9 +359,10 @@ def intel_snapshot(ctx, mark, label):
     return s
 
 
-def month_checks(ctx, label, mark):
+def month_checks(ctx, label, mark, cmark=None):
     """After every processed month: no duplicated intel reports in memory or in the saves, few new reports, and a
-    month package that does not grow (it doubled every month before 0.2.2)."""
+    month package that does not grow (it doubled every month before 0.2.2); the client rolled the month's random
+    event once (0.2.4; at chance 0 the roll finds no event)."""
     prev, s = ctx.intel_prev, intel_snapshot(ctx, mark, label)
     check(f'{label}: host intel list has no empty or repeated entries', intel_clean(s['host']), s['host'])
     check(f'{label}: client intel list has no empty or repeated entries', intel_clean(s['client']), s['client'])
@@ -378,6 +386,14 @@ def month_checks(ctx, label, mark):
     retried = log_lines(hlog, r'write .*: (succeeded after \d+ retries|replaced in place)')
     if retried:
         log(f'  {label}: transient file locks handled:', retried[:3])
+    if cmark is not None:
+        rolls = roll_lines(log_since(C, cmark))
+        if ctx.event_chance == 0:
+            check(f'{label}: the client rolled the new month\'s event once, no event at chance 0',
+                  rolls == ['event: no event this month'], rolls)
+        else:
+            check(f'{label}: the client rolled the new month\'s event once (chance {ctx.event_chance} %)',
+                  len(rolls) == 1 and 'already rolled' not in rolls[0], rolls)
     ctx.intel_prev = s
 
 
@@ -401,10 +417,15 @@ def confirm(pid, title, timeout=5):
 def run_month(ctx, label):
     """Process one month: the client submits, the host waits for everyone, presses Turn and its dialogs (and the
     client's) are answered until the client plans the new month. Never polls the host's bridge meanwhile: its
-    calls run on the game's main thread, which is busy with the month. Then the per-month checks (intel reports,
-    saved files, month package size) run."""
+    calls run on the game's main thread, which is busy with the month. Then the client's event roll of the new
+    month is awaited (its dialog answered: an open event dialog refuses most bridge commands), and the per-month
+    checks (intel reports, saved files, month package size, event roll) run."""
+    n_month = len(ctx.months) + 1
+    for hook in list(ctx.pre_month_hooks):
+        hook(ctx, label, n_month)
     date0 = ctl.status(C).get('date')
-    mark = log_mark(H)
+    mark, cmark = log_mark(H), log_mark(C)
+    ctx.month_marks = (mark, cmark)
     war = rel(0, 1).get('warCounter', '0')
     if war.lstrip('-').isdigit() and int(war) > 0:
         log(f'  WARNING: the host nation is at war (warCounter={war}); the month may start a tactical battle')
@@ -415,10 +436,12 @@ def run_month(ctx, label):
          pids=(ctx.hp, ctx.cp))
     cmd(H, 'turn')
     end = time.time() + MONTH_TIMEOUT
+    ev_seen = []  # the client's event dialogs (the new month's roll may show one before the month is detected)
     while time.time() < end:
         assert_alive()
         answer_host_box(ctx.hp)
         answer_dialogs(ctx.hp, 'host')
+        ev_seen += [i for i in select_first_answer(ctx.cp) if i not in ev_seen]
         answer_dialogs(ctx.cp, 'client')
         try:
             st = ctl.status(C)
@@ -427,7 +450,8 @@ def run_month(ctx, label):
                 dt = time.time() - t0
                 ctx.months.append((label, date0, st.get('date'), dt))
                 log(f'month processed ({label}): {date0} -> {st.get("date")} in {dt:.0f} s')
-                month_checks(ctx, label, mark)
+                wait_event_roll(ctx, cmark, ev_seen)
+                month_checks(ctx, label, mark, cmark)
                 for hook in list(ctx.month_hooks):
                     hook(ctx, label)
                 return st.get('date')
@@ -621,6 +645,497 @@ def scenario_file_lock(ctx):
                 except OSError:
                     time.sleep(0.3)
     check('test file deleted', not os.path.exists(path) and not os.path.exists(path + '.mptmp'), path)
+
+
+# ---------------------------------------------------------------- random events of joined players (0.2.4)
+
+EVENT_ROLL = (r'\] (event \d+ for nation \d+: |event: (no event this month|this month was already rolled|'
+              r'cannot read the date|events unavailable|no such event|event needs the host))')
+EVENT_ROLL_TIMEOUT = 15  # s after the new month: the client's roll and the answer of its dialog
+EVENT_BUSY = 'error an event dialog is open'
+REARM = 'XX appears to be considering a naval rearm'  # first answer: budget +2, prestige +1, tension +2
+RISKY_EVENT_WORDS = ('ship', 'accident', 'explosion', 'collision', 'aground', 'design', 'fleet', 'sabotage', 'fire',
+                     'mutiny', 'sunk', 'damage', 'yard', 'cruiser', 'battleship')  # 2nd forced event: leave ships alone
+EVENT_PAIRS = [(1, j) for j in [0] + list(range(2, 9))] + [(0, i) for i in range(2, 9)]
+
+
+def roll_lines(txt):
+    """The client's event roll results in a log slice ('event N for nation K: ...', 'event: no event this month', ...)."""
+    return [ln.split('] ', 1)[-1] for ln in log_lines(txt, EVENT_ROLL)]
+
+
+def event_files():
+    try:
+        return sorted(f for f in os.listdir(LOG_DIR) if f.startswith('events_') and f.endswith('.ini'))
+    except OSError:
+        return []
+
+
+def remove_event_files(when):
+    """Delete the client's event cooldown files (events_<hash>.ini): the fixture campaign is always at the same month,
+    so a leftover file would mark that month as already rolled. Returns the files still there."""
+    gone = []
+    for f in event_files():
+        for _ in range(10):
+            try:
+                os.remove(os.path.join(LOG_DIR, f))
+                gone.append(f)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                time.sleep(0.5)
+    if gone:
+        log(f'removed event cooldown files ({when}):', gone)
+    return event_files()
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long), ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+
+def screen_top(h):
+    r = _RECT()
+    u.GetWindowRect(h, ctypes.byref(r))
+    return r.top
+
+
+def event_dialogs(pid):
+    return [h for h in windows_of(pid, 'TdlgEventAnswer') if u.IsWindowVisible(h)]
+
+
+def select_first_answer(pid):
+    """Event dialogs (TdlgEventAnswer: RadioButton1-3 in Panel1, a hidden nation combo, OK) of one copy: select the
+    first answer (the top-most radio) if none is selected yet, and the first nation if the combo is shown and empty.
+    OK is left to dismiss_dialogs (answer_dialogs), which keeps a selected answer. Returns [(title, answers, chosen)]."""
+    out = []
+    for dlg in event_dialogs(pid):
+        kids = [h for h in children(dlg) if u.IsWindowVisible(h)]
+        radios = sorted((h for h in kids if e2e_test.class_name(h) == 'TRadioButton' and u.IsWindowEnabled(h)),
+                        key=screen_top)
+        if radios and not any(u.SendMessageW(h, 0x00F0, 0, 0) for h in radios):  # BM_GETCHECK
+            u.SendMessageW(radios[0], 0x00F5, 0, 0)  # BM_CLICK, as dismiss_dialogs selects an answer
+            if not u.SendMessageW(radios[0], 0x00F0, 0, 0):  # else what a real click sends the parent (BN_CLICKED)
+                u.PostMessageW(u.GetParent(radios[0]), 0x0111, u.GetDlgCtrlID(radios[0]) & 0xFFFF, radios[0])
+                time.sleep(0.3)
+        for cb in (h for h in kids if e2e_test.class_name(h) == 'TComboBox'):
+            if u.SendMessageW(cb, 0x0147, 0, 0) == -1 and u.SendMessageW(cb, 0x0146, 0, 0) > 0:  # CB_GETCURSEL/COUNT
+                u.SendMessageW(cb, 0x014E, 0, 0)  # CB_SETCURSEL 0, then CBN_SELCHANGE as a real pick
+                u.PostMessageW(u.GetParent(cb), 0x0111, (1 << 16) | (u.GetDlgCtrlID(cb) & 0xFFFF), cb)
+                time.sleep(0.3)
+        chosen = next((caption(h) for h in radios if u.SendMessageW(h, 0x00F0, 0, 0)), '')
+        out.append((e2e_test.window_text(dlg), [caption(h) for h in radios], chosen))
+    return out
+
+
+def answer_events(ctx, timeout, until=None):
+    """Answer the client's event dialogs (first answer; dismiss_dialogs presses OK) until none is open and `until()`
+    holds. Returns (dialogs seen [(title, answers, chosen)], seconds, or None after `timeout`)."""
+    seen, t0 = [], time.time()
+    while True:
+        assert_alive()
+        for info in select_first_answer(ctx.cp):
+            if not any(s[0] == info[0] and s[1] == info[1] for s in seen):
+                seen.append(info)
+        answer_dialogs(ctx.cp, 'client')
+        time.sleep(0.7)
+        if not event_dialogs(ctx.cp) and (until is None or until()):
+            return seen, time.time() - t0
+        if time.time() - t0 > timeout:
+            return seen, None
+
+
+def wait_event_roll(ctx, cmark, earlier=(), timeout=EVENT_ROLL_TIMEOUT):
+    """The client rolls the new month's event as soon as it is idle: answer its dialog (first answer) until the roll's
+    log line is there, so no later bridge command meets an open event dialog (it would be refused). `earlier`: event
+    dialogs already answered while the month was processed."""
+    seen, dt = answer_events(ctx, timeout, until=lambda: roll_lines(log_since(C, cmark)))
+    seen = list(earlier) + [i for i in seen if i not in earlier]
+    ctx.roll = dict(rolls=roll_lines(log_since(C, cmark)), seen=seen, seconds=dt)
+    log(f'  client event roll: {ctx.roll["rolls"]}' + (f'; dialogs {seen}' if seen else '') +
+        (f' ({dt:.1f} s)' if dt is not None else
+         f' (NO roll line within {timeout} s; windows: {describe_windows(ctx.cp)})'))
+    return ctx.roll
+
+
+def wait_log(port, mark, pattern, timeout):
+    end = time.time() + timeout
+    while True:
+        ln = log_lines(log_since(port, mark), pattern)
+        if ln or time.time() > end:
+            return ln
+        time.sleep(0.5)
+
+
+def nint(port, nation, field):
+    v = value(cmd(port, f'nfield {nation} {field}'))
+    return int(v) if v and v.lstrip('-').isdigit() else None
+
+
+def host_event_view():
+    """Host values a joined player's event may change: nation 1's Prestige and BudgetModifier, (tension, war, alliance
+    months) of nation 1 with everyone and of the host nation with 2-8, and the host's `eventlast`."""
+    v = dict(P=nint(H, 1, 'Prestige'), B=nint(H, 1, 'BudgetModifier'), last=value(cmd(H, 'eventlast')), rel={})
+    for a, b in EVENT_PAIRS:
+        r = rel(a, b)
+        v['rel'][(a, b)] = tuple(r.get(k) for k in ('tension', 'war', 'ally'))
+    return v
+
+
+def client_event_view():
+    st = ctl.status(C)
+    return dict(P=nint(C, 1, 'Prestige'), B=nint(C, 1, 'BudgetModifier'), playerIdx=st.get('playerIdx'),
+                names=[p.split(':')[1] for p in items(cmd(C, 'nations')) if p.count(':') >= 2])
+
+
+def fmt_rel(rels):
+    return ' '.join(f'{a}-{b}:{t[0]}' + ('W' if t[1] == '1' else '') + (f'A{t[2]}' if t[2] not in ('0', None) else '')
+                    for (a, b), t in rels.items())
+
+
+def parse_client_event(s):
+    """Client `eventlast`: 'event=N tension=j:d;... alliance=j:m;... delta=Field:d;... set=Field:v;...'."""
+    m = re.match(r'^event=(-?\d+) tension=(\S*) alliance=(\S*) delta=(\S*) set=(\S*)$', s or '')
+    if not m:
+        return None
+    pairs = lambda t: [(a, int(b)) for a, b in (e.split(':', 1) for e in t.split(';') if ':' in e)]
+    return dict(event=int(m[1]), tension=[(int(a), d) for a, d in pairs(m[2])],
+                alliance=[(int(a), d) for a, d in pairs(m[3])], delta=dict(pairs(m[4])), set=dict(pairs(m[5])))
+
+
+def parse_host_event(s):
+    """Host `eventlast`: 'nation=K event=N tension K-j a->b ... Prestige+1 ... alliance K-j=m ...'."""
+    m = re.match(r'^nation=(\d+) event=(-?\d+)(.*)$', s or '')
+    if not m:
+        return None
+    return dict(nation=int(m[1]), event=int(m[2]), rest=m[3].strip(),
+                tension=[tuple(map(int, t)) for t in re.findall(r'tension (\d+)-(\d+) (-?\d+)->(-?\d+)', m[3])],
+                delta={f: int(v) for f, v in re.findall(r' (Prestige|BudgetModifier|BaseResources|Funds|UnrestLevel|'
+                                                        r'TechLeakRisk|Corruption)([+-]\d+)', m[3])})
+
+
+def force_event(ctx, idx, probe=False, timeout=25):
+    """`eventnow idx` on the client: the dialog's title, the bridge's replies while it is open (probe), the answer
+    (the first; OK by dismiss_dialogs), the roll's log line and the client's `eventlast` afterwards."""
+    cmark = log_mark(C)
+    out = dict(idx=idx, reply=cmd(C, f'eventnow {idx}'), title=None, during={})
+    end = time.time() + 10
+    while time.time() < end and not event_dialogs(ctx.cp) and not roll_lines(log_since(C, cmark)):
+        time.sleep(0.2)
+    dlg = event_dialogs(ctx.cp)
+    if dlg:
+        out['title'] = e2e_test.window_text(dlg[0])
+        if probe:
+            st = ctl.status(C)
+            out['during'] = dict(status='role' in st, playerIdx=st.get('playerIdx'), nations=ctl.cmd(C, 'nations'),
+                                 eventlast=ctl.cmd(C, 'eventlast'))
+    out['seen'], out['seconds'] = answer_events(ctx, timeout, until=lambda: roll_lines(log_since(C, cmark)))
+    out['rolls'] = roll_lines(log_since(C, cmark))
+    out['last'] = value(cmd(C, 'eventlast'))
+    log(f'  eventnow {idx}: {out}')
+    return out
+
+
+def planned_months(names):
+    """Months the selected scenarios process (doctrine and events process their own if no later scenario does)."""
+    n = sum(s[1] for s in SCENARIOS if s[0] in names)
+    if 'doctrine' in names and 'design_study' not in names:
+        n += 2
+    if 'events' in names and n == 0:
+        n += 2
+    return n
+
+
+def scenario_events(ctx):
+    """0.2.4: random events of a joined player's nation are rolled and answered on the player's PC (the game rolls them
+    only for nation 0). A forced "naval rearm" event in the planning month (real dialog, first answer): its deltas
+    reach the host for nation 1 and nation 1's relations only, the client's nation list is restored; a second forced
+    event in the same month is ignored by the host; a host-only event is refused. After the next month: the effect
+    is kept once through the merge (reported). The last processed month with nation 1 at peace (the month before
+    diplomacy's war month) rolls a random event at chance 100; the war month's roll at chance 100 finds none (at war
+    only war events qualify, and those need the host)."""
+    cp = ctx.cp
+    start = roll_lines(log_since(C))
+    check('session start: the client rolled the month once, no event at chance 0 (RTW3MP_EVENT_CHANCE=0)',
+          start == ['event: no event this month'], start)
+    files, kv = event_files(), {}
+    if len(files) == 1:
+        with open(os.path.join(LOG_DIR, files[0]), encoding='utf-8', errors='replace') as f:
+            kv = dict(ln.split('=', 1) for ln in f.read().splitlines() if '=' in ln)
+    rolled = int(kv['rolled']) if kv.get('rolled', '').isdigit() else 0
+    check('client cooldown file events_<hash>.ini: this campaign\'s nation 1, the month marked as rolled',
+          len(files) == 1 and kv.get('campaign', '').endswith('|nation1') and rolled > 0 and kv.get('month') == str(rolled),
+          f'{files} rolled={kv.get("rolled")} month={kv.get("month")} campaign=...{kv.get("campaign", "")[-12:]}')
+
+    # a) the event table as the client sees it
+    evs = []
+    for p in items(cmd(C, 'eventlist')):
+        f = p.split(':', 3)
+        if len(f) == 4 and f[0].isdigit():
+            evs.append(dict(idx=int(f[0]), cond=f[1], host=f[2] == 'H', cap=f[3]))
+    hostonly = [e for e in evs if e['host']]
+    log(f'  eventlist: {len(evs)} events, {len(hostonly)} need the host: '
+        + '; '.join(f'{e["idx"]}:{e["cond"]}:{e["cap"][:28]}' for e in hostonly))
+    check('eventlist (client): at least 50 events', len(evs) >= 50, f'{len(evs)} events')
+    check('eventlist: some events are marked H (need the host: war/peace/treaties), the others are not',
+          0 < len(hostonly) < len(evs), f'{len(hostonly)} of {len(evs)}')
+    rearm = next((e for e in evs if e['cap'][:40] == REARM[:40]), None)
+    if not check(f'eventlist: "{REARM}" is listed and can run for a joined player', rearm and not rearm['host'], rearm):
+        return
+    idx = rearm['idx']
+
+    # b) before
+    h0, c0 = host_event_view(), client_event_view()
+    log(f'  before event #{idx}: host nation 1 Prestige {h0["P"]} BudgetModifier {h0["B"]} eventlast "{h0["last"]}"; '
+        f'client Prestige {c0["P"]} BudgetModifier {c0["B"]} playerIdx {c0["playerIdx"]} nations {c0["names"]}')
+    log(f'  host relations before: {fmt_rel(h0["rel"])}')
+    check('before: host and client values recorded (nation 1 Prestige/BudgetModifier, 16 relations, client nations, '
+          'playerIdx 1)', None not in (h0['P'], h0['B'], c0['P'], c0['B']) and len(c0['names']) >= 9
+          and c0['playerIdx'] == '1' and all(None not in t for t in h0['rel'].values()),
+          f'host {h0["P"]}/{h0["B"]}, client {c0["P"]}/{c0["B"]} idx {c0["playerIdx"]} {len(c0["names"])} nations')
+
+    # c) the forced event: the game's dialog on the client, first answer
+    hmark, cmark = log_mark(H), log_mark(C)
+    ev = force_event(ctx, idx, probe=True)
+    check(f'client: eventnow {idx} shows the game\'s event dialog (TdlgEventAnswer "Event - <month>")',
+          ev['reply'] == 'ok' and (ev['title'] or '').startswith('Event - '), f'reply {ev["reply"]}, title {ev["title"]}')
+    d = ev['during']
+    check('while the dialog is open the client bridge answers status but refuses `nations` ("an event dialog is open")',
+          d.get('status') and d.get('nations') == EVENT_BUSY, d)
+    first = ev['seen'][0] if ev['seen'] else None
+    check('the dialog is answered with its first answer and closes',
+          ev['seconds'] is not None and first and first[1] and first[2] == first[1][0],
+          f'{ev["seen"]} ({ev["seconds"]} s)')
+    cl = parse_client_event(ev['last'])
+    check(f'client eventlast: event={idx}', cl and cl['event'] == idx, ev['last'])
+
+    # d) what the client sent and what the host applied
+    ten = [(j, dd) for j, dd in (cl['tension'] if cl else []) if dd]
+    j, dt = ten[0] if len(ten) == 1 else (None, None)
+    check('client eventlast: exactly one relation change, with another nation (normally +2)',
+          len(ten) == 1 and j != 1, ev['last'])
+    delta = cl['delta'] if cl else {}
+    db = delta.get('BudgetModifier', 0)
+    check('client eventlast: delta Prestige:1', delta.get('Prestige') == 1, ev['last'])
+    hl = wait_log(H, hmark, rf'event of Captain \(nation 1, #{idx}\b', 10)
+    h1, c1 = host_event_view(), client_event_view()
+    he = parse_host_event(h1['last'])
+    a = int(h0['rel'][(1, j)][0]) if (1, j) in h0['rel'] else None
+    b = None if a is None else a if a > 40 else max(0, min(40, a + max(-20, min(20, dt))))
+    want = [(1, j, a, b)] if a is not None and a <= 40 else []
+    check(f'host eventlast: nation=1 event={idx} tension 1-{j} {a}->{b} (b = clamp(a{dt:+d}, 0, 40))' if dt else
+          f'host eventlast: nation=1 event={idx} with the relation change',
+          he and he['nation'] == 1 and he['event'] == idx and a is not None and he['tension'] == want, h1['last'])
+    t1 = h1['rel'].get((1, j))
+    check(f'host rel 1 {j}: tension {b}, war and alliance unchanged',
+          t1 and b is not None and int(t1[0]) == b and t1[1:] == h0['rel'][(1, j)][1:], f'{h0["rel"].get((1, j))} -> {t1}')
+    changed = {f'{k[0]}-{k[1]}': (h0['rel'][k], h1['rel'][k]) for k in h0['rel'] if k != (1, j) and
+               h0['rel'][k] != h1['rel'][k]}
+    check('host: every other recorded pair unchanged (nation 1 with the others, the host nation with 2-8)',
+          not changed, changed)
+    check(f'host nation 1: Prestige +1 and BudgetModifier {db:+d} (as reported)',
+          None not in (h0['P'], h1['P'], h0['B'], h1['B']) and h1['P'] == h0['P'] + 1 and h1['B'] == h0['B'] + db
+          and he and he['delta'].get('Prestige') == 1,
+          f'Prestige {h0["P"]} -> {h1["P"]}, BudgetModifier {h0["B"]} -> {h1["B"]}; host eventlast {h1["last"]}')
+    check('client nation 1 Prestige equals the host\'s', c1['P'] is not None and c1['P'] == h1['P'],
+          f'client {c1["P"]} (BudgetModifier {c1["B"]}), host {h1["P"]} ({h1["B"]})')
+    check('client nation list order and player index restored', c1['names'] == c0['names'] and c1['playerIdx'] == '1',
+          f'{c0["names"]} -> {c1["names"]}, playerIdx {c1["playerIdx"]}')
+    cline = log_lines(log_since(C, cmark), rf'\] event {idx} for nation 1: ')
+    check(f'client log: "event {idx} for nation 1: ..."', len(cline) == 1, cline)
+    check(f'host log: "event of Captain (nation 1, #{idx} ..."', len(hl) == 1, hl)
+    log('  ', [x.split('] ', 1)[-1] for x in cline + hl])
+    log(f'  host after the event: Prestige {h1["P"]} BudgetModifier {h1["B"]}; relations {fmt_rel(h1["rel"])}')
+
+    # e) a second forced event in the same month: shown on the client, ignored by the host
+    risky = lambda e: any(w in e['cap'].lower() for w in RISKY_EVENT_WORDS)
+    cands = sorted((e for e in evs if not e['host'] and e['idx'] != idx),
+                   key=lambda e: (risky(e), e['cond'] != '0', e['idx']))
+    hmark = log_mark(H)
+    ev2, c2 = None, None
+    for e2 in cands[:4]:
+        ev2 = force_event(ctx, e2['idx'])
+        c2 = parse_client_event(ev2['last'])
+        if c2 and c2['event'] == e2['idx']:
+            log(f'  second event #{e2["idx"]}: "{e2["cap"]}"')
+            break
+        log(f'  event #{e2["idx"]} was not shown when forced ({ev2["last"]}); trying another')
+    check('second forced event (another index, same month): shown on the client and sent',
+          c2 and c2['event'] != idx and ev2['title'] and ev2['seconds'] is not None,
+          ev2 and f'{ev2["title"]} {ev2["last"]}')
+    ln = wait_log(H, hmark, r'second event of Captain in .+ ignored \(one per month\)', 10)
+    check('host log: "second event of Captain in <date> ignored (one per month)"', len(ln) == 1,
+          ln or log_lines(log_since(H, hmark), r'event (of|from) '))
+    h2, c2v = host_event_view(), client_event_view()
+    diff = {k: (h1[k], h2[k]) for k in ('P', 'B', 'last') if h1[k] != h2[k]}
+    diff.update({f'{k[0]}-{k[1]}': (h1['rel'][k], h2['rel'][k]) for k in h1['rel'] if h1['rel'][k] != h2['rel'][k]})
+    check('host: the second event changed nothing (nation 1 Prestige/BudgetModifier, relations, eventlast)', not diff,
+          diff)
+    log(f'  after the second event: client nation 1 Prestige {c2v["P"]} BudgetModifier {c2v["B"]} (its own fields '
+        f'reach the host with the submitted turn); host {h2["P"]}/{h2["B"]}; {[x.split("] ", 1)[-1] for x in ln]}')
+
+    # f) a host-only event is refused on the client
+    hev = hostonly[0]
+    hmark, cmark = log_mark(H), log_mark(C)
+    r = cmd(C, f'eventnow {hev["idx"]}')
+    seen_dlg, last, end = False, None, time.time() + 10
+    while time.time() < end:
+        seen_dlg = seen_dlg or bool(event_dialogs(cp))
+        last = value(ctl.cmd(C, 'eventlast'))
+        if last == 'error event needs the host':
+            break
+        time.sleep(0.5)
+    time.sleep(1)
+    seen_dlg = seen_dlg or bool(event_dialogs(cp))
+    if seen_dlg:
+        answer_events(ctx, 15)
+    sent = log_lines(log_since(H, hmark), r'event (of|from) ')
+    check(f'host-only event #{hev["idx"]} ("{hev["cap"][:30]}"): client eventlast "error event needs the host"',
+          r == 'ok' and last == 'error event needs the host', f'{r}; eventlast {last}')
+    check('the refused event shows no dialog and sends nothing to the host',
+          not seen_dlg and not sent and log_lines(log_since(C, cmark), r'\] event: event needs the host'),
+          f'dialog {seen_dlg}, host lines {sent}')
+
+    # g) after the next month: the effect is kept once through the merge (reported)
+    base = dict(before=h0['P'], event=h1['P'], submit=c2v['P'], B_event=h1['B'], B_submit=c2v['B'])
+    gst = dict(n=0, need=1)
+
+    def g_hook(ctx, label):
+        outer, _scenario[0] = _scenario[0], 'events'
+        try:
+            ctx.month_hooks.remove(g_hook)
+            gst['n'] = 1
+            hp_, cp_ = nint(H, 1, 'Prestige'), nint(C, 1, 'Prestige')
+            hb_, cb_ = nint(H, 1, 'BudgetModifier'), nint(C, 1, 'BudgetModifier')
+            mc = f'{hp_ - base["submit"]:+d}' if None not in (hp_, base['submit']) else '?'
+            log(f'  events, after the next month ({label}): nation 1 Prestige host {hp_}, client {cp_} | before the '
+                f'event {base["before"]}, right after it {base["event"]}, client at submit {base["submit"]} -> month '
+                f'change {mc} (game-driven); BudgetModifier host {hb_}, client {cb_} (after the event '
+                f'{base["B_event"]}, client at submit {base["B_submit"]})')
+            check(f'after the next month ({label}): host and client agree on nation 1\'s Prestige and BudgetModifier',
+                  hp_ is not None and hp_ == cp_ and hb_ == cb_, f'Prestige host {hp_} client {cp_}, BudgetModifier '
+                                                                  f'host {hb_} client {cb_}')
+        finally:
+            _scenario[0] = outer
+
+    g_hook.scenario, g_hook.state = 'events', gst
+    ctx.month_hooks.append(g_hook)
+
+    # h) the random path: chance 100 for the last processed month in which nation 1 stays at peace (diplomacy's second
+    # month starts wars with the host and nation 2, and at war no event qualifies for a joined player, see i); the
+    # client rolls by itself
+    hst = dict(n=0, need=1)
+    target = ctx.months_planned - (1 if 'diplomacy' in ctx.selected and ctx.months_planned > 1 else 0)
+
+    def h_post(ctx, label):
+        outer, _scenario[0] = _scenario[0], 'events'
+        try:
+            ctx.month_hooks.remove(h_post)
+            hst['n'] = 1
+            mark, _ = ctx.month_marks
+            roll = ctx.roll or {}
+            rolls = roll.get('rolls', [])
+            line = [x for x in rolls if re.match(r'event \d+ for nation 1: ', x)]
+            n = int(re.match(r'event (\d+)', line[0]).group(1)) if line else None
+            check(f'random path ({label}): the client rolled an event by itself (`event N for nation 1`), its dialog '
+                  f'answered within {EVENT_ROLL_TIMEOUT} s', len(line) == 1 and roll.get('seconds') is not None
+                  and roll.get('seen'), f'{rolls}, dialogs {roll.get("seen")}, {roll.get("seconds")} s')
+            check(f'random path ({label}): no "event: no event this month" for that month',
+                  'event: no event this month' not in rolls, rolls)
+            hl = wait_log(H, mark, rf'event of Captain \(nation 1, #{n}\b' if n is not None else r'event of Captain', 10)
+            hv = value(cmd(H, 'eventlast'))
+            he = parse_host_event(hv)
+            check(f'random path ({label}): host log "event of Captain (nation 1, #{n} ...)", host eventlast nation=1 '
+                  f'event={n}', len(hl) == 1 and n is not None and he and he['nation'] == 1 and he['event'] == n,
+                  f'{hl} | {hv}')
+            log(f'  random event: {line} | dialog {roll.get("seen")} | host {[x.split("] ", 1)[-1] for x in hl]} | '
+                f'client eventlast {value(cmd(C, "eventlast"))}')
+            r = cmd(C, 'eventchance 0')
+            if r == 'ok':
+                ctx.event_chance = 0
+            check('random path: client eventchance 0 again', r == 'ok', r)
+        finally:
+            _scenario[0] = outer
+
+    def h_pre(ctx, label, n):
+        if n != target:
+            return
+        ctx.pre_month_hooks.remove(h_pre)
+        outer, _scenario[0] = _scenario[0], 'events'
+        try:
+            r = cmd(C, 'eventchance 100')
+            if r == 'ok':
+                ctx.event_chance = 100
+            check(f'random path: client eventchance 100 before month {n} of {ctx.months_planned} ({label}, nation 1 '
+                  f'at peace)', r == 'ok', r)
+            ctx.month_hooks.append(h_post)
+        finally:
+            _scenario[0] = outer
+
+    h_pre.scenario, h_pre.state = 'events', hst
+    h_post.scenario, h_post.state = 'events', hst
+    ctx.pre_month_hooks.append(h_pre)
+
+    # i) the war rule (EventLikelihoodCheck: while the war counter is > 0 only war events qualify, and every war event
+    # needs the host): chance 100 for diplomacy's war month, so the roll when the month at war loads runs the random
+    # path at war; it must find no event and show no dialog. `eventnow` without an index can't do this itself: it
+    # goes through the once-a-month guard, and the month was rolled when it loaded (`this month was already rolled`).
+    war_month = ctx.months_planned if 'diplomacy' in ctx.selected and ctx.months_planned >= 2 else None
+    wst = dict(n=0, need=1, pre=None)
+
+    def w_post(ctx, label):
+        outer, _scenario[0] = _scenario[0], 'events'
+        try:
+            ctx.month_hooks.remove(w_post)
+            wst['n'] = 1
+            roll = ctx.roll or {}
+            r01, r12 = rel(0, 1), rel(1, 2)
+            at_war = r01.get('war') == '1' or r12.get('war') == '1'
+            last = value(cmd(C, 'eventlast'))
+            cmark = log_mark(C)
+            rn = cmd(C, 'eventnow')
+            seen_dlg, end = False, time.time() + 5
+            while time.time() < end and not roll_lines(log_since(C, cmark)):
+                seen_dlg = seen_dlg or bool(event_dialogs(ctx.cp))
+                time.sleep(0.3)
+            time.sleep(1)
+            seen_dlg = seen_dlg or bool(event_dialogs(ctx.cp))
+            if seen_dlg:
+                answer_events(ctx, 15)
+            now = roll_lines(log_since(C, cmark))
+            check(f'war rule ({label}): nation 1 at war, the month\'s roll at chance 100 finds no event (`event: no '
+                  f'event this month`, eventlast none, no dialog); a random `eventnow` adds none',
+                  wst['pre'] == 'ok' and at_war and roll.get('rolls') == ['event: no event this month']
+                  and not roll.get('seen') and last == 'none' and rn == 'ok' and not seen_dlg and len(now) == 1
+                  and now[0] in ('event: this month was already rolled', 'event: no event this month'),
+                  f'eventchance 100: {wst["pre"]}; war 0-1 {r01.get("war")}, 1-2 {r12.get("war")}; roll '
+                  f'{roll.get("rolls")}, dialogs {roll.get("seen")}; eventlast {last}; eventnow {rn} -> {now}, '
+                  f'dialog {seen_dlg}')
+            r = cmd(C, 'eventchance 0')
+            if r == 'ok':
+                ctx.event_chance = 0
+        finally:
+            _scenario[0] = outer
+
+    def w_pre(ctx, label, n):
+        if n != war_month:
+            return
+        ctx.pre_month_hooks.remove(w_pre)
+        wst['pre'] = cmd(C, 'eventchance 100')
+        if wst['pre'] == 'ok':
+            ctx.event_chance = 100
+        log(f'  war rule: client eventchance 100 before month {n} ({label}, the war month): {wst["pre"]}')
+        ctx.month_hooks.append(w_post)
+
+    if war_month:
+        w_pre.scenario, w_pre.state = 'events', wst
+        w_post.scenario, w_post.state = 'events', wst
+        ctx.pre_month_hooks.append(w_pre)
+    else:
+        log('  SKIP war rule check: no month at war in this selection (needs `diplomacy`)')
+    if planned_months([n for n in ctx.selected if n != 'events']) == 0:  # no later months: process two here
+        run_month(ctx, 'events 1')
+        run_month(ctx, 'events 2')
 
 
 def scenario_merge(ctx):
@@ -1094,6 +1609,13 @@ SCENARIOS = [  # name, months processed, what it guards, function
                      '~1 s lock by another process (retries, log line) and report a lock held > 3 s (error 32/5, '
                      'FAILED log line, file unchanged, no .mptmp left); throwaway file, deleted afterwards',
      scenario_file_lock),
+    ('events', 0, 'random events of a joined player (0.2.4): eventlist (H = needs the host); a forced "naval rearm" '
+                  'event on the client (real dialog, first answer) -> deltas applied by the host to nation 1 and its '
+                  'relations only, client nation list restored; a second forced event in the month is ignored by '
+                  'the host; a host-only event is refused; after the next month the effect is kept once (reported); '
+                  'the last processed month with nation 1 at peace (before diplomacy\'s war month) rolls a random '
+                  'event at chance 100, the war month\'s roll at chance 100 finds none (own 2 months if no later '
+                  'scenario processes any)', scenario_events),
     ('merge', 1, 'client research % and a ship order survive the host\'s month; AI suppressed for nation 1 only',
      scenario_merge),
     ('doctrine', 0, 'the player\'s Doctrine dialog (real button, posted clicks) makes a pending training change; a '
@@ -1157,11 +1679,12 @@ def preflight(g1):
     return problems
 
 
-def launch(port, slot=None):
+def launch(port, slot=None, extra=None):
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith('RTW3MP_')}
     env.update(SteamAppId='2008100', SteamGameId='2008100', RTW3MP_BRIDGE_PORT=str(port), RTW3MP_LOG_TAG=str(port))
     if slot:
         env['RTW3MP_CLIENT_SLOT'] = str(slot)
+    env.update(extra or {})
     return subprocess.Popen([os.path.join(ctl.GAME, 'RTW3.exe')], cwd=ctl.GAME, env=env)
 
 
@@ -1230,6 +1753,7 @@ def remove_client_slot():
 
 def run_scenarios(ctx, names):
     ctx.selected = list(names)
+    ctx.months_planned = planned_months(names)
     aborted = None
     for name in names:
         _scenario[0] = name
@@ -1247,13 +1771,13 @@ def run_scenarios(ctx, names):
                 log(f'  {who} windows:', describe_windows(pid))
             for port in (H, C):
                 log(f'  log {port} tail:\n    ' + '\n    '.join(log_since(port).splitlines()[-12:]))
-    for hook in ctx.month_hooks:  # a scenario that shares later months never got them
+    for hook in ctx.month_hooks + ctx.pre_month_hooks:  # a scenario that shares later months never got them
         _scenario[0] = hook.scenario
         check(f'{hook.scenario}: its checks after the shared months ran', False,
-              f'only {hook.state["n"]} of 2 months processed after its setup')
+              f'only {hook.state["n"]} of {hook.state.get("need", 2)} months processed after its setup')
 
 
-def summary(names, open_s, ctx, saves_ok, left):
+def summary(names, open_s, ctx, saves_ok, left, ev_left=()):
     print()
     log('==== summary ====')
     for name in names:
@@ -1273,7 +1797,8 @@ def summary(names, open_s, ctx, saves_ok, left):
                   f'{str((s["host_file"] or {}).get("ReportNo")):>12}{str((s["client_file"] or {}).get("ReportNo")):>14}'
                   f'{str(s["pkg"]):>11}{str(s["cmem"]):>11}{str(s["hmem"]):>9}')
     print(f'  game open: {open_s:.0f} s; saves {"restored" if saves_ok else "NOT RESTORED (see above)"}; '
-          + (f'still running: {left}' if left else 'no started copy left running'))
+          + (f'still running: {left}' if left else 'no started copy left running') + '; '
+          + (f'event cooldown files LEFT: {list(ev_left)}' if ev_left else 'no events_*.ini left'))
     n = len(results)
     print(f'{n - len(failed)}/{n} checks passed', flush=True)
     return not failed
@@ -1303,15 +1828,19 @@ def main(argv=None):
         log('cannot start:', p)
     if problems:
         return 2
+    stale = remove_event_files('before the run')
+    if stale:
+        log('cannot start: event cooldown files that cannot be deleted:', stale)
+        return 2
     shutil.copytree(g1, BACKUP)
     log('backed up save slot', HOST_SLOT, '| scenarios:', ', '.join(names))
     ctx, procs, t_open = Ctx(), PROCS, time.time()
     ctx.fixture = saved_intel(save_path(HOST_SLOT))
-    saves_ok, left = False, []
+    saves_ok, left, ev_left = False, [], []
     try:
         procs.append(launch(H))
         time.sleep(4)
-        procs.append(launch(C, CLIENT_SLOT))
+        procs.append(launch(C, CLIENT_SLOT, {'RTW3MP_EVENT_CHANCE': str(ctx.event_chance)}))
         ctx.hp, ctx.cp = procs[0].pid, procs[1].pid
         log('started host PID', ctx.hp, 'client PID', ctx.cp)
         _scenario[0] = 'session'
@@ -1336,8 +1865,11 @@ def main(argv=None):
             log(f'!! could not restore save slot {HOST_SLOT} ({err}); the backup is kept at {BACKUP}')
         if not remove_client_slot():
             log(f'!! could not remove Game{CLIENT_SLOT}')
-    passed = summary(names, open_s, ctx, saves_ok, left)
-    return 0 if passed and saves_ok and not left else 1
+        ev_left = remove_event_files('after the run')
+        if ev_left:
+            log('!! could not delete the event cooldown files', ev_left)
+    passed = summary(names, open_s, ctx, saves_ok, left, ev_left)
+    return 0 if passed and saves_ok and not left and not ev_left else 1
 
 
 if __name__ == '__main__':

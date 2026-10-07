@@ -250,3 +250,53 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   dropped turn always shows up as a failure with the log line.
 - Gotcha: with a share-mode-0 handle open, `MoveFileExW` onto the file fails with error 5 (access denied), the
   in-place `CreateFileW` with 32 (sharing violation); both are retried by the mod.
+
+## Feature 2026-10-06: random events for joined players (v0.2.4)
+- Report (0.2.0): "there are no events for the joined player".
+- Game model: `CheckTurnEvents` (in the host's turn) fills one monthly slot (peace event, officer event, buy
+  technology, `GetRandomEvent` about 1 in 3, intelligence, random tension changes ...), all for PlayerNation.
+  `GetRandomEvent` -> `HandleEvent(idx, Force)` -> `EventLikelihoodCheck` -> `TdlgEventAnswer.Execute(event, nation)`,
+  which applies the answer: the player's own Prestige, BudgetModifier, BaseResources, Funds, UnrestLevel,
+  TechLeakRisk, Corruption, BuildConstraint*; other nations' `Tension`/`Allied`/`TechSharing` (their relation with
+  nation 0); treaties (`CreateArmsControlTreaty`), peace (`NegotiatePeace`), `ArmyOffensive`, `EvilPlan`, possession
+  `Rebellion`. Nation pickers (`GetMostTenseNationIndex` etc.) loop indices 1..8 = "not the player".
+  `TfrmBuildCamp.Events`: 100 records x 100 bytes from `Data\Events.dat`: +0 caption, +4 affected-nation code,
+  answers at +8+24j (caption, budget, prestige, tension, affected, condition at +0x1c+24j), +0x50 condition,
+  +0x54 cooldown months (saved as [EUT]), +0x58/+0x5c years, +0x60 government. `EventLikelihoodCheck` allows only
+  condition >= 30 events at war and only condition < 30 in peace.
+- Fix: the joined player's PC rolls once per calendar month (33 %) after the month loads. `RunClientEvent` makes
+  K "the player": swaps TList entries 0 and K, writes K's relations into every nation's Tension/Allied (TechSharing
+  0), sets the war counter from K's wars, uses K's own cooldowns (`events_<hash>.ini` in the mod data folder),
+  vetoes events that need the host (EventLikelihoodCheck hook; condition 25, 30-40, answers 20, 25-27, 40, 41,
+  50-56, 60, 61, 65), calls the game's HandleEvent inside __try/__finally, then restores everything. Relation and
+  own-field changes go to the host (MSG_EVENT): tension to the K pairs clamped 0..40, alliances only with AI
+  nations, own fields applied in memory at once (the submission carries the same values; no double count because
+  the merge replaces [NationK]). One event per player per month on both sides. While an event dialog is open,
+  LoadCampaign/SaveGame/SetPlayerNation and state-changing bridge commands refuse.
+- Bridge: `eventlist`, `eventnow [idx]`, `eventlast`, `eventchance <pct>`; env `RTW3MP_EVENT_CHANCE`.
+## Testing 2026-10-06: joined players' random events (v0.2.4)
+- The client copy now runs with `RTW3MP_EVENT_CHANCE=0`; `run_month` waits for the client's monthly roll line
+  (answering its event dialog) before any other client command, and every month checks one roll
+  (`event: no event this month` at chance 0). The runner deletes `events_*.ini` (client cooldowns, in the RTW3MP
+  folder) before and after the run: the fixture always starts at the same month, so a leftover file would mark
+  it as already rolled.
+- Scenario `events` (planning month before `merge`, no own months): forced "naval rearm" event #5 on the client
+  (real `TdlgEventAnswer`, first answer) -> host applied `tension 1-0 5->7 BudgetModifier+2 Prestige+1` to nation 1
+  only, client nation order restored; a second forced event (#1) in the same month -> `second event of Captain in
+  Aug 1900 ignored (one per month)`; host-only #4 refused (`error event needs the host`); after `merge` host and
+  client agree (Prestige 20 -> 21 after the event -> 22 after the month, see below). 28/31 in the first run, 32/32
+  (suite 189/189) in the second.
+- Found: a chance-100 roll in the month after `diplomacy` B (nation 1 at war with the host and nation 2) found no
+  event in its 101 tries (`event: no event this month`). Confirmed by disassembly: `EventLikelihoodCheck` rejects
+  events with condition < 30 while the war counter is > 0, so at war only war events qualify, and all of them need
+  the host: a joined player at war gets no random events by design. The random path is now tested in the last
+  month at peace (diplomacy A: #21 "A new naval secretary believes destroyers...", first answer -> `BudgetModifier-1
+  Prestige-2` on the host), and one check documents the war rule with the war month's own roll at chance 100.
+- Gotcha: `eventnow` without an index goes through the once-a-month guard and only logs `this month was already
+  rolled` in a month that has loaded; set `eventchance 100` before the month instead (pre-month hook).
+- Gotcha: a forced second event changes the client's own nation (here Prestige +1, BudgetModifier +1). The host
+  ignores its message, but those values still reach the host with the submitted turn (the merge replaces [NationK]).
+  Only `eventnow` can do this; the monthly roll is guarded by the cooldown file.
+- Gotcha: drive `TdlgEventAnswer` by screen position (RadioButton1..3 top to bottom in Panel1, hidden
+  `cbSelectNation`, OK); `Data\Events.dat` (plain text, read-only) gives each answer's budget/prestige/tension
+  numbers in `eventlist` order.

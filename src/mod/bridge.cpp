@@ -78,6 +78,12 @@ static std::string Execute(const std::string& line) {
         return "ok";
     }
     if (cmd == "applydiplo") return RunOnMainThread([] { mp::DebugApplyDiplomacy(); }), "ok";
+    if (cmd == "eventnow") {  // eventnow [index]: client rolls this month's event now (shows the game's dialog)
+        if (game::EventActive()) return "error an event dialog is open";
+        int idx = atoi(arg(1, "-1").c_str());
+        RunOnMainThread([idx] { mp::DebugEvent(idx); });
+        return "ok";
+    }
     if (cmd == "windows") {
         std::string out;
         EnumWindows(ListWin, (LPARAM)&out);
@@ -90,8 +96,12 @@ static std::string ExecuteOnMain(const std::string& line) {
     auto args = Split(Trim(line), ' ');
     const std::string& cmd = args[0];
     auto arg = [&](size_t i, const std::string& def = "") { return i < args.size() ? args[i] : def; };
+    // While a joined player's event dialog is open the nation list is reordered: only read-only commands.
+    static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview"};
+    if (game::EventActive() && !kReadOnly.count(cmd)) return "error an event dialog is open";
     {
         std::string err;
+        if (cmd == "eventchance") return mp::DebugEventChance(atoi(arg(1, "33").c_str())), "ok";
         if (cmd == "status") {
             mp::View v = mp::GetView();
             KV kv;
@@ -172,6 +182,21 @@ static std::string ExecuteOnMain(const std::string& line) {
             game::SetDesignReadyForBuild(n, i, atoi(arg(3).c_str()));
             return "ok " + std::to_string(game::DesignReadyForBuild(n, i));
         }
+        if (cmd == "eventlist") {  // eventlist: index:condition:H (needs the host) or -:caption start
+            std::string s;
+            for (int i = 0; i < 100; i++) {
+                int cond = 0;
+                std::wstring cap;
+                bool hostOnly = false;
+                if (!game::GetEventInfo(i, cond, cap, hostOnly)) continue;
+                std::string c = W2U(cap.substr(0, 40));
+                for (char& ch : c)
+                    if (ch == ';' || ch == '|') ch = ',';
+                s += std::to_string(i) + ":" + std::to_string(cond) + ":" + (hostOnly ? "H" : "-") + ":" + c + "; ";
+            }
+            return s.empty() ? "error unavailable" : "ok " + s;
+        }
+        if (cmd == "eventlast") return "ok " + mp::DebugLastEvent();
         if (cmd == "intel") {  // intel: entries in the in-memory intel report list and distinct non-empty ones
             int unique = 0, count = game::IntelReportCount(&unique);
             return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count) + " unique=" + std::to_string(unique);
