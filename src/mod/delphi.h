@@ -18,6 +18,7 @@ bool IsInstanceOf(void* obj, const char* cls);
 
 // Method code address by name (published + extended RTTI), searching parent classes.
 void* Method(const char* cls, const char* name);
+void* MethodFewestParams(const char* cls, const char* name);
 // Instance field offset by name (published + extended RTTI), searching parent classes. -1 if missing.
 int Field(const char* cls, const char* name);
 

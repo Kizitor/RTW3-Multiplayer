@@ -70,8 +70,16 @@ notes, gotchas) before changing tests. Source: `src/mod/*.cpp`, tests: `tools/`.
 `submit`, `turn`, `advance`, `leave`, `load <slot> <player>`, `save` (writes the slot: safety rule 6),
 `mpwindow`, `windows`,
 `nfield <nation> <IntegerField> [value]`, `areas`, `shipinfo/shiporder`, diplomacy: `diplo <action> <n>`,
-`diploas <from> <action> <n>` (host), `reserve <n> <player>` (host: stand-in human nation), `rel <a> <b>`,
-`diploview`, `settension`, `aipeace` (async), `applydiplo` (async), design studies:
+`diploas <from> <action> <n> [extra]` (host; extra = the claim list for `claim`), `reserve <n> <player>` (host:
+stand-in human nation), `rel <a> <b>`, `diploview` (rows `nation/name/player/relation/tension/[pending]/flags`, since
+0.2.5 followed by `/vp=mine:theirs/claim=budget:nclaimable:nclaims/outlook`; parse with `regression.row`),
+`settension`, `aipeace` (async), `applydiplo` (async), peace treaties (0.2.5): `claimland <loser> <name|name>` (the
+winner of an agreed peace, client or host; empty list = leave it to the peace conference), `warvp <a> <b> [vpA vpB]`
+(host: read or set a player war's score -> `ok a:vpA b:vpB scale=G`), `terms <a> <b>` (host: `ok agreed winner=W
+loser=L level=N budget=B claims=x|y|` or `ok outlook winner=W level=N vp=a:b`), `possessions <n>`, `claimable
+<winner> <loser>` (`ok N name~area~value[~oil]; ...`), `claimui state` / `claimui toggle <row>` (client claim window:
+`ok open=0` or `ok open=1 target=.. budget=.. mpEnabled=0|1 checked=i,j sum=<label text> rows=i:name:value; ...`;
+toggle ticks a row through the list view's own LVN_ITEMCHANGED path), design studies:
 `designs <nation>` (index, class name, ReadyForBuild for each design), `setready <nation> <index> <months>`,
 intel reports: `intel` -> `ok count=<entries> unique=<distinct non-empty>` (host or client, the campaign in
 memory; a clean list has count == unique), doctrine: `doctrine <nation>` -> `ok training=a,b,c,d pending=a,b,c,d
@@ -167,6 +175,51 @@ Commands that may open modal game dialogs must be async on the bridge side; answ
 - `eventnow` without an index is this month's random roll and goes through the once-a-month guard: once the month
   was rolled (every month is rolled when it loads) it only logs `event: this month was already rolled`. To roll
   the random path in a given month, set `eventchance 100` before that month is processed (a pre-month hook).
+- Client diplomacy requests are asynchronous: the client's bridge answers `ok` once `diplo`/`claimland` is *sent*.
+  Before anything that depends on it (`applydiplo`, host `terms`, `diploas` accepting it) wait for the host log line
+  `diplomacy request 1 <action> <target> accepted` (`client_request` in the runner). A race here made `applydiplo`
+  run before the war declaration arrived. Host-side `diplo`/`diploas`/`warvp` are synchronous, but the client sees
+  the result only with the next lobby broadcast: poll `diploview` (`wait_until`).
+- Peace treaties (0.2.5): the scenario fails fast (3 checks) unless both logs say `Peace treaties: ok (... 
+  battleHooks=1/1/1)`; without it every treaty call is refused or a compromise. The game's treaty dialog is
+  `TdlgTotalLog` captioned "Peace treaty" (RichEdit `mmRichTotal` + OK/Cancel, the same form as the design report);
+  `answer_dialogs` records its text in `TREATY_SEEN` before pressing OK.
+- `applydiplo` applies a treaty at once (exact deltas), but the joined player gets the treaty dialog and the new
+  values only with the next processed month, and that month's merge replaces `[Nation1]` (prestige, base resources,
+  ship list) with the client's planning copy. So treaties that change nation 1 are applied with `applydiplo` only
+  after the scenario's last processed month; the treaty that must reach the client goes through a real month (the
+  host applies it after the merge, as for players).
+- The game's `DoPeace` (the host's last war ends) shows "With the war ending without any major battle, Navy prestige
+  takes a dent!" and takes 1 Prestige from the host: a host treaty without battles is +2 - 1. It also sets the
+  Prestige (+0x198) of nations 1-8 to 0 (its nation loop: `if idx > 0: GetBNation(idx).Prestige = 0`); since 0.2.5
+  the mod's DoPeace hook puts the players' (and reserved nations') values back and logs `end of war: prestige of
+  player nation N kept at P (the game set X)` (also seen in `diplomacy`'s host peace). `TMessageForm` texts are a
+  TLabel (no window text): count such boxes, don't read them.
+- `TBuilderNation.PrestigeWarLoss(Big)` is not a per-nation routine: it first runs
+  `form.ProportionalPrestigeLoss(10)`, which acts on `[form+0x3204]` = PlayerNation (the host's nation: -1, or
+  -Prestige/10 from 20 up), then `Self.Prestige -= 1` (Big only; once more above 20). The mod applies that formula
+  to the loser itself (`treaty_loss` in the runner); compare the host's Prestige around every treaty (the first
+  0.2.5 build cost the host 20 -> 18 -> 17 in treaties it was not a party to).
+- The game's own AI peace (`aipeace`, HandleAIPeace) for a joined nation's war with an AI nation can cede that
+  nation's possessions and shows the host a "Peace treaty" dialog (in `diplomacy`: Corsica and Tunisia from
+  France to Russia). So the stand-in's possessions at the start of `treaty` differ between runs with and without
+  `diplomacy`: read `claimable`/`possessions` at run time, never hard-code them.
+- The game's reparation text has no line break: `RemoveShipInPeace` concatenates `<ship> handed over to <winner>
+  as war reparation` and ` She is renamed <new> in <adjective> service.` (literals at 0xc5b5d4/0xc5b65c), so it
+  reads "... as war reparation She is renamed ...". Count a treaty's lines from its dialog, not as 1 per ship.
+- Python output piped through PowerShell (`| Tee-Object`) garbles non-ASCII text such as ship names (`M?nchen`): set
+  `PYTHONIOENCODING=utf-8` before reading such logs as evidence.
+- `terms`/`warvp` on a pair that is not at war create a ledger entry (`war score a-b starts at ...`); a war started by
+  the month-end step always restarts at 0:0, so read the score only after the war began.
+- The Diplomacy list (1081) and other list views of the game copy are read and selected with cross-process
+  LVM_GETITEM/LVM_GETITEMTEXT/LVM_SETITEMSTATE: the LVITEM goes into a scratch buffer allocated in the game copy
+  (`RemoteBuf`, 32-bit LVITEM layout, 60 bytes, lParam at 32). LVM_SETITEMSTATE notifies the window like a click
+  (the button captions follow the selection). The claim window `RTW3MP_Claim` is top-level, owned by the
+  Multiplayer window; its buttons (1093 Claim selected, 1094 Let the conference choose, 1095 Cancel) take a posted
+  `WM_COMMAND` with BN_CLICKED and the button handle.
+- Chat checks compare counts (`new_chat_missing`), not offsets: the chat log drops its oldest lines past 300.
+- `events` finds diplomacy's war month in run order (`months_through(names, 'diplomacy')`), so scenarios after
+  `diplomacy` may process months too.
 
 ## Regression suite
 Runner: `python tools/regression.py [--only <name,...>] [--list]`. It refuses to start while `RTW3.exe` runs,
@@ -181,7 +234,9 @@ until the client plans the new month, 240 s timeout -> `wait_event_roll` -> `mon
 `answer_dialogs`, `chat`, `designs`, `rel`/`row`, `intel`/`saved_intel`/`private_mb`/`intel_snapshot`,
 `log_mark`/`log_since` (per-month slices of the host and client logs), events: `force_event`,
 `select_first_answer`, `answer_events`, `roll_lines`, `host_event_view`/`client_event_view`,
-`remove_event_files`.
+`remove_event_files`, treaties: `client_request`, `apply_diplo`, `terms`, `warvp`, `poss_list`, `nation_view`,
+`greedy` (the mod's automatic pick), `lv_rows`/`lv_select` (`RemoteBuf`), `claim_state`/`open_claim_window`/
+`claim_button`/`claim_closed`, `capture_treaty`/`TREATY_SEEN`, `wait_until`, `wait_chat`, `new_chat_missing`.
 `tools/diplomacy_test.py` is a thin wrapper (`--only session,diplomacy`).
 
 **Per-month checks (`month_checks`, 8 after every processed month, counted in the scenario that processed
@@ -204,9 +259,12 @@ start and after each month (summary table), and handled transient file locks.
 | `merge` | client research % and a ship order survive the host's month (host and client); `merge nation 1` and `AI suppressed ... for nation 1` in the host log; no AI suppression for AI nation 3 | 9 + 8 | 1 | from `tools/e2e_test.py` |
 | `doctrine` | 0.2.3 doctrine fix. Player path on the client: real "Doctrine" button -> `TdlgDoctrine` -> toggle a training check box -> Apply -> Close gives a pending change with 12 months (falls back to `settraining` if the dialog can't be driven). Then nation 1 training shortened to 2 months + missile policy pending 2 months (client, merged on submit) and the host's own training change (2 months). After month 1: host and client at 1 month, not applied, one `doctrine nation 1: training 2 -> 1 months, missile storage 2 -> 1 months` line. After month 2: training and missiles applied on host and client, both Doctrine chat lines, `(applied)` line, host's own change applied by the game, no countdown lines for AI nations | 17 | 0 (shares `design_study`'s 2; processes 2 itself if `design_study` is not selected) | setup in the planning month before `design_study`; month checks run as a `run_month` hook |
 | `design_study` | a joined player's study (set to 2 on the client, submitted) counts down 2 -> 1 -> 0 on the host, host and client agree, one `design study nation 1` log line per month, client chat "ready for construction" (or the 1 % "technical issues" line with the value kept); the host's own study (2) still advances in the game's routine (0 or 1 after two months) with no `design study nation 0` lines; AI nation 3's designs unchanged and no countdown lines for AI nations | 15 + 16 | 2 | added for the design-study fix (0.2.1); fails without the fix |
-| `diplomacy` | offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from player wars, Diplomacy buttons via posted clicks | 52 + 16 (51 + 16 if the host is at war in month B) | 2 | moved from `tools/diplomacy_test.py`; its month A is the `events` random-path month, month B the `events` war-rule month |
+| `diplomacy` | offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from player wars, Diplomacy buttons via posted clicks | 52 + 16 (51 + 16 if the host is at war in month B) | 2 | moved from `tools/diplomacy_test.py`; its month A is the `events` random-path month, month B the `events` war-rule month; its peaces are compromises (wars started at month end score 0:0) |
+| `treaty` | 0.2.5 peace terms of wars between players. a) both logs `Peace treaties: ok (... battleHooks=1/1/1)` (else one more failing check and stop). Start: 1-2 at peace, host at war with nobody; `claimable 1 2/2 1/0 1` only the loser's possessions, Value < 11. b) client `diplo war 2` + `applydiplo`: war, chat, score 0:0; `warvp 1 2 A 100` (A = max(900, 100G+500)) -> `terms` outlook winner 1 level 2; client row vp/outlook "you are winning: ... major victory". c) client offers, nation 2 accepts (`diploas 2 peace 1`): terms agreed level 2 budget 8, chat on both sides, client row `claim=8:N:0`, a second offer refused, `rtw3mp_session.ini` has `warVP` and `treaties`. d) unknown name, the winner's own possession, a loser's possession worth >= 11, land worth > 8 refused on client (`claimland`) and host (`diploas 1 claim 2`); the loser can't claim; a valid claim accepted (terms, chat, `land claimed: v of 8`). f) client `diplo cancel 2` erases the terms (outlook again, `treaties=` empty, claim 0:0:0); agreed again the other way round, the old claim is gone. e) client window: row of nation 2 selected (LVM_SETITEMSTATE), button 1084 "Claim land...", Tension column `VP A:100`, Pending text, label = outlook; click opens `RTW3MP_Claim` (owner = MP window, MP window disabled, `claimui` target/budget/rows = `claimable 1 2`, claim pre-checked, sum label); untick + Cancel (1095) sends nothing; WM_CLOSE likewise; 1094 withdraws the claims (chat); ticks within 8, a tick past it is undone ("(over the limit)"), 1093 sends the claims (terms, chat, `claim=8:N:k`). g) processed month: one `treaty 1 over 2 (level 2): k possession(s) (claimed), s ship(s), prestige +2, resources -500` line, war over, the claimed possessions moved (host and client), treaty + "Peace: ... (<nation 1> victorious)." in both chats, client `showing a peace treaty (n lines)` + the "Peace treaty" dialog (`treaty_text`: heading, ceded, every hand-over as `... as war reparation.` plus its own sentences, reparations; n = the dialog's lines, one period per line; the same lines in both chats; answered), no host dialog; prestige exact: winner +2, loser by the formula (P div 10 when P >= 20 else 1, not below 0; major -1, -1 more above 20), the host (not a party) unchanged unless it answered an event that month; funds/ships reported. k) that month's `war score 1-2: +x/+y -> A:B` lines add up from A:100, no `first battle` line. h) `applydiplo` (after the last month): new war 0:0, nation 2 ahead (minor), 2 offers / client accepts (budget 4), the loser can't claim, > 4 refused, nobody claims -> `treaty 2 over 1 (level 1): k (automatic)` = most valuable first within 4, exact: Prestige 2 +1, loser 1 by the formula (minor), BaseResources 1 -r, ships -s/+s; the host (not a party) keeps its Prestige. i) host `diplo war 1` + `applydiplo`, `warvp 0 1`, client offers / host accepts, host `claimland 1 ...`, `applydiplo`: war over (warCounter 0, hostWars 0, `diplomacy: peace 1-0`), `treaty 0 over 1 (level 2) ... (claimed)`, claims moved, exact deltas (host Prestige +1 = treaty +2 and the DoPeace dent -1; loser 1 by the formula, major), the players keep their Prestige through DoPeace (nation 2 unchanged, nation 1 at its treaty value, host log `end of war: prestige of player nation N kept at P (the game set 0)` for 1 and 2), the host's own treaty dialog (same `treaty_text` checks). j) equal score 300:300: compromise terms, claims refused, `applydiplo`: "(compromise peace)", no treaty line, possessions/Prestige/BaseResources of the host, 1 and 2 unchanged | 65 + 8 month checks = 73 with every optional case (SKIP lines otherwise); 3 when the feature is unavailable | 1 (g) | needs `Peace treaties: ok`; h-j use `applydiplo` after the last month (see Known traps). 0.2.5: 73/73 (full run 262/262; with the reparation lines split at " She is renamed ", `--only treaty` 73/73 in 69 s, 11 lines per treaty) |
 
-Full run: 189 checks (188 if the host is at war in month B), 5 processed months (~2.5-3 min of game time).
+Full run: 262 checks with peace treaties available (261 if the host is at war in month B; fewer if a treaty SKIP
+applies), 6 processed months (~4 min of game time; 227 s in the 0.2.5 run). With `Peace treaties: UNAVAILABLE` the treaty scenario stops
+after 3 checks: 192 checks, 5 months (~3 min).
 Scenarios may share months: `ctx.month_hooks` callables run after every `run_month` (the `doctrine` scenario
 sets up, then checks after the next two months; `events` checks after the next month, after its random-path
 month and after the war month), `ctx.pre_month_hooks` (ctx, label, n) run before month n of the run is submitted

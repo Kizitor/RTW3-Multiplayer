@@ -26,6 +26,11 @@ struct NationView {
 };
 
 // Relation between my nation and another player's nation.
+struct ClaimOption {
+    std::string name, area;
+    int value = 0;
+    bool oil = false;
+};
 struct DiploRow {
     int nation = -1;
     std::string nationName, player;
@@ -35,6 +40,13 @@ struct DiploRow {
     std::string pending;   // proposals and decisions waiting for the end of the month
     bool canWar = false, canAlly = false, allyAccept = false, canPeace = false, peaceAccept = false;
     bool canLeave = false, canCancel = false, cancelIsDecline = false;
+    // war score and peace terms
+    int vpMine = 0, vpTheirs = 0;  // victory points of this war
+    std::string outlook;           // what a peace would bring right now
+    bool canClaim = false;         // peace agreed and I won: I can pick the loser's possessions
+    int claimBudget = 0;
+    std::vector<ClaimOption> claimable;
+    std::vector<std::string> claims;
 };
 
 struct View {
@@ -80,15 +92,19 @@ void SendChat(const std::string& text);
 void SubmitTurn();
 
 // Diplomacy with another player's nation (campaign index): "war", "ally" (offer or accept), "peace" (offer or
-// accept), "leave" (the alliance), "cancel" (withdraw my request or decline theirs). Takes effect when the host
+// accept), "leave" (the alliance), "cancel" (withdraw my request or decline theirs), "claim" (the winner of an agreed
+// peace picks the loser's possessions; `extra` = possession names separated by '|'). Takes effect when the host
 // processes the month. Returns "" or why it is not possible right now.
-std::string Diplomacy(const std::string& action, int targetNation);
-std::string DebugDiplomacyAs(int fromNation, const std::string& action, int targetNation);  // tests (host)
+std::string Diplomacy(const std::string& action, int targetNation, const std::string& extra = "");
+std::string DebugDiplomacyAs(int fromNation, const std::string& action, int targetNation,
+                             const std::string& extra = "");  // tests (host)
 void DebugReserve(int nation, const std::string& player);                                    // tests (host)
 void DebugApplyDiplomacy();  // tests (host): run the month-end diplomacy step now
 void DebugEvent(int forcedIdx);  // tests (client): roll this month's event now (-1 = random, else that event)
 void DebugEventChance(int pct);  // tests (client): chance of an event per month (default 33)
 std::string DebugLastEvent();    // tests: last event sent (client) or applied (host)
+std::string DebugWarVP(int a, int b, int va, int vb, bool set);  // tests (host): read or set a war's victory points
+std::string DebugTerms(int a, int b);                            // tests (host): the peace terms right now
 
 View GetView();
 const std::vector<std::string>& Chat();

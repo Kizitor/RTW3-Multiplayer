@@ -300,3 +300,84 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Gotcha: drive `TdlgEventAnswer` by screen position (RadioButton1..3 top to bottom in Panel1, hidden
   `cbSelectNation`, OK); `Data\Events.dat` (plain text, read-only) gives each answer's budget/prestige/tension
   numbers in `eventlist` order.
+## Feature 2026-10-06: peace terms for wars between players (v0.2.5)
+- Report (0.2.0): "there is no peace deal for either player in a player-vs-player war". The user chose: the winner
+  picks the possessions like in single player; if they don't pick before the month ends, they are picked
+  automatically.
+- Game model (1.01.44): `NegotiatePeace(aChance=EDX, aLossGain=ECX, ForceBadPeace)` with lossGain -6..+6. Gains:
+  1..2 = minor (prestige +1, enemy BaseResources -100), >= 3 = large (prestige +2, -500); losses: <= -5 utterly
+  defeated, -4..-3 considerable concessions (ships via `RemoveShipInPeace`, possessions taken). For lossGain > 1
+  the player picks possessions in `TdlgPossessions` (unnamed proc at 0xcf4514, budget 2 x lossGain): owned by an
+  enemy at war, Value < 11, `AreaIsAdjacentToOwnPossessions(area, player)`; then `ChangePossessionOwner(poss,
+  newOwner, RemoveAllCoastalArtillery)`, `ScrapShipsAccordingToTreaty`, `ShowPeaceTreaty(TStringList)`, `DoPeace`.
+  War record cell: 1 won, 2 lost, 3 compromise. `AINationSelectPossessionsAfterWar` (0xcf4b64) needs the winner's
+  AITension (> 40), which nation 0 doesn't keep, so the mod picks possessions itself.
+- `RemoveShipInPeace(form, from, to, var aText)` (unnamed, 0xc5b6b8, found by its call in NegotiatePeace): large,
+  recent, in-play ships not under repair, 60 % each, via `TransferShipAsReparation` (renames the ship).
+- War progress: `EventLikelihoodCheck` conditions 34-36: winning = VP >= 2 x enemy and >= 100*G + 500, slightly
+  ahead = >= 100*G + 300 (G: a global read through `6B 15 [G] 64`, imul with an 8-bit immediate). Nation VP comes from
+  `HandleBattleAftermath` (PlayerNation.VP / form.EnemyVP), `DoBattleBetweenAINations` and
+  `QuickResolveRaiderBattle`; `HandleAIPeace` zeroes VP of nations 1..8, so the mod keeps its own ledger per pair
+  of players (hooks on the three battle functions compare VP before/after; naked thunks copy the stack args).
+- Design: terms are fixed when the peace is accepted (level 2 major / 1 minor / 0 compromise), shown in the
+  Diplomacy list (war score in the Tension column, outlook in the label) and the chat. The winner may claim the
+  loser's possessions worth up to 4/8 (Claim land... window, `claim` diplomacy action validated on the host);
+  unclaimed -> automatic pick (most valuable first, within the budget). At month end the host applies:
+  possessions (`ChangePossessionOwner`), 1/3 `RemoveShipInPeace` calls, prestige +1/+2 and `PrestigeWarLoss`,
+  BaseResources -100/-500 (at most half), then `DoPeace` with record 1/2/3 for the host; `ShowPeaceTreaty` on the
+  host, and on the two players' PCs with the new month (MSG_CHAT key `treaty`). Ledger and terms are saved with
+  the reservations file. Protocol unchanged (2): new lobby keys `dipWars`/`dipTreaties`.
+- Bridge: `claimland`, `warvp`, `terms`, `possessions`, `claimable`; `diploas` takes the claim list; `diploview`
+  shows `/vp=/claim=/outlook`.
+- Found by the regression run, fixed in the same version:
+  - `PrestigeWarLoss(Big)` starts with `ProportionalPrestigeLoss(10)` on PlayerNation (the host), so every treaty
+    cost the host prestige. The loser's loss is now computed directly: P div 10 when P >= 20, otherwise 1 (not
+    below 0, the game's DecMin helper 0xab7744); major: -1, and -1 again above 20.
+  - `DoPeace` (end of the host's last war) sets Prestige of nations 1..8 to 0. AI nations don't use it; the
+    joined players' nations did lose theirs at every end of the host's last war, since 0.2.0. A DoPeace hook now
+    restores the prestige of human nations (log `end of war: prestige of player nation N kept at P`).
+## Testing 2026-10-12: peace treaties between players (v0.2.5)
+- Scenario `treaty` (after `diplomacy`, one own month; `events` now finds diplomacy's war month in run order). War
+  1-2 by the client + `applydiplo`, `warvp` for a major victory, peace offered/accepted, claim validation on the
+  client and the host, the real "Claim land..." window (Diplomacy list row selected with a cross-process
+  LVM_SETITEMSTATE, posted clicks, `claimui toggle`), calling the peace off, then the processed month applies the
+  treaty (possessions, ships, prestige, reparations, both chats, the client's "Peace treaty" dialog, war score
+  lines). After the last month, with `applydiplo`: an automatic minor victory of the stand-in, a host-vs-client
+  victory (DoPeace, the host's own treaty dialog) and a compromise. 65 checks (+ 8 for its month) when the
+  feature is on; it stops after 3 when the startup line is not `Peace treaties: ok`.
+- The first 0.2.5 build had `Peace treaties: UNAVAILABLE (... scale=00000000 ...)`: the G lookup searched the
+  imm32 form of `imul edx, [G], 100`, the game uses `6B 15 [G] 64` (imm8). Fixed in the same version (the lookup
+  tries the imm8 form first); the client's claim check also skips repeated names now, like the host's.
+- The first test runs also found that the loser's `PrestigeWarLoss` (its `ProportionalPrestigeLoss` part acts on
+  PlayerNation) cost the host Prestige in every player treaty, and that the game's `DoPeace` sets the Prestige of
+  nations 1-8 to 0 when the host's last war ends (older than 0.2.5; also the game's own peaces). Both fixed in the
+  same version: the loser's loss is applied to the loser (P div 10 when P >= 20, else 1, not below 0; major -1, -1
+  more above 20), a DoPeace hook keeps the players' Prestige (`end of war: prestige of player nation N kept at P (the
+  game set X)`); the reparation lines no longer end in "..".
+- Final 0.2.5 results: `--only treaty` 80/80 (session 7, treaty 73 = 65 + 8 month checks) in 73 s; full suite
+  262/262 (session 7, intel_reports 10, file_lock 7, events 32, merge 17, doctrine 17, design_study 31, diplomacy
+  68, treaty 73), 6 processed months (13-17 s each), game open 227 s.
+- Observed in the full run (Germany 1 vs France 2, G = 3): one battle in the treaty month (`war score 1-2: +2/+2 ->
+  902:102`); claims from the window Senegal 2 + Cochin China 5 + Polynesia 1 = 8 of 8 (Algeria past the budget
+  refused) moved to Germany with 3 ships, France BaseResources -500, Prestige Germany 22 -> 24, France 20 -> 17,
+  host 19 -> 19; client dialog "Peace treaty" (8 lines). Automatic minor win of France: Tanganyika 3, Marshall
+  Islands 1 and two worth 0 (= 4), 1 ship, Germany -100 and Prestige 24 -> 22, France 17 -> 18, host unchanged.
+  Britain over Germany: the 3 claims moved, 3 ships, -500, host Prestige 19 -> 20 (+2, DoPeace dent -1), Germany
+  22 -> 19, France kept at 18 (`kept at` lines for 1 and 2), the host's own dialog (8 lines). Compromise: nothing
+  changed. The game's own AI peace in `diplomacy` (France vs Russia) ceded Corsica and Tunisia to Russia, so the
+  claimable lists differ from a `--only treaty` run.
+- Follow-up: the reparation lines were to be split at the game's line break into "... as war reparation." and
+  "She is renamed ...", but the game's text has none: `RemoveShipInPeace` concatenates `<ship> handed over to
+  <winner> as war reparation` and ` She is renamed <new> in <adjective> service.` (the earlier "line break"
+  explanation was wrong). With that build `--only treaty` 78/80 (treaty 71/73, 66 s): the client and host dialog
+  checks failed on "reparation She". The checks now take the line count from the dialog (`treaty_text`) instead of
+  1 + k + s + ... Fixed in the same version by splitting at the game's " She is renamed ": `--only treaty` 80/80
+  (treaty 73/73, 69 s), each treaty 11 lines (3 ships x 2), e.g. "B Mecklenburg handed over to Great Britain as war
+  reparation." / "She is renamed B Rodney in British service.".
+- Gotcha: client `diplo`/`claimland` return when the request is sent; `applydiplo` right after it ran before the war
+  declaration reached the host. Wait for `diplomacy request 1 <action> <target> accepted` in the host log.
+- Gotcha: `applydiplo` applies a treaty at once, but a processed month afterwards merges the client's planning copy
+  of `[Nation1]` (prestige, base resources, ships) over it. Only the real month-end path (after the merge) is
+  safe, so the scenario uses `applydiplo` treaties after its last month.
+- Gotcha: the game's treaty dialog is `TdlgTotalLog` captioned "Peace treaty" (RichEdit + OK); `DoPeace` takes 1
+  host Prestige when a war ends without a major battle ("Navy prestige takes a dent", a TMessageForm).

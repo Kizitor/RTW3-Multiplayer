@@ -157,15 +157,40 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "load") return game::LoadCampaign(atoi(arg(1).c_str()), atoi(arg(2, "0").c_str())) ? "ok" : "error load";
         if (cmd == "setplayer") return game::SetPlayerNation(atoi(arg(1).c_str())), "ok";
         if (cmd == "mpwindow") return ui::ShowMpWindow(), "ok";
+        if (cmd == "claimui") return ui::DebugClaimWindow(arg(1, "state"), atoi(arg(2, "-1").c_str()));  // state | toggle <row>
         if (cmd == "savedir") return "ok " + W2U(game::SaveDir(atoi(arg(1, "1").c_str())));
         // --- diplomacy ---
         if (cmd == "diplo") {  // diplo <war|ally|peace|leave|cancel> <target nation>
             std::string why = mp::Diplomacy(arg(1), atoi(arg(2, "-1").c_str()));
             return why.empty() ? "ok" : "error " + why;
         }
-        if (cmd == "diploas") {  // host: diploas <from nation> <action> <target nation>
-            std::string why = mp::DebugDiplomacyAs(atoi(arg(1).c_str()), arg(2), atoi(arg(3, "-1").c_str()));
+        if (cmd == "diploas") {  // host: diploas <from nation> <action> <target nation> [extra]
+            std::string extra;
+            size_t pos = 0;
+            for (int i = 0; i < 4 && pos != std::string::npos; i++) pos = line.find(' ', pos + 1);
+            if (pos != std::string::npos) extra = Trim(line.substr(pos + 1));
+            std::string why = mp::DebugDiplomacyAs(atoi(arg(1).c_str()), arg(2), atoi(arg(3, "-1").c_str()), extra);
             return why.empty() ? "ok" : "error " + why;
+        }
+        if (cmd == "claimland") {  // claimland <loser nation> <name|name|...>: the winner of an agreed peace claims land
+            size_t pos = line.find(' ');
+            pos = pos == std::string::npos ? pos : line.find(' ', pos + 1);
+            std::string names = pos == std::string::npos ? "" : Trim(line.substr(pos + 1));
+            std::string why = mp::Diplomacy("claim", atoi(arg(1, "-1").c_str()), names);
+            return why.empty() ? "ok" : "error " + why;
+        }
+        if (cmd == "warvp") {  // host: warvp <a> <b> [vpA vpB]: read or set a player war's victory points
+            bool set = args.size() >= 5;
+            return mp::DebugWarVP(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3, "0").c_str()),
+                                  atoi(arg(4, "0").c_str()), set);
+        }
+        if (cmd == "terms") return mp::DebugTerms(atoi(arg(1).c_str()), atoi(arg(2).c_str()));  // host: terms <a> <b>
+        if (cmd == "possessions" || cmd == "claimable") {  // possessions <nation> | claimable <winner> <loser>
+            auto list = cmd == "possessions" ? game::Possessions(atoi(arg(1).c_str()))
+                                             : game::ClaimablePossessions(atoi(arg(1).c_str()), atoi(arg(2).c_str()));
+            std::string s;
+            for (auto& p : list) s += W2U(p.name) + "~" + W2U(p.area) + "~" + std::to_string(p.value) + (p.oil ? "~oil" : "") + "; ";
+            return "ok " + std::to_string(list.size()) + " " + s;
         }
         if (cmd == "reserve") return mp::DebugReserve(atoi(arg(1).c_str()), arg(2, "Bot")), "ok";
         if (cmd == "designs") {  // designs <nation>: index:class name:ReadyForBuild (months left in the design study)
@@ -251,7 +276,9 @@ static std::string ExecuteOnMain(const std::string& line) {
                      std::to_string(r.tension) + "/[" + r.pending + "]/" + (r.canWar ? "W" : "-") +
                      (r.canAlly ? "A" : "-") + (r.allyAccept ? "a" : "-") + (r.canPeace ? "P" : "-") +
                      (r.peaceAccept ? "p" : "-") + (r.canLeave ? "L" : "-") + (r.canCancel ? "C" : "-") +
-                     (r.cancelIsDecline ? "d" : "-") + "; ";
+                     (r.cancelIsDecline ? "d" : "-") + "/vp=" + std::to_string(r.vpMine) + ":" +
+                     std::to_string(r.vpTheirs) + "/claim=" + std::to_string(r.canClaim ? r.claimBudget : 0) + ":" +
+                     std::to_string(r.claimable.size()) + ":" + std::to_string(r.claims.size()) + "/" + r.outlook + "; ";
             return "ok " + s;
         }
         // --- dev helpers for automated tests ---

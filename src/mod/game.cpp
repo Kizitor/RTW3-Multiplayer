@@ -1,5 +1,6 @@
 #include "game.h"
 #include "../../third_party/minhook/include/MinHook.h"
+#include <algorithm>
 #include <climits>
 #include <random>
 
@@ -43,6 +44,14 @@ struct Api {
     int fEvents = -1, fTechSharing = -1;
     void *mHandleEvent = nullptr, *mLikelihood = nullptr;
     bool events = false;
+    // peace treaties between players
+    int fMapAreas = -1, fAreaName = -1, fAreaPossessions = -1, fPossName = -1, fPossValue = -1, fPossOil = -1,
+        fPossOwner = -1, fBaseResources = -1, fPrestige = -1, fVP = -1, fEnemyVP = -1, fBattleOpp = -1;
+    void *mChangeOwner = nullptr, *mAdjacent = nullptr, *mRemoveShipInPeace = nullptr, *mShowTreaty = nullptr,
+         *mSLCreate = nullptr, *mFree = nullptr, *mBattleAftermath = nullptr,
+         *mAIBattle = nullptr, *mRaiderBattle = nullptr;
+    int* scaleVar = nullptr;  // the game's scale value used in its war-progress thresholds (100*G + 300/500)
+    bool treaties = false;
 } A;
 
 static void* g_buildCamp = nullptr;
@@ -67,6 +76,60 @@ static bool g_inTurn = false;
     } while (0)
 
 static bool InImage(uintptr_t a) { return a >= dl::g_base && a < dl::g_base + dl::g_size; }
+
+static void* CallTarget(uint8_t* e8) {  // target of an E8 rel32 call
+    return e8 + 5 + *(int32_t*)(e8 + 1);
+}
+
+// Peace treaties between players: the game's own building blocks (possession owner change, reparation ships,
+// treaty report), found by name or, for unnamed routines, from the instructions around their calls.
+static void ResolveTreaties() {
+    A.fMapAreas = dl::Field("TfrmBuildCamp", "MapAreas");
+    A.fAreaName = dl::Field("TMapArea", "Name");
+    A.fAreaPossessions = dl::Field("TMapArea", "Possessions");
+    A.fPossName = dl::Field("TPossession", "Name");
+    A.fPossValue = dl::Field("TPossession", "Value");
+    A.fPossOil = dl::Field("TPossession", "Oil");
+    A.fPossOwner = dl::Field("TPossession", "Owner");
+    A.fBaseResources = dl::Field("TBuilderNation", "BaseResources");
+    A.fPrestige = dl::Field("TBuilderNation", "Prestige");
+    A.fVP = dl::Field("TBuilderNation", "VP");
+    A.fEnemyVP = dl::Field("TfrmBuildCamp", "EnemyVP");
+    A.fBattleOpp = dl::Field("TfrmBuildCamp", "BattleOpponentIdx");
+    A.mChangeOwner = dl::Method("TfrmBuildCamp", "ChangePossessionOwner");
+    A.mAdjacent = dl::Method("TfrmBuildCamp", "AreaIsAdjacentToOwnPossessions");
+    A.mShowTreaty = dl::Method("TfrmBuildCamp", "ShowPeaceTreaty");
+    A.mSLCreate = dl::MethodFewestParams("TStringList", "Create");
+    A.mFree = dl::Method("TObject", "Free");
+    A.mBattleAftermath = dl::Method("TfrmBuildCamp", "HandleBattleAftermath");
+    A.mAIBattle = dl::Method("TfrmBuildCamp", "DoBattleBetweenAINations");
+    A.mRaiderBattle = dl::Method("TfrmBuildCamp", "QuickResolveRaiderBattle");
+    // RemoveShipInPeace (unnamed): NegotiatePeace hands the player's ships to an enemy with
+    // `call GetRandomEnemy; mov ecx,eax; mov eax,[ebp-4]; mov edx,[eax+PlayerNation]; mov eax,[ebp-4]; call X`.
+    void* negotiate = dl::Method("TfrmBuildCamp", "NegotiatePeace");
+    if (negotiate) {
+        uint8_t* hit = dl::FindPattern((uint8_t*)negotiate, 0x1400,
+                                       {0x8B, 0xC8, 0x8B, 0x45, 0xFC, 0x8B, 0x90, -1, -1, -1, -1, 0x8B, 0x45, 0xFC, 0xE8});
+        if (hit && *(int32_t*)(hit + 7) == A.fPlayerNation) {
+            void* t = CallTarget(hit + 14);
+            if (InImage((uintptr_t)t)) A.mRemoveShipInPeace = t;
+        }
+    }
+    // The scale value in the war-progress checks of EventLikelihoodCheck: `imul edx, dword ptr [G], 100` (8-bit
+    // immediate `6B 15 [G] 64` in 1.01.44; the 32-bit form `69 15 [G] 64 00 00 00` is accepted too).
+    if (A.mLikelihood) {
+        uint8_t* hit = dl::FindPattern((uint8_t*)A.mLikelihood, 0x1000, {0x6B, 0x15, -1, -1, -1, -1, 0x64});
+        if (!hit) hit = dl::FindPattern((uint8_t*)A.mLikelihood, 0x1000, {0x69, 0x15, -1, -1, -1, -1, 0x64, 0x00, 0x00, 0x00});
+        if (hit && InImage(*(uint32_t*)(hit + 2))) A.scaleVar = (int*)(uintptr_t) * (uint32_t*)(hit + 2);
+    }
+    A.treaties = A.diplomacy && A.fMapAreas >= 0 && A.fAreaName >= 0 && A.fAreaPossessions >= 0 && A.fPossName >= 0 &&
+                 A.fPossValue >= 0 && A.fPossOil >= 0 && A.fPossOwner >= 0 && A.fBaseResources >= 0 && A.fPrestige >= 0 &&
+                 A.fVP >= 0 && A.fEnemyVP >= 0 && A.fBattleOpp >= 0 && A.mChangeOwner && A.mAdjacent && A.mShowTreaty &&
+                 A.mSLCreate && A.mFree && A.mRemoveShipInPeace && A.scaleVar && A.mSLAdd;
+    Log("Peace treaties: %s (removeShip=%p scale=%p slCreate=%p battleHooks=%d/%d/%d)", A.treaties ? "ok" : "UNAVAILABLE",
+        A.mRemoveShipInPeace, A.scaleVar, A.mSLCreate, A.mBattleAftermath != nullptr, A.mAIBattle != nullptr,
+        A.mRaiderBattle != nullptr);
+}
 
 // Optional: diplomacy between human players. Missing pieces only disable that feature.
 static void ResolveDiplomacy() {
@@ -208,6 +271,7 @@ bool Resolve() {
     A.mLikelihood = dl::Method("TfrmBuildCamp", "EventLikelihoodCheck");
     A.events = A.diplomacy && A.fEvents >= 0 && A.fTechSharing >= 0 && A.mHandleEvent && A.mLikelihood;
     if (!A.events) Log("WARNING: event data not found; joined players won't get random events");
+    ResolveTreaties();
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -660,6 +724,368 @@ int NationIntField(int nationIdx, const std::string& field) {
     return field == "BuildConstraintType" ? dl::At<uint8_t>(n, off) : dl::At<int>(n, off);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Peace treaties between players
+
+bool TreatiesAvailable() { return A.treaties && BuildCamp() && NationCount() >= 9; }
+
+int WarScale() { return A.scaleVar ? *A.scaleVar : 0; }
+
+int NationVP(int idx) {
+    void* n = Nation(idx);
+    return A.treaties && n ? dl::At<int>(n, A.fVP) : 0;
+}
+
+int EnemyVP() {
+    void* f = BuildCamp();
+    return A.treaties && f ? dl::At<int>(f, A.fEnemyVP) : 0;
+}
+
+template <class Fn>
+static void ForEachPossession(Fn fn) {
+    void* f = BuildCamp();
+    if (!A.treaties || !f) return;
+    void* areas = dl::At<void*>(f, A.fMapAreas);
+    for (int a = 0; a < dl::ListCount(areas); a++) {
+        void* area = dl::ListItem(areas, a);
+        if (!area) continue;
+        void* poss = dl::At<void*>(area, A.fAreaPossessions);
+        for (int p = 0; p < dl::ListCount(poss); p++) {
+            void* ps = dl::ListItem(poss, p);
+            if (ps) fn(area, ps);
+        }
+    }
+}
+
+static PossessionInfo PossInfo(void* area, void* ps) {
+    PossessionInfo i;
+    i.name = dl::ReadUStr(dl::At<void*>(ps, A.fPossName));
+    i.area = dl::ReadUStr(dl::At<void*>(area, A.fAreaName));
+    i.value = dl::At<int>(ps, A.fPossValue);
+    i.oil = dl::At<uint8_t>(ps, A.fPossOil) != 0;
+    i.owner = NationIndex(dl::At<void*>(ps, A.fPossOwner));
+    return i;
+}
+
+std::vector<PossessionInfo> Possessions(int ownerIdx) {
+    std::vector<PossessionInfo> out;
+    void* owner = Nation(ownerIdx);
+    if (!owner) return out;
+    ForEachPossession([&](void* area, void* ps) {
+        if (dl::At<void*>(ps, A.fPossOwner) == owner) out.push_back(PossInfo(area, ps));
+    });
+    return out;
+}
+
+// The possessions a winner may claim, with the rules of the game's own peace dialog (SelectPossessionsAfterWar):
+// owned by the loser, value below 11, in a sea area next to the winner's own possessions.
+std::vector<PossessionInfo> ClaimablePossessions(int winnerIdx, int loserIdx) {
+    std::vector<PossessionInfo> out;
+    void* f = BuildCamp();
+    void* winner = Nation(winnerIdx);
+    void* loser = Nation(loserIdx);
+    if (!TreatiesAvailable() || !winner || !loser || winner == loser) return out;
+    ForEachPossession([&](void* area, void* ps) {
+        if (dl::At<void*>(ps, A.fPossOwner) != loser || dl::At<int>(ps, A.fPossValue) >= 11) return;
+        if (!(dl::Call(A.mAdjacent, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)area, (uint32_t)(uintptr_t)winner) & 0xFF))
+            return;
+        out.push_back(PossInfo(area, ps));
+    });
+    return out;
+}
+
+static void* StringListCreate() {
+    return (void*)(uintptr_t)dl::Call(A.mSLCreate, (uint32_t)(uintptr_t)dl::ClassVmt("TStringList"), 1);
+}
+
+static void StringListAdd(void* sl, const std::wstring& s) {
+    dl::ConstUStr u(s);
+    dl::Call(A.mSLAdd, (uint32_t)(uintptr_t)sl, u.ptr());
+}
+
+static void ShowTreatyGuarded(void* form, void* sl) {
+    __try {
+        dl::Call(A.mShowTreaty, (uint32_t)(uintptr_t)form, (uint32_t)(uintptr_t)sl);
+    } __finally {
+        dl::Call(A.mFree, (uint32_t)(uintptr_t)sl);
+    }
+}
+
+void ShowPeaceTreaty(const std::vector<std::wstring>& lines) {
+    void* f = BuildCamp();
+    if (!TreatiesAvailable() || !f || lines.empty() || EventActive()) return;
+    void* sl = StringListCreate();
+    if (!sl) return;
+    for (auto& l : lines) StringListAdd(sl, l);
+    ShowTreatyGuarded(f, sl);
+}
+
+static std::wstring ShipTransferText(void* f, void* from, void* to) {
+    void* text = nullptr;  // Delphi string result (var parameter)
+    uint32_t stack[1] = {(uint32_t)(uintptr_t)&text};
+    dl::Call(A.mRemoveShipInPeace, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)from, (uint32_t)(uintptr_t)to, 1, stack);
+    return dl::ReadUStr(text);
+}
+
+TreatyResult ApplyTreaty(int winnerIdx, int loserIdx, int level, const std::vector<std::wstring>& claims, unsigned seed) {
+    TreatyResult r;
+    void* f = BuildCamp();
+    void* winner = Nation(winnerIdx);
+    void* loser = Nation(loserIdx);
+    if (!TreatiesAvailable() || !winner || !loser || winner == loser || level <= 0) return r;
+    // Land: the winner's claims (still valid ones), otherwise the game's rules with a random choice.
+    int budget = level >= 2 ? 8 : 4;  // the game's dialog budget is 2 x its win level (minor 2, major 4)
+    auto claimable = ClaimablePossessions(winnerIdx, loserIdx);
+    std::vector<std::wstring> take;
+    int used = 0;
+    if (!claims.empty()) {
+        for (auto& c : claims)
+            for (auto& p : claimable)
+                if (p.name == c && used + p.value <= budget) {
+                    take.push_back(p.name);
+                    used += p.value;
+                    break;
+                }
+    } else {
+        std::mt19937 rng(seed);
+        std::shuffle(claimable.begin(), claimable.end(), rng);
+        std::stable_sort(claimable.begin(), claimable.end(),
+                         [](const PossessionInfo& a, const PossessionInfo& b) { return a.value > b.value; });
+        for (auto& p : claimable)
+            if (used + p.value <= budget) {
+                take.push_back(p.name);
+                used += p.value;
+            }
+        r.automatic = true;
+    }
+    std::wstring wName = NationName(winnerIdx), lName = NationName(loserIdx);
+    for (auto& name : take) {
+        void* found = nullptr;
+        ForEachPossession([&](void*, void* ps) {
+            if (!found && dl::At<void*>(ps, A.fPossOwner) == loser && dl::ReadUStr(dl::At<void*>(ps, A.fPossName)) == name)
+                found = ps;
+        });
+        if (!found) continue;
+        uint32_t stack[1] = {0};  // RemoveAllCoastalArtillery = False (as the game's peace dialog)
+        dl::Call(A.mChangeOwner, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)found, (uint32_t)(uintptr_t)winner, 1, stack);
+        r.ceded.push_back(name);
+        r.report.push_back(name + L" is ceded from " + lName + L" to " + wName + L".");
+    }
+    // Ships: the loser hands recent capital ships over as war reparations (the game's own selection).
+    int handovers = level >= 2 ? 3 : 1;
+    for (int i = 0; i < handovers; i++) {
+        std::wstring t = ShipTransferText(f, loser, winner);
+        if (t.empty()) continue;
+        r.ships++;
+        // The game runs two sentences together: "<ship> handed over to <winner> as war reparation She is renamed
+        // <name> in <adjective> service." Report them as two lines.
+        for (auto& ch : t)
+            if (ch == L'\r' || ch == L'\n') ch = L' ';
+        size_t cut = t.find(L" She is renamed ");
+        std::wstring parts[2] = {cut == std::wstring::npos ? t : t.substr(0, cut),
+                                 cut == std::wstring::npos ? L"" : t.substr(cut + 1)};
+        for (auto& part : parts) {
+            while (!part.empty() && part.back() == L' ') part.pop_back();
+            if (!part.empty()) r.report.push_back(part.back() == L'.' ? part : part + L".");
+        }
+    }
+    // Prestige and economy, as the game's peace treaties. The loser's loss is the game's PrestigeWarLoss, which
+    // can't be called for another nation (its proportional part always hits PlayerNation, i.e. the host):
+    // ProportionalPrestigeLoss(10) = P div 10 when P >= 20, otherwise 1 (not below 0); a major defeat costs 1 more,
+    // and 1 more again above 20.
+    dl::At<int>(winner, A.fPrestige) += level >= 2 ? 2 : 1;
+    int& prestige = dl::At<int>(loser, A.fPrestige);
+    int loss = prestige >= 20 ? prestige / 10 : 1;
+    prestige = std::max(0, prestige - loss);
+    if (level >= 2) {
+        prestige--;
+        if (prestige > 20) prestige--;
+    }
+    int& res = dl::At<int>(loser, A.fBaseResources);
+    int cut = level >= 2 ? 500 : 100;
+    r.resourcesCut = std::min(cut, std::max(0, res / 2));
+    res -= r.resourcesCut;
+    Log("treaty %d over %d (level %d): %d possession(s)%s, %d ship(s), prestige +%d, resources -%d", winnerIdx, loserIdx,
+        level, (int)r.ceded.size(), r.automatic ? " (automatic)" : " (claimed)", r.ships, level >= 2 ? 2 : 1,
+        r.resourcesCut);
+    return r;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Victory points of each battle, for the war score of player wars. The game adds a battle's points to the two
+// nations' VP (AI wars) or to the host nation's VP and EnemyVP (the host's wars); these hooks measure the change
+// around each battle and report it with the two nations that fought. Battles can run inside other hooked battles
+// (a raider battle of the host's ships ends with HandleBattleAftermath; the month can go on inside the aftermath
+// of a tactical battle): each frame carries its own slot, and points reported by an inner battle are taken out of
+// the outer frames, so every battle counts once.
+
+static int g_vpDepth = 0;
+static const int kVPSlots = 32;
+static struct VPCtx {
+    int kind, a, b;
+    int vp[9];
+    int enemyVP;
+} g_vpStack[kVPSlots];
+
+static void VPSnapshot(VPCtx& c) {
+    for (int i = 0; i < 9; i++) c.vp[i] = NationVP(i);
+    c.enemyVP = EnemyVP();
+}
+
+static bool VPReport(const VPCtx& c) {
+    if (c.a < 0 || c.b < 0 || c.a > 8 || c.b > 8 || c.a == c.b) return false;
+    int da, db;
+    if (c.a == 0 || c.b == 0) {  // the host's side: its own VP; the enemy side: EnemyVP
+        int host = NationVP(0) - c.vp[0], enemy = EnemyVP() - c.enemyVP;
+        da = c.a == 0 ? host : enemy;
+        db = c.b == 0 ? host : enemy;
+    } else {
+        da = NationVP(c.a) - c.vp[c.a];
+        db = NationVP(c.b) - c.vp[c.b];
+    }
+    da = std::max(0, da);  // points only grow in a battle; a drop is a reset (peace) inside the frame
+    db = std::max(0, db);
+    if (da || db) hookcb::OnBattleVP(c.a, c.b, da, db);
+    return true;
+}
+
+extern "C" int __stdcall CB_BeforeVP(int kind, uint32_t edx, uint32_t ecx, void* self) {
+    int d = g_vpDepth++;
+    if (d < 0 || d >= kVPSlots) return d;
+    VPCtx& c = g_vpStack[d];
+    c.kind = kind;
+    c.a = c.b = -1;
+    __try {
+        if (!TreatiesAvailable()) return d;
+        if (kind == 0) {  // HandleBattleAftermath: the host's battle against BattleOpponentIdx
+            bool insideBattle = false;  // then the outer battle knows the two sides; it reports
+            for (int k = 0; k < d; k++) insideBattle |= g_vpStack[k].kind != 0 && g_vpStack[k].a >= 0;
+            if (!insideBattle) {
+                c.a = 0;
+                c.b = dl::At<int>(self, A.fBattleOpp);
+            }
+        } else if (kind == 1) {  // DoBattleBetweenAINations(NationA, NationB, ...)
+            c.a = NationIndex((void*)(uintptr_t)edx);
+            c.b = NationIndex((void*)(uintptr_t)ecx);
+        } else {  // QuickResolveRaiderBattle(InterceptingShip, InterceptedShip, ...)
+            int fShipNation = dl::Field("TCampaignShip", "Nation");
+            if (fShipNation >= 0 && edx && ecx) {
+                c.a = dl::At<int>((void*)(uintptr_t)edx, fShipNation);
+                c.b = dl::At<int>((void*)(uintptr_t)ecx, fShipNation);
+            }
+        }
+        VPSnapshot(c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        c.a = c.b = -1;
+    }
+    return d;
+}
+
+extern "C" void __stdcall CB_AfterVP(int slot) {
+    if (slot < 0) return;
+    g_vpDepth = slot;  // also drops frames left behind by an exception
+    if (slot >= kVPSlots) return;
+    __try {
+        VPCtx& c = g_vpStack[slot];
+        if (c.a < 0 || c.b < 0 || !VPReport(c)) return;
+        int now[9];
+        for (int i = 0; i < 9; i++) now[i] = NationVP(i);
+        int e = EnemyVP();
+        for (int k = 0; k < slot; k++) {
+            for (int i = 0; i < 9; i++) g_vpStack[k].vp[i] += now[i] - c.vp[i];
+            g_vpStack[k].enemyVP += e - c.enemyVP;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+extern "C" void* o_BattleAftermath = nullptr;
+extern "C" void* o_AIBattle = nullptr;
+extern "C" void* o_RaiderBattle = nullptr;
+
+// Register-convention methods with stack arguments (removed by the callee): report the registers and keep the
+// returned slot in a local, call the game's routine with a copy of the stack arguments, report the slot, then
+// return removing the caller's arguments. EAX/EDX/ECX reach the game unchanged; EAX (the result) is kept.
+extern "C" __declspec(naked) void d_BattleAftermath() {  // (Self, VP0, VP1, aVictoryLevel)
+    __asm {
+        sub esp, 4
+        push eax
+        push ecx
+        push edx
+        push eax
+        push ecx
+        push edx
+        push 0
+        call CB_BeforeVP
+        mov [esp + 12], eax
+        pop edx
+        pop ecx
+        pop eax
+        push dword ptr [esp + 8]
+        call dword ptr [o_BattleAftermath]
+        push eax
+        push dword ptr [esp + 4]
+        call CB_AfterVP
+        pop eax
+        add esp, 4
+        ret 4
+    }
+}
+
+extern "C" __declspec(naked) void d_AIBattle() {  // (Self, NationA, NationB, ShipCountA, ShipCountB, anArea): Boolean
+    __asm {
+        sub esp, 4
+        push eax
+        push ecx
+        push edx
+        push eax
+        push ecx
+        push edx
+        push 1
+        call CB_BeforeVP
+        mov [esp + 12], eax
+        pop edx
+        pop ecx
+        pop eax
+        push dword ptr [esp + 16]
+        push dword ptr [esp + 16]
+        push dword ptr [esp + 16]
+        call dword ptr [o_AIBattle]
+        push eax
+        push dword ptr [esp + 4]
+        call CB_AfterVP
+        pop eax
+        add esp, 4
+        ret 12
+    }
+}
+
+extern "C" __declspec(naked) void d_RaiderBattle() {  // (Self, InterceptingShip, InterceptedShip, SideIntercepted)
+    __asm {
+        sub esp, 4
+        push eax
+        push ecx
+        push edx
+        push eax
+        push ecx
+        push edx
+        push 2
+        call CB_BeforeVP
+        mov [esp + 12], eax
+        pop edx
+        pop ecx
+        pop eax
+        push dword ptr [esp + 8]
+        call dword ptr [o_RaiderBattle]
+        push eax
+        push dword ptr [esp + 4]
+        call CB_AfterVP
+        pop eax
+        add esp, 4
+        ret 4
+    }
+}
+
 std::vector<ShipSnap> SnapshotShips(int nationIdx) {
     std::vector<ShipSnap> out;
     void* n = Nation(nationIdx);
@@ -766,16 +1192,17 @@ void StartWar(int a, int b) {
     Log("diplomacy: war %d-%d (tension %d, war counter %d)", a, b, Tension(a, b), WarCounter());
 }
 
-void MakePeace(int a, int b) {
+void MakePeace(int a, int b, int hostOutcome) {
     void* f = BuildCamp();
     if (!f || !A.diplomacy || !ValidPair(a, b) || !AtWar(a, b)) return;
     const int kPeaceTension = 5;
     if (a == 0 || b == 0) {
         int other = a == 0 ? b : a;
         if (CountAtWarWithHost() == 1 && A.mDoPeace && A.recYearCell && A.recMonthCell) {
-            // The host's last war ends: run the game's own end-of-war routine, recorded as a compromise peace.
+            // The host's last war ends: run the game's own end-of-war routine, with this month's war record set to
+            // the outcome (1 won, 2 lost, 3 compromise), as the game's own peace treaties do.
             int* rec = (int*)((uint8_t*)f + **A.recYearCell * 0x4B0 + **A.recMonthCell * 100 + A.recDisp);
-            *rec = 3;
+            *rec = hostOutcome >= 1 && hostOutcome <= 3 ? hostOutcome : 3;
             dl::Call(A.mDoPeace, (uint32_t)(uintptr_t)f);
         }
         if (AtWar(0, other)) SetTensionRaw(0, other, kPeaceTension);  // separate peace while other wars go on
@@ -1171,6 +1598,46 @@ extern "C" __declspec(naked) void d_EndOfTurn() {
     }
 }
 
+// DoPeace (the end of the host's last war) sets Prestige of nations 1..8 to 0: AI nations don't use it, but the
+// joined players' nations do, so theirs is put back afterwards.
+extern "C" void* o_DoPeace = nullptr;
+static int g_peacePrestige[9];
+static bool g_peaceKeep[9];
+
+extern "C" void __stdcall CB_BeforeDoPeace() {
+    for (int i = 1; i < 9; i++) {
+        g_peaceKeep[i] = false;
+        void* n = i < NationCount() && hookcb::IsHumanRemoteNation(i) ? Nation(i) : nullptr;
+        if (n) {
+            g_peacePrestige[i] = dl::At<int>(n, A.fPrestige);
+            g_peaceKeep[i] = true;
+        }
+    }
+}
+
+extern "C" void __stdcall CB_AfterDoPeace() {
+    for (int i = 1; i < 9; i++) {
+        if (!g_peaceKeep[i]) continue;
+        g_peaceKeep[i] = false;
+        void* n = i < NationCount() ? Nation(i) : nullptr;
+        if (!n || dl::At<int>(n, A.fPrestige) == g_peacePrestige[i]) continue;
+        Log("end of war: prestige of player nation %d kept at %d (the game set %d)", i, g_peacePrestige[i],
+            dl::At<int>(n, A.fPrestige));
+        dl::At<int>(n, A.fPrestige) = g_peacePrestige[i];
+    }
+}
+
+extern "C" __declspec(naked) void d_DoPeace() {  // (Self)
+    __asm {
+        push eax
+        call CB_BeforeDoPeace
+        pop eax
+        call dword ptr [o_DoPeace]
+        call CB_AfterDoPeace
+        ret
+    }
+}
+
 extern "C" __declspec(naked) void d_AIMoves() {
     __asm {
         push eax
@@ -1282,12 +1749,18 @@ bool InstallHooks() {
     ok &= Hook(A.mDoEndOfTurn, (void*)&d_EndOfTurn, &o_EndOfTurn, "DoEndOfTurn");
     if (A.mAIMoves) Hook(A.mAIMoves, (void*)&d_AIMoves, &o_AIMoves, "AIStrategicMoves");
     if (A.diplomacy && A.mHandleAIPeace) Hook(A.mHandleAIPeace, (void*)&d_AIPeace, &o_AIPeace, "HandleAIPeace");
+    if (A.diplomacy && A.mDoPeace && A.fPrestige >= 0) Hook(A.mDoPeace, (void*)&d_DoPeace, &o_DoPeace, "DoPeace");
     if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
         Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
     if (A.doctrine) Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");
     if (A.events) Hook(A.mLikelihood, (void*)&d_Likelihood, &o_Likelihood, "EventLikelihoodCheck");
+    if (A.treaties) {
+        if (A.mBattleAftermath) Hook(A.mBattleAftermath, (void*)&d_BattleAftermath, &o_BattleAftermath, "HandleBattleAftermath");
+        if (A.mAIBattle) Hook(A.mAIBattle, (void*)&d_AIBattle, &o_AIBattle, "DoBattleBetweenAINations");
+        if (A.mRaiderBattle) Hook(A.mRaiderBattle, (void*)&d_RaiderBattle, &o_RaiderBattle, "QuickResolveRaiderBattle");
+    }
     for (int i = 0; i < (int)(sizeof(g_skips) / sizeof(g_skips[0])); i++) {
         void* target = dl::Method(g_skips[i].cls, g_skips[i].method);
         void* thunk = target ? EmitSkipThunk(i) : nullptr;

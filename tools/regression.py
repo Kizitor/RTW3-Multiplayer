@@ -14,7 +14,7 @@ The game is driven only through the test bridge and posted window messages: the 
 never used and the screen is never captured. Exit code: 0 = every check passed, 1 = a check failed or the saves
 could not be restored, 2 = not started (precondition).
 """
-import argparse, ctypes, ctypes.wintypes as wt, hashlib, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, ctypes, ctypes.wintypes as wt, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_test  # noqa: E402
@@ -43,10 +43,12 @@ u.GetParent.argtypes = [wt.HWND]
 u.GetDlgCtrlID.argtypes = [wt.HWND]
 u.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 IDC = dict(label=1080, list=1081, war=1082, ally=1083, peace=1084, leave=1085, cancel=1086, chatlog=IDS['chatlog'])
+CLAIM_IDC = dict(label=1090, list=1091, sum=1092, ok=1093, auto=1094, cancel=1095)  # RTW3MP_Claim window (0.2.5)
 
 results = []  # (scenario, check, ok, detail)
 _scenario = ['-']
 PROCS = []  # the game copies this run started (Popen)
+ANSWERED = []  # (time, who, 'Class:"title"->button') of every game dialog answer_dialogs answered
 
 
 class Ctx:
@@ -101,12 +103,23 @@ def rel(a, b):
 
 
 def row(port, nation):
+    """A `diploview` row: nation/name/player/relation/tension/[pending]/flags, since 0.2.5 followed by
+    /vp=mine:theirs/claim=budget:nclaimable:nclaims/outlook."""
     r = cmd(port, 'diploview')
     for part in r.split('rows=', 1)[-1].split('; '):
         f = part.split('/')
         if len(f) >= 7 and f[0] == str(nation):
-            return dict(nation=f[0], name=f[1], player=f[2], relation=f[3], tension=f[4], pending=f[5].strip('[]'),
-                        flags=f[6].rstrip(';'))
+            d = dict(nation=f[0], name=f[1], player=f[2], relation=f[3], tension=f[4], pending=f[5].strip('[]'),
+                     flags=f[6].rstrip(';'), vp=None, claim=None, outlook='')
+            for x in f[7:]:
+                x = x.rstrip(';')
+                if x.startswith('vp='):
+                    d['vp'] = x[3:]
+                elif x.startswith('claim='):
+                    d['claim'] = x[6:]
+                else:
+                    d['outlook'] = x
+            return d
     return None
 
 
@@ -208,9 +221,12 @@ def assert_alive():
 
 def answer_dialogs(pid, who):
     """Answer the game's dialogs of one copy. The game reuses its dialog windows, so the per-window click guard of
-    dismiss_dialogs is reset on every pass; the callers' timeouts bound their loops."""
+    dismiss_dialogs is reset on every pass; the callers' timeouts bound their loops. A "Peace treaty" dialog is
+    recorded (TREATY_SEEN) before it is answered."""
+    capture_treaty(pid, who)
     e2e_test._clicks.clear()
     for c in dismiss_dialogs(pid):
+        ANSWERED.append((time.time(), who, c))
         log(f'  {who} dialog answered:', c)
     for top in top_windows(pid):  # other forms with a "Not now" button (e.g. a design ready for construction)
         k = e2e_test.class_name(top)
@@ -846,6 +862,12 @@ def planned_months(names):
     return n
 
 
+def months_through(names, last):
+    """Months processed up to and including scenario `last` (run order), with planned_months' rules."""
+    order = [s[0] for s in SCENARIOS]
+    return planned_months([n for n in names if order.index(n) <= order.index(last)])
+
+
 def scenario_events(ctx):
     """0.2.4: random events of a joined player's nation are rolled and answered on the player's PC (the game rolls them
     only for nation 0). A forced "naval rearm" event in the planning month (real dialog, first answer): its deltas
@@ -1023,9 +1045,11 @@ def scenario_events(ctx):
 
     # h) the random path: chance 100 for the last processed month in which nation 1 stays at peace (diplomacy's second
     # month starts wars with the host and nation 2, and at war no event qualifies for a joined player, see i); the
-    # client rolls by itself
+    # client rolls by itself. Later scenarios (treaty) may process months after diplomacy's, so the war month is
+    # counted in run order.
     hst = dict(n=0, need=1)
-    target = ctx.months_planned - (1 if 'diplomacy' in ctx.selected and ctx.months_planned > 1 else 0)
+    war_month = months_through(ctx.selected, 'diplomacy') if 'diplomacy' in ctx.selected else None
+    target = war_month - 1 if war_month else ctx.months_planned
 
     def h_post(ctx, label):
         outer, _scenario[0] = _scenario[0], 'events'
@@ -1080,7 +1104,6 @@ def scenario_events(ctx):
     # needs the host): chance 100 for diplomacy's war month, so the roll when the month at war loads runs the random
     # path at war; it must find no event and show no dialog. `eventnow` without an index can't do this itself: it
     # goes through the once-a-month guard, and the month was rolled when it loaded (`this month was already rolled`).
-    war_month = ctx.months_planned if 'diplomacy' in ctx.selected and ctx.months_planned >= 2 else None
     wst = dict(n=0, need=1, pre=None)
 
     def w_post(ctx, label):
@@ -1598,6 +1621,934 @@ def scenario_diplomacy(ctx):
     check('client list shows peace with the host', r and r['relation'] == 'Peace' and r['pending'] == '', r)
 
 
+# ---------------------------------------------------------------- peace treaties between players (0.2.5)
+
+TREATY_RE = (r'treaty (\d+) over (\d+) \(level (\d)\): (\d+) possession\(s\) \((claimed|automatic)\), (\d+) ship\(s\), '
+             r'prestige \+(\d+), resources -(\d+)')
+TREATY_CAPTION = 'Peace treaty'  # ShowPeaceTreaty uses the game's TdlgTotalLog (RichEdit + OK/Cancel) with this caption
+TREATY_SEEN = []  # each "Peace treaty" dialog answer_dialogs met before answering it: dict(who, t, text)
+_treaty_open = {}
+SESSION_FILE = 'rtw3mp_session.ini'  # the host's session file in the slot 1 folder (restored with the slot)
+LVM_GETITEMCOUNT, LVM_SETITEMSTATE, LVM_GETITEMSTATE, LVM_GETITEMW, LVM_GETITEMTEXTW = 0x1004, 0x102B, 0x102C, 0x104B, 0x1073
+
+_k32 = ctypes.WinDLL('kernel32', use_last_error=True)  # own instances: the prototypes below don't touch `u`
+_k32.OpenProcess.restype = wt.HANDLE
+_k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+_k32.VirtualAllocEx.restype = ctypes.c_void_p
+_k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+_k32.VirtualFreeEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD]
+_k32.WriteProcessMemory.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                    ctypes.POINTER(ctypes.c_size_t)]
+_k32.ReadProcessMemory.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                   ctypes.POINTER(ctypes.c_size_t)]
+_k32.CloseHandle.argtypes = [wt.HANDLE]
+_u32 = ctypes.WinDLL('user32')
+_u32.SendMessageW.restype = ctypes.c_ssize_t
+_u32.SendMessageW.argtypes = [wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_size_t]
+_u32.GetWindow.restype = wt.HWND
+_u32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+
+
+class RemoteBuf:
+    """A scratch buffer inside a game copy (32-bit) for list-view messages that carry a pointer (LVM_GETITEM,
+    LVM_GETITEMTEXT, LVM_SETITEMSTATE). The messages themselves are sent to the window as usual; nothing else in the
+    game's memory is read or written."""
+
+    def __init__(self, pid, size=1024):
+        self.h = _k32.OpenProcess(0x0008 | 0x0010 | 0x0020 | 0x0400, False, pid)  # VM_OPERATION/READ/WRITE, QUERY
+        if not self.h:
+            raise OSError(f'OpenProcess({pid}) failed: {ctypes.get_last_error()}')
+        self.addr = _k32.VirtualAllocEx(self.h, None, size, 0x3000, 0x04)  # MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE
+        if not self.addr:
+            _k32.CloseHandle(self.h)
+            raise OSError(f'VirtualAllocEx failed: {ctypes.get_last_error()}')
+
+    def write(self, off, data):
+        b = ctypes.create_string_buffer(data, len(data))
+        _k32.WriteProcessMemory(self.h, self.addr + off, b, len(data), None)
+
+    def read(self, off, n):
+        b = ctypes.create_string_buffer(max(1, n))
+        _k32.ReadProcessMemory(self.h, self.addr + off, b, n, None)
+        return b.raw[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        _k32.VirtualFreeEx(self.h, self.addr, 0, 0x8000)  # MEM_RELEASE
+        _k32.CloseHandle(self.h)
+
+
+def _lvitem(mask=0, item=0, sub=0, state=0, state_mask=0, text_ptr=0, text_max=0):
+    """LVITEMW as a 32-bit process sees it (60 bytes; lParam at offset 32)."""
+    return struct.pack('<IiiIIIii', mask, item, sub, state, state_mask, text_ptr, text_max, 0) + bytes(28)
+
+
+def lv_rows(pid, lv, cols=5):
+    """[(lParam, selected, [column texts])] of a report list view in a game copy."""
+    out = []
+    n = _u32.SendMessageW(lv, LVM_GETITEMCOUNT, 0, 0)
+    with RemoteBuf(pid) as rb:
+        for i in range(max(0, n)):
+            rb.write(0, _lvitem(mask=0x4, item=i))  # LVIF_PARAM
+            _u32.SendMessageW(lv, LVM_GETITEMW, 0, rb.addr)
+            param = struct.unpack('<i', rb.read(32, 4))[0]
+            sel = bool(_u32.SendMessageW(lv, LVM_GETITEMSTATE, i, 0x2) & 0x2)  # LVIS_SELECTED
+            texts = []
+            for c in range(cols):
+                rb.write(0, _lvitem(item=i, sub=c, text_ptr=rb.addr + 64, text_max=256))
+                k = _u32.SendMessageW(lv, LVM_GETITEMTEXTW, i, rb.addr)
+                texts.append(rb.read(64, 2 * max(0, k)).decode('utf-16-le', 'replace'))
+            out.append((param, sel, texts))
+    return out
+
+
+def lv_select(pid, lv, i):
+    """Select and focus row i (LVM_SETITEMSTATE: the list notifies its parent with LVN_ITEMCHANGED, as for a click)."""
+    with RemoteBuf(pid) as rb:
+        rb.write(0, _lvitem(state=0x3, state_mask=0x3))  # LVIS_SELECTED | LVIS_FOCUSED
+        return _u32.SendMessageW(lv, LVM_SETITEMSTATE, i, rb.addr)
+
+
+def capture_treaty(pid, who):
+    """Record the game's peace treaty dialog (TdlgTotalLog captioned "Peace treaty") and its text before
+    answer_dialogs presses OK. The game reuses the form: a new text in the window is a new treaty."""
+    for h in windows_of(pid, 'TdlgTotalLog'):
+        key = (pid, h)
+        if not u.IsWindowVisible(h):
+            _treaty_open.pop(key, None)
+            continue
+        if e2e_test.window_text(h) != TREATY_CAPTION:
+            continue
+        rich = next((c for c in children(h) if 'RichEdit' in e2e_test.class_name(c)), None)
+        txt = text(rich).replace('\r\n', '\n').replace('\r', '\n').strip() if rich else ''
+        if _treaty_open.get(key) != txt:
+            _treaty_open[key] = txt
+            TREATY_SEEN.append(dict(who=who, t=time.time(), text=txt))
+            log(f'  {who} shows the game\'s "{TREATY_CAPTION}" dialog: {txt!r}')
+
+
+def treaty_dialog_open(pid):
+    return [h for h in windows_of(pid, 'TdlgTotalLog') if u.IsWindowVisible(h)]
+
+
+def wait_until(fn, pred, timeout, step=0.4):
+    """Poll fn() until pred(value) holds or the timeout passes; returns the last value."""
+    end = time.time() + timeout
+    while True:
+        v = fn()
+        if pred(v) or time.time() > end:
+            return v
+        time.sleep(step)
+
+
+def wait_chat(pid, line, before, timeout=8):
+    """True once the Multiplayer window's chat of a copy holds `line` more often than in `before`."""
+    n0 = before.count(line)
+    return wait_until(lambda: chat(pid), lambda t: t.count(line) > n0, timeout).count(line) > n0
+
+
+def new_chat_missing(before, after, lines, pattern=None):
+    """The expected lines (and regex) that did not appear again since `before` (counts, not offsets: the chat log
+    drops its oldest lines when it grows long)."""
+    miss = [x for x in lines if after.count(x) <= before.count(x)]
+    if pattern and len(re.findall(pattern, after)) <= len(re.findall(pattern, before)):
+        miss.append(pattern)
+    return miss
+
+
+def nation_table():
+    """{index: dict(name, funds, ships)} from the host's `nations`."""
+    out = {}
+    for p in items(cmd(H, 'nations')):
+        f = p.split(':')
+        if len(f) >= 4 and f[0].isdigit():
+            out[int(f[0])] = dict(name=f[1], funds=int(f[2].split('=')[1]), ships=int(f[3].split('=')[1]))
+    return out
+
+
+def poss_list(port, query):
+    """`possessions <n>` / `claimable <w> <l>`: 'ok N name~area~value[~oil]; ...' -> [dict(name, area, value, oil)]."""
+    v = value(cmd(port, query))
+    if v is None:
+        return None
+    cnt, _, rest = v.partition(' ')
+    out = []
+    for e in rest.split('; '):
+        e = e.strip().rstrip(';').strip()
+        if e:
+            f = e.split('~')
+            out.append(dict(name=f[0], area=f[1] if len(f) > 1 else '', oil=len(f) > 3 and f[3] == 'oil',
+                            value=int(f[2]) if len(f) > 2 and f[2].lstrip('-').isdigit() else 0))
+    return out if cnt.isdigit() and int(cnt) == len(out) else None
+
+
+def pnames(lst):
+    return sorted(p['name'] for p in lst or [])
+
+
+def terms(a, b):
+    """Host `terms a b`: 'agreed winner=W loser=L level=N budget=B claims=x|y|' or 'outlook winner=W level=N vp=a:b'."""
+    v = value(cmd(H, f'terms {a} {b}')) or ''
+    kind, _, rest = v.partition(' ')
+    d = dict(kind=kind, raw=v)
+    head, sep, claims = rest.partition('claims=')
+    for k, x in re.findall(r'(\w+)=(\S*)', head):
+        d[k] = x
+    if sep:
+        d['claims'] = [c for c in claims.split('|') if c]
+    return d
+
+
+def warvp(a, b, va=None, vb=None):
+    """Host `warvp a b [va vb]` -> dict(a=points of a, b=points of b, scale=G) or None."""
+    m = re.match(rf'^ok {a}:(-?\d+) {b}:(-?\d+) scale=(-?\d+)',
+                 cmd(H, f'warvp {a} {b}' + (f' {va} {vb}' if va is not None else '')))
+    return dict(a=int(m[1]), b=int(m[2]), scale=int(m[3])) if m else None
+
+
+def session_file():
+    try:
+        with open(os.path.join(SAVE, f'Game{HOST_SLOT}', SESSION_FILE), 'rb') as f:
+            txt = f.read().decode('utf-8', errors='replace')
+    except OSError:
+        return {}
+    return dict(ln.split('=', 1) for ln in txt.splitlines() if '=' in ln)
+
+
+def treaty_loss(p, level):
+    """The loser's Prestige after a treaty (the game's PrestigeWarLoss applied to the loser): ProportionalPrestigeLoss(10)
+    = P div 10 when P >= 20, otherwise 1 (not below 0); a major defeat 1 more, and 1 more again while above 20."""
+    p = max(0, p - (p // 10 if p >= 20 else 1))
+    if level >= 2:
+        p -= 1
+        if p > 20:
+            p -= 1
+    return p
+
+
+def greedy(options, budget):
+    """The automatic pick of the mod (and a sensible claim): most valuable first, every one that still fits."""
+    pick, used = [], 0
+    for p in sorted(options, key=lambda p: -p['value']):
+        if used + p['value'] <= budget:
+            pick.append(p)
+            used += p['value']
+    return pick, used
+
+
+def over_budget(options, budget):
+    """The most valuable possessions until their worth exceeds the budget, or None if all of them fit."""
+    pick, used = [], 0
+    for p in sorted(options, key=lambda p: -p['value']):
+        pick.append(p)
+        used += p['value']
+        if used > budget:
+            return pick
+    return None
+
+
+def client_request(line, action, target, timeout=8):
+    """A diplomacy command on the client (`diplo ...`, `claimland ...`). The client's bridge answers as soon as the
+    request is sent, so wait until the host handled it (`diplomacy request 1 <action> <target> accepted`) before
+    anything that depends on it (applydiplo, host terms). 'ok' only if the host accepted it."""
+    mark = log_mark(H)
+    r = cmd(C, line)
+    if r != 'ok':
+        return r
+    if wait_log(H, mark, rf'diplomacy request 1 {action} {target} accepted', timeout):
+        return 'ok'
+    return f'ok, but the host did not accept it within {timeout} s'
+
+
+def apply_diplo(ctx, until, timeout=20):
+    """The host's month-end diplomacy step now (`applydiplo`, async on the bridge): the host's dialogs are answered
+    until until() holds. Returns the host log written meanwhile."""
+    mark = log_mark(H)
+    cmd(H, 'applydiplo')
+    end = time.time() + timeout
+    time.sleep(0.5)
+    while time.time() < end:
+        answer_dialogs(ctx.hp, 'host')
+        if until():
+            break
+        time.sleep(0.5)
+    drain(ctx.hp, 1)
+    return log_since(H, mark)
+
+
+def claim_state():
+    """Client `claimui state` (or toggle reply) -> dict(open, target, budget, mp, checked, sum, rows) or None."""
+    r = cmd(C, 'claimui state')
+    return parse_claim(r)
+
+
+def parse_claim(r):
+    m = re.match(r'^ok open=(\d)(?: target=(-?\d+) budget=(\d+) mpEnabled=(\d) checked=([\d,]*) sum=(.*?) rows=(.*))?$',
+                 r or '', re.S)
+    if not m:
+        return None
+    if m[1] == '0':
+        return dict(open=False)
+    rows = []
+    for e in m[7].split('; '):
+        e = e.strip().rstrip(';')
+        if e:
+            i, rest = e.split(':', 1)
+            name, v = rest.rsplit(':', 1)
+            rows.append(dict(i=int(i), name=name, value=int(v)))
+    return dict(open=True, target=int(m[2]), budget=int(m[3]), mp=m[4] == '1',
+                checked=[int(x) for x in m[5].split(',') if x], sum=m[6].strip(), rows=rows)
+
+
+def claim_windows(pid):
+    return [h for h in windows_of(pid, 'RTW3MP_Claim') if u.IsWindowVisible(h)]
+
+
+def open_claim_window(pid):
+    """Post a click on the Multiplayer window's "Claim land..." button (IDC_DPEACE) and wait for the claim window."""
+    u.PostMessageW(mp_ctl(pid, 'peace'), 0x00F5, 0, 0)  # BM_CLICK
+    return wait_until(lambda: claim_windows(pid), bool, 5)[:1] and claim_windows(pid)[0]
+
+
+def claim_button(cw, key):
+    """What a click on one of the claim window's buttons sends it: WM_COMMAND, BN_CLICKED | id, the button."""
+    u.PostMessageW(cw, 0x0111, CLAIM_IDC[key] & 0xFFFF, u.GetDlgItem(cw, CLAIM_IDC[key]))
+
+
+def claim_closed(ctx):
+    """The claim window is gone and the Multiplayer window enabled again (a refused claim would show a message box,
+    which is closed and reported)."""
+    gone = wait_until(lambda: claim_windows(ctx.cp), lambda w: not w, 5) == []
+    boxes = [d for d in windows_of(ctx.cp, '#32770') if text(d) == 'Claim land' and u.IsWindowVisible(d)]
+    for d in boxes:
+        u.PostMessageW(d, 0x0010, 0, 0)  # WM_CLOSE
+    return gone and bool(u.IsWindowEnabled(mp_window(ctx.cp))), boxes
+
+
+def treaty_text(dlg_text, shown, head, ceded, ships, repar):
+    """A "Peace treaty" dialog against the log: heading, ceded possessions (exact lines, or prefixes such as "X cedes
+    no possessions"), the reparation ships, then the reparations line. A hand-over may give several lines (the game's
+    text is split at its line break: "<ship> handed over to <winner> as war reparation." / "She is renamed ..."), so
+    the line count comes from the dialog and must equal the log's `showing a peace treaty (n lines)`. Returns
+    (ok, lines, detail)."""
+    lines = [ln.strip() for ln in (dlg_text or '').split('\n') if ln.strip()]
+    m = re.search(r'\((\d+) lines\)', shown[0]) if shown else None
+    n_log = int(m.group(1)) if m else None
+    is_ceded = lambda ln: any(ln.startswith(c.rstrip('.')) for c in ceded)
+    ship_lines = [ln for ln in lines[1:] if not is_ceded(ln) and ln not in repar]
+    handed = [ln for ln in ship_lines if ' handed over to ' in ln]
+    bad = [ln for ln in lines if not ln.endswith('.') or ln.endswith('..') or 'reparation She' in ln]
+    ok = (n_log == len(lines) and lines[:1] == [head] and
+          all(any(ln.startswith(c.rstrip('.')) for ln in lines) for c in ceded) and
+          all(c in lines for c in ceded if c.endswith('.')) and all(r in lines for r in repar) and
+          len(handed) == ships and all(ln.endswith(' as war reparation.') for ln in handed) and not bad and
+          len(ship_lines) >= ships)
+    return ok, lines, (f'log {n_log} lines, dialog {len(lines)}; {len(handed)} hand-over(s) of {ships}, '
+                       f'{len(ship_lines) - len(handed)} more ship line(s); bad endings {bad}; lines {lines}')
+
+
+def treaty_lines(txt, winner, loser):
+    return [m for m in re.findall(TREATY_RE, txt) if int(m[0]) == winner and int(m[1]) == loser]
+
+
+def nation_view(nations):
+    """Host values a treaty changes: possessions, ships, funds, Prestige, BaseResources of some nations."""
+    nt = nation_table()
+    return {n: dict(poss=pnames(poss_list(H, f'possessions {n}')), ships=nt[n]['ships'], funds=nt[n]['funds'],
+                    P=nint(H, n, 'Prestige'), R=nint(H, n, 'BaseResources'), VP=nint(H, n, 'VP')) for n in nations}
+
+
+def fmt_view(v):
+    return ' | '.join(f'{n}: {len(x["poss"])} poss, {x["ships"]} ships, funds {x["funds"]}, Prestige {x["P"]}, '
+                      f'BaseResources {x["R"]}, VP {x["VP"]}' for n, x in v.items())
+
+
+def scenario_treaty(ctx):
+    """0.2.5: peace terms of wars between players. War 1-2 (client vs the stand-in), a major victory for the client set
+    with `warvp`; peace offered and accepted freezes the terms; claims are validated on the client and the host; the
+    client's "Claim land..." window (real button, posted messages, `claimui`) claims land within the budget; calling
+    the peace off erases the terms; the processed month applies the treaty (possessions, ships, prestige, reparations,
+    chat, the client's treaty dialog) and the war score lines of that month are checked. Then, with `applydiplo` after
+    the last processed month (no later merge can overwrite the host's values with the client's planning copy): an
+    automatic minor victory of nation 2, a host-vs-client major victory (DoPeace, the host's treaty dialog) and a
+    compromise peace."""
+    hp, cp = ctx.hp, ctx.cp
+    W, Lo = 1, STANDIN
+
+    # a) startup
+    avail = {}
+    for port, who in ((H, 'host'), (C, 'client')):
+        ln = log_lines(log_since(port), r'Peace treaties: ')
+        ok = bool(ln) and re.search(r'Peace treaties: ok \(removeShip=(?!0+ )\w+ scale=(?!0+ )\w+ slCreate=(?!0+ )\w+ '
+                                    r'battleHooks=1/1/1\)', ln[0])
+        avail[who] = bool(ok)
+        check(f'a) {who} log at startup: "Peace treaties: ok (removeShip=.. scale=.. slCreate=.. battleHooks=1/1/1)"',
+              ok, [x.split('] ', 1)[-1] for x in ln[:1]] or 'no line')
+    if not all(avail.values()):  # every further step needs the feature: don't keep the game open for timeouts
+        check('treaty: peace treaties available on host and client (needed by every further check)', False,
+              f'{avail}: the remaining checks (b-k) were not run')
+        return
+    cmd(H, 'mpwindow')  # the host's chat log is checked too
+    cmd(C, 'mpwindow')
+    time.sleep(1)
+    nt = nation_table()
+    n0, n1, n2 = nt[0]['name'], nt[W]['name'], nt[Lo]['name']
+    r01, r12 = rel(0, 1), rel(1, 2)
+    check('start: nations 1 and 2 at peace, the host at war with nobody',
+          r01['war'] == '0' and r12['war'] == '0' and r01['hostWars'] == '0', f'0-1 {r01} | 1-2 {r12}')
+    p1, p2 = poss_list(H, 'possessions 1'), poss_list(H, 'possessions 2')
+    c12, c21, c01 = (poss_list(H, q) for q in ('claimable 1 2', 'claimable 2 1', 'claimable 0 1'))
+    log(f'  nations: 0 {n0}, 1 {n1}, 2 {n2}')
+    log(f'  possessions 1: {[(p["name"], p["value"]) for p in p1 or []]}')
+    log(f'  possessions 2: {[(p["name"], p["value"]) for p in p2 or []]}')
+    for q, lst in (('1 2', c12), ('2 1', c21), ('0 1', c01)):
+        log(f'  claimable {q}: {[(p["name"], p["area"], p["value"]) for p in lst or []]} '
+            f'(worth {sum(p["value"] for p in lst or [])})')
+    check('claimable 1 2 / 2 1 / 0 1: only possessions of the loser, each worth less than 11',
+          None not in (p1, p2, c12, c21, c01) and set(pnames(c12)) <= set(pnames(p2)) and
+          set(pnames(c21)) <= set(pnames(p1)) and set(pnames(c01)) <= set(pnames(p1)) and
+          all(p['value'] < 11 for p in (c12 or []) + (c21 or []) + (c01 or [])),
+          f'{len(c12 or [])}/{len(c21 or [])}/{len(c01 or [])} claimable')
+    c12, c21, c01, p1, p2 = c12 or [], c21 or [], c01 or [], p1 or [], p2 or []
+
+    # b) war 1-2 and a major victory for 1 by its war score
+    before = chat(cp)
+    rc = client_request(f'diplo war {Lo}', 'war', Lo)
+    hl = apply_diplo(ctx, lambda: rel(1, 2).get('war') == '1')
+    r12 = rel(1, 2)
+    check('b) client declares war on nation 2; applydiplo starts it (rel 1 2 war=1, "diplomacy: war 1-2")',
+          rc == 'ok' and r12['war'] == '1' and log_lines(hl, r'diplomacy: war 1-2'), f'{rc}; {r12}')
+    line = f'War: {n1} has declared war on {n2}!'
+    check(f'b) chat (client): "{line}"', wait_chat(cp, line, before), chat(cp)[-300:])
+    v0 = warvp(1, 2)
+    check('b) the new war starts with a war score of 0:0 (warvp 1 2)', v0 and v0['a'] == 0 and v0['b'] == 0, v0)
+    g = v0['scale'] if v0 else 0
+    A, B = max(900, 100 * g + 500), 100
+    v1, t = warvp(1, 2, A, B), terms(1, 2)
+    check(f'b) warvp 1 2 {A} {B} (scale G={g}): terms outlook winner=1 level=2 vp={A}:{B}',
+          v1 and (v1['a'], v1['b']) == (A, B) and t['kind'] == 'outlook' and t.get('winner') == '1' and
+          t.get('level') == '2' and t.get('vp') == f'{A}:{B}', f'{v1} | {t["raw"]}')
+    r = wait_until(lambda: row(C, Lo), lambda r: r and r['vp'] == f'{A}:{B}', 6)
+    check(f'b) client diploview row 2: At war, vp={A}:{B}, outlook "you are winning: a peace now would be a major '
+          f'victory"', r and r['relation'] == 'At war' and r['vp'] == f'{A}:{B}' and
+          r['outlook'] == 'you are winning: a peace now would be a major victory', r)
+
+    # c) peace offered by the client, accepted by nation 2: the terms are frozen
+    before = chat(cp)
+    rc = client_request(f'diplo peace {Lo}', 'peace', Lo)
+    got = wait_chat(cp, f'{n1} offers peace to {n2}.', before)
+    rh = cmd(H, f'diploas {Lo} peace {W}')
+    line = (f'{n2} accepts the peace offered by {n1}: {n1} wins a major victory and may claim {n2}\'s land worth up '
+            f'to 8. It takes effect when this month is processed.')
+    okc = wait_chat(cp, line, before)
+    t = terms(1, 2)
+    check('c) client offers peace, nation 2 accepts: terms agreed winner=1 loser=2 level=2 budget=8, no claims',
+          rc == 'ok' and got and rh == 'ok' and t['kind'] == 'agreed' and (t.get('winner'), t.get('loser'),
+          t.get('level'), t.get('budget')) == ('1', '2', '2', '8') and t.get('claims') == [], f'{rc}; {rh}; {t["raw"]}')
+    check(f'c) chat on both sides: "{line[:60]}... worth up to 8. ..."', okc and line in chat(hp),
+          f'client {okc}, host {line in chat(hp)}')
+    r = wait_until(lambda: row(C, Lo), lambda r: r and (r['claim'] or '').startswith('8:'), 6)
+    check(f'c) client diploview row 2: claim=8:{len(c12)}:0, pending "peace agreed: you win (major), claim land '
+          f'(worth up to 8)"', r and r['claim'] == f'8:{len(c12)}:0' and
+          r['pending'] == 'peace agreed: you win (major), claim land (worth up to 8)', r)
+    rc = cmd(C, f'diplo peace {Lo}')
+    check('c) another peace offer is refused (client)', rc.startswith('error'), rc)
+    sf = session_file()
+    check(f'c) {SESSION_FILE} keeps the war score and the agreed terms (warVP 1-2:{A}:{B}, treaties 1-2 winner 1 '
+          f'level 2, diplomacyDate)', f'1-2:{A}:{B},' in sf.get('warVP', '') and
+          sf.get('treaties', '').startswith('1\x1f2\x1f1\x1f2\x1f2') and sf.get('diplomacyDate'),
+          {k: sf.get(k) for k in ('warVP', 'treaties', 'diplomacyDate')})
+
+    # d) claim validation (client first, then the host's own check with diploas)
+    big = next((p for p in p2 if p['value'] >= 11), None)
+    bad = [('an unknown name', 'Atlantis'), ('a possession of the winner', p1[0]['name'] if p1 else 'Atlantis')]
+    if big:
+        bad.append(('a possession of nation 2 worth 11 or more', big['name']))
+    for what, name in bad:
+        rc, rh = cmd(C, f'claimland {Lo} {name}'), cmd(H, f'diploas {W} claim {Lo} {name}')
+        check(f'd) claiming {what} ("{name}") is refused on the client and on the host ("cannot be claimed")',
+              rc.startswith('error') and 'cannot be claimed' in rc and rh.startswith('error') and
+              'cannot be claimed' in rh, f'client {rc} | host {rh}')
+    over = over_budget(c12, 8)
+    if over:
+        worth = sum(p['value'] for p in over)
+        names = '|'.join(p['name'] for p in over)
+        rc, rh = cmd(C, f'claimland {Lo} {names}'), cmd(H, f'diploas {W} claim {Lo} {names}')
+        want = f'worth {worth}; you may claim up to 8'
+        check(f'd) claiming land worth {worth} (> 8) is refused on the client and on the host',
+              rc.startswith('error') and want in rc and rh.startswith('error') and want in rh,
+              f'client {rc} | host {rh}')
+    else:
+        log(f'  SKIP d) over-budget claim: the claimable possessions are worth only '
+            f'{sum(p["value"] for p in c12)} together')
+    rh = cmd(H, f'diploas {Lo} claim {W} {c21[0]["name"] if c21 else "Atlantis"}')
+    check('d) the loser cannot claim (host: "Only the winner of the war can claim possessions.")',
+          rh == 'error Only the winner of the war can claim possessions.', rh)
+    t = terms(1, 2)
+    check('d) the refused claims changed nothing (terms claims empty)', t.get('claims') == [], t['raw'])
+    first = next((p for p in sorted(c12, key=lambda p: -p['value']) if p['value'] <= 8), None)
+    if first:
+        before = chat(cp)
+        line = f'{n1} claims {first["name"]} from {n2}.'
+        rc = client_request(f'claimland {Lo} {first["name"]}', 'claim', Lo)
+        okc = wait_chat(cp, line, before)
+        t = terms(1, 2)
+        r = wait_until(lambda: row(C, Lo), lambda r: r and (r['claim'] or '').endswith(':1'), 6)
+        check(f'd) a valid claim ({first["name"]}, worth {first["value"]}) is accepted: terms claims, chat "{line}", '
+              f'client diploview claim=8:{len(c12)}:1 "land claimed: {first["value"]} of 8"',
+              rc == 'ok' and okc and t.get('claims') == [first['name']] and r and r['claim'] == f'8:{len(c12)}:1' and
+              r['pending'] == f'peace agreed: you win (major), land claimed: {first["value"]} of 8',
+              f'{rc}; chat {okc}; {t["raw"]}; {r}')
+    else:
+        before = chat(cp)
+        line = f'{n1} leaves the choice of land to the peace conference.'
+        rc = client_request(f'claimland {Lo}', 'claim', Lo)
+        check('d) no claimable land next to nation 1: an empty claim is accepted ("leaves the choice of land to the '
+              'peace conference")', rc == 'ok' and wait_chat(cp, line, before), rc)
+
+    # f) calling the agreed peace off erases the terms; agreed again the other way round (2 offers, 1 accepts)
+    before = chat(cp)
+    rc = client_request(f'diplo cancel {Lo}', 'cancel', Lo)
+    okc = wait_chat(cp, f'{n1} calls off the agreed peace with {n2}.', before)
+    t = terms(1, 2)
+    r = wait_until(lambda: row(C, Lo), lambda r: r and r['pending'] == '' and r['claim'] == '0:0:0', 6)
+    sf = session_file()
+    check('f) the client calls off the agreed peace: terms erased (terms 1 2 = the outlook, claims gone, no treaty in '
+          'the session file), chat line, client row: nothing pending, claim=0:0:0, peace can be proposed again',
+          rc == 'ok' and okc and t['kind'] == 'outlook' and t.get('vp') == f'{A}:{B}' and r and r['claim'] == '0:0:0'
+          and 'P' in r['flags'] and sf.get('treaties', 'x') == '', f'{rc}; chat {okc}; {t["raw"]}; {r}; '
+                                                                   f'treaties {sf.get("treaties")!r}')
+    before = chat(cp)
+    rh = cmd(H, f'diploas {Lo} peace {W}')
+    r = wait_until(lambda: row(C, Lo), lambda r: r and 'p' in r['flags'], 6)
+    rc = client_request(f'diplo peace {Lo}', 'peace', Lo)
+    line = (f'{n1} accepts the peace offered by {n2}: {n1} wins a major victory and may claim {n2}\'s land worth up '
+            f'to 8.')
+    okc = wait_chat(cp, line, before)
+    t = terms(1, 2)
+    check('f) peace agreed again (nation 2 offers, the client accepts): winner 1, level 2, budget 8, the old claim is '
+          'not back', rh == 'ok' and r and 'p' in r['flags'] and rc == 'ok' and okc and t['kind'] == 'agreed' and
+          (t.get('winner'), t.get('level'), t.get('budget')) == ('1', '2', '8') and t.get('claims') == [],
+          f'{rh}; {r}; {rc}; chat {okc}; {t["raw"]}')
+    if first:
+        client_request(f'claimland {Lo} {first["name"]}', 'claim', Lo)
+        wait_until(lambda: row(C, Lo), lambda r: r and (r['claim'] or '').endswith(':1'), 6)
+
+    # e) the client's "Claim land..." window (real button and list view, posted messages; `claimui` toggles a row
+    # through the list view's own notification)
+    cmd(C, 'mpwindow')
+    time.sleep(0.5)
+    mpw, lvh, btn = mp_window(cp), mp_ctl(cp, 'list'), mp_ctl(cp, 'peace')
+    rows = lv_rows(cp, lvh)
+    idx = next((i for i, (prm, _, _) in enumerate(rows) if prm == Lo), None)
+    if idx is not None:
+        lv_select(cp, lvh, idx)
+    bt = wait_until(lambda: text(btn), lambda s: s == 'Claim land...', 4)
+    rows = lv_rows(cp, lvh)
+    sel = [prm for prm, s, _ in rows if s]
+    check('e) client window: nation 2 selected in the Diplomacy list (LVM_SETITEMSTATE), the button (1084) reads '
+          '"Claim land..." and is enabled', idx is not None and sel == [Lo] and bt == 'Claim land...' and
+          u.IsWindowEnabled(btn), f'rows {rows}, selected {sel}, button "{bt}"')
+    cols = rows[idx][2] if idx is not None else []
+    label = text(mp_ctl(cp, 'label'))
+    claimed = f'land claimed: {first["value"]} of 8' if first else 'claim land (worth up to 8)'
+    check(f'e) Diplomacy list row: Tension column "VP {A}:{B}", Pending "peace agreed: you win (major), {claimed}"; '
+          f'label "Diplomacy: you are winning: a peace now would be a major victory"',
+          len(cols) == 5 and cols[0] == n2 and cols[3] == f'VP {A}:{B}' and
+          cols[4] == f'peace agreed: you win (major), {claimed}' and
+          label == 'Diplomacy: you are winning: a peace now would be a major victory', f'{cols} | label "{label}"')
+
+    pre = [i for i, p in enumerate(c12) if first and p['name'] == first['name']]
+    pre_sum = f'Selected: {first["value"] if first else 0} of 8'
+    # open 1: the claimed row pre-checked, the Multiplayer window disabled; untick, then Cancel
+    cw = open_claim_window(cp)
+    st = claim_state()
+    check('e) "Claim land..." opens the RTW3MP_Claim window, owned by the Multiplayer window, which is disabled '
+          '(claimui mpEnabled=0)', cw and _u32.GetWindow(cw, 4) == mpw and not u.IsWindowEnabled(mpw) and st and
+          st['open'] and not st['mp'], f'window {cw}, owner {cw and _u32.GetWindow(cw, 4)} (MP {mpw}), MP enabled '
+                                       f'{u.IsWindowEnabled(mpw)}, {st}')
+    lbl = text(u.GetDlgItem(cw, CLAIM_IDC['label'])) if cw else ''
+    check(f'e) claim window: target 2, budget 8, one row per claimable possession (claimable 1 2), the claimed one '
+          f'pre-checked, sum label "{pre_sum}"', st and st.get('open') and st['target'] == Lo and st['budget'] == 8
+          and [x['name'] for x in st['rows']] == [p['name'] for p in c12] and st['checked'] == pre and
+          st['sum'] == pre_sum and text(u.GetDlgItem(cw, CLAIM_IDC['sum'])) == pre_sum and
+          (lbl.startswith(f'Peace with {n2}: you may claim possessions worth up to 8.') if c12 else
+           lbl.startswith(f'None of {n2}\'s possessions lie next to yours')), f'{st} | label "{lbl}"')
+    if pre:
+        s2 = parse_claim(cmd(C, f'claimui toggle {pre[0]}'))
+        check('e) unticking the claimed row: sum "Selected: 0 of 8"', s2 and s2['checked'] == [] and
+              s2['sum'] == 'Selected: 0 of 8', s2)
+    if cw:
+        claim_button(cw, 'cancel')
+    ok, boxes = claim_closed(ctx)
+    t = terms(1, 2)
+    check('e) Cancel (1095) closes the window, enables the Multiplayer window and sends nothing (claims unchanged)',
+          cw and ok and not boxes and t.get('claims') == ([first['name']] if first else []), f'{ok} {boxes} {t["raw"]}')
+    # open 2: WM_CLOSE
+    cw = open_claim_window(cp)
+    st = claim_state()
+    if cw:
+        u.PostMessageW(cw, 0x0010, 0, 0)  # WM_CLOSE (the caption's [x])
+    ok, boxes = claim_closed(ctx)
+    t = terms(1, 2)
+    check('e) reopened: the claim still pre-checked; WM_CLOSE closes the window and enables the Multiplayer window, '
+          'claims unchanged', cw and st and st.get('checked') == pre and ok and not boxes and
+          t.get('claims') == ([first['name']] if first else []), f'{st} | {ok} {boxes} {t["raw"]}')
+    # open 3: "Let the conference choose" withdraws the claims
+    before = chat(cp)
+    cw = open_claim_window(cp)
+    if cw:
+        claim_button(cw, 'auto')
+    ok, boxes = claim_closed(ctx)
+    line = f'{n1} leaves the choice of land to the peace conference.'
+    okc = wait_chat(cp, line, before)
+    t = terms(1, 2)
+    check(f'e) "Let the conference choose" (1094): window closed, claims withdrawn (terms claims empty), chat "{line}"',
+          cw and ok and not boxes and okc and t.get('claims') == [], f'{ok} {boxes} chat {okc} {t["raw"]}')
+    # open 4: tick within the budget, a tick past it is refused, then "Claim selected"
+    cw = open_claim_window(cp)
+    st = claim_state()
+    pick, used = greedy(c12, 8)
+    ticks_ok, steps = True, []
+    for p in pick:
+        i = next(k for k, q in enumerate(c12) if q['name'] == p['name'])
+        s2 = parse_claim(cmd(C, f'claimui toggle {i}'))
+        steps.append((i, s2 and s2['checked'], s2 and s2['sum']))
+        ticks_ok = ticks_ok and bool(s2) and i in s2['checked']
+    want_idx = sorted(next(k for k, q in enumerate(c12) if q['name'] == p['name']) for p in pick)
+    s3 = claim_state()
+    check(f'e) ticking the most valuable rows within the budget: checked {want_idx}, sum "Selected: {used} of 8"',
+          cw and st and st.get('checked') == [] and ticks_ok and s3 and s3['checked'] == want_idx and
+          s3['sum'] == f'Selected: {used} of 8', f'start {st}; steps {steps}; now {s3}')
+    extra = next((k for k, q in enumerate(c12) if k not in want_idx and q['value'] > 8 - used), None)
+    if extra is not None:
+        s4 = parse_claim(cmd(C, f'claimui toggle {extra}'))
+        sumtxt = text(u.GetDlgItem(cw, CLAIM_IDC['sum'])) if cw else ''
+        check(f'e) ticking a row past the budget ({c12[extra]["name"]}, worth {c12[extra]["value"]}) unticks it again: '
+              f'"Selected: {used} of 8   (over the limit)"', s4 and s4['checked'] == want_idx and
+              s4['sum'] == f'Selected: {used} of 8   (over the limit)' and sumtxt == s4['sum'], f'{s4} | "{sumtxt}"')
+    else:
+        log(f'  SKIP e) over-the-limit tick: every claimable row fits into the budget ({used} of 8 ticked)')
+    before = chat(cp)
+    if cw:
+        claim_button(cw, 'ok')
+    ok, boxes = claim_closed(ctx)
+    names = [p['name'] for p in c12 if p['name'] in {q['name'] for q in pick}]
+    line = f'{n1} claims {", ".join(names)} from {n2}.' if names else \
+        f'{n1} leaves the choice of land to the peace conference.'
+    okc = wait_chat(cp, line, before)
+    t = terms(1, 2)
+    r = wait_until(lambda: row(C, Lo), lambda r: r and r['claim'] == f'8:{len(c12)}:{len(names)}', 6)
+    check(f'e) "Claim selected" (1093): window closed, Multiplayer window enabled, host terms claims {names}, chat '
+          f'"{line}", client diploview claim=8:{len(c12)}:{len(names)}',
+          cw and ok and not boxes and okc and t.get('claims') == names and r and
+          r['claim'] == f'8:{len(c12)}:{len(names)}', f'{ok} {boxes} chat {okc} {t["raw"]} {r}')
+
+    # g) the processed month applies the treaty (claimed land, ships, prestige, reparations); the client's dialog
+    claims_g = t.get('claims') or []
+    bv = nation_view((0, 1, 2))
+    cb1, cb2 = pnames(poss_list(C, 'possessions 1')), pnames(poss_list(C, 'possessions 2'))
+    log(f'  before the month: {fmt_view(bv)}')
+    hc0, cc0, seen0, t_month = chat(hp), chat(cp), len(TREATY_SEEN), time.time()
+    run_month(ctx, 'treaty')
+    hmark, cmark = ctx.month_marks
+    end = time.time() + 20
+    while time.time() < end and not [d for d in TREATY_SEEN[seen0:] if d['who'] == 'client']:
+        answer_dialogs(cp, 'client')
+        time.sleep(0.5)
+    drain(cp, 1, 'client')
+    hlog, clog = log_since(H, hmark), log_since(C, cmark)
+    av = nation_view((0, 1, 2))
+    log(f'  after the month: {fmt_view(av)}')
+    tl = treaty_lines(hlog, 1, 2)
+    k, mode, s, pr, res = (int(tl[0][3]), tl[0][4], int(tl[0][5]), int(tl[0][6]), int(tl[0][7])) if tl else \
+        (None, None, None, None, None)
+    rmax = min(500, max(0, (bv[2]['R'] or 0) // 2))
+    check(f'g) host log: one "treaty 1 over 2 (level 2): {len(claims_g)} possession(s) '
+          f'({"claimed" if claims_g else "automatic"}), s ship(s) (0-3), prestige +2, resources -{rmax}"',
+          len(tl) == 1 and int(tl[0][2]) == 2 and k == len(claims_g) and
+          mode == ('claimed' if claims_g else 'automatic') and 0 <= s <= 3 and pr == 2 and res == rmax,
+          [x.split('] ', 1)[-1] for x in log_lines(hlog, r'treaty \d+ over')] or 'no line')
+    r12 = rel(1, 2)
+    r = row(C, Lo)
+    check('g) the war is over: rel 1 2 war=0; client row 2: Peace, nothing pending, no claim',
+          r12['war'] == '0' and r and r['relation'] == 'Peace' and r['pending'] == '' and r['claim'] == '0:0:0',
+          f'{r12} | {r}')
+    moved, gained = set(bv[2]['poss']) - set(av[2]['poss']), set(av[1]['poss']) - set(bv[1]['poss'])
+    check(f'g) host: the claimed possessions {claims_g} moved from 2 to 1 (possessions 1/2), nothing else',
+          moved == gained == set(claims_g) and len(av[1]['poss']) == len(bv[1]['poss']) + len(claims_g) and
+          len(av[2]['poss']) == len(bv[2]['poss']) - len(claims_g), f'moved {sorted(moved)}, gained {sorted(gained)}')
+    ca1, ca2 = pnames(poss_list(C, 'possessions 1')), pnames(poss_list(C, 'possessions 2'))
+    check('g) client (its new month): possessions 1/2 as on the host', ca1 == av[1]['poss'] and ca2 == av[2]['poss']
+          and set(ca1) - set(cb1) == set(claims_g), f'client gained {sorted(set(ca1) - set(cb1))}, lost '
+                                                    f'{sorted(set(cb2) - set(ca2))}')
+    head = f'Peace treaty between {n1} and {n2}: {n1} wins a major victory.'
+    ceded = [f'{x} is ceded from {n2} to {n1}.' for x in sorted(moved)] or [f'{n2} cedes no possessions']
+    repar = [f'{n2} pays reparations (base resources -{res}).'] if res else []
+    end_re = rf'Peace: ({re.escape(n1)}|{re.escape(n2)}) and ({re.escape(n1)}|{re.escape(n2)}) have ended their war ' \
+             rf'\({re.escape(n1)} victorious\)\.'
+    hc, cc = chat(hp), wait_month_chat(cp, cc0)
+    miss = {who: new_chat_missing(c0, c, [head] + ceded + repar, end_re)
+            for who, c0, c in (('host', hc0, hc), ('client', cc0, cc))}
+    check('g) chat on both sides: the treaty (head, ceded possessions, reparations) and "Peace: ... (<1> victorious)."',
+          not miss['host'] and not miss['client'], miss)
+    shown = log_lines(clog, r'showing a peace treaty \((\d+) lines\)')
+    dlg = [d for d in TREATY_SEEN[seen0:] if d['who'] == 'client']
+    tok, tlines, tdet = treaty_text(dlg[0]['text'] if dlg else '', shown, head, ceded, s or 0, repar)
+    miss = {who: new_chat_missing(c0, c, tlines) for who, c0, c in (('host', hc0, hc), ('client', cc0, cc))}
+    check('g) client: "showing a peace treaty (n lines)" once; the game\'s "Peace treaty" dialog: heading, ceded '
+          'possessions, every hand-over as "... as war reparation." plus its own sentences, reparations, n = the '
+          'dialog\'s lines, each ending with one period; the same lines in both chats; answered',
+          len(shown) == 1 and len(dlg) == 1 and tok and not miss['host'] and not miss['client'] and
+          not treaty_dialog_open(cp), f'{[x.split("] ", 1)[-1] for x in shown]}; {tdet}; chat missing {miss}')
+    check('g) host (not a party): no treaty dialog', not log_lines(hlog, r'showing a peace treaty') and
+          not [d for d in TREATY_SEEN[seen0:] if d['who'] == 'host'], log_lines(hlog, r'showing a peace treaty'))
+    log(f'  treaty month: nation 1 Prestige {bv[1]["P"]} -> {av[1]["P"]} (treaty +{pr}), nation 2 Prestige '
+        f'{bv[2]["P"]} -> {av[2]["P"]} (war loss), host Prestige {bv[0]["P"]} -> {av[0]["P"]}, nation 2 BaseResources '
+        f'{bv[2]["R"]} -> {av[2]["R"]} '
+        f'(treaty -{res}), ships 1 {bv[1]["ships"]} -> {av[1]["ships"]}, 2 {bv[2]["ships"]} -> {av[2]["ships"]} '
+        f'(treaty {s} handed over), funds 1 {bv[1]["funds"]} -> {av[1]["funds"]}, 2 {bv[2]["funds"]} -> '
+        f'{av[2]["funds"]} (month changes included)')
+    want2 = None if bv[2]['P'] is None else treaty_loss(bv[2]['P'], 2)
+    host_events = [c for ts, who, c in ANSWERED if ts >= t_month and who == 'host' and c.startswith('TdlgEventAnswer')]
+    host_ok = av[0]['P'] == bv[0]['P'] or bool(host_events)
+    check(f'g) prestige: winner 1 +2, loser 2 {bv[2]["P"]} -> {want2} (P div 10 when >= 20 else 1, major -1, -1 more '
+          f'above 20); the host (not a party) unchanged (unless it answered an event that month)',
+          None not in (bv[1]['P'], av[1]['P'], want2) and av[1]['P'] == bv[1]['P'] + 2 and av[2]['P'] == want2 and
+          host_ok, f'nation 1 {bv[1]["P"]} -> {av[1]["P"]}, nation 2 {bv[2]["P"]} -> {av[2]["P"]} (want {want2}), host '
+                   f'{bv[0]["P"]} -> {av[0]["P"]}; host events {host_events}')
+    # k) war score lines of the month's battles between 1 and 2: one per battle, totals consistent from A:B
+    ws = [m for m in re.findall(r'war score (\d+)-(\d+): \+(\d+)/\+(\d+) -> (\d+):(\d+)', hlog) if m[:2] == ('1', '2')]
+    cur, chain = (A, B), True
+    for m in ws:
+        nxt = (cur[0] + int(m[2]), cur[1] + int(m[3]))
+        chain = chain and nxt == (int(m[4]), int(m[5]))
+        cur = (int(m[4]), int(m[5]))
+    seeded = log_lines(hlog, r'war score 1-2: first battle')
+    log(f'  war score lines 1-2 in the treaty month: {len(ws)} {ws[:6]}' + ('' if ws else ' (no battle between 1 and '
+                                                                            '2 this month)'))
+    check('k) war score 1-2 in the processed month: every "+x/+y -> A:B" line adds up from the set score (no battle '
+          'counted twice), no "first battle, already counted" line', chain and not seeded,
+          f'{ws} | {seeded}')
+
+    # h) automatic: nation 2 wins a minor victory, nobody claims (applydiplo: exact values, no month in between)
+    before = chat(cp)
+    rc = client_request(f'diplo war {Lo}', 'war', Lo)
+    apply_diplo(ctx, lambda: rel(1, 2).get('war') == '1')
+    v0 = warvp(1, 2)
+    vl, vw = 100 * g + 300, 100 * g + 400
+    v1, t = warvp(1, 2, vl, vw), terms(1, 2)
+    r = wait_until(lambda: row(C, Lo), lambda r: r and r['vp'] == f'{vl}:{vw}', 6)
+    check(f'h) new war 1-2 (score 0:0); warvp 1 2 {vl} {vw}: outlook winner=2 level=1; client row 2: "they are '
+          f'winning: a peace now would be a minor defeat"', rc == 'ok' and rel(1, 2)['war'] == '1' and v0 and
+          (v0['a'], v0['b']) == (0, 0) and t.get('winner') == '2' and t.get('level') == '1' and r and
+          r['outlook'] == 'they are winning: a peace now would be a minor defeat', f'{rc} {v0} {t["raw"]} {r}')
+    before = chat(cp)
+    rh = cmd(H, f'diploas {Lo} peace {W}')
+    r = wait_until(lambda: row(C, Lo), lambda r: r and 'p' in r['flags'], 6)
+    rc = client_request(f'diplo peace {Lo}', 'peace', Lo)
+    line = (f'{n1} accepts the peace offered by {n2}: {n2} wins a minor victory and may claim {n1}\'s land worth up '
+            f'to 4.')
+    okc = wait_chat(cp, line, before)
+    t = terms(1, 2)
+    r = wait_until(lambda: row(C, Lo), lambda r: r and r['pending'].startswith('peace agreed: they win'), 6)
+    check('h) nation 2 offers peace, the client accepts: terms winner=2 loser=1 level=1 budget=4; chat; client row: '
+          '"peace agreed: they win (minor), they may claim your land", claim=0:0:0',
+          rh == 'ok' and rc == 'ok' and okc and (t.get('winner'), t.get('loser'), t.get('level'), t.get('budget')) ==
+          ('2', '1', '1', '4') and r and r['pending'] == 'peace agreed: they win (minor), they may claim your land'
+          and r['claim'] == '0:0:0', f'{rh} {rc} chat {okc} {t["raw"]} {r}')
+    rc = cmd(C, f'claimland {Lo} {c21[0]["name"] if c21 else "Atlantis"}')
+    check('h) the loser (client) cannot claim: "Only the winner of an agreed peace can claim possessions."',
+          rc == 'error Only the winner of an agreed peace can claim possessions.', rc)
+    c21n = poss_list(H, 'claimable 2 1') or []
+    over = over_budget(c21n, 4)
+    if over:
+        worth = sum(p['value'] for p in over)
+        rh = cmd(H, f'diploas {Lo} claim {W} {"|".join(p["name"] for p in over)}')
+        check(f'h) the minor budget: nation 2 claiming land worth {worth} is refused ("you may claim up to 4")',
+              rh.startswith('error') and f'worth {worth}; you may claim up to 4' in rh, rh)
+    else:
+        log(f'  SKIP h) minor over-budget claim: claimable 2 1 is worth {sum(p["value"] for p in c21n)}')
+    auto, worth = greedy(c21n, 4)
+    bv = nation_view((0, 1, 2))
+    hm = log_mark(H)
+    apply_diplo(ctx, lambda: rel(1, 2).get('war') == '0')
+    time.sleep(1)
+    hl = log_since(H, hm)
+    av = nation_view((0, 1, 2))
+    log(f'  automatic treaty: before {fmt_view(bv)}')
+    log(f'  automatic treaty: after  {fmt_view(av)}')
+    tl = treaty_lines(hl, 2, 1)
+    k, mode, s, pr, res = (int(tl[0][3]), tl[0][4], int(tl[0][5]), int(tl[0][6]), int(tl[0][7])) if tl else \
+        (None, None, None, None, None)
+    rmax = min(100, max(0, (bv[1]['R'] or 0) // 2))
+    check(f'h) applydiplo: one "treaty 2 over 1 (level 1): {len(auto)} possession(s) (automatic), s ship(s) (0-1), '
+          f'prestige +1, resources -{rmax}" line (most valuable first within 4: worth {worth})',
+          len(tl) == 1 and int(tl[0][2]) == 1 and k == len(auto) and mode == 'automatic' and 0 <= s <= 1 and
+          pr == 1 and res == rmax, [x.split('] ', 1)[-1] for x in log_lines(hl, r'treaty \d+ over')] or 'no line')
+    moved, gained = set(bv[1]['poss']) - set(av[1]['poss']), set(av[2]['poss']) - set(bv[2]['poss'])
+    val = {p['name']: p['value'] for p in c21n}
+    check(f'h) possessions: the automatic pick moved from 1 to 2 (claimable ones only, worth {worth})',
+          moved == gained and len(moved) == len(auto) and moved <= set(val) and sum(val[x] for x in moved) == worth,
+          f'moved {sorted(moved)}, gained {sorted(gained)}, expected e.g. {[p["name"] for p in auto]}')
+    want1 = None if bv[1]['P'] is None else treaty_loss(bv[1]['P'], 1)
+    check(f'h) exact: nation 2 Prestige +1, nation 1 Prestige {bv[1]["P"]} -> {want1} (minor: P div 10 when >= 20 else '
+          f'1), nation 1 BaseResources -{res}, ships 1 -{s} / 2 +{s}',
+          None not in (bv[2]['P'], av[2]['P'], bv[1]['R'], av[1]['R'], s, want1) and
+          av[2]['P'] == bv[2]['P'] + 1 and av[1]['R'] == bv[1]['R'] - res and
+          av[1]['ships'] == bv[1]['ships'] - s and av[2]['ships'] == bv[2]['ships'] + s and av[1]['P'] == want1,
+          f'Prestige 2 {bv[2]["P"]}->{av[2]["P"]}, 1 {bv[1]["P"]}->{av[1]["P"]}; BaseResources 1 {bv[1]["R"]}->'
+          f'{av[1]["R"]}; ships 1 {bv[1]["ships"]}->{av[1]["ships"]}, 2 {bv[2]["ships"]}->{av[2]["ships"]}')
+    check('h) the host (not a party) keeps its Prestige: the loser\'s war loss must not reach the host\'s nation '
+          '(TBuilderNation.PrestigeWarLoss runs form.ProportionalPrestigeLoss on PlayerNation)',
+          bv[0]['P'] is not None and av[0]['P'] == bv[0]['P'], f'host Prestige {bv[0]["P"]} -> {av[0]["P"]}')
+    head = f'Peace treaty between {n2} and {n1}: {n2} wins a minor victory.'
+    end_re = rf'Peace: ({re.escape(n1)}|{re.escape(n2)}) and ({re.escape(n1)}|{re.escape(n2)}) have ended their war ' \
+             rf'\({re.escape(n2)} victorious\)\.'
+    time.sleep(1)
+    cc = chat(cp)
+    miss = new_chat_missing(before, cc, [head], end_re)
+    check(f'h) war over (rel 1 2 war=0); chat (client) "{head}" and "Peace: ... ({n2} victorious)."; no treaty dialog '
+          f'on the host (not a party)', rel(1, 2)['war'] == '0' and not miss and
+          not log_lines(hl, r'showing a peace treaty'), f'missing {miss}; {cc[-400:]}')
+
+    # i) host vs client: the host wins a major victory and claims land; DoPeace ends the host's war; its own dialog
+    rh = cmd(H, f'diplo war {W}')
+    apply_diplo(ctx, lambda: rel(0, 1).get('war') == '1')
+    r01 = rel(0, 1)
+    check('i) the host declares war on nation 1; applydiplo starts it (war=1, hostWars=1)',
+          rh == 'ok' and r01['war'] == '1' and r01['hostWars'] == '1', f'{rh} {r01}')
+    A0 = max(900, 100 * g + 500)
+    v1, t = warvp(0, 1, A0, 100), terms(0, 1)
+    r = wait_until(lambda: row(C, 0), lambda r: r and r['vp'] == f'100:{A0}', 6)
+    check(f'i) warvp 0 1 {A0} 100: outlook winner=0 level=2; client row 0: vp 100:{A0}, "they are winning: a peace '
+          f'now would be a major defeat"', v1 and t.get('winner') == '0' and t.get('level') == '2' and r and
+          r['outlook'] == 'they are winning: a peace now would be a major defeat', f'{v1} {t["raw"]} {r}')
+    before = chat(hp)
+    rc = client_request('diplo peace 0', 'peace', 0)
+    got = wait_chat(hp, f'{n1} offers peace to {n0}.', before)
+    rh = cmd(H, f'diplo peace {W}')
+    line = (f'{n0} accepts the peace offered by {n1}: {n0} wins a major victory and may claim {n1}\'s land worth up '
+            f'to 8.')
+    okc = wait_chat(hp, line, before)
+    t = terms(0, 1)
+    check('i) the client offers peace, the host accepts: terms winner=0 loser=1 level=2 budget=8; chat',
+          rc == 'ok' and got and rh == 'ok' and okc and (t.get('winner'), t.get('loser'), t.get('level'),
+                                                         t.get('budget')) == ('0', '1', '2', '8'),
+          f'{rc} {rh} chat {got}/{okc} {t["raw"]}')
+    c01n = poss_list(H, 'claimable 0 1') or []
+    pick0, worth0 = greedy(c01n, 8)
+    names0 = [p['name'] for p in pick0]
+    before = chat(hp)
+    rh = cmd(H, f'claimland {W} {"|".join(names0)}')
+    line = f'{n0} claims {", ".join(names0)} from {n1}.' if names0 else \
+        f'{n0} leaves the choice of land to the peace conference.'
+    okc = wait_chat(hp, line, before)
+    t = terms(0, 1)
+    check(f'i) the host claims as the winner (claimland 1 {"|".join(names0)}): terms claims, chat "{line}"',
+          rh == 'ok' and okc and t.get('claims') == names0, f'{rh} chat {okc} {t["raw"]}')
+    bv = nation_view((0, 1, 2))
+    seen0, hm = len(TREATY_SEEN), log_mark(H)
+    cmd(H, 'applydiplo')
+    end = time.time() + 25
+    while time.time() < end:
+        answer_dialogs(hp, 'host')
+        if [d for d in TREATY_SEEN[seen0:] if d['who'] == 'host'] and not treaty_dialog_open(hp):
+            break
+        time.sleep(0.5)
+    drain(hp, 2)
+    hl = log_since(H, hm)
+    r01 = rel(0, 1)
+    av = nation_view((0, 1, 2))
+    log(f'  host treaty: before {fmt_view(bv)}')
+    log(f'  host treaty: after  {fmt_view(av)}')
+    log('  host dialogs meanwhile:', [x.split('] ', 1)[-1] for x in log_lines(hl, r'notice:|showing a peace|treaty|'
+                                                                               r'diplomacy: peace')])
+    check('i) the war is over through the game\'s end-of-war routine: rel 0 1 war=0 warCounter=0 hostWars=0, '
+          '"diplomacy: peace 1-0" (offerer-accepter)', r01['war'] == '0' and r01['warCounter'] == '0' and
+          r01['hostWars'] == '0' and log_lines(hl, r'diplomacy: peace (0-1|1-0)'), r01)
+    tl = treaty_lines(hl, 0, 1)
+    k, mode, s, pr, res = (int(tl[0][3]), tl[0][4], int(tl[0][5]), int(tl[0][6]), int(tl[0][7])) if tl else \
+        (None, None, None, None, None)
+    rmax = min(500, max(0, (bv[1]['R'] or 0) // 2))
+    check(f'i) one "treaty 0 over 1 (level 2): {len(names0)} possession(s) '
+          f'({"claimed" if names0 else "automatic"}), s ship(s) (0-3), prestige +2, resources -{rmax}" line',
+          len(tl) == 1 and int(tl[0][2]) == 2 and k == len(names0) and
+          mode == ('claimed' if names0 else 'automatic') and 0 <= s <= 3 and pr == 2 and res == rmax,
+          [x.split('] ', 1)[-1] for x in log_lines(hl, r'treaty \d+ over')] or 'no line')
+    moved, gained = set(bv[1]['poss']) - set(av[1]['poss']), set(av[0]['poss']) - set(bv[0]['poss'])
+    check(f'i) the host\'s claims {names0} moved from 1 to 0 (and stay there after DoPeace)',
+          moved == gained == set(names0), f'moved {sorted(moved)}, gained {sorted(gained)}')
+    dp = None if None in (bv[0]['P'], av[0]['P']) else av[0]['P'] - bv[0]['P']
+    want1 = None if bv[1]['P'] is None else treaty_loss(bv[1]['P'], 2)
+    check(f'i) exact: nation 1 BaseResources -{res}, ships 1 -{s} / 0 +{s}; host Prestige +1 (treaty +2, the game\'s '
+          f'DoPeace "war ending without any major battle" -1; no other loss for the host); loser nation 1 Prestige '
+          f'{bv[1]["P"]} -> {want1} (major)',
+          s is not None and av[1]['R'] == bv[1]['R'] - res and av[1]['ships'] == bv[1]['ships'] - s and
+          av[0]['ships'] == bv[0]['ships'] + s and dp == 1 and want1 is not None and av[1]['P'] == want1,
+          f'BaseResources 1 {bv[1]["R"]}->{av[1]["R"]}; ships 1 {bv[1]["ships"]}->{av[1]["ships"]}, 0 '
+          f'{bv[0]["ships"]}->{av[0]["ships"]}; host Prestige {bv[0]["P"]}->{av[0]["P"]}; nation 1 Prestige '
+          f'{bv[1]["P"]}->{av[1]["P"]}')
+    kept = [x.split('] ', 1)[-1] for x in log_lines(hl, r'end of war: prestige of player nation \d+ kept at')]
+    want_kept = [f'end of war: prestige of player nation {n} kept at {p} (the game set 0)'
+                 for n, p in ((1, want1), (2, bv[2]['P'])) if p]
+    check('i) the joined players keep their Prestige through the game\'s end-of-war routine (DoPeace sets Prestige '
+          f'of nations 1-8 to 0): nation 2 (not a party) unchanged, nation 1 at its treaty value; host log {want_kept}',
+          None not in (bv[1]['P'], av[1]['P'], bv[2]['P'], av[2]['P']) and av[2]['P'] == bv[2]['P'] and
+          av[1]['P'] == want1 and sorted(kept) == sorted(want_kept),
+          f'nation 1 {bv[1]["P"]} -> {av[1]["P"]}, nation 2 {bv[2]["P"]} -> {av[2]["P"]}; log {kept}')
+    shown = log_lines(hl, r'showing a peace treaty \((\d+) lines\)')
+    dlg = [d for d in TREATY_SEEN[seen0:] if d['who'] == 'host']
+    head = f'Peace treaty between {n0} and {n1}: {n0} wins a major victory.'
+    ceded = [f'{x} is ceded from {n1} to {n0}.' for x in names0] or [f'{n1} cedes no possessions']
+    repar = [f'{n1} pays reparations (base resources -{res}).'] if res else []
+    tok, tlines, tdet = treaty_text(dlg[0]['text'] if dlg else '', shown, head, ceded, s or 0, repar)
+    check('i) the host (a party) shows the game\'s "Peace treaty" dialog: log "showing a peace treaty (n lines)" = the '
+          'dialog\'s lines (heading, ceded, hand-overs "... as war reparation." plus their own sentences, reparations, '
+          'one period each), answered', len(shown) == 1 and len(dlg) == 1 and tok and not treaty_dialog_open(hp),
+          f'{[x.split("] ", 1)[-1] for x in shown]}; {tdet}')
+    log('  treaty text example (host):\n    ' + '\n    '.join(tlines))
+
+    # j) a compromise: equal war score, no terms
+    rc = client_request(f'diplo war {Lo}', 'war', Lo)
+    apply_diplo(ctx, lambda: rel(1, 2).get('war') == '1')
+    v1, t = warvp(1, 2, 300, 300), terms(1, 2)
+    r = wait_until(lambda: row(C, Lo), lambda r: r and r['vp'] == '300:300', 6)
+    check('j) war 1-2 again; warvp 1 2 300 300: outlook winner=-1 level=0; client row 2: "a peace now would be a '
+          'compromise"', rc == 'ok' and rel(1, 2)['war'] == '1' and t.get('winner') == '-1' and
+          t.get('level') == '0' and r and r['outlook'] == 'a peace now would be a compromise', f'{rc} {t["raw"]} {r}')
+    before = chat(cp)
+    rh = cmd(H, f'diploas {Lo} peace {W}')
+    wait_until(lambda: row(C, Lo), lambda r: r and 'p' in r['flags'], 6)
+    rc = client_request(f'diplo peace {Lo}', 'peace', Lo)
+    line = f'{n1} accepts the peace offered by {n2}: a compromise peace without terms.'
+    okc = wait_chat(cp, line, before)
+    t = terms(1, 2)
+    r = wait_until(lambda: row(C, Lo), lambda r: r and r['pending'] == 'peace agreed: compromise, no terms', 6)
+    rc2 = cmd(C, f'claimland {Lo} {c12[0]["name"] if c12 else "Atlantis"}')
+    rh2 = cmd(H, f'diploas {W} claim {Lo} {c12[0]["name"] if c12 else "Atlantis"}')
+    check('j) peace agreed: terms winner=-1 level=0 budget=0, chat "a compromise peace without terms", client row '
+          '"peace agreed: compromise, no terms"; claims refused on the client and the host',
+          rh == 'ok' and rc == 'ok' and okc and (t.get('winner'), t.get('level'), t.get('budget')) == ('-1', '0', '0')
+          and r and r['claim'] == '0:0:0' and rc2.startswith('error Only the winner') and
+          rh2 == 'error Only the winner of the war can claim possessions.', f'{t["raw"]} {r} | {rc2} | {rh2}')
+    bv = nation_view((0, 1, 2))
+    hm = log_mark(H)
+    apply_diplo(ctx, lambda: rel(1, 2).get('war') == '0')
+    time.sleep(1)
+    hl = log_since(H, hm)
+    av = nation_view((0, 1, 2))
+    line = 'have ended their war (compromise peace).'
+    check('j) applydiplo: war over, chat "... have ended their war (compromise peace).", no treaty line; possessions, '
+          'prestige and base resources of the host, 1 and 2 unchanged',
+          rel(1, 2)['war'] == '0' and not new_chat_missing(before, chat(cp), [line]) and
+          not log_lines(hl, r'treaty \d+ over') and
+          all(av[n][f] == bv[n][f] for n in (0, 1, 2) for f in ('poss', 'P', 'R')),
+          f'{fmt_view(bv)} -> {fmt_view(av)}; {log_lines(hl, "treaty")}')
+
+
 SCENARIOS = [  # name, months processed, what it guards, function
     ('session', 0, 'host/join/claim/start; the client plans nation 1 in slot 77; nation 2 reserved as the stand-in '
                    'player "Bot"; client Multiplayer window open', scenario_session),
@@ -1628,6 +2579,12 @@ SCENARIOS = [  # name, months processed, what it guards, function
      scenario_design_study),
     ('diplomacy', 2, 'offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from '
                      'player wars, Diplomacy buttons via posted clicks', scenario_diplomacy),
+    ('treaty', 1, 'peace terms of wars between players (0.2.5): war score (warvp) -> major/minor/compromise terms frozen '
+                  'at acceptance, claims validated (client and host), the "Claim land..." window (real button, '
+                  'list view, posted clicks), calling the peace off erases the terms, the processed month applies the '
+                  'treaty (possessions, ships, prestige, reparations, chat, the client\'s treaty dialog, war score '
+                  'lines); then via applydiplo: automatic minor victory of nation 2, host-vs-client victory (DoPeace, '
+                  'the host\'s treaty dialog), compromise', scenario_treaty),
 ]
 
 

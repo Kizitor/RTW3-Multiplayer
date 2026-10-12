@@ -18,6 +18,7 @@ enum {
     IDC_START = 1060, IDC_ADVANCE, IDC_RELEASE,
     IDC_CHATLOG = 1070, IDC_CHATIN, IDC_SEND,
     IDC_DIPLOLBL = 1080, IDC_DIPLO, IDC_DWAR, IDC_DALLY, IDC_DPEACE, IDC_DLEAVE, IDC_DCANCEL,
+    IDC_CLAIMLBL = 1090, IDC_CLAIMLIST, IDC_CLAIMSUM, IDC_CLAIMOK, IDC_CLAIMAUTO, IDC_CLAIMCANCEL,
     IDC_STARTMENU = 0x4D50,
 };
 
@@ -113,6 +114,184 @@ static int SelectedDiploNation() {
     return ListView_GetItem(lv, &it) ? (int)it.lParam : -1;
 }
 
+// ---------------------------------------------------------------------------------------------
+// "Claim land" window: the winner of an agreed peace picks the loser's possessions within the budget, like the
+// game's own peace dialog. Possessions that are not claimed are chosen by the game when the month is processed.
+
+static HWND g_claimWnd = nullptr;
+static int g_claimTarget = -1, g_claimBudget = 0;
+static std::vector<mp::ClaimOption> g_claimOptions;
+static bool g_claimUpdating = false;
+
+static int ClaimSelectedValue() {
+    HWND lv = GetDlgItem(g_claimWnd, IDC_CLAIMLIST);
+    int sum = 0;
+    for (int i = 0; i < (int)g_claimOptions.size(); i++)
+        if (ListView_GetCheckState(lv, i)) sum += g_claimOptions[i].value;
+    return sum;
+}
+
+static void ClaimUpdateSum(const wchar_t* note = nullptr) {
+    std::wstring t = L"Selected: " + std::to_wstring(ClaimSelectedValue()) + L" of " + std::to_wstring(g_claimBudget);
+    if (note) t += L"   " + std::wstring(note);
+    SetWindowTextW(GetDlgItem(g_claimWnd, IDC_CLAIMSUM), t.c_str());
+}
+
+static void CloseClaimWindow() {
+    if (!g_claimWnd) return;
+    EnableWindow(g_wnd, TRUE);
+    DestroyWindow(g_claimWnd);
+    g_claimWnd = nullptr;
+    SetForegroundWindow(g_wnd);
+}
+
+static void SendClaims(bool automatic) {
+    std::string names;
+    if (!automatic) {
+        HWND lv = GetDlgItem(g_claimWnd, IDC_CLAIMLIST);
+        for (int i = 0; i < (int)g_claimOptions.size(); i++)
+            if (ListView_GetCheckState(lv, i)) names += (names.empty() ? "" : "|") + g_claimOptions[i].name;
+    }
+    std::string why = mp::Diplomacy("claim", g_claimTarget, names);
+    if (!why.empty()) {
+        MessageBoxW(g_claimWnd, U2W(why).c_str(), L"Claim land", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    CloseClaimWindow();
+}
+
+static LRESULT CALLBACK ClaimWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_COMMAND:
+            if (HIWORD(w) == BN_CLICKED) {
+                if (LOWORD(w) == IDC_CLAIMOK) SendClaims(false);
+                if (LOWORD(w) == IDC_CLAIMAUTO) SendClaims(true);
+                if (LOWORD(w) == IDC_CLAIMCANCEL) CloseClaimWindow();
+            }
+            return 0;
+        case WM_NOTIFY: {
+            auto* nm = (NMLISTVIEW*)l;
+            if (nm->hdr.idFrom == IDC_CLAIMLIST && nm->hdr.code == LVN_ITEMCHANGED && (nm->uChanged & LVIF_STATE) &&
+                ((nm->uNewState ^ nm->uOldState) & LVIS_STATEIMAGEMASK) && !g_claimUpdating) {
+                bool checked = ((nm->uNewState & LVIS_STATEIMAGEMASK) >> 12) == 2;
+                if (checked && ClaimSelectedValue() > g_claimBudget) {  // over budget: refuse this one
+                    g_claimUpdating = true;
+                    ListView_SetCheckState(nm->hdr.hwndFrom, nm->iItem, FALSE);
+                    g_claimUpdating = false;
+                    ClaimUpdateSum(L"(over the limit)");
+                } else {
+                    ClaimUpdateSum();
+                }
+            }
+            return 0;
+        }
+        case WM_CLOSE:
+            CloseClaimWindow();
+            return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void OpenClaimWindow(const mp::DiploRow& row) {
+    if (g_claimWnd) CloseClaimWindow();
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = ClaimWndProc;
+        wc.hInstance = g_inst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+        wc.lpszClassName = L"RTW3MP_Claim";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    g_claimTarget = row.nation;
+    g_claimBudget = row.claimBudget;
+    g_claimOptions = row.claimable;
+    DWORD style = WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT r = {0, 0, 460, 380};
+    AdjustWindowRectEx(&r, style, FALSE, WS_EX_TOOLWINDOW);
+    RECT owner;
+    GetWindowRect(g_wnd, &owner);
+    g_claimWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"RTW3MP_Claim", L"Claim land", style, owner.left + 20, owner.top + 120,
+                                 r.right - r.left, r.bottom - r.top, g_wnd, nullptr, g_inst, nullptr);
+    if (!g_claimWnd) {
+        MessageBoxW(g_wnd, L"The Claim land window could not be opened.", L"Claim land", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    auto ctl = [&](const wchar_t* cls, const wchar_t* text, DWORD st, int x, int y, int w, int hh, int id) {
+        HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | st, x, y, w, hh, g_claimWnd, (HMENU)(INT_PTR)id,
+                                 g_inst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
+        return c;
+    };
+    std::wstring head = L"Peace with " + U2W(row.nationName) + L": you may claim possessions worth up to " +
+                        std::to_wstring(row.claimBudget) +
+                        L". Possessions you don't claim are chosen by the peace conference when the month is processed.";
+    ctl(L"STATIC", head.c_str(), SS_LEFT, 10, 8, 440, 34, IDC_CLAIMLBL);
+    HWND lv = ctl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER |
+                  WS_TABSTOP, 10, 46, 440, 250, IDC_CLAIMLIST);
+    ListView_SetExtendedListViewStyle(lv, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    const wchar_t* cols[] = {L"Possession", L"Sea area", L"Value", L"Oil"};
+    int widths[] = {170, 160, 50, 40};
+    for (int i = 0; i < 4; i++) {
+        LVCOLUMNW c = {};
+        c.mask = LVCF_TEXT | LVCF_WIDTH;
+        c.pszText = (LPWSTR)cols[i];
+        c.cx = widths[i];
+        ListView_InsertColumn(lv, i, &c);
+    }
+    g_claimUpdating = true;
+    for (size_t i = 0; i < g_claimOptions.size(); i++) {
+        const auto& o = g_claimOptions[i];
+        std::wstring name = U2W(o.name), area = U2W(o.area), value = std::to_wstring(o.value);
+        LVITEMW it = {};
+        it.mask = LVIF_TEXT;
+        it.iItem = (int)i;
+        it.pszText = (LPWSTR)name.c_str();
+        ListView_InsertItem(lv, &it);
+        ListView_SetItemText(lv, (int)i, 1, (LPWSTR)area.c_str());
+        ListView_SetItemText(lv, (int)i, 2, (LPWSTR)value.c_str());
+        ListView_SetItemText(lv, (int)i, 3, (LPWSTR)(o.oil ? L"yes" : L""));
+        for (auto& c : row.claims)
+            if (c == o.name) ListView_SetCheckState(lv, (int)i, TRUE);
+    }
+    g_claimUpdating = false;
+    ctl(L"STATIC", L"", SS_LEFT, 10, 304, 440, 18, IDC_CLAIMSUM);
+    ctl(L"BUTTON", L"Claim selected", WS_TABSTOP | BS_DEFPUSHBUTTON, 10, 334, 130, 30, IDC_CLAIMOK);
+    ctl(L"BUTTON", L"Let the conference choose", WS_TABSTOP, 150, 334, 180, 30, IDC_CLAIMAUTO);
+    ctl(L"BUTTON", L"Cancel", WS_TABSTOP, 340, 334, 110, 30, IDC_CLAIMCANCEL);
+    if (g_claimOptions.empty())
+        SetWindowTextW(GetDlgItem(g_claimWnd, IDC_CLAIMLBL),
+                       (L"None of " + U2W(row.nationName) +
+                        L"'s possessions lie next to yours, so there is no land to claim in this peace. Ships and "
+                        L"reparations are still handed over.")
+                           .c_str());
+    ClaimUpdateSum();
+    EnableWindow(g_wnd, FALSE);
+    ShowWindow(g_claimWnd, SW_SHOW);
+    SetForegroundWindow(g_claimWnd);
+}
+
+std::string DebugClaimWindow(const std::string& action, int index) {
+    if (!g_claimWnd) return "ok open=0";
+    HWND lv = GetDlgItem(g_claimWnd, IDC_CLAIMLIST);
+    if (action == "toggle") {
+        if (index < 0 || index >= (int)g_claimOptions.size()) return "error no row " + std::to_string(index);
+        ListView_SetCheckState(lv, index, !ListView_GetCheckState(lv, index));  // notifies like a click on the box
+    }
+    wchar_t sum[200] = {};
+    GetWindowTextW(GetDlgItem(g_claimWnd, IDC_CLAIMSUM), sum, 199);
+    std::string checked, rows;
+    for (int i = 0; i < (int)g_claimOptions.size(); i++) {
+        if (ListView_GetCheckState(lv, i)) checked += (checked.empty() ? "" : ",") + std::to_string(i);
+        rows += std::to_string(i) + ":" + g_claimOptions[i].name + ":" + std::to_string(g_claimOptions[i].value) + "; ";
+    }
+    return "ok open=1 target=" + std::to_string(g_claimTarget) + " budget=" + std::to_string(g_claimBudget) +
+           " mpEnabled=" + (IsWindowEnabled(g_wnd) ? "1" : "0") + " checked=" + checked + " sum=" + W2U(sum) +
+           " rows=" + rows;
+}
+
 static void OnDiplomacy(int id) {
     int nation = SelectedDiploNation();
     mp::View v = mp::GetView();
@@ -121,6 +300,10 @@ static void OnDiplomacy(int id) {
         if (r.nation == nation) row = &r;
     if (!row) {
         MessageBoxW(g_wnd, L"Choose a nation in the diplomacy list first.", L"Diplomacy", MB_OK);
+        return;
+    }
+    if (id == IDC_DPEACE && row->canClaim) {
+        OpenClaimWindow(*row);
         return;
     }
     std::wstring who = U2W(row->nationName + (row->player.empty() ? "" : " (" + row->player + ")"));
@@ -384,7 +567,7 @@ static void CreateMpWindow() {
                    WS_TABSTOP, 10, y, 480, 96, IDC_DIPLO);
     ListView_SetExtendedListViewStyle(dlv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     const wchar_t* dcols[] = {L"Nation", L"Player", L"Relation", L"Tension", L"Pending"};
-    int dwidths[] = {112, 100, 62, 52, 150};
+    int dwidths[] = {104, 92, 58, 76, 146};
     for (int i = 0; i < 5; i++) {
         LVCOLUMNW c = {};
         c.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -450,7 +633,9 @@ static void RefreshDiplomacy(const mp::View& v) {
     for (size_t i = 0; i < v.diplo.size(); i++) {
         const auto& r = v.diplo[i];
         std::wstring cols[5] = {U2W(r.nationName), U2W(r.player), U2W(r.relation),
-                                r.atWar ? L"war" : std::to_wstring(r.tension), U2W(r.pending)};
+                                r.atWar ? L"VP " + std::to_wstring(r.vpMine) + L":" + std::to_wstring(r.vpTheirs)
+                                        : std::to_wstring(r.tension),
+                                U2W(r.pending)};
         for (int c = 0; c < 5; c++) {
             wchar_t buf[256] = {};
             ListView_GetItemText(lv, (int)i, c, buf, 255);
@@ -462,12 +647,13 @@ static void RefreshDiplomacy(const mp::View& v) {
             ListView_SetItemState(lv, (int)i, want ? LVIS_SELECTED : 0, LVIS_SELECTED);
     }
     bool open = v.diploOpen && cur;
+    if (cur && !cur->outlook.empty() && v.diploOpen) SetText(IDC_DIPLOLBL, "Diplomacy: " + cur->outlook);
     SetText(IDC_DALLY, cur && cur->allyAccept ? "Accept alliance" : "Propose alliance");
-    SetText(IDC_DPEACE, cur && cur->peaceAccept ? "Accept peace" : "Propose peace");
+    SetText(IDC_DPEACE, cur && cur->canClaim ? "Claim land..." : cur && cur->peaceAccept ? "Accept peace" : "Propose peace");
     SetText(IDC_DCANCEL, cur && cur->cancelIsDecline ? "Decline" : "Withdraw");
     EnableWindow(GetDlgItem(g_wnd, IDC_DWAR), open && cur->canWar);
     EnableWindow(GetDlgItem(g_wnd, IDC_DALLY), open && (cur->allyAccept || cur->canAlly));
-    EnableWindow(GetDlgItem(g_wnd, IDC_DPEACE), open && (cur->peaceAccept || cur->canPeace));
+    EnableWindow(GetDlgItem(g_wnd, IDC_DPEACE), open && (cur->peaceAccept || cur->canPeace || cur->canClaim));
     EnableWindow(GetDlgItem(g_wnd, IDC_DLEAVE), open && cur->canLeave);
     EnableWindow(GetDlgItem(g_wnd, IDC_DCANCEL), open && cur->canCancel);
 }

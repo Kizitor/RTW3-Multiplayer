@@ -171,6 +171,35 @@ void* Method(const char* cls, const char* name) {
     return nullptr;
 }
 
+// The overload of a method with the fewest parameters (extended RTTI: Name, then Version, CC, ResultType, ParOff,
+// ParamCount), looked up in the class itself; falls back to Method().
+void* MethodFewestParams(const char* cls, const char* name) {
+    uintptr_t vmt = (uintptr_t)ClassVmt(cls);
+    uint32_t mt = vmt ? RD32(vmt + VMT_METHODS) : 0;
+    void* best = nullptr;
+    int bestCount = 1 << 30;
+    if (mt && InImage(mt)) {
+        uint16_t cnt = RD16(mt);
+        uintptr_t p = mt + 2;
+        for (int i = 0; i < cnt; i++) p += RD16(p);
+        uint16_t ex = RD16(p);
+        p += 2;
+        std::string nm;
+        for (int i = 0; i < ex; i++, p += 8) {
+            uint32_t entry = RD32(p);
+            if (!InImage(entry) || !ReadShortString(entry + 6, nm) || nm != name) continue;
+            uintptr_t q = entry + 7 + nm.size();
+            if (q + 9 > entry + RD16(entry)) continue;  // no extended information
+            int pc = *(const uint8_t*)(q + 8);
+            if (pc < bestCount) {
+                bestCount = pc;
+                best = (void*)(uintptr_t)RD32(entry + 2);
+            }
+        }
+    }
+    return best ? best : Method(cls, name);
+}
+
 static int FieldInVmt(uintptr_t vmt, const char* name) {
     uint32_t ft = RD32(vmt + VMT_FIELDS);
     if (!ft || !InImage(ft)) return -1;
@@ -227,6 +256,7 @@ extern "C" __declspec(naked) uint32_t __cdecl DelphiCallAsm(void* fn, uint32_t a
         mov edx, [ebp + 16]
         mov ecx, [ebp + 20]
         call dword ptr [ebp + 8]
+        lea esp, [ebp - 12]  // whatever the callee removed, the stack is ours again
         pop edi
         pop esi
         pop ebx

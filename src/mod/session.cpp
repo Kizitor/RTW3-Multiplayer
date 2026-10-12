@@ -69,9 +69,20 @@ struct DipSnap {
         int idx;
         std::string nation, player;
     };
+    struct War {  // victory points of a war between two players and what a peace would bring
+        int vpLo = 0, vpHi = 0;
+        int winner = -1, level = 0;  // level 0 compromise, 1 minor win, 2 major win
+    };
+    struct Treaty {  // terms frozen when peace was agreed; the winner may claim possessions until the month ends
+        int winner = -1, loser = -1, level = 0, budget = 0;
+        std::vector<ClaimOption> claimable;
+        std::vector<std::string> claims;
+    };
     bool on = false;
     std::vector<Human> humans;
     std::map<std::pair<int, int>, std::pair<char, int>> rel;  // (low, high) -> W/A/P, tension
+    std::map<std::pair<int, int>, War> wars;
+    std::map<std::pair<int, int>, Treaty> treaties;
     std::vector<DipItem> items;
 };
 static std::vector<DipItem> g_dip;                        // host
@@ -80,10 +91,22 @@ static std::vector<std::tuple<int, int, int>> g_peaceMask;   // host: wars hidde
 static DipSnap g_cSnap;                                   // client: as broadcast by the host
 static const int kPactMonths = 60;
 
+// Peace treaties between players (host). Victory points of each war between two players, counted per battle
+// (low nation, high nation) -> (VP of low, VP of high), and the terms of each agreed peace.
+struct TreatyTerms {
+    int winner = -1, loser = -1, level = 0;
+    std::vector<std::string> claims;
+};
+static std::map<std::pair<int, int>, std::pair<int, int>> g_warVP;
+static std::map<std::pair<int, int>, TreatyTerms> g_treaties;
+static std::vector<std::string> g_pendingTreaty;          // treaty lines to show when the game is idle (the host
+                                                          // too: after the new month went out)
+
 // Monthly countdowns the game only runs for the host's nation, done here for the joined players' nations (host).
 static int g_designSeq = -1;                              // month (g_seq) whose design studies were advanced
 static int g_doctrineSeq = -1;                            // month (g_seq) whose doctrine changes were advanced
 static std::map<int, std::vector<std::string>> g_playerNews;  // nation -> lines for its player
+static std::map<int, std::vector<std::string>> g_treatyNews;  // nation -> peace treaty for its player's dialog
 static std::mt19937 g_rng((unsigned)(GetTickCount() ^ (GetCurrentProcessId() << 16)));
 
 static std::pair<int, int> PairKey(int a, int b) { return {std::min(a, b), std::max(a, b)}; }
@@ -240,6 +263,64 @@ static std::vector<DipItem> DecodeDipItems(const std::string& s) {
     return o;
 }
 
+// Possession names may contain any printable character except these separators.
+static const char kSepRec = '\x1e', kSepField = '\x1f';
+
+static std::string SafeText(std::string s) {
+    for (char& c : s)
+        if (c == '\n' || c == '\r' || c == kSepRec || c == kSepField || c == '|') c = ' ';
+    return s;
+}
+
+static std::string EncodeWarVP() {
+    std::string o;
+    for (auto& w : g_warVP)
+        o += std::to_string(w.first.first) + "-" + std::to_string(w.first.second) + ":" + std::to_string(w.second.first) +
+             ":" + std::to_string(w.second.second) + ",";
+    return o;
+}
+
+static void DecodeWarVP(const std::string& s) {
+    g_warVP.clear();
+    for (auto& e : Split(s, ',')) {
+        auto f = Split(e, ':');
+        if (f.size() != 3) continue;
+        auto p = Split(f[0], '-');
+        if (p.size() != 2) continue;
+        int a = atoi(p[0].c_str()), b = atoi(p[1].c_str());
+        if (a >= 0 && b > a && b <= 8) g_warVP[{a, b}] = {atoi(f[1].c_str()), atoi(f[2].c_str())};
+    }
+}
+
+static std::string EncodeTreaties() {
+    std::string o;
+    for (auto& t : g_treaties) {
+        o += std::to_string(t.first.first) + std::string(1, kSepField) + std::to_string(t.first.second) + kSepField +
+             std::to_string(t.second.winner) + kSepField + std::to_string(t.second.loser) + kSepField +
+             std::to_string(t.second.level);
+        for (auto& c : t.second.claims) o += kSepField + c;
+        o += kSepRec;
+    }
+    return o;
+}
+
+static void DecodeTreaties(const std::string& s) {
+    g_treaties.clear();
+    for (auto& e : Split(s, kSepRec)) {
+        auto f = Split(e, kSepField);
+        if (f.size() < 5) continue;
+        int a = atoi(f[0].c_str()), b = atoi(f[1].c_str());
+        if (a < 0 || b <= a || b > 8) continue;
+        TreatyTerms t;
+        t.winner = atoi(f[2].c_str());
+        t.loser = atoi(f[3].c_str());
+        t.level = atoi(f[4].c_str());
+        for (size_t i = 5; i < f.size(); i++)
+            if (!f[i].empty()) t.claims.push_back(f[i]);
+        g_treaties[{a, b}] = t;
+    }
+}
+
 static void SaveReservations() {
     if (g_hostSlot <= 0) return;
     KV kv;
@@ -248,7 +329,9 @@ static void SaveReservations() {
     kv["campaign"] = CampaignKey();
     kv["pactAllies"] = EncodePairs(g_pactAllies);
     kv["pactWars"] = EncodePairs(g_pactWars);
+    kv["warVP"] = EncodeWarVP();
     kv["diplomacy"] = EncodeDipItems(g_dip);
+    kv["treaties"] = EncodeTreaties();
     kv["diplomacyDate"] = HostDate();  // pending decisions belong to this month only
     WriteFileBytes(SessionFile(), KVEncode(kv));
 }
@@ -258,6 +341,8 @@ static void LoadReservations() {
     g_dip.clear();
     g_pactAllies.clear();
     g_pactWars.clear();
+    g_warVP.clear();
+    g_treaties.clear();
     std::string s;
     if (g_hostSlot <= 0 || !ReadFileBytes(SessionFile(), s)) return;
     KV kv = KVDecode(s);
@@ -274,10 +359,16 @@ static void LoadReservations() {
     if (kv.count("turnLimitSec")) g_turnLimitSec = KVInt(kv, "turnLimitSec");
     g_pactAllies = DecodePairs(KVStr(kv, "pactAllies"));
     g_pactWars = DecodePairs(KVStr(kv, "pactWars"));
-    if (KVStr(kv, "diplomacyDate") == HostDate())
+    // War scores, pending decisions and agreed terms belong to the month they were saved with: an older save of the
+    // campaign would count its battles again (the scores then restart from the nations' points, see WarVP).
+    if (KVStr(kv, "diplomacyDate") == HostDate()) {
+        DecodeWarVP(KVStr(kv, "warVP"));
         g_dip = DecodeDipItems(KVStr(kv, "diplomacy"));
-    else if (!KVStr(kv, "diplomacy").empty())
-        Log("pending diplomacy from %s dropped (campaign is at %s)", KVStr(kv, "diplomacyDate").c_str(), HostDate().c_str());
+        DecodeTreaties(KVStr(kv, "treaties"));
+    } else if (!KVStr(kv, "diplomacy").empty() || !KVStr(kv, "warVP").empty()) {
+        Log("pending diplomacy and war scores from %s dropped (campaign is at %s)", KVStr(kv, "diplomacyDate").c_str(),
+            HostDate().c_str());
+    }
 }
 
 static std::string ClaimedBy(int nation) {
@@ -339,6 +430,56 @@ static std::string NationPlayerName(int n) {
     return ClaimedBy(n);
 }
 
+// Victory points of a war between two players. A war seen for the first time starts from the nations' own points
+// when they fight nobody else (the game counts them per nation), otherwise from zero. `seeded` tells whether the
+// start came from the nations' points.
+static std::pair<int, int>& WarVP(int a, int b, bool* seeded = nullptr) {
+    auto key = PairKey(a, b);
+    if (seeded) *seeded = false;
+    auto it = g_warVP.find(key);
+    if (it != g_warVP.end()) return it->second;
+    auto onlyEnemy = [](int n, int other) {
+        for (int j = 0; j <= 8 && j < game::NationCount(); j++)
+            if (j != n && j != other && game::AtWar(n, j)) return false;
+        return true;
+    };
+    int lo = key.first, hi = key.second, vLo = 0, vHi = 0;
+    if (onlyEnemy(lo, hi) && onlyEnemy(hi, lo)) {
+        if (seeded) *seeded = true;
+        if (lo == 0) {
+            vLo = std::max(0, game::NationVP(0));
+            vHi = std::max(0, game::EnemyVP());
+        } else {
+            vLo = std::max(0, game::NationVP(lo));
+            vHi = std::max(0, game::NationVP(hi));
+        }
+    }
+    Log("war score %d-%d starts at %d:%d", lo, hi, vLo, vHi);
+    return g_warVP[key] = {vLo, vHi};
+}
+
+// What a peace between two players would bring now, with the thresholds of the game's own war-progress checks:
+// "winning" = at least twice the enemy's points and 100*G + 500; "slightly ahead" = more points and 100*G + 300.
+static DipSnap::War WarOutlook(int a, int b) {
+    DipSnap::War w;
+    auto key = PairKey(a, b);
+    auto& vp = WarVP(a, b);
+    w.vpLo = vp.first;
+    w.vpHi = vp.second;
+    int g = std::max(0, game::WarScale());
+    int lead = std::max(w.vpLo, w.vpHi), trail = std::min(w.vpLo, w.vpHi);
+    if (lead == trail) return w;
+    w.winner = w.vpLo > w.vpHi ? key.first : key.second;
+    if (lead >= 2 * trail && lead >= 100 * g + 500)
+        w.level = 2;
+    else if (lead >= 100 * g + 300)
+        w.level = 1;
+    if (!w.level) w.winner = -1;
+    return w;
+}
+
+static int TreatyBudget(int level) { return level >= 2 ? 8 : level == 1 ? 4 : 0; }
+
 static DipSnap HostDipSnap() {
     static DipSnap cache;  // reused while the month is processed (the game may be reloading its nations)
     if (g_role != Role::Host || g_phase == Phase::Lobby || !game::DiplomacyAvailable()) return DipSnap();
@@ -352,7 +493,20 @@ static DipSnap HostDipSnap() {
             int a = s.humans[x].idx, b = s.humans[y].idx;
             char st = game::AtWar(a, b) ? 'W' : game::AllianceMonths(a, b) > 0 ? 'A' : 'P';
             s.rel[PairKey(a, b)] = {st, game::Tension(a, b)};
+            if (st == 'W' && game::TreatiesAvailable()) s.wars[PairKey(a, b)] = WarOutlook(a, b);
         }
+    for (auto& t : g_treaties) {
+        DipSnap::Treaty tr;
+        tr.winner = t.second.winner;
+        tr.loser = t.second.loser;
+        tr.level = t.second.level;
+        tr.budget = TreatyBudget(t.second.level);
+        tr.claims = t.second.claims;
+        if (tr.level > 0)
+            for (auto& p : game::ClaimablePossessions(tr.winner, tr.loser))
+                tr.claimable.push_back({SafeText(W2U(p.name)), SafeText(W2U(p.area)), p.value, p.oil});
+        s.treaties[t.first] = tr;
+    }
     s.items = g_dip;
     cache = s;
     return s;
@@ -368,6 +522,27 @@ static void EncodeDipSnap(const DipSnap& s, KV& kv) {
     kv["dipHumans"] = hum;
     kv["dipRel"] = rel;
     kv["dipItems"] = EncodeDipItems(s.items);
+    std::string wars;
+    for (auto& w : s.wars)
+        wars += std::to_string(w.first.first) + ":" + std::to_string(w.first.second) + ":" + std::to_string(w.second.vpLo) +
+                ":" + std::to_string(w.second.vpHi) + ":" + std::to_string(w.second.winner) + ":" +
+                std::to_string(w.second.level) + ";";
+    kv["dipWars"] = wars;
+    // Treaties: one record per agreed peace: lo, hi, winner, loser, level, budget, then claimable possessions as
+    // name/area/value/oil quadruples, then "#" and the claims.
+    std::string tr;
+    for (auto& t : s.treaties) {
+        auto f = [](const std::string& x) { return x + kSepField; };
+        std::string r = f(std::to_string(t.first.first)) + f(std::to_string(t.first.second)) +
+                        f(std::to_string(t.second.winner)) + f(std::to_string(t.second.loser)) +
+                        f(std::to_string(t.second.level)) + f(std::to_string(t.second.budget));
+        for (auto& c : t.second.claimable)
+            r += f(c.name) + f(c.area) + f(std::to_string(c.value)) + f(c.oil ? "1" : "0");
+        r += f("#");
+        for (auto& c : t.second.claims) r += f(c);
+        tr += r + kSepRec;
+    }
+    kv["dipTreaties"] = tr;
 }
 
 static DipSnap DecodeDipSnap(const KV& kv) {
@@ -382,6 +557,32 @@ static DipSnap DecodeDipSnap(const KV& kv) {
         if (f.size() >= 4 && !f[2].empty()) s.rel[PairKey(atoi(f[0].c_str()), atoi(f[1].c_str()))] = {f[2][0], atoi(f[3].c_str())};
     }
     s.items = DecodeDipItems(KVStr(kv, "dipItems"));
+    for (auto& e : Split(KVStr(kv, "dipWars"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() < 6) continue;
+        DipSnap::War w;
+        w.vpLo = atoi(f[2].c_str());
+        w.vpHi = atoi(f[3].c_str());
+        w.winner = atoi(f[4].c_str());
+        w.level = atoi(f[5].c_str());
+        s.wars[PairKey(atoi(f[0].c_str()), atoi(f[1].c_str()))] = w;
+    }
+    for (auto& e : Split(KVStr(kv, "dipTreaties"), kSepRec)) {
+        auto f = Split(e, kSepField);
+        if (f.size() < 7) continue;
+        DipSnap::Treaty t;
+        t.winner = atoi(f[2].c_str());
+        t.loser = atoi(f[3].c_str());
+        t.level = atoi(f[4].c_str());
+        t.budget = atoi(f[5].c_str());
+        size_t i = 6;
+        for (; i + 3 < f.size() && f[i] != "#"; i += 4)
+            t.claimable.push_back({f[i], f[i + 1], atoi(f[i + 2].c_str()), f[i + 3] == "1"});
+        while (i < f.size() && f[i] != "#") i++;
+        for (i++; i < f.size(); i++)
+            if (!f[i].empty()) t.claims.push_back(f[i]);
+        s.treaties[PairKey(atoi(f[0].c_str()), atoi(f[1].c_str()))] = t;
+    }
     return s;
 }
 
@@ -434,6 +635,43 @@ static std::vector<DiploRow> DiploRows(int me, const DipSnap& s) {
         bool mineToCancel = oaMine || opMine || ally || peace || warMine || leaveMine;
         r.canCancel = mineToCancel || oaTheirs || opTheirs;
         r.cancelIsDecline = !mineToCancel && (oaTheirs || opTheirs);
+        auto key = PairKey(me, o);
+        auto wi = s.wars.find(key);
+        if (r.atWar && wi != s.wars.end()) {
+            const auto& w = wi->second;
+            r.vpMine = me == key.first ? w.vpLo : w.vpHi;
+            r.vpTheirs = me == key.first ? w.vpHi : w.vpLo;
+            const char* size = w.level >= 2 ? "major" : "minor";
+            r.outlook = w.level <= 0 ? "a peace now would be a compromise"
+                        : w.winner == me ? std::string("you are winning: a peace now would be a ") + size + " victory"
+                                         : std::string("they are winning: a peace now would be a ") + size + " defeat";
+        }
+        auto ti = s.treaties.find(key);
+        if (peace && ti != s.treaties.end()) {
+            const auto& t = ti->second;
+            std::string terms = t.level <= 0 ? "compromise, no terms"
+                                : t.winner == me ? std::string("you win (") + (t.level >= 2 ? "major" : "minor") + ")"
+                                                 : std::string("they win (") + (t.level >= 2 ? "major" : "minor") + ")";
+            r.pending = "peace agreed: " + terms;
+            if (t.level > 0 && t.winner == me) {
+                int used = 0;
+                for (auto& c : t.claims)
+                    for (auto& o2 : t.claimable)
+                        if (o2.name == c) used += o2.value;
+                r.canClaim = true;
+                r.claimBudget = t.budget;
+                r.claimable = t.claimable;
+                r.claims = t.claims;
+                r.pending += t.claims.empty() ? ", claim land (worth up to " + std::to_string(t.budget) + ")"
+                                              : ", land claimed: " + std::to_string(used) + " of " + std::to_string(t.budget);
+            } else if (t.level > 0) {
+                r.pending += t.claims.empty() ? ", they may claim your land" : ", they claimed " +
+                                                                                   std::to_string(t.claims.size()) +
+                                                                                   " possession(s)";
+            }
+            for (auto& x : p)
+                if (x != "peace agreed") r.pending += ", " + x;
+        }
         rows.push_back(r);
     }
     return rows;
@@ -516,10 +754,14 @@ static void DropDiplomacyFor(int nation) {
     DipEraseWhere([&](const DipItem& d) { return d.from == nation || d.to == nation; });
     for (auto* s : {&g_pactAllies, &g_pactWars})
         for (auto it = s->begin(); it != s->end();) it = (it->first == nation || it->second == nation) ? s->erase(it) : std::next(it);
+    for (auto it = g_treaties.begin(); it != g_treaties.end();)
+        it = (it->first.first == nation || it->first.second == nation) ? g_treaties.erase(it) : std::next(it);
+    for (auto it = g_warVP.begin(); it != g_warVP.end();)
+        it = (it->first.first == nation || it->first.second == nation) ? g_warVP.erase(it) : std::next(it);
 }
 
 // A player's diplomatic request; `from` is the requester's nation. Returns "" or the reason it is refused.
-static std::string HostDiplo(int from, const std::string& action, int to) {
+static std::string HostDiplo(int from, const std::string& action, int to, const std::string& extra = "") {
     if (g_role != Role::Host || g_phase != Phase::Planning || !CampaignReady())
         return "Diplomacy is possible while the players plan a month.";
     if (!game::DiplomacyAvailable()) return "Diplomacy is not available with this game version.";
@@ -530,7 +772,35 @@ static std::string HostDiplo(int from, const std::string& action, int to) {
     bool allied = !war && game::AllianceMonths(from, to) > 0;
     int declared = DipFindPair("war", from, to), agreedAlly = DipFindPair("ally", from, to),
         agreedPeace = DipFindPair("peace", from, to);
-    if (action == "war") {
+    if (action == "claim") {
+        auto it = g_treaties.find(PairKey(from, to));
+        if (agreedPeace < 0 || it == g_treaties.end()) return "There is no agreed peace with " + B + ".";
+        TreatyTerms& t = it->second;
+        if (t.level <= 0 || t.winner != from) return "Only the winner of the war can claim possessions.";
+        auto claimable = game::ClaimablePossessions(t.winner, t.loser);
+        std::vector<std::string> claims;
+        int used = 0;
+        for (auto& name : Split(extra, '|')) {
+            if (name.empty() || std::find(claims.begin(), claims.end(), name) != claims.end()) continue;
+            const game::PossessionInfo* p = nullptr;
+            for (auto& c : claimable)
+                if (SafeText(W2U(c.name)) == name) {
+                    p = &c;
+                    break;
+                }
+            if (!p) return name + " cannot be claimed from " + B + ".";
+            used += p->value;
+            claims.push_back(name);
+        }
+        if (used > TreatyBudget(t.level))
+            return "Those possessions are worth " + std::to_string(used) + "; you may claim up to " +
+                   std::to_string(TreatyBudget(t.level)) + ".";
+        t.claims = claims;
+        std::string list;
+        for (auto& c : claims) list += (list.empty() ? "" : ", ") + c;
+        AddChat("* " + A + (claims.empty() ? " leaves the choice of land to the peace conference."
+                                           : " claims " + list + " from " + B + "."));
+    } else if (action == "war") {
         if (war) return "You are already at war with " + B + ".";
         if (declared >= 0) return "A declaration of war between you and " + B + " is already pending.";
         DipEraseWhere([&](const DipItem& d) {
@@ -563,7 +833,23 @@ static std::string HostDiplo(int from, const std::string& action, int to) {
         if (theirs >= 0) {
             g_dip.erase(g_dip.begin() + theirs);
             g_dip.push_back({"peace", to, from});
-            AddChat("* " + A + " accepts the peace offered by " + B + ". It takes effect when this month is processed.");
+            // The terms are fixed now, so the winner can pick the possessions before the month ends.
+            TreatyTerms t;
+            if (game::TreatiesAvailable()) {
+                DipSnap::War w = WarOutlook(from, to);
+                if (w.level > 0) {
+                    t.winner = w.winner;
+                    t.loser = w.winner == from ? to : from;
+                    t.level = w.level;
+                }
+            }
+            g_treaties[PairKey(from, to)] = t;
+            std::string terms = t.level <= 0 ? "a compromise peace without terms"
+                                : CampaignNationName(t.winner) + " wins a " + (t.level >= 2 ? "major" : "minor") +
+                                      " victory and may claim " + CampaignNationName(t.loser) + "'s land worth up to " +
+                                      std::to_string(TreatyBudget(t.level));
+            AddChat("* " + A + " accepts the peace offered by " + B + ": " + terms +
+                    ". It takes effect when this month is processed.");
         } else {
             if (DipFind("offer_peace", from, to) >= 0) return "You already offered peace to " + B + ".";
             g_dip.push_back({"offer_peace", from, to});
@@ -593,6 +879,7 @@ static std::string HostDiplo(int from, const std::string& action, int to) {
                 msg = mine ? A + " withdraws the " + what + " offer to " + B : A + " declines the " + what + " offered by " + B;
             } else if (d.kind == "ally" || d.kind == "peace") {
                 msg = A + " calls off the agreed " + std::string(d.kind == "ally" ? "alliance" : "peace") + " with " + B;
+                if (d.kind == "peace") g_treaties.erase(PairKey(from, to));
             } else if (mine && d.kind == "war") {
                 msg = A + " withdraws the declaration of war on " + B;
             } else if (mine && d.kind == "leave") {
@@ -641,11 +928,49 @@ static void ApplyDiplomacy() {
                 msg = Nm(d.from) + " has left the alliance with " + Nm(d.to) + ".";
             } else if (d.kind == "peace") {
                 g_pactWars.erase(key);
-                game::MakePeace(d.from, d.to);
-                msg = "Peace: " + Nm(d.from) + " and " + Nm(d.to) + " have ended their war.";
+                TreatyTerms t;
+                auto ti = g_treaties.find(key);
+                if (ti != g_treaties.end()) t = ti->second;
+                bool terms = t.level > 0 && game::TreatiesAvailable() && game::AtWar(d.from, d.to) &&
+                             IsHumanNation(t.winner) && IsHumanNation(t.loser);
+                if (terms) {
+                    std::vector<std::wstring> claims;
+                    for (auto& c : t.claims) claims.push_back(U2W(c));
+                    game::TreatyResult r = game::ApplyTreaty(t.winner, t.loser, t.level, claims, g_rng());
+                    std::wstring head = U2W("Peace treaty between " + Nm(t.winner) + " and " + Nm(t.loser) + ": " +
+                                            Nm(t.winner) + (t.level >= 2 ? " wins a major victory." : " wins a minor victory."));
+                    r.report.insert(r.report.begin(), head);
+                    if (r.ceded.empty())
+                        r.report.push_back(U2W(Nm(t.loser) + " cedes no possessions" +
+                                               (r.automatic ? " (none next to " + Nm(t.winner) + "'s possessions)." : ".")));
+                    if (r.resourcesCut)
+                        r.report.push_back(U2W(Nm(t.loser) + " pays reparations (base resources -" +
+                                               std::to_string(r.resourcesCut) + ")."));
+                    game::MakePeace(d.from, d.to, t.winner == 0 ? 1 : t.loser == 0 ? 2 : 3);
+                    g_treaties.erase(key);
+                    g_warVP.erase(key);
+                    // Everyone sees the treaty in the chat; the two nations' players also get the game's treaty
+                    // dialog once the new month is out (the host's own as well, so nobody waits for its OK).
+                    std::vector<std::string> lines;
+                    for (auto& l : r.report) lines.push_back(SafeText(W2U(l)));
+                    for (int n : {t.winner, t.loser}) {
+                        auto& news = n == 0 ? g_pendingTreaty : g_treatyNews[n];
+                        if (!news.empty()) news.push_back(" ");  // a second treaty this month
+                        news.insert(news.end(), lines.begin(), lines.end());
+                    }
+                    for (auto& l : lines) AddChat("* " + l);
+                    msg = "Peace: " + Nm(d.from) + " and " + Nm(d.to) + " have ended their war (" + Nm(t.winner) +
+                          " victorious).";
+                } else {
+                    game::MakePeace(d.from, d.to);
+                    g_treaties.erase(key);
+                    g_warVP.erase(key);
+                    msg = "Peace: " + Nm(d.from) + " and " + Nm(d.to) + " have ended their war (compromise peace).";
+                }
             } else if (d.kind == "war") {
                 g_pactWars.insert(key);
                 g_pactAllies.erase(key);
+                g_warVP[key] = {0, 0};  // a new war is scored from its first battle
                 game::StartWar(d.from, d.to);
                 msg = "War: " + Nm(d.from) + " has declared war on " + Nm(d.to) + "!";
             } else if (game::AtWar(d.from, d.to)) {
@@ -698,10 +1023,23 @@ static void ApplyDiplomacy() {
         if (!keep) changed = true;
         return !keep;
     });
-    if (changed) {
-        SaveReservations();
-        game::RefreshUI();
-    }
+    // Scores and terms of wars that are over (ended by the game, or a nation went back to the AI).
+    for (auto it = g_warVP.begin(); it != g_warVP.end();)
+        if (!both(it->first.first, it->first.second) || !game::AtWar(it->first.first, it->first.second)) {
+            it = g_warVP.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    for (auto it = g_treaties.begin(); it != g_treaties.end();)
+        if (DipFindPair("peace", it->first.first, it->first.second) < 0) {
+            it = g_treaties.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    SaveReservations();  // also keeps the war scores of the month's battles
+    if (changed) game::RefreshUI();
 }
 
 // Host: results of a joined player's random event (answered on the player's PC). Relation changes go to the
@@ -822,8 +1160,17 @@ static void BroadcastState() {
     // News about each player's design studies goes to that player only (after the month, so it is the last line).
     for (auto& kv : g_players) {
         Player& p = kv.second;
+        if (!p.connected || !p.welcomed) continue;
+        auto tr = g_treatyNews.find(p.nation);
+        if (tr != g_treatyNews.end()) {
+            std::string joined;
+            for (auto& l : tr->second) joined += l + kSepRec;
+            KV c;
+            c["treaty"] = joined;
+            net::Send(p.peer, net::MSG_CHAT, KVEncode(c));
+        }
         auto it = g_playerNews.find(p.nation);
-        if (it == g_playerNews.end() || !p.connected || !p.welcomed) continue;
+        if (it == g_playerNews.end()) continue;
         for (auto& line : it->second) {
             KV c;
             c["from"] = "*";
@@ -833,6 +1180,7 @@ static void BroadcastState() {
         }
     }
     g_playerNews.clear();
+    g_treatyNews.clear();
 }
 
 // Host: the monthly countdown of a joined player's design studies, as the game does it for the host's nation
@@ -1096,7 +1444,8 @@ static void HostOnMessage(net::Msg& m) {
         case net::MSG_DIPLO: {
             if (!p || !p->welcomed) break;
             KV kv = KVDecode(m.data);
-            std::string why = p->nation > 0 ? HostDiplo(p->nation, KVStr(kv, "action"), KVInt(kv, "target", -1))
+            std::string why = p->nation > 0 ? HostDiplo(p->nation, KVStr(kv, "action"), KVInt(kv, "target", -1),
+                                                         KVStr(kv, "extra"))
                                             : "Claim a nation first.";
             if (!why.empty()) {
                 KV c;
@@ -1394,6 +1743,12 @@ static void ClientOnMessage(net::Msg& m) {
         }
         case net::MSG_CHAT: {
             KV kv = KVDecode(m.data);
+            if (!KVStr(kv, "treaty").empty()) {  // a peace treaty of my nation: shown in the game's dialog when idle
+                if (!g_pendingTreaty.empty()) g_pendingTreaty.push_back(" ");
+                for (auto& l : Split(KVStr(kv, "treaty"), kSepRec))
+                    if (!l.empty()) g_pendingTreaty.push_back(l);
+                break;
+            }
             std::string from = KVStr(kv, "from");
             AddChat(from == "*" ? "* " + KVStr(kv, "text") : from + ": " + KVStr(kv, "text"));
             if (KVInt(kv, "notice") && g_onNotice) g_onNotice(KVStr(kv, "text"));  // flash the window
@@ -1481,6 +1836,10 @@ void Leave() {
     g_pactWars.clear();
     g_cSnap = DipSnap();
     g_playerNews.clear();
+    g_treatyNews.clear();
+    g_pendingTreaty.clear();
+    g_warVP.clear();
+    g_treaties.clear();
     g_eventRollSeq = -1;
     g_submissions.clear();
     g_haveState = g_submitted = false;
@@ -1683,8 +2042,8 @@ void SubmitTurn() {
     Notice("Turn submitted. You can still change orders and press Submit again until the host processes the turn.");
 }
 
-std::string Diplomacy(const std::string& action, int target) {
-    if (g_role == Role::Host) return HostDiplo(0, action, target);
+std::string Diplomacy(const std::string& action, int target, const std::string& extra) {
+    if (g_role == Role::Host) return HostDiplo(0, action, target, extra);
     if (g_role != Role::Client) return "Not connected.";
     if (g_phase != Phase::Planning) return "Diplomacy is possible while the players plan a month.";
     if (g_myNation <= 0) return "Claim a nation first.";
@@ -1704,16 +2063,69 @@ std::string Diplomacy(const std::string& action, int target) {
         return r->atWar ? "Peace with " + B + " is already offered or agreed." : "You are not at war with " + B + ".";
     if (action == "leave" && !r->canLeave) return "You are not allied with " + B + ".";
     if (action == "cancel" && !r->canCancel) return "Nothing to withdraw or decline with " + B + ".";
+    if (action == "claim") {
+        if (!r->canClaim) return "Only the winner of an agreed peace can claim possessions.";
+        int used = 0;
+        std::vector<std::string> seen;
+        for (auto& name : Split(extra, '|')) {
+            if (name.empty() || std::find(seen.begin(), seen.end(), name) != seen.end()) continue;  // as the host
+            seen.push_back(name);
+            bool found = false;
+            for (auto& c : r->claimable)
+                if (c.name == name) {
+                    used += c.value;
+                    found = true;
+                    break;
+                }
+            if (!found) return name + " cannot be claimed from " + B + ".";
+        }
+        if (used > r->claimBudget)
+            return "Those possessions are worth " + std::to_string(used) + "; you may claim up to " +
+                   std::to_string(r->claimBudget) + ".";
+    }
     KV kv;
     kv["action"] = action;
     kv["target"] = std::to_string(target);
+    if (!extra.empty()) kv["extra"] = extra;
     net::Send(0, net::MSG_DIPLO, KVEncode(kv));
     return "";
 }
 
-std::string DebugDiplomacyAs(int from, const std::string& action, int target) {
+std::string DebugDiplomacyAs(int from, const std::string& action, int target, const std::string& extra) {
     if (g_role != Role::Host) return "host only";
-    return HostDiplo(from, action, target);
+    return HostDiplo(from, action, target, extra);
+}
+
+std::string DebugWarVP(int a, int b, int va, int vb, bool set) {
+    if (g_role != Role::Host || a < 0 || b < 0 || a > 8 || b > 8 || a == b) return "error host only / bad pair";
+    if (!game::TreatiesAvailable()) return "error treaties unavailable";
+    auto& vp = WarVP(a, b);
+    if (set) {
+        bool aLow = a < b;
+        vp = aLow ? std::make_pair(va, vb) : std::make_pair(vb, va);
+        SaveReservations();
+        BroadcastLobby();
+    }
+    int mineA = a < b ? vp.first : vp.second, mineB = a < b ? vp.second : vp.first;
+    return "ok " + std::to_string(a) + ":" + std::to_string(mineA) + " " + std::to_string(b) + ":" + std::to_string(mineB) +
+           " scale=" + std::to_string(game::WarScale());
+}
+
+std::string DebugTerms(int a, int b) {
+    if (g_role != Role::Host || !game::TreatiesAvailable()) return "error host only / treaties unavailable";
+    std::string s;
+    auto ti = g_treaties.find(PairKey(a, b));
+    if (ti != g_treaties.end()) {
+        const auto& t = ti->second;
+        s = "agreed winner=" + std::to_string(t.winner) + " loser=" + std::to_string(t.loser) + " level=" +
+            std::to_string(t.level) + " budget=" + std::to_string(TreatyBudget(t.level)) + " claims=";
+        for (auto& c : t.claims) s += c + "|";
+    } else {
+        DipSnap::War w = WarOutlook(a, b);
+        s = "outlook winner=" + std::to_string(w.winner) + " level=" + std::to_string(w.level) + " vp=" +
+            std::to_string(w.vpLo) + ":" + std::to_string(w.vpHi);
+    }
+    return "ok " + s;
 }
 
 void DebugReserve(int nation, const std::string& player) {
@@ -1804,6 +2216,14 @@ void Tick() {
             if (g_hostWantsTurn) text = "Host is ready. " + text;
             BroadcastStatus(text);
         }
+        if (!g_pendingTreaty.empty() && g_phase == Phase::Planning && !g_turnRunning && !game::IsBusy() &&
+            !game::BattleActive() && !game::EventActive()) {
+            std::vector<std::wstring> lines;
+            for (auto& l : g_pendingTreaty) lines.push_back(U2W(l));
+            g_pendingTreaty.clear();
+            Log("showing a peace treaty (%d lines)", (int)lines.size());
+            game::ShowPeaceTreaty(lines);
+        }
     } else if (g_role == Role::Client) {
         if (!g_pendingState.empty()) ClientApplyPendingState();
         if (g_forceSubmitPending && !g_submitted && g_haveState && !game::IsBusy()) SubmitTurn();
@@ -1812,6 +2232,14 @@ void Tick() {
             !g_submitted && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive()) {
             g_eventRollSeq = -1;
             ClientRunEvent(-1);
+        }
+        if (!g_pendingTreaty.empty() && g_haveState && g_pendingState.empty() && !game::IsBusy() &&
+            !game::BattleActive() && !game::EventActive()) {
+            std::vector<std::wstring> lines;
+            for (auto& l : g_pendingTreaty) lines.push_back(U2W(l));
+            g_pendingTreaty.clear();
+            Log("showing a peace treaty (%d lines)", (int)lines.size());
+            game::ShowPeaceTreaty(lines);
         }
     }
 }
@@ -2008,6 +2436,29 @@ void OnAfterAIPeace() {
     if (g_peaceDepth > 0) return;
     for (auto& m : mp::g_peaceMask) game::SetTensionRaw(std::get<0>(m), std::get<1>(m), std::get<2>(m));
     mp::g_peaceMask.clear();
+}
+
+// A battle gave victory points: count them for the war score of a war between two players.
+void OnBattleVP(int a, int b, int vpA, int vpB) {
+    using namespace mp;
+    if (g_role != Role::Host || g_phase == Phase::Lobby || !IsHumanNation(a) || !IsHumanNation(b) || !game::AtWar(a, b))
+        return;
+    bool seeded = false;
+    auto& vp = WarVP(a, b, &seeded);
+    if (seeded) {  // the nations' points already include this battle
+        Log("war score %d-%d: first battle, already counted in the start %d:%d", std::min(a, b), std::max(a, b),
+            vp.first, vp.second);
+        return;
+    }
+    if (a < b) {
+        vp.first += vpA;
+        vp.second += vpB;
+    } else {
+        vp.first += vpB;
+        vp.second += vpA;
+    }
+    Log("war score %d-%d: +%d/+%d -> %d:%d", std::min(a, b), std::max(a, b), a < b ? vpA : vpB, a < b ? vpB : vpA,
+        vp.first, vp.second);
 }
 
 // The game just counted down the host nation's design studies (end of month, or after a battle): do the same

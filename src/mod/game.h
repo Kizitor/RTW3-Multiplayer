@@ -91,6 +91,31 @@ ClientEventResult RunClientEvent(int playerNation, int forcedIdx, int used[100])
 bool AdjustNationField(int nationIdx, const std::string& field, int value, bool isDelta);
 int NationIntField(int nationIdx, const std::string& field);  // INT_MIN if unknown
 
+// Peace treaties between players, with the game's own rules and routines (the winner's claimable possessions,
+// ships handed over as reparations, prestige, the treaty report dialog).
+struct PossessionInfo {
+    std::wstring name, area;
+    int value = 0;
+    bool oil = false;
+    int owner = -1;
+};
+struct TreatyResult {
+    std::vector<std::wstring> report;  // lines of the peace treaty
+    std::vector<std::wstring> ceded;
+    int ships = 0, resourcesCut = 0;
+    bool automatic = false;  // possessions chosen by the game (no claims)
+};
+bool TreatiesAvailable();
+int WarScale();   // the game's scale value G in its war-progress thresholds (100*G + 300 slightly ahead, + 500 winning)
+int NationVP(int idx);
+int EnemyVP();    // the victory points of the host nation's enemies
+std::vector<PossessionInfo> Possessions(int ownerIdx);
+std::vector<PossessionInfo> ClaimablePossessions(int winnerIdx, int loserIdx);
+// level 1 = minor win (land worth 4, one ship hand-over), 2 = major win (land worth 8, three hand-overs). Call
+// while the two nations are still at war.
+TreatyResult ApplyTreaty(int winnerIdx, int loserIdx, int level, const std::vector<std::wstring>& claims, unsigned seed);
+void ShowPeaceTreaty(const std::vector<std::wstring>& lines);  // the game's modal treaty dialog
+
 // Ship orders the AI strategic-move routine may overwrite (restored for human nations).
 struct ShipSnap {
     void* ship;
@@ -116,7 +141,7 @@ int AllianceMonths(int a, int b);
 int WarCounter();                             // months the host's nation has been at war (<= 0: peace)
 int CountAtWarWithHost();
 void StartWar(int a, int b);                  // what the game does when a war breaks out
-void MakePeace(int a, int b);                 // ends only the war between a and b (compromise peace)
+void MakePeace(int a, int b, int hostOutcome = 3);  // ends only the war between a and b; hostOutcome 1 won, 2 lost, 3 compromise
 void SetAlliance(int a, int b, int months);   // 0 ends it
 
 }  // namespace game
@@ -133,4 +158,5 @@ bool OnBeforeAIPeace(int nationIdx, bool badLoss);  // true => skip the game's A
 void OnAfterAIPeace();
 void OnAfterDesignStudies(void* self);  // the game advanced the host nation's design studies
 void OnAfterReduceTimeLimits(void* self);  // the game counted down the host nation's pending changes this month
+void OnBattleVP(int a, int b, int vpA, int vpB);  // victory points a battle between nations a and b gave each side
 }  // namespace hookcb

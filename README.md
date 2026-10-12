@@ -18,12 +18,13 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 - The host plays nation #1 of their campaign (the nation chosen at New Game). Joining players pick any of
   the 8 AI opponents in that campaign.
 - Players can ally with each other, declare war and make peace with buttons in the Multiplayer window
-  (see [Diplomacy between players](#diplomacy-between-players)).
+  (see [Diplomacy between players](#diplomacy-between-players)). A war between players ends with peace
+  terms for the winner, as in single player: land, ships and reparations.
 - Tactical battles are fought on the host's PC.
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.4-win32.zip` from the
+2. Download `RTW3MP-0.2.5-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -96,7 +97,7 @@ nation, then:
 |---|---|
 | **Declare war** | One-sided. Asks for confirmation; you can withdraw it until the month is processed. Breaks an alliance between you. |
 | **Propose alliance** / **Accept alliance** | Offers an alliance. When the other player offered one to you, the button reads *Accept alliance*. |
-| **Propose peace** / **Accept peace** | Offers peace while you are at war; *Accept peace* when they offered it. |
+| **Propose peace** / **Accept peace** | Offers peace while you are at war; *Accept peace* when they offered it. The winner of an agreed peace gets **Claim land…** here (see [Peace terms](#peace-terms-between-players)). |
 | **Leave alliance** | One-sided. Ends the alliance (or calls off an agreed alliance that hasn't started yet). |
 | **Withdraw** / **Decline** | Takes back your own offer or declaration, or declines the other player's offer. |
 
@@ -113,9 +114,40 @@ nation, then:
   with **Propose peace** too.
 - AI nations are unchanged: they get no buttons, and their diplomacy (with each other and with the
   players) is decided by the game as in single player.
-- Peace between players is a compromise peace: no territory changes hands. When the host makes peace with
-  its last enemy, the game's normal end-of-war routine runs on the host (budget cut, released prisoners,
-  and the usual messages).
+- When the host makes peace with its last enemy, the game's normal end-of-war routine runs on the host
+  (budget cut, released prisoners, and the usual messages).
+
+### Peace terms between players
+A war between two players ends like a war against the AI in single player: the side that is clearly ahead
+wins concessions.
+- **War score:** the **Tension** column of a war shows the victory points (VP) both sides scored in this war
+  (*VP yours:theirs*), counted from the battles between the two nations: the host's tactical battles and the
+  battles the game resolves on its own. The label above the list tells you what a peace would bring now.
+- **Who wins:** the game's own rules for "winning the war" are used. A side with at least twice the
+  enemy's points and a clear margin wins a *major victory*; a side with a smaller lead but enough points
+  wins a *minor victory*; otherwise the peace is a compromise without terms. The margin grows with the era,
+  as in single player.
+- **The terms are fixed when the peace is accepted** and shown in the chat and the Pending column. They
+  take effect when the month is processed:
+
+  | | Minor victory | Major victory |
+  |---|---|---|
+  | Possessions the winner may take (total value) | up to 4 | up to 8 |
+  | Ships handed over as war reparations | up to 1 | up to 3 |
+  | Winner's prestige | +1 | +2 |
+  | Loser's base resources | −100 | −500 |
+
+  The loser also loses prestige, as after a lost war in single player. The rules of single player apply:
+  only possessions worth less than 11 can be taken, and only in sea areas next to the winner's own
+  possessions; ships handed over are recent, large ships that are not under repair (if the loser has none,
+  fewer ships change hands).
+- **Claim land:** after the peace is accepted, the winner's **Propose peace** button reads
+  **Claim land…**. It opens a list of the loser's possessions that may be taken, with their value and oil.
+  Tick the ones you want, up to the limit, and press **Claim selected**. You can change the choice until
+  the month is processed. If you don't choose (or press **Let the conference choose**), the most valuable
+  possessions that fit the limit are picked for you when the month ends.
+- When the month is processed, both players get the game's peace treaty window with the terms, and
+  everyone sees them in the chat. Withdrawing an agreed peace before then also drops its terms.
 
 ## Known limitations (v0.2)
 - **Wars and battles:**
