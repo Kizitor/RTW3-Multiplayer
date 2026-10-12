@@ -308,11 +308,13 @@ static int MergePossessions(IniDoc& host, const IniDoc& client, const std::strin
 
 // Diplomacy is decided on the host: these [NationK] keys keep the host's values when a player's turn is merged
 // (the other side of each relation lives in the other nations' sections).
-static bool IsDiplomacyKey(const std::string& line) {
+// Keys of [NationK] the host keeps when it merges a player's turn: the diplomacy values, and the victory points (the
+// host credits them during the month; the player's copy is the older value).
+static bool IsHostOwnedKey(const std::string& line) {
     size_t eq = line.find('=');
     if (eq == std::string::npos) return false;
     std::string k = line.substr(0, eq);
-    if (k == "Tension" || k == "Allied") return true;
+    if (k == "Tension" || k == "Allied" || k == "VP") return true;
     for (const char* p : {"AITension", "AIAlliance"}) {
         size_t n = strlen(p);
         if (k.size() == n + 1 && k.compare(0, n, p) == 0 && isdigit((unsigned char)k[n])) return true;
@@ -351,13 +353,13 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
         const IniSection* cs = cli.Find(name);
         IniSection* hs = host.Find(name);
         if (cs && hs) {
-            std::map<std::string, std::string> keep;  // host's diplomacy values ([NationK] only)
+            std::map<std::string, std::string> keep;  // host-owned values ([NationK] only)
             if (fmt == kNationSections[0])
                 for (auto& l : hs->lines)
-                    if (IsDiplomacyKey(l)) keep[l.substr(0, l.find('='))] = l;
+                    if (IsHostOwnedKey(l)) keep[l.substr(0, l.find('='))] = l;
             hs->lines = cs->lines;
             for (auto& l : hs->lines) {
-                if (!IsDiplomacyKey(l)) continue;
+                if (!IsHostOwnedKey(l)) continue;
                 auto it = keep.find(l.substr(0, l.find('=')));
                 if (it != keep.end()) l = it->second;
             }

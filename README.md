@@ -24,7 +24,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.5-win32.zip` from the
+2. Download `RTW3MP-0.2.6-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -155,6 +155,11 @@ wins concessions.
   - Wars between a joined player's nation and an AI nation are resolved by the game's AI-vs-AI
     battle model.
   - Joined players don't fight tactical battles yet.
+  - **Victory points:** a joined player's *VP* counts what their nation scored in its wars, including
+    battles against the host; *Enemy VP* counts the points of the nations at war with them. (The game
+    itself only keeps the host's view, so the mod fills in a joined player's.) Points the host's enemies
+    score outside battles (blockades, sinkings, control of sea areas) are shared evenly among the host's
+    enemies when the host fights several nations at once. VP go back to 0 when a nation's last war ends.
 - **Decided by the game for joined nations:** diplomacy with AI nations and new aircraft types. Diplomacy
   between players is decided with the buttons.
 - **Design studies of joined players** count down every month on the host, including the game's

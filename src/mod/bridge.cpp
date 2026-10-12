@@ -185,6 +185,12 @@ static std::string ExecuteOnMain(const std::string& line) {
                                   atoi(arg(4, "0").c_str()), set);
         }
         if (cmd == "terms") return mp::DebugTerms(atoi(arg(1).c_str()), atoi(arg(2).c_str()));  // host: terms <a> <b>
+        if (cmd == "vpinfo") return mp::DebugVPInfo();
+        if (cmd == "enemyvpadd")  // host: enemyvpadd <n>: the host's enemies gain n VP outside a battle (as a blockade)
+            return game::ShowEnemyVP(game::EnemyVP() + atoi(arg(1, "0").c_str())), mp::DebugVPInfo();
+        if (cmd == "battlevp")  // host: battlevp <opponent> <vp host> <vp opponent> [Major|Minor|Marginal]: end-of-battle routine
+            return game::DebugBattleAftermath(atoi(arg(1).c_str()), atoi(arg(2, "0").c_str()), atoi(arg(3, "0").c_str()),
+                                              arg(4, "Minor"));
         if (cmd == "possessions" || cmd == "claimable") {  // possessions <nation> | claimable <winner> <loser>
             auto list = cmd == "possessions" ? game::Possessions(atoi(arg(1).c_str()))
                                              : game::ClaimablePossessions(atoi(arg(1).c_str()), atoi(arg(2).c_str()));

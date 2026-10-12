@@ -49,7 +49,7 @@ struct Api {
         fPossOwner = -1, fBaseResources = -1, fPrestige = -1, fVP = -1, fEnemyVP = -1, fBattleOpp = -1;
     void *mChangeOwner = nullptr, *mAdjacent = nullptr, *mRemoveShipInPeace = nullptr, *mShowTreaty = nullptr,
          *mSLCreate = nullptr, *mFree = nullptr, *mBattleAftermath = nullptr,
-         *mAIBattle = nullptr, *mRaiderBattle = nullptr;
+         *mAIBattle = nullptr, *mRaiderBattle = nullptr, *mUpdateVPNumbers = nullptr;
     int* scaleVar = nullptr;  // the game's scale value used in its war-progress thresholds (100*G + 300/500)
     bool treaties = false;
 } A;
@@ -104,6 +104,7 @@ static void ResolveTreaties() {
     A.mBattleAftermath = dl::Method("TfrmBuildCamp", "HandleBattleAftermath");
     A.mAIBattle = dl::Method("TfrmBuildCamp", "DoBattleBetweenAINations");
     A.mRaiderBattle = dl::Method("TfrmBuildCamp", "QuickResolveRaiderBattle");
+    A.mUpdateVPNumbers = dl::Method("TfrmBuildCamp", "UpdateVPNumbers");
     // RemoveShipInPeace (unnamed): NegotiatePeace hands the player's ships to an enemy with
     // `call GetRandomEnemy; mov ecx,eax; mov eax,[ebp-4]; mov edx,[eax+PlayerNation]; mov eax,[ebp-4]; call X`.
     void* negotiate = dl::Method("TfrmBuildCamp", "NegotiatePeace");
@@ -739,6 +740,39 @@ int NationVP(int idx) {
 int EnemyVP() {
     void* f = BuildCamp();
     return A.treaties && f ? dl::At<int>(f, A.fEnemyVP) : 0;
+}
+
+void SetNationVP(int idx, int vp) {
+    void* n = Nation(idx);
+    if (A.treaties && n) dl::At<int>(n, A.fVP) = vp;
+}
+
+bool AtWarWithAnyone(int idx) {
+    for (int j = 0; j <= 8 && j < NationCount(); j++)
+        if (j != idx && AtWar(idx, j)) return true;
+    return false;
+}
+
+void ShowEnemyVP(int vp) {
+    void* f = BuildCamp();
+    if (!A.treaties || !f) return;
+    dl::At<int>(f, A.fEnemyVP) = vp;
+    if (A.mUpdateVPNumbers) dl::Call(A.mUpdateVPNumbers, (uint32_t)(uintptr_t)f);
+}
+
+std::string DebugBattleAftermath(int opp, int vp0, int vp1, const std::string& level) {
+    void* f = BuildCamp();
+    if (!TreatiesAvailable() || !A.mBattleAftermath || !f) return "error treaties unavailable";
+    if (opp < 1 || opp > 8 || EventActive() || BattleActive()) return "error not now";
+    int h0 = NationVP(0), e0 = EnemyVP(), o0 = NationVP(opp);
+    dl::At<int>(f, A.fBattleOpp) = opp;
+    dl::ConstUStr lv(U2W(level));
+    uint32_t stack[1] = {lv.ptr()};
+    dl::Call(A.mBattleAftermath, (uint32_t)(uintptr_t)f, (uint32_t)vp0, (uint32_t)vp1, 1, stack);  // through the hook
+    char buf[160];
+    snprintf(buf, sizeof(buf), "ok host=%d->%d enemy=%d->%d opp=%d->%d", h0, NationVP(0), e0, EnemyVP(), o0,
+             NationVP(opp));
+    return buf;
 }
 
 template <class Fn>
@@ -1447,16 +1481,45 @@ extern "C" void __stdcall CB_AfterAIMoves(void* self) {
     } catch (...) {
     }
 }
-extern "C" BOOL __stdcall CB_BeforeAIPeace(void* self, void* nation, uint32_t badLoss) {
-    try {
-        return hookcb::OnBeforeAIPeace(NationIndex(nation), (badLoss & 0xFF) != 0) ? TRUE : FALSE;
-    } catch (...) {
-        return FALSE;
+// HandleAIPeace ends with VP = 0 for every nation 1..8 after any AI peace (AI nations don't need it afterwards). A
+// joined player's nation keeps its VP while it is still at war; the depth counts nested calls.
+static int g_aiPeaceDepth = 0;
+static int g_aiPeaceVP[9];
+static bool g_aiPeaceKeep[9];
+
+static void AIPeaceKeepVP() {
+    if (g_aiPeaceDepth++ > 0 || !A.treaties) return;
+    for (int i = 1; i < 9; i++) {
+        g_aiPeaceKeep[i] = i < NationCount() && hookcb::IsHumanRemoteNation(i);
+        g_aiPeaceVP[i] = g_aiPeaceKeep[i] ? NationVP(i) : 0;
     }
+}
+
+static void AIPeaceRestoreVP() {
+    if (g_aiPeaceDepth <= 0 || --g_aiPeaceDepth > 0 || !A.treaties) return;
+    for (int i = 1; i < 9; i++) {
+        if (!g_aiPeaceKeep[i]) continue;
+        g_aiPeaceKeep[i] = false;
+        if (NationVP(i) == g_aiPeaceVP[i] || !AtWarWithAnyone(i)) continue;
+        Log("AI peace: VP of player nation %d kept at %d (the game set %d)", i, g_aiPeaceVP[i], NationVP(i));
+        SetNationVP(i, g_aiPeaceVP[i]);
+    }
+}
+
+extern "C" BOOL __stdcall CB_BeforeAIPeace(void* self, void* nation, uint32_t badLoss) {
+    BOOL skip = FALSE;
+    try {
+        AIPeaceKeepVP();
+        skip = hookcb::OnBeforeAIPeace(NationIndex(nation), (badLoss & 0xFF) != 0) ? TRUE : FALSE;
+        if (skip) AIPeaceRestoreVP();  // the game's routine doesn't run
+    } catch (...) {
+    }
+    return skip;
 }
 extern "C" void __stdcall CB_AfterAIPeace() {
     try {
         hookcb::OnAfterAIPeace();
+        AIPeaceRestoreVP();
     } catch (...) {
     }
 }
@@ -1613,6 +1676,10 @@ extern "C" void __stdcall CB_BeforeDoPeace() {
             g_peaceKeep[i] = true;
         }
     }
+    try {
+        hookcb::OnHostPeace(false);
+    } catch (...) {
+    }
 }
 
 extern "C" void __stdcall CB_AfterDoPeace() {
@@ -1624,6 +1691,10 @@ extern "C" void __stdcall CB_AfterDoPeace() {
         Log("end of war: prestige of player nation %d kept at %d (the game set %d)", i, g_peacePrestige[i],
             dl::At<int>(n, A.fPrestige));
         dl::At<int>(n, A.fPrestige) = g_peacePrestige[i];
+    }
+    try {
+        hookcb::OnHostPeace(true);
+    } catch (...) {
     }
 }
 

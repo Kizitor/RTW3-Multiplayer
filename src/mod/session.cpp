@@ -99,6 +99,8 @@ struct TreatyTerms {
 };
 static std::map<std::pair<int, int>, std::pair<int, int>> g_warVP;
 static std::map<std::pair<int, int>, TreatyTerms> g_treaties;
+// The game's EnemyVP (the host's enemies' points) already given to the enemies' nations; -1 = not known yet.
+static int g_enemyVPSeen = -1;
 static std::vector<std::string> g_pendingTreaty;          // treaty lines to show when the game is idle (the host
                                                           // too: after the new month went out)
 
@@ -330,6 +332,7 @@ static void SaveReservations() {
     kv["pactAllies"] = EncodePairs(g_pactAllies);
     kv["pactWars"] = EncodePairs(g_pactWars);
     kv["warVP"] = EncodeWarVP();
+    kv["enemyVPSeen"] = std::to_string(g_enemyVPSeen);
     kv["diplomacy"] = EncodeDipItems(g_dip);
     kv["treaties"] = EncodeTreaties();
     kv["diplomacyDate"] = HostDate();  // pending decisions belong to this month only
@@ -343,6 +346,7 @@ static void LoadReservations() {
     g_pactWars.clear();
     g_warVP.clear();
     g_treaties.clear();
+    g_enemyVPSeen = -1;
     std::string s;
     if (g_hostSlot <= 0 || !ReadFileBytes(SessionFile(), s)) return;
     KV kv = KVDecode(s);
@@ -363,6 +367,7 @@ static void LoadReservations() {
     // campaign would count its battles again (the scores then restart from the nations' points, see WarVP).
     if (KVStr(kv, "diplomacyDate") == HostDate()) {
         DecodeWarVP(KVStr(kv, "warVP"));
+        g_enemyVPSeen = KVInt(kv, "enemyVPSeen", -1);
         g_dip = DecodeDipItems(KVStr(kv, "diplomacy"));
         DecodeTreaties(KVStr(kv, "treaties"));
     } else if (!KVStr(kv, "diplomacy").empty() || !KVStr(kv, "warVP").empty()) {
@@ -904,8 +909,11 @@ static std::string HostDiplo(int from, const std::string& action, int to, const 
 // Host, after the game finished the month and before the new month is sent: carry out this month's decisions,
 // then keep the players' agreements (alliances don't run out; a war the players declared only ends when both
 // agree to peace, even if the game's own peace routines ended it during the month).
+static void ShareEnemyVP();
+static void ResetPeacetimeVP();
 static void ApplyDiplomacy() {
     if (!game::DiplomacyAvailable() || !CampaignReady()) return;
+    ShareEnemyVP();  // with this month's enemies, before peace is made
     auto both = [](int a, int b) { return IsHumanNation(a) && IsHumanNation(b); };
     auto Nm = [](int n) { return CampaignNationName(n); };
     bool changed = false;
@@ -1038,8 +1046,42 @@ static void ApplyDiplomacy() {
         } else {
             ++it;
         }
+    ResetPeacetimeVP();
+    g_enemyVPSeen = game::EnemyVP();  // peace and war made above may have reset the score; nothing new was scored
     SaveReservations();  // also keeps the war scores of the month's battles
     if (changed) game::RefreshUI();
+}
+
+// Host: victory points of the joined players' nations in the host's wars. The game credits everything the host's
+// enemies achieve to EnemyVP (the "Enemy VP" of the host's screen) and nothing to the enemy nation itself, so a
+// player fighting the host never saw its own VP rise. Battles are given to the nation that fought them as they
+// happen (hookcb::OnBattleVP); the rest of the month's EnemyVP (blockades, sinkings, forces in an area, ...) is
+// shared here among the host's enemies. AI nations keep the game's model and get nothing.
+static void ShareEnemyVP() {
+    int e = game::EnemyVP(), seen = g_enemyVPSeen;
+    g_enemyVPSeen = e;
+    if (seen < 0 || e <= seen) return;  // unknown start, or the game reset the score (the host's war ended or began)
+    std::vector<int> enemies;
+    for (int j = 1; j <= 8 && j < game::NationCount(); j++)
+        if (game::AtWar(0, j)) enemies.push_back(j);
+    if (enemies.empty()) return;
+    int rest = e - seen, share = rest / (int)enemies.size(), extra = rest % (int)enemies.size();
+    for (int j : enemies) {
+        int give = share + (extra-- > 0 ? 1 : 0);
+        if (give <= 0 || !hookcb::IsHumanRemoteNation(j)) continue;
+        game::SetNationVP(j, game::NationVP(j) + give);
+        Log("victory points: nation %d +%d of the host's enemies' %d this month -> %d", j, give, rest, game::NationVP(j));
+    }
+}
+
+// Host: a joined player's nation at peace starts its next war from 0, like the host's nation (the game resets the
+// player's VP when its last war ends, and only its own).
+static void ResetPeacetimeVP() {
+    for (int n = 1; n <= 8 && n < game::NationCount(); n++)
+        if (hookcb::IsHumanRemoteNation(n) && game::NationVP(n) != 0 && !game::AtWarWithAnyone(n)) {
+            Log("victory points: nation %d is at peace; %d -> 0", n, game::NationVP(n));
+            game::SetNationVP(n, 0);
+        }
 }
 
 // Host: results of a joined player's random event (answered on the player's PC). Relation changes go to the
@@ -1269,6 +1311,7 @@ static void RunHostTurn() {
         return;
     }
     Log("host turn: %d submissions merged, running turn", merged);
+    if (g_enemyVPSeen < 0) g_enemyVPSeen = game::EnemyVP();  // the points before this month (see ShareEnemyVP)
     game::RunOriginalTurn();
     g_idleSinceTick = 0;
     Log("host turn: click handler returned (endOfTurn=%d battle=%d)", g_afterTurnPending, game::BattleActive());
@@ -1495,6 +1538,13 @@ static void ClientApplyPendingState() {
         Notice("Loading the received game failed.");
         return;
     }
+    // "Enemy VP" of the received game is the host's enemies' score; show the points of this nation's enemies ("VP"
+    // is the nation's own, kept by the host).
+    int enemyVP = 0;
+    for (int j = 0; j <= 8 && j < game::NationCount(); j++)
+        if (j != nation && game::AtWar(nation, j)) enemyVP += std::max(0, game::NationVP(j));
+    game::ShowEnemyVP(enemyVP);
+    Log("victory points shown: own %d, enemy %d", game::NationVP(nation), enemyVP);
     g_myNation = nation;
     g_clientSeq = seq;
     g_haveState = true;
@@ -1840,6 +1890,7 @@ void Leave() {
     g_pendingTreaty.clear();
     g_warVP.clear();
     g_treaties.clear();
+    g_enemyVPSeen = -1;
     g_eventRollSeq = -1;
     g_submissions.clear();
     g_haveState = g_submitted = false;
@@ -2109,6 +2160,13 @@ std::string DebugWarVP(int a, int b, int va, int vb, bool set) {
     int mineA = a < b ? vp.first : vp.second, mineB = a < b ? vp.second : vp.first;
     return "ok " + std::to_string(a) + ":" + std::to_string(mineA) + " " + std::to_string(b) + ":" + std::to_string(mineB) +
            " scale=" + std::to_string(game::WarScale());
+}
+
+std::string DebugVPInfo() {
+    std::string s = "ok enemy=" + std::to_string(game::EnemyVP()) + " seen=" + std::to_string(g_enemyVPSeen) + " vp=";
+    for (int i = 0; i <= 8 && i < game::NationCount(); i++)
+        s += std::to_string(i) + ":" + std::to_string(game::NationVP(i)) + ",";
+    return s;
 }
 
 std::string DebugTerms(int a, int b) {
@@ -2438,11 +2496,34 @@ void OnAfterAIPeace() {
     mp::g_peaceMask.clear();
 }
 
-// A battle gave victory points: count them for the war score of a war between two players.
+// The game ends the host's last war (DoPeace resets the host's VP and EnemyVP to 0): first share what the host's
+// enemies scored this month while they are still at war, then start counting from the reset score.
+void OnHostPeace(bool after) {
+    using namespace mp;
+    if (g_role != Role::Host || g_phase == Phase::Lobby) return;
+    if (!after)
+        ShareEnemyVP();
+    else
+        g_enemyVPSeen = game::EnemyVP();
+}
+
+// A battle gave victory points: give a joined player's nation what it scored against the host, and count the points
+// for the war score of a war between two players.
 void OnBattleVP(int a, int b, int vpA, int vpB) {
     using namespace mp;
-    if (g_role != Role::Host || g_phase == Phase::Lobby || !IsHumanNation(a) || !IsHumanNation(b) || !game::AtWar(a, b))
-        return;
+    if (g_role != Role::Host || g_phase == Phase::Lobby) return;
+    if (a == 0 || b == 0) {  // the host's battle: the game put the enemy's points into EnemyVP only
+        int enemy = a == 0 ? b : a, gain = a == 0 ? vpB : vpA;
+        if (gain > 0) {
+            if (IsHumanRemoteNation(enemy)) {
+                game::SetNationVP(enemy, game::NationVP(enemy) + gain);
+                Log("victory points: nation %d +%d in its battle against the host -> %d", enemy, gain,
+                    game::NationVP(enemy));
+            }
+            g_enemyVPSeen = g_enemyVPSeen >= 0 ? g_enemyVPSeen + gain : game::EnemyVP();
+        }
+    }
+    if (!IsHumanNation(a) || !IsHumanNation(b) || !game::AtWar(a, b)) return;
     bool seeded = false;
     auto& vp = WarVP(a, b, &seeded);
     if (seeded) {  // the nations' points already include this battle

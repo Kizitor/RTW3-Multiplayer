@@ -14,7 +14,7 @@ The game is driven only through the test bridge and posted window messages: the 
 never used and the screen is never captured. Exit code: 0 = every check passed, 1 = a check failed or the saves
 could not be restored, 2 = not started (precondition).
 """
-import argparse, ctypes, ctypes.wintypes as wt, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, time
+import argparse, ctypes, ctypes.wintypes as wt, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_test  # noqa: E402
@@ -2549,6 +2549,404 @@ def scenario_treaty(ctx):
           f'{fmt_view(bv)} -> {fmt_view(av)}; {log_lines(hl, "treaty")}')
 
 
+# ---------------------------------------------------------------- victory points of joined players (0.2.6)
+
+VP_BATTLE_RE = r'victory points: nation (\d+) \+(\d+) in its battle against the host -> (-?\d+)'
+VP_SHARE_RE = r"victory points: nation (\d+) \+(\d+) of the host's enemies' (\d+) this month -> (-?\d+)"
+VP_PEACE_RE = r'victory points: nation (\d+) is at peace; (-?\d+) -> 0'
+VP_AIPEACE_RE = r'AI peace: VP of player nation (\d+) kept at (-?\d+) \(the game set (-?\d+)\)'
+VP_SHOWN_RE = r'victory points shown: own (-?\d+), enemy (-?\d+)'
+WAR_SCORE_RE = r'war score (\d+)-(\d+): \+(\d+)/\+(\d+) -> (\d+):(\d+)'
+VP_PLAYERS = (1, STANDIN)  # the human nations the host credits (the client's and the stand-in's); 3..8 are AI
+VP_AI = tuple(range(3, 9))
+
+
+def vpinfo(port):
+    """`vpinfo` -> dict(enemy=EnemyVP (on a client: its "Enemy VP" as shown), seen=the part of EnemyVP the host
+    already gave out (-1 = not known yet), vp={nation: VP}, raw), or None."""
+    m = re.match(r'^ok enemy=(-?\d+) seen=(-?\d+) vp=(\S*)$', cmd(port, 'vpinfo'))
+    if not m:
+        return None
+    vp = {int(a): int(b) for a, b in (e.split(':') for e in m[3].split(',') if ':' in e)}
+    return dict(enemy=int(m[1]), seen=int(m[2]), vp=vp, raw=m.group(0)[3:])
+
+
+def battlevp(ctx, opp, vp_host, vp_opp, level='Minor'):
+    """Host `battlevp`: the game's own HandleBattleAftermath against `opp` through the mod's hook, as after a tactical
+    battle -> dict(ok, host=(a, b), enemy=(c, d), opp=(e, f), raw). The bridge runs it synchronously on the game's main
+    thread, so the host's dialogs are answered meanwhile."""
+    out = {}
+
+    def run():
+        try:
+            out['r'] = ctl.cmd(H, f'battlevp {opp} {vp_host} {vp_opp} {level}', 130)
+        except OSError as e:
+            out['r'] = f'error {e!r}'
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    while th.is_alive():
+        answer_dialogs(ctx.hp, 'host')
+        th.join(0.3)
+    r = out.get('r', '')
+    m = re.match(r'^ok host=(-?\d+)->(-?\d+) enemy=(-?\d+)->(-?\d+) opp=(-?\d+)->(-?\d+)$', r)
+    if not m:
+        log('  !! battlevp ->', r)
+        return dict(ok=False, host=(0, 0), enemy=(0, 0), opp=(0, 0), raw=r)
+    v = [int(x) for x in m.groups()]
+    return dict(ok=True, host=(v[0], v[1]), enemy=(v[2], v[3]), opp=(v[4], v[5]), raw=r[3:])
+
+
+def wars_of(n):
+    """The nations (0..8) at war with nation n on the host."""
+    return [j for j in range(9) if j != n and rel(n, j).get('war') == '1']
+
+
+def vp_shares(rest, enemies):
+    """ShareEnemyVP's split: `rest` evenly among the host's enemies in index order, the remainder +1 to the first."""
+    share, extra = divmod(rest, len(enemies)) if enemies else (0, 0)
+    return {j: share + (1 if i < extra else 0) for i, j in enumerate(enemies)}
+
+
+def vp_diff(a, b, nations):
+    """{nation: (before, after)} for the nations whose VP differ between two vpinfo results."""
+    return {n: (a['vp'].get(n), b['vp'].get(n)) for n in nations if a['vp'].get(n) != b['vp'].get(n)}
+
+
+def apply_vp(ctx, want_seen, timeout=15):
+    """applydiplo when the month-end step must share EnemyVP: done once `seen` (set first thing) reached want_seen."""
+    return apply_diplo(ctx, lambda: (vpinfo(H) or {}).get('seen') == want_seen, timeout)
+
+
+def client_accept_peace(ctx, nation):
+    """The client accepts the peace `nation` offered with its Diplomacy button: the nation's row selected in the list
+    (LVM_SETITEMSTATE), button 1084 reading "Accept peace", a posted BM_CLICK. Returns (button text, the host's
+    `diplomacy request 1 peace <nation> accepted` lines)."""
+    cp = ctx.cp
+    cmd(C, 'mpwindow')
+    time.sleep(0.5)
+    lvh, btn = mp_ctl(cp, 'list'), mp_ctl(cp, 'peace')
+    rows = lv_rows(cp, lvh)
+    idx = next((i for i, (prm, _, _) in enumerate(rows) if prm == nation), None)
+    if idx is not None:
+        lv_select(cp, lvh, idx)
+    bt = wait_until(lambda: text(btn), lambda s: s == 'Accept peace', 8)
+    mark = log_mark(H)
+    if bt == 'Accept peace':
+        u.PostMessageW(btn, 0x00F5, 0, 0)  # BM_CLICK
+    return bt, wait_log(H, mark, rf'diplomacy request 1 peace {nation} accepted', 8)
+
+
+def scenario_victory_points(ctx):
+    """0.2.6: victory points of joined players. The game credits whatever the host's enemies achieve in the host's
+    wars to EnemyVP only (a joined nation's own VP never moved). The host now gives a human enemy the points of its
+    battles at once (OnBattleVP), shares the rest of the month's EnemyVP among its enemies at month end
+    (ShareEnemyVP; `seen` = the part already given out), resets a human nation at peace to VP 0, keeps the VP of
+    human nations still at war through HandleAIPeace and keeps its own VP in the merge; the client shows the VP of
+    its own enemies as "Enemy VP". Driven with `battlevp` (the game's HandleBattleAftermath), `enemyvpadd` (EnemyVP
+    outside a battle, like a blockade) and `applydiplo`, so no month is processed while the host is at war; one month
+    is processed with only the war 1-2 (merge and the client's view)."""
+    hp = ctx.hp
+    ALL = range(9)
+
+    # a) startup
+    avail = {}
+    for port, who in ((H, 'host'), (C, 'client')):
+        ln = log_lines(log_since(port), r'Peace treaties: ')
+        avail[who] = bool(ln) and bool(re.search(r'Peace treaties: ok \(.*battleHooks=1/1/1\)', ln[0]))
+        check(f'a) {who} log at startup: "Peace treaties: ok (... battleHooks=1/1/1)" (the VP hooks)', avail[who],
+              [x.split('] ', 1)[-1] for x in ln[:1]] or 'no line')
+    if not all(avail.values()):  # every further step needs the hooks: don't keep the game open for nothing
+        check('victory points: the VP hooks are available on host and client (needed by every further check)', False,
+              f'{avail}: the remaining checks were not run')
+        return
+    cv = vpinfo(C)
+    shown = re.findall(VP_SHOWN_RE, log_since(C))
+    check('a) client log "victory points shown: own V, enemy E" for every loaded month; the latest = the client\'s '
+          'vpinfo (nation 1\'s VP, the shown Enemy VP)',
+          bool(shown) and cv is not None and shown[-1] == (str(cv['vp'].get(1)), str(cv['enemy'])),
+          f'{shown[-3:]} | {cv and cv["raw"]}')
+    r01, r12 = rel(0, 1), rel(1, 2)
+    v0 = vpinfo(H)
+    log(f'  start: host vpinfo {v0 and v0["raw"]} | client vpinfo {cv and cv["raw"]} | wars of 1: {wars_of(1)}, '
+        f'of 2: {wars_of(2)}')
+    check('start: the host at war with nobody, nations 1 and 2 at peace with each other',
+          r01['hostWars'] == '0' and r12['war'] == '0', f'0-1 {r01} | 1-2 {r12}')
+
+    # b) the host at war with nation 1; the game's end-of-battle routine of a host battle against it
+    mark = log_mark(H)
+    rh = cmd(H, 'diplo war 1')
+    acc = wait_log(H, mark, r'diplomacy request 0 war 1 accepted', 8)
+    apply_diplo(ctx, lambda: rel(0, 1).get('war') == '1')
+    r01, v1 = rel(0, 1), vpinfo(H)
+    check('b) host `diplo war 1` (accepted) + applydiplo: at war with 1 (rel 0 1 war=1, hostWars=1)',
+          rh == 'ok' and acc and r01['war'] == '1' and r01['hostWars'] == '1', f'{rh} {acc} {r01}')
+    log(f'  b) at war: host vpinfo {v1["raw"]}')
+    mark = log_mark(H)
+    bv = battlevp(ctx, 1, 1000, 3000, 'Minor')
+    v2, hl = vpinfo(H), log_since(H, mark)
+    gain = bv['enemy'][1] - bv['enemy'][0]
+    log(f'  b) battlevp 1 1000 3000 Minor -> {bv["raw"]} | host vpinfo {v2["raw"]}')
+    check('b) the host\'s side as before: its VP and EnemyVP rise (battlevp host a->b, enemy c->d; vpinfo agrees)',
+          bv['ok'] and bv['host'][1] > bv['host'][0] == v1['vp'][0] and gain > 0 and bv['enemy'][0] == v1['enemy']
+          and v2['vp'][0] == bv['host'][1] and v2['enemy'] == bv['enemy'][1], bv['raw'])
+    check(f'b) nation 1 (the joined enemy) VP +{gain} = the EnemyVP gain of the battle (0.2.5: unchanged)',
+          bv['ok'] and bv['opp'] == (v1['vp'][1], v1['vp'][1] + gain) and v2['vp'][1] == v1['vp'][1] + gain,
+          f'opp {bv["opp"]}, vpinfo nation 1 {v1["vp"][1]} -> {v2["vp"][1]}')
+    got = re.findall(VP_BATTLE_RE, hl)
+    check(f'b) host log "victory points: nation 1 +{gain} in its battle against the host -> {v2["vp"][1]}"',
+          got == [('1', str(gain), str(v2['vp'][1]))], got)
+    check('b) vpinfo seen == enemy (the battle\'s points count as given out)', v2['seen'] == v2['enemy'], v2['raw'])
+    check('b) nation 2 and the AI nations 3-8 keep their VP', not vp_diff(v1, v2, (2,) + VP_AI),
+          vp_diff(v1, v2, (2,) + VP_AI))
+
+    # c) EnemyVP outside a battle (like a blockade) is shared at month end: nation 1 is the host's only enemy
+    ra = cmd(H, 'enemyvpadd 101')
+    va, enemies = vpinfo(H), wars_of(0)
+    hl = apply_vp(ctx, va['enemy'])
+    vc = vpinfo(H)
+    rest = va['enemy'] - va['seen']
+    got = re.findall(VP_SHARE_RE, hl)
+    log(f'  c) enemyvpadd 101 -> {ra[3:]} | host enemies {enemies} | after applydiplo {vc["raw"]} | {got}')
+    check('c) enemyvpadd 101: EnemyVP +101, seen unchanged (the reply is vpinfo)',
+          ra.startswith('ok enemy=') and va['enemy'] == v2['enemy'] + 101 and va['seen'] == v2['seen'], ra)
+    check('c) applydiplo shares the month\'s rest 101 with the host\'s only enemy: nation 1 +101',
+          enemies == [1] and rest == 101 and vc['vp'][1] == va['vp'][1] + 101,
+          f'enemies {enemies}, rest {rest}, nation 1 {va["vp"][1]} -> {vc["vp"][1]}')
+    check(f'c) host log "victory points: nation 1 +101 of the host\'s enemies\' 101 this month -> {vc["vp"][1]}"',
+          got == [('1', '101', '101', str(vc['vp'][1]))], got)
+    check('c) seen == enemy; the share changes neither the host\'s VP nor its EnemyVP (the host\'s screen) nor '
+          'nations 2-8', vc['seen'] == vc['enemy'] == va['enemy'] and vc['vp'][0] == va['vp'][0] and
+          not vp_diff(va, vc, (2,) + VP_AI), f'{va["raw"]} -> {vc["raw"]}')
+    sf = session_file()
+    check(f'c) {SESSION_FILE} keeps enemyVPSeen={vc["seen"]}, stamped with diplomacyDate',
+          sf.get('enemyVPSeen') == str(vc['seen']) and bool(sf.get('diplomacyDate')),
+          {k: sf.get(k) for k in ('enemyVPSeen', 'diplomacyDate')})
+
+    # d) a second enemy: the host at war with 1 and 2, the month's rest split evenly in index order
+    mark = log_mark(H)
+    rh = cmd(H, 'diplo war 2')
+    acc = wait_log(H, mark, r'diplomacy request 0 war 2 accepted', 8)
+    apply_diplo(ctx, lambda: rel(0, 2).get('war') == '1')
+    r02, vd0 = rel(0, 2), vpinfo(H)
+    check('d) host `diplo war 2` + applydiplo: at war with 1 and 2 (hostWars=2); a second war resets nothing (VP, '
+          'EnemyVP, seen unchanged)', rh == 'ok' and acc and r02['war'] == '1' and r02['hostWars'] == '2' and
+          vd0['enemy'] == vc['enemy'] and vd0['seen'] == vc['seen'] and not vp_diff(vc, vd0, ALL),
+          f'{rh} {acc} {r02} | {vc["raw"]} -> {vd0["raw"]}')
+    ra = cmd(H, 'enemyvpadd 101')
+    va, enemies = vpinfo(H), wars_of(0)
+    hl = apply_vp(ctx, va['enemy'])
+    vd = vpinfo(H)
+    rest = va['enemy'] - va['seen']
+    want = vp_shares(rest, enemies)
+    got = re.findall(VP_SHARE_RE, hl)
+    want_lines = sorted((str(j), str(want[j]), str(rest), str(vd['vp'][j])) for j in enemies
+                        if j in VP_PLAYERS and want[j] > 0)
+    log(f'  d) enemyvpadd 101 -> {ra[3:]} | host enemies {enemies} | after applydiplo {vd["raw"]} | {got}')
+    check('d) enemyvpadd 101 + applydiplo: shared evenly among the host\'s enemies [1, 2] in index order: nation 1 '
+          '+51, nation 2 +50', enemies == [1, 2] and rest == 101 and vd['vp'][1] == va['vp'][1] + 51 and
+          vd['vp'][2] == va['vp'][2] + 50, f'enemies {enemies}, rest {rest}, {va["raw"]} -> {vd["raw"]}')
+    check(f'd) host log "victory points: nation K +x of the host\'s enemies\' {rest} this month -> V" for 1 and 2',
+          sorted(got) == want_lines and len(got) == 2, f'{got} (want {want_lines})')
+    check('d) seen == enemy; the host\'s VP, its EnemyVP and the AI nations unchanged by the share',
+          vd['seen'] == vd['enemy'] == va['enemy'] and vd['vp'][0] == va['vp'][0] and not vp_diff(va, vd, VP_AI),
+          f'{va["raw"]} -> {vd["raw"]}')
+
+    # e) a drop: the game reset EnemyVP (DoPeace / WarStartsWithNation set it to 0) and it is below `seen` at month end
+    E = vd['enemy']
+    r1, r2 = cmd(H, f'enemyvpadd {-E}'), cmd(H, 'enemyvpadd 101')
+    ve0 = vpinfo(H)
+    hl = apply_vp(ctx, ve0['enemy'])
+    ve = vpinfo(H)
+    got = re.findall(VP_SHARE_RE, hl)
+    check(f'e) a drop: EnemyVP {E} -> 0 (as the game resets it) -> 101, below seen {vd["seen"]}: applydiplo shares '
+          f'nothing (no share line, every VP unchanged) and seen = enemy = 101',
+          E > 101 and r1.startswith('ok') and r2.startswith('ok') and ve0['enemy'] == 101 and
+          ve0['seen'] == vd['seen'] and not got and not vp_diff(ve0, ve, ALL) and ve['seen'] == ve['enemy'] == 101,
+          f'{ve0["raw"]} -> {ve["raw"]}; {got}')
+
+    # f) peace with 1 (the host stays at war with 2), the client accepts with its button; equal war score: compromise
+    warvp(0, 1, 300, 300)
+    rh = cmd(H, 'diplo peace 1')
+    bt, acc = client_accept_peace(ctx, 0)
+    r = wait_until(lambda: row(H, 1), lambda r: r and 'peace agreed' in r['pending'], 5)
+    check('f) host offers peace to 1; the client accepts with its "Accept peace" button (1084): host row 1 "peace '
+          'agreed"', rh == 'ok' and bt == 'Accept peace' and bool(acc) and r and 'peace agreed' in r['pending'],
+          f'{rh}; button "{bt}"; {acc}; {r}')
+    vf0 = vpinfo(H)
+    hl = apply_diplo(ctx, lambda: rel(0, 1).get('war') == '0')
+    vf, r01, w1 = vpinfo(H), rel(0, 1), wars_of(1)
+    got = re.findall(VP_PEACE_RE, hl)
+    log(f'  f) peace 0-1: {vf0["raw"]} -> {vf["raw"]} | {got}')
+    check('f) applydiplo: peace 0-1, the host still at war with 2 (hostWars=1): no DoPeace, the host\'s VP and '
+          'EnemyVP unchanged', r01['war'] == '0' and r01['hostWars'] == '1' and vf['vp'][0] == vf0['vp'][0] and
+          vf['enemy'] == vf0['enemy'], f'{r01} | {vf0["raw"]} -> {vf["raw"]}')
+    check(f'f) nation 1 at war with nobody: host log "victory points: nation 1 is at peace; {vf0["vp"][1]} -> 0", VP '
+          f'0; nation 2 (still at war) keeps {vf0["vp"][2]}',
+          not w1 and vf0['vp'][1] != 0 and got == [('1', str(vf0['vp'][1]))] and vf['vp'][1] == 0 and
+          vf['vp'][2] == vf0['vp'][2], f'wars of 1 {w1}; {got}; {vf0["raw"]} -> {vf["raw"]}')
+
+    # peace with 2 ends the host's last war (DoPeace); in the same month-end step the host declares war on 1 again
+    warvp(0, 2, 300, 300)
+    rh, ra, rw = cmd(H, 'diplo peace 2'), cmd(H, 'diploas 2 peace 0'), cmd(H, 'diplo war 1')
+    vg0 = vpinfo(H)
+    hl = apply_diplo(ctx, lambda: rel(0, 2).get('war') == '0' and rel(0, 1).get('war') == '1', 25)
+    vg, r02, r01, w2 = vpinfo(H), rel(0, 2), rel(0, 1), wars_of(2)
+    got = re.findall(VP_PEACE_RE, hl)
+    log(f'  f) peace 0-2 + war 0-1 in one step: {vg0["raw"]} -> {vg["raw"]} | {got}')
+    check('f) host offers peace to 2, the stand-in accepts (diploas 2 peace 0) + applydiplo: the host\'s last war '
+          'ends, DoPeace resets the host\'s VP and EnemyVP to 0',
+          rh == ra == 'ok' and r02['war'] == '0' and vg0['vp'][0] != 0 and vg['vp'][0] == 0 and vg['enemy'] == 0,
+          f'{rh} {ra} {r02} | {vg0["raw"]} -> {vg["raw"]}')
+    check(f'f) nation 2 at war with nobody: host log "victory points: nation 2 is at peace; {vg0["vp"][2]} -> 0", VP 0',
+          not w2 and vg0['vp'][2] != 0 and got == [('2', str(vg0['vp'][2]))] and vg['vp'][2] == 0,
+          f'wars of 2 {w2}; {got}; {vg["raw"]}')
+    check('f) the host\'s new war on 1 started in the same step (rel 0 1 war=1, hostWars=1)',
+          rw == 'ok' and r01['war'] == '1' and r01['hostWars'] == '1', f'{rw} {r01}')
+    # The step reset EnemyVP after its own ShareEnemyVP (DoPeace; the new war): `seen` is re-synced by the DoPeace hook
+    # and at the end of the step, so the new war's points are shared from 0 (0.2.6 first build: seen stayed at the old
+    # score and the new war's first month shared nothing).
+    shared = re.findall(VP_SHARE_RE, hl)
+    check(f'f) re-sync: after that step seen == enemy == 0 (was seen {vg0["seen"]}), and no share line in it (the DoPeace '
+          f'hook\'s ShareEnemyVP credits nothing twice)', vg['seen'] == vg['enemy'] == 0 and not shared,
+          f'{vg0["raw"]} -> {vg["raw"]}; {shared}')
+    ra = cmd(H, 'enemyvpadd 101')
+    vh0 = vpinfo(H)
+    hl = apply_vp(ctx, vh0['enemy'])
+    vh = vpinfo(H)
+    got = re.findall(VP_SHARE_RE, hl)
+    log(f'  f) re-sync: enemyvpadd 101 -> {ra[3:]} | after applydiplo {vh["raw"]} | {got}')
+    check(f'f) re-sync: enemyvpadd 101 + applydiplo in the new war: nation 1 (the host\'s only enemy) {vh0["vp"][1]} -> '
+          f'{vh0["vp"][1] + 101}, "victory points: nation 1 +101 of the host\'s enemies\' 101 this month -> '
+          f'{vh0["vp"][1] + 101}", seen == enemy == 101',
+          ra.startswith('ok') and wars_of(0) == [1] and vh['vp'][1] == vh0['vp'][1] + 101 and
+          got == [('1', '101', '101', str(vh['vp'][1]))] and vh['seen'] == vh['enemy'] == 101,
+          f'{vh0["raw"]} -> {vh["raw"]}; {got}')
+
+    # g) the players' war 1-2, and the host at war with both: the host's battles against 1 and 2 credit them; then the
+    # host makes peace with both (the game's DoPeace) while 1 and 2 stay at war with each other, and one month is
+    # processed (merge, the client's view). Battles only inside a host war that DoPeace ends: a battlevp at peace
+    # leaves the host's VP and EnemyVP non-zero, and the game's DoPeace of a later war then skips its "war ending
+    # without any major battle" prestige dent (treaty i failed with host Prestige +2 instead of +1).
+    rc = client_request('diplo war 2', 'war', 2)
+    mark = log_mark(H)
+    rh = cmd(H, 'diplo war 2')
+    acc = wait_log(H, mark, r'diplomacy request 0 war 2 accepted', 8)
+    apply_diplo(ctx, lambda: rel(1, 2).get('war') == '1' and rel(0, 2).get('war') == '1')
+    r12, r02, vj = rel(1, 2), rel(0, 2), vpinfo(H)
+    check('g) client `diplo war 2` + host `diplo war 2` + applydiplo: 1-2 at war, the host at war with 1 and 2 '
+          '(hostWars=2)', rc == 'ok' and rh == 'ok' and bool(acc) and r12['war'] == '1' and r02['war'] == '1' and
+          r02['hostWars'] == '2', f'{rc} {rh} {acc}; 1-2 {r12}; 0-2 {r02}')
+    for opp, a, b in ((1, 500, 2000), (2, 300, 1000)):
+        mark = log_mark(H)
+        bv = battlevp(ctx, opp, a, b, 'Minor')
+        vn, hl = vpinfo(H), log_since(H, mark)
+        gain, other = bv['enemy'][1] - bv['enemy'][0], 3 - opp
+        got = re.findall(VP_BATTLE_RE, hl)
+        log(f'  g) battlevp {opp} {a} {b} Minor -> {bv["raw"]} | host vpinfo {vn["raw"]}')
+        check(f'g) battlevp {opp} {a} {b} Minor: nation {opp} +{gain} = the EnemyVP gain (log line), nation {other} '
+              f'unchanged, seen == enemy', bv['ok'] and gain > 0 and vn['vp'][opp] == vj['vp'][opp] + gain and
+              vn['vp'][other] == vj['vp'][other] and got == [(str(opp), str(gain), str(vn['vp'][opp]))] and
+              vn['seen'] == vn['enemy'], f'{bv["raw"]} | {got} | {vj["raw"]} -> {vn["raw"]}')
+        vj = vn
+    warvp(0, 1, 300, 300)
+    warvp(0, 2, 300, 300)
+    rh = cmd(H, 'diplo peace 1')
+    bt, acc = client_accept_peace(ctx, 0)
+    wait_until(lambda: row(H, 1), lambda r: r and 'peace agreed' in r['pending'], 5)
+    rh2, ra2 = cmd(H, 'diplo peace 2'), cmd(H, 'diploas 2 peace 0')
+    hl = apply_diplo(ctx, lambda: rel(0, 1).get('war') == '0' and rel(0, 2).get('war') == '0', 25)
+    vi, r01, r12 = vpinfo(H), rel(0, 1), rel(1, 2)
+    got = re.findall(VP_PEACE_RE, hl)
+    log(f'  g) peace 0-1 and 0-2: {vj["raw"]} -> {vi["raw"]} | {got}')
+    check('g) host peace with 1 (the client\'s "Accept peace" button) and with 2 + applydiplo: the host\'s last war '
+          'ends (hostWars=0), DoPeace resets the host\'s VP and EnemyVP to 0',
+          rh == rh2 == ra2 == 'ok' and bt == 'Accept peace' and bool(acc) and r01['war'] == '0' and
+          r01['hostWars'] == '0' and vj['vp'][0] != 0 and vi['vp'][0] == 0 and vi['enemy'] == 0,
+          f'{rh} {rh2} {ra2}; button "{bt}"; {acc}; {r01}; {vj["raw"]} -> {vi["raw"]}')
+    check(f'g) nations 1 and 2, still at war with each other, keep their VP {vj["vp"][1]}/{vj["vp"][2]} through the '
+          f'host\'s DoPeace (no "is at peace" line)', r12['war'] == '1' and vi['vp'][1] == vj['vp'][1] and
+          vi['vp'][2] == vj['vp'][2] and not got, f'1-2 {r12}; {got}; {vj["raw"]} -> {vi["raw"]}')
+    shared = re.findall(VP_SHARE_RE, hl)
+    check(f'g) re-sync after the host\'s DoPeace: seen == enemy == 0 (was {vj["seen"]}), no share line (nothing new to '
+          f'share before DoPeace, nothing credited twice)', vi['seen'] == vi['enemy'] == 0 and not shared,
+          f'{vj["raw"]} -> {vi["raw"]}; {shared}')
+    if r01['war'] != '0' or r01['hostWars'] != '0':
+        check('g) the month can be processed (the host at war with nobody)', False, r01)
+        return
+    cmd(H, 'enemyvpadd 77')  # a marker: the host's own "Enemy VP", unlike what the client shows (reset at the end)
+    vj = vpinfo(H)
+    credited, cpre = vj['vp'][1], vpinfo(C)
+    hm, cm = log_mark(H), log_mark(C)
+    run_month(ctx, 'victory_points')
+    hl, cl = log_since(H, hm), log_since(C, cm)
+    vk, w1 = vpinfo(H), wars_of(1)
+    ws = [m for m in re.findall(WAR_SCORE_RE, hl) if {m[0], m[1]} == {'1', '2'}]
+    g1 = sum(int(m[2]) if m[0] == '1' else int(m[3]) for m in ws)
+    g2 = sum(int(m[3]) if m[0] == '1' else int(m[2]) for m in ws)
+    log(f'  g) month: host {vj["raw"]} -> {vk["raw"]} | client before {cpre and cpre["raw"]} | wars of 1 {w1} | war '
+        f'score 1-2 lines {ws} | AI peace lines {re.findall(VP_AIPEACE_RE, hl)} | share/peace lines '
+        f'{re.findall(VP_SHARE_RE, hl)} {re.findall(VP_PEACE_RE, hl)} | merge {log_lines(hl, r"merge nation 1")[:1]}')
+    check(f'g) host after the month: nation 1 VP = the credited {credited} + its 1-2 battle points {g1} (the merge kept '
+          f'the host\'s VP; the player\'s copy had {cpre and cpre["vp"].get(1)}); nation 2 = {vj["vp"][2]} + {g2}',
+          w1 == [2] and vk['vp'][1] == credited + g1 and vk['vp'][2] == vj['vp'][2] + g2 and
+          bool(log_lines(hl, r'merge nation 1')), f'wars of 1 {w1}; {vj["raw"]} -> {vk["raw"]}; war score {ws}')
+    cv = vpinfo(C)
+    want_e = sum(max(0, vk['vp'][j]) for j in w1)
+    shown = re.findall(VP_SHOWN_RE, cl)
+    check(f'g) client vpinfo after the month: every nation\'s VP as on the host (nation 1: {vk["vp"][1]}), "Enemy VP" '
+          f'= the VP of the nations at war with 1 {w1} = {want_e} (not the host\'s EnemyVP {vk["enemy"]})',
+          cv is not None and cv['vp'] == vk['vp'] and cv['enemy'] == want_e and want_e > 0 and
+          want_e != vk['enemy'], f'client {cv and cv["raw"]} | host {vk["raw"]}')
+    check(f'g) client log "victory points shown: own {vk["vp"][1]}, enemy {want_e}" once for the new month',
+          shown == [(str(vk['vp'][1]), str(want_e))], shown)
+    check(f'i) the host\'s EnemyVP is its own: unchanged by the month and the merge ({vj["enemy"]}; the client showed '
+          f'{cpre and cpre["enemy"]} and never sends [General])', vk['enemy'] == vj['enemy'],
+          f'{vj["enemy"]} -> {vk["enemy"]}')
+
+    # h) a real AI peace (HandleAIPeace sets VP 0 for nations 1-8) while the players' nations are at war with VP
+    vh0 = vpinfo(H)
+    keep = {n: vh0['vp'][n] for n in VP_PLAYERS if vh0['vp'][n] != 0 and wars_of(n)}
+    cmd(H, 'settension 2 3 50')  # nation 2 also fights the AI nation 3
+    r23 = rel(2, 3)
+    hm = log_mark(H)
+    cmd(H, 'aipeace 2 0')
+    drain(hp, 6)
+    r23b, r12, vh1 = rel(2, 3), rel(1, 2), vpinfo(H)
+    got = re.findall(VP_AIPEACE_RE, log_since(H, hm))
+    log(f'  h) aipeace 2 0: 2-3 {r23} -> {r23b}, 1-2 {r12} | {vh0["raw"]} -> {vh1["raw"]} | {got}')
+    if r23['war'] == '1' and r23b['war'] == '0' and keep:
+        want = sorted((str(n), str(p), '0') for n, p in keep.items())
+        check(f'h) a real AI peace (aipeace 2 0 ends the AI war 2-3; the players\' war 1-2 goes on): host log "AI '
+              f'peace: VP of player nation K kept at P (the game set 0)" for {sorted(keep)}',
+              r12['war'] == '1' and sorted(got) == want, f'{got} (want {want}); 1-2 {r12}')
+        check(f'h) the players\' nations at war keep their VP {keep}; the AI nations get the game\'s 0',
+              all(vh1['vp'][n] == p for n, p in keep.items()) and all(vh1['vp'][n] == 0 for n in VP_AI),
+              f'{vh0["raw"]} -> {vh1["raw"]}')
+    else:
+        log(f'  SKIP h) no AI peace with a player nation at war with VP != 0 (2-3 {r23} -> {r23b}, keep {keep})')
+
+    # end: peace 1-2 (compromise), so the next scenario starts from peace
+    warvp(1, 2, 300, 300)
+    rc = client_request('diplo peace 2', 'peace', 2)
+    ra = cmd(H, 'diploas 2 peace 1')
+    vz0 = vpinfo(H)
+    hl = apply_diplo(ctx, lambda: rel(1, 2).get('war') == '0')
+    vz, r01 = vpinfo(H), rel(0, 1)
+    got = sorted(re.findall(VP_PEACE_RE, hl))
+    at_peace = [n for n in VP_PLAYERS if not wars_of(n)]
+    want = sorted((str(n), str(vz0['vp'][n])) for n in at_peace if vz0['vp'][n])
+    log(f'  end: peace 1-2: {vz0["raw"]} -> {vz["raw"]} | {got}')
+    check('end: peace 1-2 (client offers, nation 2 accepts, compromise) + applydiplo: 1 and 2 at war with nobody, VP 0, '
+          'a "nation K is at peace; V -> 0" line for each that had VP; the host at war with nobody',
+          rc == 'ok' and ra == 'ok' and at_peace == list(VP_PLAYERS) and all(vz['vp'][n] == 0 for n in VP_PLAYERS)
+          and got == want and r01['hostWars'] == '0', f'{rc} {ra}; at peace {at_peace}; {got} (want {want}); {r01}')
+    rz = cmd(H, f'enemyvpadd {-vz["enemy"]}') if vz['enemy'] else 'ok'
+    vz = vpinfo(H)
+    check('end: the host\'s VP and EnemyVP back at 0 (marker removed), as after the game\'s DoPeace, so later scenarios '
+          'meet a host without battles', rz.startswith('ok') and vz['vp'][0] == 0 and vz['enemy'] == 0, vz['raw'])
+
+
 SCENARIOS = [  # name, months processed, what it guards, function
     ('session', 0, 'host/join/claim/start; the client plans nation 1 in slot 77; nation 2 reserved as the stand-in '
                    'player "Bot"; client Multiplayer window open', scenario_session),
@@ -2579,6 +2977,12 @@ SCENARIOS = [  # name, months processed, what it guards, function
      scenario_design_study),
     ('diplomacy', 2, 'offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from '
                      'player wars, Diplomacy buttons via posted clicks', scenario_diplomacy),
+    ('victory_points', 1, 'joined players\' victory points (0.2.6): a host battle against a joined nation credits '
+                          'it (battlevp = the game\'s HandleBattleAftermath), EnemyVP outside battles (enemyvpadd) is '
+                          'shared among the host\'s enemies at month end (1 enemy, 2 enemies 51/50, a drop shares '
+                          'nothing), peace -> VP 0 (buttons, DoPeace), the merge keeps the host\'s VP and the client '
+                          'shows its own enemies\' VP (one month with the war 1-2 only), AI peace keeps the VP of '
+                          'player nations at war', scenario_victory_points),
     ('treaty', 1, 'peace terms of wars between players (0.2.5): war score (warvp) -> major/minor/compromise terms frozen '
                   'at acceptance, claims validated (client and host), the "Claim land..." window (real button, '
                   'list view, posted clicks), calling the peace off erases the terms, the processed month applies the '
@@ -2740,7 +3144,7 @@ def summary(names, open_s, ctx, saves_ok, left, ev_left=()):
     for name in names:
         rs = [r for r in results if r[0] == name]
         n_ok = sum(1 for r in rs if r[2])
-        print(f'  {name:<14} {n_ok:>3}/{len(rs):<3} {"PASS" if rs and n_ok == len(rs) else "FAIL"}')
+        print(f'  {name:<16} {n_ok:>3}/{len(rs):<3} {"PASS" if rs and n_ok == len(rs) else "FAIL"}')
     failed = [r for r in results if not r[2]]
     for sc, name, _, detail in failed:
         print(f'  FAIL [{sc}] {name}: {detail}')
@@ -2767,9 +3171,9 @@ def main(argv=None):
     ap.add_argument('--only', help='comma-separated scenarios to run (session is always included)')
     a = ap.parse_args(argv)
     if a.list:
-        print(f'{"scenario":<14}{"months":<8}what it guards')
+        print(f'{"scenario":<16}{"months":<8}what it guards')
         for name, months, what, _ in SCENARIOS:
-            print(f'{name:<14}{months:<8}{what}')
+            print(f'{name:<16}{months:<8}{what}')
         print(f'default: all, in this order ({sum(s[1] for s in SCENARIOS)} months processed)')
         return 0
     names = [s[0] for s in SCENARIOS]

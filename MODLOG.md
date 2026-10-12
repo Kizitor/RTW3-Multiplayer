@@ -381,3 +381,73 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   safe, so the scenario uses `applydiplo` treaties after its last month.
 - Gotcha: the game's treaty dialog is `TdlgTotalLog` captioned "Peace treaty" (RichEdit + OK); `DoPeace` takes 1
   host Prestige when a war ends without a major battle ("Navy prestige takes a dent", a TMessageForm).
+## Fix 2026-10-12: joined players' victory points never rose against the host (v0.2.6)
+- Report (0.2.0): "VP for non host player does not increase when fighting the host".
+- Game model (1.01.44): the strategic screen shows `stVP` = PlayerNation.VP (TBuilderNation +0x175, `[NationK] VP=`)
+  and `stEVP` = TfrmBuildCamp.EnemyVP (+0x4a63, `[General] EnemyVP=`) (`UpdateVPNumbers`). In the host's wars,
+  everything the enemy achieves goes to EnemyVP only: `HandleBattleAftermath` (+GetLogAdjustedVP(VP0) to
+  PlayerNation.VP, +GetLogAdjustedVP(VP1) to EnemyVP), QuickResolveRaiderBattle, DoHomeAreaBattle,
+  CheckForcesInArea, DoBlockadeEffects, CheckBlockadeStatus, CheckResultOfSinkings, CheckForceOnForeignStations,
+  ResolveArmyOffensive, DoPlayerDecline. The enemy nation's own VP is never written. DoPeace (and
+  WarStartsWithNation when the war counter 0xf52ff4 is not positive) reset PlayerNation.VP and EnemyVP to 0;
+  HandleAIPeace sets VP = 0 for nations
+  1..8 after any AI peace. On a joined player's PC PlayerNation is its own nation K, so its "VP" never moved in a
+  war with the host, and its "Enemy VP" showed the host's enemies' score (its own points).
+- Fix (host): battles are credited as they happen (OnBattleVP, from the existing VP hooks: the enemy side's
+  EnemyVP gain of a host battle goes to the enemy nation's VP when it is human); the rest of the month's EnemyVP
+  (`EnemyVP - enemyVPSeen`) is shared evenly among the host's enemies at month end, only human ones credited (AI
+  nations keep the game's model). A human nation at peace gets VP 0 (as the game does for the player). Human
+  nations still at war keep their VP through HandleAIPeace. `[NationK] VP` is host-owned in the merge. The DoPeace
+  hook shares the pending points before the game's own end of the host's last war and restarts the count after
+  it; the month-end step re-syncs the count after the peace and war it makes (found by the regression run: a
+  peace and a new war in the same step left the count at the old score, so the next non-battle points were lost).
+- Fix (client): after loading a month, EnemyVP = the VP of the nations at war with the player's nation (the
+  host's VP included), then `UpdateVPNumbers`. `[General]` is never merged back, so this only changes the view.
+- Bridge: `vpinfo`, `battlevp <opp> <vpHost> <vpOpp> [level]` (the real HandleBattleAftermath through the hook),
+  `enemyvpadd <n>`.
+## Testing 2026-10-12: victory points of joined players (v0.2.6)
+- Validation of the report against 0.2.5 (0.2.5 code + the test-only `vpinfo`/`battlevp`; log `RTW3MP 0.2.5 starting`,
+  `Peace treaties: ok (... battleHooks=1/1/1)`): session as in `session`, host `diplo war 1` (`diplomacy request 0
+  war 1 accepted`) + `applydiplo` (war=1, hostWars=1), then `battlevp 1 1000 3000 Minor` -> `ok host=0->129
+  enemy=0->291 opp=0->0`; host `vpinfo` `enemy=291 seen=-1 vp=0:129,1:0,...`, client `vpinfo` `vp=0:0,1:0,...`.
+  Bug confirmed: the host's EnemyVP took the 291 and nation 1's own VP stayed 0. Game open 21 s, slot 1 restored.
+- Scenario `victory_points` (after `diplomacy`, before `treaty`, one own month; see the catalog in the regression
+  agent): `battlevp` battles of the host against 1 and 2, `enemyvpadd` + `applydiplo` sharing (one enemy, two
+  enemies, a drop), peace through the client's "Accept peace" button and `diploas` (separate peace, DoPeace), one
+  processed month with only the war 1-2 (merge keeps the host's VP, the client's "Enemy VP" = its enemies' VP), a
+  real AI peace (`aipeace 2 0` after `settension 2 3 50`) with both player nations at war. 42 checks + 8 month checks.
+- Results, first 0.2.6 build: `--only victory_points,treaty` 127/127 (victory_points 47) in 107 s; full suite 309/309
+  in 266 s. Final 0.2.6 build (the `seen` re-sync below): `--only victory_points,treaty` 130/130 (session 7,
+  victory_points 50, treaty 73) in 110 s; full suite 312/312 (session 7, intel_reports 10, file_lock 7, events 32,
+  merge 17, doctrine 17, design_study 31, diplomacy 68, victory_points 50, treaty 73), 7 processed months (13-17 s
+  each), game open 263 s.
+- Observed (full run, Germany 1, France 2): battle 1000/3000 -> host VP 0 -> 129, EnemyVP 0 -> 291, Germany 0 -> 291
+  (`victory points: nation 1 +291 in its battle against the host -> 291`); `enemyvpadd 101` -> Germany 392; with
+  France at war too: +51/+50 -> 443/50; drop 493 -> 0 -> 101: nothing shared; separate peace 0-1: Germany 443 -> 0,
+  France keeps 50; peace 0-2 (DoPeace) + a new war 0-1 in one step: host VP 129 -> 0, EnemyVP 101 -> 0, France
+  50 -> 0; host at war with both + 1-2 at war: battles 500/2000 and 300/1000 -> Germany 214, France 129 (host
+  0 -> 80 -> 138); host peace with both: DoPeace resets the host only, Germany 214 and France 129 kept; the month:
+  Germany still 214 after the merge (the client's copy had 0), client `victory points shown: own 214, enemy 129`
+  while the host's EnemyVP was 77; `aipeace 2 0`: `AI peace: VP of player nation 1 kept at 214 (the game set 0)`
+  and nation 2 at 129; peace 1-2: both -> 0. An `--only` run had a 1-2 battle in the month (`war score 1-2:
+  +2/+12`): Germany 214 -> 216, France 129 -> 141, client `own 216, enemy 141` against the host's EnemyVP 343. With
+  the final build Germany also gets the re-sync step's 101, so it enters g) with 101: battles -> 315, client `own
+  315, enemy 129`, `AI peace: VP of player nation 1 kept at 315 (the game set 0)`.
+- Finding, fixed in the same version: `seen` was taken at the start of the month-end step (ShareEnemyVP), but the
+  step can reset EnemyVP after that (MakePeace -> DoPeace when the host's last war ends; StartWar). When one step
+  ended the host's last war and started a new one, `seen` stayed at the old score (101) while EnemyVP was 0, so the
+  new war shared nothing until EnemyVP passed the old `seen`: `enemyvpadd 101` + `applydiplo` with Germany the host's
+  only enemy gave Germany +0 of 101 (battles were not affected). Fix: `seen = EnemyVP()` at the end of ApplyDiplomacy,
+  and the DoPeace hook (`OnHostPeace`) shares before the game's DoPeace and re-syncs after it. Now asserted: after
+  that step seen == enemy == 0 (was 101) with no share line, then `enemyvpadd 101` + `applydiplo` gives Germany
+  0 -> 101 (`victory points: nation 1 +101 of the host's enemies' 101 this month -> 101`, seen == enemy == 101); after
+  the host's DoPeace in g) seen == enemy == 0 (was 444), no share line. The share before a DoPeace that the game makes
+  itself during a month can't be reached with `applydiplo` (ApplyDiplomacy shares first). It stays untested; the
+  checks only show that nothing is credited twice.
+- The first full run failed `treaty` i) (host Prestige 18 -> 20 instead of +1): the scenario's first version ran
+  `battlevp` with the host at peace, leaving host VP 138 / EnemyVP 343. The next host war's start kept the host's VP
+  at 138 (WarStartsWithNation resets VP/EnemyVP only while the war counter is not positive, see the fix entry). The
+  game's DoPeace then skipped its "without any major battle" dent. The scenario now fights its battles inside a host
+  war that DoPeace ends and resets its EnemyVP marker. This was test interference, not a mod bug.
+- Gotcha: `battlevp` is synchronous on the host's main thread: run it from a thread and answer dialogs meanwhile.
+  GetLogAdjustedVP does not depend on the current score (2000 -> 214 from EnemyVP 0 and from 101).
