@@ -1758,13 +1758,13 @@ def new_chat_missing(before, after, lines, pattern=None):
     return miss
 
 
-def nation_table():
-    """{index: dict(name, funds, ships)} from the host's `nations`."""
+def nation_table(port=H):
+    """{index: dict(name, funds, ships)} from a copy's `nations` (the host's by default)."""
     out = {}
-    for p in items(cmd(H, 'nations')):
+    for p in items(cmd(port, 'nations')):
         f = p.split(':')
         if len(f) >= 4 and f[0].isdigit():
-            out[int(f[0])] = dict(name=f[1], funds=int(f[2].split('=')[1]), ships=int(f[3].split('=')[1]))
+            out[int(f[0])] = dict(name=':'.join(f[1:-2]), funds=int(f[-2].split('=')[1]), ships=int(f[-1].split('=')[1]))
     return out
 
 
@@ -2947,6 +2947,682 @@ def scenario_victory_points(ctx):
           'meet a host without battles', rz.startswith('ok') and vz['vp'][0] == 0 and vz['enemy'] == 0, vz['raw'])
 
 
+# ---------------------------------------------------------------- a joined player's "Copy game" (0.2.7)
+
+COPY_SLOTS = (78, 79, 80)  # player_copy's bridge copies: the run refuses to start if one exists; deleted after the run
+BUTTON_SLOTS = range(9, 2, -1)  # the game's Copy game dialog takes slots 1-9 only (81 became 9): the highest free one
+_button_slot = [None]  # the slot the real button copies to, chosen free before the run (deleted after it)
+PLAYER_COPY_RE = (r'player copy in slot (\d+): (.+) is the player nation, (.+) is nation (\d+) \(AI\); (\d+) sections, '
+                  r'(\d+) commanders, (\d+) map fields, divisions (\d+) kept / (\d+) dropped, (at war|at peace)')
+REL_KEY = re.compile(r'Tension|Allied|TechSharing|AITension\d+|AIAlliance\d+')
+NUM_KEY = re.compile(r'Ship\d+BuildingNationIdx|.*A[UT]\d+Nation')
+BATTLE_FILES = ('Autosave.sac', 'Autosave.off', 'BattleInfo.bbi')  # the copy must not keep the host's battle
+_u32t = ctypes.WinDLL('user32')  # WM_SETTEXT with a string argument (Windows marshals it across processes)
+_u32t.SendMessageW.restype = ctypes.c_ssize_t
+_u32t.SendMessageW.argtypes = [wt.HWND, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+
+
+def slot_dir(slot):
+    return os.path.join(SAVE, f'Game{slot}')
+
+
+def read_save(path):
+    """A save file (.bcs, MapData .dat, .off) as {section: {key: value}} ('' = lines before the first section; the first
+    of a repeated key wins), or None."""
+    try:
+        with open(path, 'rb') as f:
+            t = f.read().decode('utf-8-sig', errors='replace')
+    except OSError:
+        return None
+    out, cur = {'': {}}, ''
+    for ln in t.splitlines():
+        if ln.startswith('[') and ln.endswith(']'):
+            cur = ln[1:-1]
+            out.setdefault(cur, {})
+        elif '=' in ln:
+            k, v = ln.split('=', 1)
+            out[cur].setdefault(k, v)
+    return out
+
+
+def save_files(slot):
+    """{file name: sha256} of a save slot folder ({} if there is none)."""
+    return tree_digest(slot_dir(slot)) if os.path.isdir(slot_dir(slot)) else {}
+
+
+def save_date(slot):
+    """(Year, Month) of a slot's .bcs, or None while it can't be read."""
+    g = (read_save(save_path(slot)) or {}).get('General')
+    return (g.get('Year'), g.get('Month')) if g else None
+
+
+def slot_snapshot(slot, d=None):
+    d = d or slot_dir(slot)
+    return dict(slot=slot, files=tree_digest(d) if os.path.isdir(d) else {},
+                bcs=read_save(os.path.join(d, f'RTWGame{slot}.bcs')), map=read_save(os.path.join(d, f'MapData{slot}.dat')),
+                off=read_save(os.path.join(d, f'RTWGame{slot}.off')))
+
+
+def ship_ids(sec):
+    return [v for k, v in (sec or {}).items() if re.fullmatch(r'Ship\d+Id', k)]
+
+
+def nation_sections(doc, n):
+    """[Nation<n>], [Nation<n>Ships], [Nation<n>Losses], ... (not [Nation<n><digit>...])."""
+    p = f'Nation{n}'
+    return [s for s in doc if s.startswith(p) and not (len(s) > len(p) and s[len(p)].isdigit())]
+
+
+def swap_idx(v, k):
+    return k if v == 0 else 0 if v == k else v
+
+
+def is_int(v):
+    return bool(re.fullmatch(r'-?\d+', v or ''))
+
+
+def expected_copy(src, K, eut=None):
+    """What the .bcs of a joined player's copy must hold (0.2.7 specification), from the source save `src`: every
+    [Nation0*] section trades contents with [NationK*]; relations from K's point of view (the others' Tension/Allied
+    = their relation with K, their AITension<K>/AIAlliance<K> = their relation with the old host, TechSharing 0, the
+    new nation 0 keeps the player slot's own values); nation numbers 0 <-> K; the host's old ships without commanders;
+    [General] war state for K; [EUT] = the player's cooldowns `eut` (None: unchanged). Returns (document, facts)."""
+    def gi(doc, sec, key):
+        v = doc.get(sec, {}).get(key, '0')
+        return int(v) if is_int(v) else 0
+
+    exp = {s: dict(kv) for s, kv in src.items()}
+    pairs = 0
+    for s in nation_sections(src, 0):
+        o = f'Nation{K}' + s[7:]
+        if o in src:
+            exp[s], exp[o] = dict(src[o]), dict(src[s])
+            pairs += 1
+
+    def put(sec, key, val):
+        if key in exp.get(sec, {}):
+            exp[sec][key] = str(val)
+
+    for key in list(exp['Nation0']):
+        if REL_KEY.fullmatch(key) and key in src['Nation0']:
+            exp['Nation0'][key] = src['Nation0'][key]
+    for x in range(1, 9):
+        sec = f'Nation{x}'
+        if x == K:  # the old host, now AI nation K: its relations as the host had them
+            put(sec, 'Tension', gi(src, sec, 'Tension'))
+            put(sec, 'Allied', gi(src, sec, 'Allied'))
+            for y in range(1, 9):
+                put(sec, f'AITension{y}', 0 if y == K else gi(src, f'Nation{y}', 'Tension'))
+                put(sec, f'AIAlliance{y}', 0 if y == K else gi(src, f'Nation{y}', 'Allied'))
+        else:
+            put(sec, 'Tension', gi(src, sec, f'AITension{K}'))
+            put(sec, 'Allied', gi(src, sec, f'AIAlliance{K}'))
+            put(sec, f'AITension{K}', gi(src, sec, 'Tension'))
+            put(sec, f'AIAlliance{K}', gi(src, sec, 'Allied'))
+            put(sec, f'AITension{x}', 0)
+            put(sec, f'AIAlliance{x}', 0)
+        put(sec, 'TechSharing', 0)
+    swaps = commanders = 0
+    hk = f'Nation{K}'
+    for s, kv in exp.items():
+        host_ships = s.startswith(hk) and len(s) > len(hk) and not s[len(hk)].isdigit()
+        for k, v in kv.items():
+            if not is_int(v):
+                continue
+            if NUM_KEY.fullmatch(k):
+                kv[k] = str(swap_idx(int(v), K))
+                swaps += kv[k] != v
+            elif host_ships and re.fullmatch(r'Ship\d+CommanderId', k) and v != '-1':
+                kv[k] = '-1'
+                commanders += 1
+    at_war = [x for x in range(1, 9) if gi(exp, f'Nation{x}', 'Tension') > 40]
+    enemy_vp = sum(max(0, gi(exp, f'Nation{x}', 'VP')) for x in at_war)
+    war = gi(src, 'General', 'War')
+    put('General', 'War', (war if war > 0 else 1) if at_war else (-12 if war > 0 else war))
+    put('General', 'EnemyVP', enemy_vp)
+    put('General', 'ScenarioInProgress', -1)
+    for key in ('BattleAlliedNationIdx', 'BattleEnemyAlliedNationIdx'):
+        v = src['General'].get(key, '')
+        if is_int(v):
+            put('General', key, swap_idx(int(v), K))
+    for key, val in (('InvasionTargetName', 'XXX'), ('EnemyInvasionTargetName', 'XXX'), ('ArmyOffensive', 0),
+                     ('RevolutionPending', 0), ('LastMissionIdx', 20)):
+        put('General', key, val)
+    if war > 0 and not at_war:  # only the host was at war: as the game's DoPeace leaves it
+        for key, val in (('TotalWar', 0), ('TFW', 1), ('HasBeenBattle', 0), ('AutoBuildSubs', 0)):
+            put('General', key, val)
+    if eut:
+        for j in range(100):
+            put('EUT', f'EUT{j}', eut[j])
+    return exp, dict(pairs=pairs, swaps=swaps, commanders=commanders, at_war=at_war, enemy_vp=enemy_vp,
+                     war=(war, exp['General'].get('War')), player_ids=set(ship_ids(exp.get('Nation0Ships'))))
+
+
+def expected_map(src, K):
+    """MapData: MapArea<a>MineLevel<0|K> trade values, MapArea...TakenFrom 0 <-> K. Returns (document, changed lines)."""
+    exp, n = {s: dict(kv) for s, kv in src.items()}, 0
+    for s, kv in src.items():
+        for k, v in kv.items():
+            m = re.fullmatch(r'(MapArea\d+MineLevel)(\d+)', k)
+            if m and int(m[2]) in (0, K):
+                exp[s][f'{m[1]}{swap_idx(int(m[2]), K)}'] = v
+                n += 1
+            elif k.startswith('MapArea') and k.endswith('TakenFrom') and is_int(v) and int(v) in (0, K):
+                exp[s][k] = str(swap_idx(int(v), K))
+                n += 1
+    return exp, n
+
+
+def expected_off(src, player_ids):
+    """.off: officers kept; [CampaignDivisions] keeps the divisions whose ships are all the new player's (renumbered).
+    Returns (document, kept, dropped)."""
+    exp = {s: dict(kv) for s, kv in src.items()}
+    cd = src.get('CampaignDivisions')
+    if cd is None:
+        return exp, 0, 0
+    divs, other = {}, {}
+    for k, v in cd.items():
+        m = re.fullmatch(r'CampDiv(\d+)(\D.*)', k)
+        if m:
+            divs.setdefault(int(m[1]), []).append((m[2], v))
+        elif k != 'CampDivNo':
+            other[k] = v
+    new, kept, dropped = {}, 0, 0
+    for n in sorted(divs):
+        if all(v in player_ids for f, v in divs[n] if re.fullmatch(r'ShipId\d+', f)):
+            new.update({f'CampDiv{kept}{f}': v for f, v in divs[n]})
+            kept += 1
+        else:
+            dropped += 1
+    if divs or other:
+        exp['CampaignDivisions'] = dict(CampDivNo=str(kept), **new, **other)
+    return exp, kept, dropped
+
+
+def doc_diff(exp, act):
+    """[(section, key, expected, actual)] where two documents differ (key None: a section missing on one side)."""
+    out = []
+    for s in list(exp) + [s for s in act if s not in exp]:
+        e, a = exp.get(s), act.get(s)
+        if e is None or a is None:
+            out.append((s, None, e is not None, a is not None))
+            continue
+        out += [(s, k, e.get(k), a.get(k)) for k in list(e) + [k for k in a if k not in e] if e.get(k) != a.get(k)]
+    return out
+
+
+def diff_kind(d):
+    s, k = d[0], d[1]
+    if s == 'EUT':
+        return 'eut'
+    if k and (NUM_KEY.fullmatch(k) or re.fullmatch(r'Ship\d+CommanderId', k) or 'BattleAllied' in k
+              or 'BattleEnemyAllied' in k):
+        return 'numbers'
+    if s == 'General':
+        return 'general'
+    if k and re.fullmatch(r'Nation\d+', s) and REL_KEY.fullmatch(k):
+        return 'relations'
+    if s.startswith('Nation'):
+        return 'sections'
+    return 'other'
+
+
+def verify_copy(src, to, K, eut=None, d=None):
+    """The copy in slot `to` against the specification applied to the source snapshot `src` (slot_snapshot).
+    Returns dict(diffs={kind: [...]}, facts, files=[problems], act=snapshot of the copy)."""
+    act = slot_snapshot(to, d)
+    exp_bcs, facts = expected_copy(src['bcs'], K, eut)
+    exp_map, facts['map_fields'] = expected_map(src['map'] or {}, K)
+    exp_off, facts['div_kept'], facts['div_dropped'] = expected_off(src['off'] or {}, facts['player_ids'])
+    diffs = {}
+    for d in doc_diff(exp_bcs, act['bcs'] or {}):
+        diffs.setdefault(diff_kind(d), []).append(d)
+    diffs['map'] = doc_diff(exp_map, act['map'] or {})
+    diffs['off'] = doc_diff(exp_off, act['off'] or {})
+    s, sf, af = src['slot'], src['files'], act['files']
+    probs = [f'missing {n}' for n in (f'RTWGame{to}.bcs', f'RTWGame{to}.sta', f'MapData{to}.dat') if n not in af]
+    if f'RTWGame{s}.off' in sf and f'RTWGame{to}.off' not in af:
+        probs.append(f'missing RTWGame{to}.off')
+    probs += [f'{n} left in the copy' for n in BATTLE_FILES + ('DesignFiles_swap.tmp',) if n in af]
+    if af.get(f'RTWGame{to}.sta') != sf.get(f'RTWGame{s}.sta'):
+        probs.append('.sta differs from the source')
+    for i in range(9):
+        want = sf.get(f'DesignFiles{swap_idx(i, K)}.des')
+        if af.get(f'DesignFiles{i}.des') != want:
+            probs.append(f'DesignFiles{i}.des != source DesignFiles{swap_idx(i, K)}.des')
+    facts['battle_files_in_source'] = [n for n in BATTLE_FILES if n in sf]
+    facts['copy_files'] = sorted(af)
+    return dict(diffs=diffs, facts=facts, files=probs, act=act)
+
+
+def client_cooldowns():
+    """The joined player's event cooldowns (the 100 'used' values of its events_<hash>.ini for nation 1) or None."""
+    for f in event_files():
+        try:
+            with open(os.path.join(LOG_DIR, f), encoding='utf-8', errors='replace') as fh:
+                kv = dict(ln.split('=', 1) for ln in fh.read().splitlines() if '=' in ln)
+        except OSError:
+            continue
+        used = [int(x) for x in kv.get('used', '').split(',') if is_int(x.strip())]
+        if kv.get('campaign', '').endswith('|nation1') and len(used) == 100:
+            return used
+    return None
+
+
+def visible_boxes(pid):
+    """Visible message boxes and game dialogs of a copy: TMessageForm, #32770 and Tdlg* windows."""
+    return [h for h in top_windows(pid)
+            if e2e_test.class_name(h) in ('TMessageForm', '#32770') or e2e_test.class_name(h).startswith('Tdlg')]
+
+
+def box_info(h):
+    """(dict(cls, title, text, buttons), [(button caption, hwnd)]); text only for Win32 boxes (#32770): a VCL
+    TMessageForm shows its text in a TLabel, which has no window."""
+    k = e2e_test.class_name(h)
+    btns = [(caption(c), c) for c in children(h) if e2e_test.class_name(c) in ('TButton', 'TBitBtn', 'Button')
+            and u.IsWindowVisible(c) and u.IsWindowEnabled(c)]
+    txt = ' '.join(text(c) for c in children(h) if e2e_test.class_name(c) == 'Static' and text(c)) if k == '#32770' else ''
+    return dict(cls=k, title=e2e_test.window_text(h), text=txt.replace('\r', ' ').replace('\n', ' '),
+                buttons=[b for b, _ in btns]), btns
+
+
+def copy_dialogs(pid, confirm, done, who='client', timeout=30, quiet=2.5):
+    """Answer the dialogs of a "Copy game" and record them until done(seen) holds and no dialog was open for `quiet` s:
+    the game's overwrite confirmation (a box with Yes/OK and No/Cancel: Yes/OK if `confirm`, else No/Cancel), its
+    "Saved game copied to slot N" (OK) and the mod's "Multiplayer" box (OK). Other Tdlg* dialogs are recorded and left
+    alone (dismiss_dialogs is never used here: on an overwrite prompt it would press OK). Returns [dict(cls, title,
+    text, buttons, confirm, pressed)]."""
+    seen, pressed, end, last = [], {}, time.time() + timeout, time.time()
+    while time.time() < end:
+        assert_alive()
+        boxes = visible_boxes(pid)
+        for h in boxes:
+            if time.time() - pressed.get(h, 0) < 1.5:
+                continue
+            info, btns = box_info(h)
+            pos = next((b for b in btns if b[0].lower() in ('yes', 'ok')), None)
+            neg = next((b for b in btns if b[0].lower() in ('no', 'cancel')), None)
+            info['confirm'] = bool(pos and neg)
+            b = None if info['cls'].startswith('Tdlg') else (pos if confirm else neg) if info['confirm'] else \
+                pos or (btns[0] if len(btns) == 1 else None)
+            info['pressed'] = b[0] if b else None
+            if b:
+                u.PostMessageW(b[1], 0x00F5, 0, 0)  # BM_CLICK
+            pressed[h] = time.time() + (3600 if not b else 0)  # an unexpected dialog is recorded once
+            seen.append(info)
+            log(f'  {who} copy dialog: {info["cls"]}:"{info["title"]}" {info["buttons"]}'
+                + (f' "{info["text"]}"' if info['text'] else '') + f' -> {info["pressed"]}')
+        if boxes:
+            last = time.time()
+        if done(seen) and time.time() - last >= quiet:
+            break
+        time.sleep(0.3)
+    return seen
+
+
+def copy_lines(port, mark, to):
+    return [x.split('] ', 1)[-1] for x in log_lines(log_since(port, mark), rf'player copy in slot {to}:|copy of slot \d+ to {to}\b')]
+
+
+def transform_done(port, mark, to):
+    """done() for copy_dialogs: the hook's log line for slot `to` is there and, after a rewrite (or a failed one), the
+    mod's "Multiplayer" box was seen."""
+    def done(seen):
+        ln = copy_lines(port, mark, to)
+        return bool(ln) and (not re.search(r'player copy in slot|failed', ln[0])
+                             or any(d['cls'] == '#32770' and d['title'] == 'Multiplayer' for d in seen))
+    return done
+
+
+def sort_dialogs(seen):
+    """(confirmations, the mod's "Multiplayer" boxes, the game's other boxes)."""
+    conf = [d for d in seen if d['confirm']]
+    mp = [d for d in seen if not d['confirm'] and d['cls'] == '#32770' and d['title'] == 'Multiplayer']
+    return conf, mp, [d for d in seen if d not in conf and d not in mp]
+
+
+def copy_with_button(ctx, slot):
+    """The player's path: the strategic screen's "Copy game" (TBitBtn btbnSaveToOtherSlot) -> TdlgInputNumber
+    (TSpinEdit seNumber, OK, Cancel) -> `slot` -> OK. Posted clicks and WM_SETTEXT only; nothing else answers the
+    client's dialogs meanwhile. Returns ('ok' | 'skip', detail)."""
+    cp = ctx.cp
+    btn = next((h for top in windows_of(cp, 'TfrmBuildCamp') for h in children(top)
+                if e2e_test.class_name(h) == 'TBitBtn' and caption(h) == 'Copy game'), None)
+    if not btn:
+        return 'skip', 'no "Copy game" TBitBtn on the client\'s TfrmBuildCamp'
+    if not (u.IsWindowVisible(btn) and u.IsWindowEnabled(btn)):
+        return 'skip', f'"Copy game" visible {bool(u.IsWindowVisible(btn))} enabled {bool(u.IsWindowEnabled(btn))}'
+    u.PostMessageW(btn, 0x00F5, 0, 0)  # BM_CLICK
+    dlg = wait_window(cp, 'TdlgInputNumber', 8)
+    if not dlg:
+        return 'skip', f'no TdlgInputNumber after BM_CLICK; windows: {describe_windows(cp)}'
+    kids = children(dlg)
+    spin = next((h for h in kids if e2e_test.class_name(h) == 'TSpinEdit'), None)
+    ok = next((h for h in kids if e2e_test.class_name(h) == 'TButton' and caption(h) == 'OK'), None)
+    cancel = next((h for h in kids if e2e_test.class_name(h) == 'TButton' and caption(h) == 'Cancel'), None)
+    shown = text(spin) if spin else None
+    if spin and ok:
+        _u32t.SendMessageW(spin, 0x000C, 0, str(slot))  # WM_SETTEXT
+        time.sleep(0.3)
+    got = text(spin) if spin else None
+    if got != str(slot):
+        if cancel:
+            u.PostMessageW(cancel, 0x00F5, 0, 0)
+        wait_window(cp, 'TdlgInputNumber', 5, gone=True)
+        return 'skip', f'TSpinEdit {bool(spin)}, OK {bool(ok)}; text {shown!r} -> {got!r}; cancelled'
+    u.PostMessageW(ok, 0x00F5, 0, 0)
+    gone = wait_window(cp, 'TdlgInputNumber', 5, gone=True)
+    return 'ok', f'TdlgInputNumber "{e2e_test.window_text(dlg)}": seNumber {shown!r} -> {got!r}, OK (closed {gone})'
+
+
+def buildcamp_idle(pid):
+    """The strategic screen is visible and enabled and no dialog is open."""
+    return not visible_boxes(pid) and any(u.IsWindowEnabled(h) for h in windows_of(pid, 'TfrmBuildCamp')
+                                          if u.IsWindowVisible(h))
+
+
+def single_player_month(ctx, slot, timeout=MONTH_TIMEOUT):
+    """The client, out of the session, processes one month of the campaign in `slot` on its own: Turn, the game's
+    dialogs answered (events: first answer). The game does not write the slot at the end of a month (the host's
+    session saves it itself), so the month counts as done once the game's turn report (TdlgCampTurnRep "Turn
+    messages") was answered and the strategic screen is idle for 3 s; no bridge call before that (the game's main
+    thread is busy with the month). Then `save` writes the slot (a throwaway copy) and its date is read. Stops without
+    answering anything if the battle screen (TfrmMain) or a dialog whose class names a battle shows up."""
+    cp, d0, t0, n0 = ctx.cp, save_date(slot), time.time(), len(ANSWERED)
+    r = cmd(C, 'turn')
+    quiet = None
+    while True:
+        if time.time() - t0 > timeout:
+            return dict(ok=False, why=f'timeout (turn report answered: {any("TdlgCampTurnRep" in a[2] for a in ANSWERED[n0:])}'
+                        f'); windows: {describe_windows(cp)}', turn=r, d0=d0, d1=None, dt=time.time() - t0,
+                        answered=ANSWERED[n0:])
+        assert_alive()
+        battle = [f'{e2e_test.class_name(h)}:"{e2e_test.window_text(h)[:40]}"' for h in top_windows(cp)
+                  if e2e_test.class_name(h) == 'TfrmMain' or 'battle' in e2e_test.class_name(h).lower()]
+        if battle:
+            return dict(ok=False, why=f'battle: {battle}', turn=r, d0=d0, d1=None, dt=time.time() - t0,
+                        answered=ANSWERED[n0:])
+        select_first_answer(cp)
+        answer_dialogs(cp, 'client')
+        if any('TdlgCampTurnRep' in a[2] for a in ANSWERED[n0:]) and buildcamp_idle(cp):
+            quiet = quiet or time.time()
+            if time.time() - quiet >= 3:
+                break
+        else:
+            quiet = None
+        time.sleep(1.0)
+    dt = time.time() - t0
+    rs = cmd(C, 'save')
+    time.sleep(1)
+    return dict(ok=rs == 'ok', why='' if rs == 'ok' else f'save: {rs}', turn=r, d0=d0, d1=save_date(slot), dt=dt,
+                answered=ANSWERED[n0:])
+
+
+def next_month(d):
+    y, m = int(d[0]), int(d[1])
+    return (str(y + (m == 12)), str(m % 12 + 1))
+
+
+def fmt_diffs(ds, n=5):
+    return '; '.join(f'[{s}] {k}: want {e!r} got {a!r}' for s, k, e, a in ds[:n]) + (f' (+{len(ds) - n})' if len(ds) > n else '')
+
+
+def scenario_player_copy(ctx):
+    """0.2.7: a joined player's "Copy game" makes the copy the player's own campaign (nation K plays as nation 0, the
+    host's nation becomes AI nation K). In the session: the client's copy (bridge `copygame` = the game's
+    CopyGameToOtherSlot through the hook) checked key by key against the specification computed from slot 77; slot 77
+    and the host's slot untouched; the host's own copy untouched; a copy cancelled at the overwrite prompt; the real
+    "Copy game" button; one processed month (the session goes on). Out of the session: the client leaves, loads slot
+    77 (it plays the host's nation there) and copies it (nation from rtw3mp_player.ini); then it loads its first copy
+    and plays one month of it in single player."""
+    hp, cp, K = ctx.hp, ctx.cp, 1
+    st0, nat0 = ctl.status(C), nation_table(C)
+    me, host = nat0[K]['name'], nat0[0]['name']
+    src = slot_snapshot(CLIENT_SLOT)
+    g1 = save_files(HOST_SLOT)
+    eut = client_cooldowns()
+    b77 = src['bcs']
+    wars = [j for j in range(9) if j != K and int(b77.get(f'Nation{K}', {}).get('Tension', '0') if j == 0 else
+                                                   b77.get(f'Nation{j}', {}).get(f'AITension{K}', '0') or 0) > 40]
+    log(f'  start: client {st0.get("date")} slot {st0.get("slot")} playerIdx {st0.get("playerIdx")}; nation {K} '
+        f'({me}) at war with {wars or "nobody"} in slot 77 (host: rel 0 1 {rel(0, 1)}, rel 1 2 {rel(1, 2)}); '
+        f'client cooldowns {"from " + str(sum(1 for x in eut if x)) + " non-zero" if eut else "none"}; '
+        f'slot 77 files {sorted(src["files"])}')
+
+    # a) the client's copy in the session
+    cm = log_mark(C)
+    r = cmd(C, 'copygame 78')
+    seen = copy_dialogs(cp, True, transform_done(C, cm, 78))
+    conf, mp, game = sort_dialogs(seen)
+    box = mp[0]['text'] if mp else ''
+    want_box = [f'Slot 78 is your own copy of the campaign: you play {me}.',
+                f'{host}, the host\'s nation, is run by the computer in this copy.']
+    check(f'a) client `copygame 78`: the game\'s "Saved game copied" box (OK), then the mod\'s "Multiplayer" box naming '
+          f'{me} and {host} (OK); no overwrite prompt, nothing left open',
+          r == 'ok' and not conf and len(game) == 1 and game[0]['pressed'] == 'OK' and len(mp) == 1
+          and mp[0]['pressed'] == 'OK' and all(w in box for w in want_box) and not visible_boxes(cp),
+          f'{r}; {seen}; open: {describe_windows(cp)}')
+    res = verify_copy(src, 78, K, eut)
+    fx, dd, act = res['facts'], res['diffs'], res['act']['bcs'] or {}
+    lines = copy_lines(C, cm, 78)
+    m = re.search(PLAYER_COPY_RE, lines[0]) if lines else None
+    want = ('78', me, host, str(K), str(fx['pairs']), str(fx['commanders']), str(fx['map_fields']), str(fx['div_kept']),
+            str(fx['div_dropped']), 'at war' if fx['at_war'] else 'at peace')
+    check(f'a) client log "player copy in slot 78: {me} is the player nation, {host} is nation {K} (AI); ..." with the '
+          f'counts of the specification', len(lines) == 1 and m and m.groups() == want, f'{lines} (want {want})')
+    check('a) Game78 files: RTWGame78.bcs/.sta/.off, MapData78.dat, DesignFiles0-8; .sta = the source\'s; no '
+          'Autosave.sac/.off, BattleInfo.bbi or DesignFiles_swap.tmp', not res['files'],
+          f'{res["files"]}; copy {fx["copy_files"]}; battle files in slot 77: {fx["battle_files_in_source"]}')
+    log(f'  Game78: files {fx["copy_files"]}; slot 77 battle files {fx["battle_files_in_source"]}')
+    s0, sk = src['bcs'], act
+    names = (act.get('Nation0', {}).get('Name'), act.get(f'Nation{K}', {}).get('Name'))
+    check(f'a) [Nation0] Name = {me}, [Nation{K}] Name = {host}; all {fx["pairs"]} [Nation0*]/[Nation{K}*] sections '
+          f'traded (ship ids, coastal artillery, submarines, losses; other keys as the specification)',
+          names == (me, host) and fx['pairs'] >= 4 and not dd.get('sections')
+          and ship_ids(sk.get('Nation0Ships')) == ship_ids(s0.get(f'Nation{K}Ships'))
+          and ship_ids(sk.get(f'Nation{K}Ships')) == ship_ids(s0.get('Nation0Ships')),
+          f'names {names}; ships {len(ship_ids(sk.get("Nation0Ships")))}/{len(ship_ids(sk.get(f"Nation{K}Ships")))}; '
+          f'{fmt_diffs(dd.get("sections", []))}')
+    n1, n2 = sk.get(f'Nation{K}', {}), sk.get('Nation2', {})
+    ex = (f'new Nation{K} ({host}) Tension {n1.get("Tension")} (old Nation{K} Tension {s0[f"Nation{K}"].get("Tension")}), '
+          f'Nation2 Tension {n2.get("Tension")} (old Nation{K} AITension2 {s0[f"Nation{K}"].get("AITension2")}, old '
+          f'Nation2 AITension{K} {s0["Nation2"].get(f"AITension{K}")}), Nation2 AITension{K} {n2.get(f"AITension{K}")} '
+          f'(old Nation2 Tension {s0["Nation2"].get("Tension")})')
+    check('a) relations exactly as specified (Tension/Allied/TechSharing/AITension*/AIAlliance* of Nation0-8, from '
+          f'slot 77): {ex}', not dd.get('relations'), fmt_diffs(dd.get('relations', [])))
+    log('  relations:', ex)
+    check(f'a) nation numbers 0 <-> {K} (Ship*BuildingNationIdx, AU/AT*Nation, BattleAllied/EnemyAlliedNationIdx: '
+          f'{fx["swaps"]} changed) and the host\'s ships without commanders ({fx["commanders"]} cleared)',
+          not dd.get('numbers'), fmt_diffs(dd.get('numbers', [])))
+    g0, g = s0['General'], act.get('General', {})
+    check(f'a) [General]: War {g0.get("War")} -> {fx["war"][1]} ({me} at war with {fx["at_war"] or "nobody"}), EnemyVP '
+          f'{fx["enemy_vp"]}, ScenarioInProgress -1, invasion targets XXX, ArmyOffensive/RevolutionPending 0, '
+          f'LastMissionIdx 20; nothing else changed',
+          not dd.get('general'), f'{fmt_diffs(dd.get("general", []))}; got War {g.get("War")} EnemyVP {g.get("EnemyVP")}')
+    eut_src = [s0.get('EUT', {}).get(f'EUT{j}') for j in range(100)]
+    check('a) [EUT] = the client\'s own event cooldowns' + (' (events_<hash>.ini)' if eut else
+                                                             ' (no cooldown file: the source\'s values kept)'),
+          not dd.get('eut'), fmt_diffs(dd.get('eut', [])))
+    log(f'  EUT: client {[(j, x) for j, x in enumerate(eut or []) if x]} | source (host) '
+        f'{[(j, x) for j, x in enumerate(eut_src) if x not in ("0", None)]}')
+    check(f'a) MapData78: MineLevel 0/{K} and TakenFrom 0 <-> {K} ({fx["map_fields"]} fields changed), nothing else',
+          not dd['map'], fmt_diffs(dd['map']))
+    check(f'a) RTWGame78.off: officers kept, divisions {fx["div_kept"]} kept / {fx["div_dropped"]} dropped as specified',
+          not dd['off'], fmt_diffs(dd['off']))
+    check(f'a) design files swapped: DesignFiles0 = slot 77\'s DesignFiles{K}, DesignFiles{K} = its DesignFiles0, '
+          f'the others identical', not [p for p in res['files'] if 'DesignFiles' in p], res['files'])
+    check('a) nothing else in RTWGame78.bcs differs from slot 77', not dd.get('other'), fmt_diffs(dd.get('other', [])))
+
+    # b) slot 77 and the host's slot untouched, the client still in the session
+    st, nat = ctl.status(C), nation_table(C)
+    check('b) slot 77 and the host\'s slot 1 byte-identical before and after the copy',
+          save_files(CLIENT_SLOT) == src['files'] and save_files(HOST_SLOT) == g1,
+          f'77 same {save_files(CLIENT_SLOT) == src["files"]}, 1 same {save_files(HOST_SLOT) == g1}')
+    check('b) the client is still in the session: role client, planning, slot 77, playerIdx 1, same date and nations',
+          (st.get('role'), st.get('phase'), st.get('slot'), st.get('playerIdx'), st.get('date')) ==
+          ('client', 'planning', str(CLIENT_SLOT), str(K), st0.get('date')) and nat == nat0, f'{st} {nat == nat0}')
+
+    # c) the host copies its own slot: untouched
+    hm = log_mark(H)
+    g1 = save_files(HOST_SLOT)
+    r = cmd(H, 'copygame 79')
+    seen = copy_dialogs(hp, True, lambda s: os.path.exists(save_path(79)) and any(d['pressed'] for d in s), who='host')
+    conf, mp, game = sort_dialogs(seen)
+    g79 = save_files(79)
+    ren = {n.replace(f'RTWGame{HOST_SLOT}.', 'RTWGame79.').replace(f'MapData{HOST_SLOT}.', 'MapData79.'): h
+           for n, h in g1.items()}
+    diff79 = [n for n, h in g79.items() if ren.get(n) != h]
+    n79 = (read_save(save_path(79)) or {}).get('Nation0', {}).get('Name')
+    hl = log_lines(log_since(H, hm), r'player copy in slot|copy of slot')
+    sth = ctl.status(H)
+    check(f'c) host `copygame 79` from its own slot: the game\'s box only, Game79 = slot 1 file by file ([Nation0] '
+          f'{n79}), no "player copy"/"copy of slot" line, the host still hosts slot 1 as nation 0',
+          r == 'ok' and not conf and not mp and len(game) == 1 and 'RTWGame79.bcs' in g79 and not diff79
+          and n79 == host and not hl and (sth.get('role'), sth.get('slot'), sth.get('playerIdx')) ==
+          ('host', str(HOST_SLOT), '0'), f'{r}; {seen}; differ {diff79}; {n79}; {hl}; {sth}')
+
+    # d) a copy cancelled at the game's overwrite prompt
+    cm, g78 = log_mark(C), save_files(78)
+    r = cmd(C, 'copygame 78')
+    seen = copy_dialogs(cp, False, lambda s: bool(copy_lines(C, cm, 78)))
+    conf, mp, game = sort_dialogs(seen)
+    lines = copy_lines(C, cm, 78)
+    check('d) client `copygame 78` onto the existing copy: the game\'s overwrite prompt answered No -> no other box, '
+          'log "copy of slot 77 to 78: not copied", Game78 and slot 77 unchanged',
+          r == 'ok' and len(conf) == 1 and conf[0]['pressed'] in ('No', 'Cancel') and not mp and not game
+          and lines == ['copy of slot 77 to 78: not copied'] and save_files(78) == g78
+          and save_files(CLIENT_SLOT) == src['files'], f'{r}; {seen}; {lines}; 78 same {save_files(78) == g78}')
+
+    # g) the real "Copy game" button (its dialog takes slots 1-9: the highest slot that was free before the run)
+    bs = _button_slot[0]
+    if bs is None or os.path.exists(slot_dir(bs)):
+        log(f'  SKIP g) the real "Copy game" button: no free slot in 3-9 (chosen {bs})')
+        how, det = 'skip', ''
+    else:
+        cm = log_mark(C)
+        how, det = copy_with_button(ctx, bs)
+        log(f'  g) Copy game button: {how}: {det}')
+    if how == 'ok':
+        seen = copy_dialogs(cp, False, transform_done(C, cm, bs))
+        conf, mp, game = sort_dialogs(seen)
+        resb = verify_copy(src, bs, K, eut)
+        lines = copy_lines(C, cm, bs)
+        fb, f78 = resb['act']['files'], res['act']['files']
+        same = (fb.get(f'RTWGame{bs}.bcs'), fb.get(f'MapData{bs}.dat')) == (f78.get('RTWGame78.bcs'), f78.get('MapData78.dat'))
+        bad = [d for v in resb['diffs'].values() for d in v]
+        check(f'g) the real "Copy game" button (BM_CLICK) -> TdlgInputNumber (seNumber {bs}, OK) -> the game\'s box and '
+              f'the mod\'s box; "player copy in slot {bs}" line; Game{bs} as specified, its .bcs/MapData = Game78\'s',
+              not conf and len(game) == 1 and len(mp) == 1
+              and all(w.replace('Slot 78', f'Slot {bs}') in mp[0]['text'] for w in want_box) and len(lines) == 1
+              and lines[0].startswith(f'player copy in slot {bs}: {me} is the player nation') and not bad
+              and not resb['files'] and same, f'{det}; {seen}; {lines}; {fmt_diffs(bad)} {resb["files"]}; same as 78 {same}')
+    elif det:
+        log(f'  SKIP g) the real "Copy game" button: {det}')
+
+    # the session goes on
+    d0 = ctl.status(C).get('date')
+    d1 = run_month(ctx, 'player_copy')
+    st = ctl.status(C)
+    merged = log_lines(log_since(H, ctx.month_marks[0]), rf'merge nation {K}\b')
+    check('the session goes on after the copies: the month was processed (host "merge nation 1"), the client plans the '
+          'new month in slot 77 as nation 1', d1 and d1 != d0 and merged and (st.get('role'), st.get('phase'),
+          st.get('slot'), st.get('playerIdx')) == ('client', 'planning', str(CLIENT_SLOT), str(K)),
+          f'{d0} -> {d1}; {merged[:1]}; {st}')
+
+    # e) out of the session: the client leaves, opens slot 77 (the host's nation) and copies it
+    cm = log_mark(C)
+    rl = cmd(C, 'leave')
+    time.sleep(1.5)
+    role = ctl.status(C).get('role')
+    try:
+        with open(os.path.join(slot_dir(CLIENT_SLOT), 'rtw3mp_player.ini'), encoding='utf-8', errors='replace') as f:
+            ini = f.read().strip()
+    except OSError:
+        ini = None
+    r = cmd(C, f'load {CLIENT_SLOT} 0')
+    st, nat = ctl.status(C), nation_table(C)
+    boxes = [box_info(h)[0] for h in visible_boxes(cp)]
+    check(f'e) client `leave` (role {role}), slot 77\'s rtw3mp_player.ini {ini!r}, `load 77 0`: slot 77 as nation 0 = '
+          f'{host} (the host\'s nation, what the 0.2.6 copy played), no dialog',
+          rl == 'ok' and role == 'none' and ini and re.search(rf'nation={K}\b', ini) and r == 'ok'
+          and (st.get('slot'), st.get('playerIdx'), st.get('startBuild')) == (str(CLIENT_SLOT), '0', '2')
+          and nat.get(0, {}).get('name') == host and not boxes, f'{r}; {st}; {nat.get(0)}; {boxes}')
+    src80 = slot_snapshot(CLIENT_SLOT)
+    cm = log_mark(C)
+    r = cmd(C, 'copygame 80')
+    seen = copy_dialogs(cp, False, transform_done(C, cm, 80))
+    conf, mp, game = sort_dialogs(seen)
+    lines = copy_lines(C, cm, 80)
+    res80 = verify_copy(src80, 80, K, None)
+    fx80 = res80['facts']
+    m = re.search(PLAYER_COPY_RE, lines[0]) if lines else None
+    want = ('80', me, host, str(K), str(fx80['pairs']), str(fx80['commanders']), str(fx80['map_fields']),
+            str(fx80['div_kept']), str(fx80['div_dropped']), 'at war' if fx80['at_war'] else 'at peace')
+    check('e) out of the session `copygame 80`: the game\'s box and the mod\'s box (naming both nations), the log line '
+          f'"player copy in slot 80: {me} is the player nation, {host} is nation {K} (AI); ..." (nation from '
+          'rtw3mp_player.ini)', r == 'ok' and not conf and len(game) == 1 and len(mp) == 1
+          and all(w.replace('78', '80') in mp[0]['text'] for w in want_box) and m and m.groups() == want,
+          f'{r}; {seen}; {lines} (want {want})')
+    bad = [d for v in res80['diffs'].values() for d in v]
+    a80 = res80['act']['bcs'] or {}
+    check(f'e) Game80 as specified from slot 77\'s new month (relations, sections, numbers, [General], [EUT] kept '
+          f'outside the session, MapData {fx80["map_fields"]} fields, divisions {fx80["div_kept"]}/{fx80["div_dropped"]}, '
+          f'designs, files): [Nation0] {a80.get("Nation0", {}).get("Name")}, [Nation{K}] '
+          f'{a80.get(f"Nation{K}", {}).get("Name")}', not bad and not res80['files']
+          and (a80.get('Nation0', {}).get('Name'), a80.get(f'Nation{K}', {}).get('Name')) == (me, host),
+          f'{fmt_diffs(bad)} {res80["files"]}')
+    log(f'  Game80 facts: at war {fx80["at_war"]}, War {fx80["war"]}, EnemyVP {fx80["enemy_vp"]}, '
+        f'{fx80["swaps"]} numbers, {fx80["commanders"]} commanders, {fx80["map_fields"]} map fields')
+
+    # f) the key check: the copy is playable
+    cm = log_mark(C)
+    f78 = read_save(save_path(78))
+    r = cmd(C, 'load 78 0')
+    time.sleep(1.5)
+    st, nat = ctl.status(C), nation_table(C)
+    boxes = [box_info(h)[0] for h in visible_boxes(cp)]
+    check('f) client `load 78 0`: slot 78, playerIdx 0, campaign loaded (startBuild 2), no dialog',
+          r == 'ok' and (st.get('slot'), st.get('playerIdx'), st.get('startBuild')) == ('78', '0', '2') and not boxes,
+          f'{r}; {st}; {boxes}')
+    want_nat = {0: nat0[K], K: nat0[0], **{j: nat0[j] for j in nat0 if j not in (0, K)}}
+    check(f'f) `nations`: nation 0 = {me} with its session funds/ships {nat0[K]["funds"]}/{nat0[K]["ships"]}, nation '
+          f'{K} = {host} with {nat0[0]["funds"]}/{nat0[0]["ships"]}, the others unchanged', nat == want_nat,
+          f'{nat} (want {want_nat})')
+    rels = {j: dict(kv.split('=') for kv in (cmd(C, f'rel 0 {j}')[3:]).split()) for j in range(1, 9)}
+    ai = {j: dict(kv.split('=') for kv in (cmd(C, f'rel {K} {j}')[3:]).split()) for j in range(2, 9)}
+    ft = {j: f78[f'Nation{j}'].get('Tension') for j in range(1, 9)}
+    fa = {j: f78[f'Nation{K}'].get(f'AITension{j}') for j in range(2, 9)}
+    nwar = sum(1 for j in ft if int(ft[j]) > 40)
+    check(f'f) relations in memory (the relation bars): `rel 0 j` = the copy\'s [Nation j] Tension, `rel {K} j` = '
+          f'[Nation{K}] AITension j, warCounter = [General] War {f78["General"].get("War")}, hostWars {nwar}',
+          all(rels[j].get('tension') == ft[j] and rels[j].get('war') == ('1' if int(ft[j]) > 40 else '0') for j in ft)
+          and all(ai[j].get('tension') == fa[j] for j in fa) and rels[1].get('warCounter') == f78['General'].get('War')
+          and rels[1].get('hostWars') == str(nwar),
+          f'rel 0 j {[(j, rels[j].get("tension"), ft[j]) for j in ft]}; rel {K} j {[(j, ai[j].get("tension"), fa[j]) for j in fa]}; '
+          f'{rels[1]}')
+    p_host = poss_list(C, f'possessions {K}')
+    if fx['at_war']:
+        log(f'  WARNING: {me} is at war with {fx["at_war"]} in the copy: the month may generate a battle')
+    sp = single_player_month(ctx, 78)
+    ctx.months.append(('player_copy (slot 78 alone)', '/'.join(sp['d0'] or ()), '/'.join(sp['d1'] or ()), sp['dt']))
+    log(f'  single-player month on slot 78: {sp["d0"]} -> {sp["d1"]} in {sp["dt"]:.0f} s; {len(sp["answered"])} '
+        f'dialogs answered: {[a[2] for a in sp["answered"]][:12]}' + (f'; {sp["why"]}' if sp['why'] else ''))
+    check('f) one month of the copy in single player (`turn`, the game\'s dialogs answered up to its turn report, no '
+          'battle), then `save` writes slot 78 with the next month\'s date', sp['ok'] and sp['d0']
+          and sp['d1'] == next_month(sp['d0']), f'{sp["why"]}; {sp["d0"]} -> {sp["d1"]}')
+    st, nat2 = ctl.status(C), nation_table(C)
+    p_host2 = poss_list(C, f'possessions {K}')
+    cl = log_since(C, cm)
+    bad = log_lines(cl, r'(?i)exception|AI suppressed|merge nation|player copy')
+    check(f'f) after the month: responsive (slot 78, playerIdx 0, not busy), nation 0 {me}, {host} (AI) still has ships '
+          f'({nat.get(K, {}).get("ships")} -> {nat2.get(K, {}).get("ships")}) and possessions ({len(p_host or [])} -> '
+          f'{len(p_host2 or [])}); no exception or session line in the client log',
+          (st.get('slot'), st.get('playerIdx'), st.get('busy')) == ('78', '0', '0')
+          and nat2.get(0, {}).get('name') == me and nat2.get(K, {}).get('name') == host
+          and nat2.get(K, {}).get('ships', 0) > 0 and p_host2 and bad == [], f'{st}; {nat2}; {bad[:3]}')
+    log(f'  after the month: {nat2}; {host} possessions {pnames(p_host)} -> {pnames(p_host2)}')
+
+
 SCENARIOS = [  # name, months processed, what it guards, function
     ('session', 0, 'host/join/claim/start; the client plans nation 1 in slot 77; nation 2 reserved as the stand-in '
                    'player "Bot"; client Multiplayer window open', scenario_session),
@@ -2989,6 +3665,14 @@ SCENARIOS = [  # name, months processed, what it guards, function
                   'treaty (possessions, ships, prestige, reparations, chat, the client\'s treaty dialog, war score '
                   'lines); then via applydiplo: automatic minor victory of nation 2, host-vs-client victory (DoPeace, '
                   'the host\'s treaty dialog), compromise', scenario_treaty),
+    ('player_copy', 1, 'a joined player\'s "Copy game" (0.2.7): the client\'s copy (copygame = the game\'s '
+                       'CopyGameToOtherSlot through the hook) is its own campaign (its nation is nation 0, the host\'s '
+                       'nation AI nation 1; relations, sections, numbers, war state, cooldowns, map, divisions, designs '
+                       'checked key by key against slot 77); slot 77 and the host\'s slot untouched; the host\'s own copy '
+                       'untouched; a copy cancelled at the overwrite prompt; the real button; one session month; out of '
+                       'the session (rtw3mp_player.ini) the copy is made too, and the copy loads and plays one month in '
+                       'single player (slots 78-80 and, for the button, the highest slot of 3-9 that was free; all '
+                       'deleted after the run)', scenario_player_copy),
 ]
 
 
@@ -3019,7 +3703,7 @@ def tree_digest(d):
     return out
 
 
-def preflight(g1):
+def preflight(g1, copy_slots=()):
     problems = []
     if running_pids('RTW3.exe'):
         problems.append(f'RTW3.exe is already running (PIDs {running_pids("RTW3.exe")}); close it first')
@@ -3030,6 +3714,10 @@ def preflight(g1):
             problems.append(f'{f} not found in the game folder (set RTW3_DIR)')
     if not os.path.exists(os.path.join(g1, f'RTWGame{HOST_SLOT}.bcs')):
         problems.append(f'save slot {HOST_SLOT} has no campaign')
+    for s in copy_slots:  # player_copy writes these slots and deletes them afterwards: never someone's own save
+        if os.path.exists(slot_dir(s)):
+            problems.append(f'save slot {s} exists ({slot_dir(s)}); player_copy would overwrite and delete it: move it '
+                            f'away first')
     if os.path.exists(BACKUP):
         if os.path.isdir(g1) and tree_digest(BACKUP) == tree_digest(g1):
             shutil.rmtree(BACKUP)
@@ -3112,6 +3800,20 @@ def remove_client_slot():
     return False
 
 
+def remove_copy_slots(slots):
+    """Delete player_copy's slots (preflight made sure none of them existed before the run). Returns those left."""
+    for s in slots:
+        for _ in range(10):
+            shutil.rmtree(slot_dir(s), ignore_errors=True)
+            if not os.path.exists(slot_dir(s)):
+                break
+            time.sleep(1)
+    left = [s for s in slots if os.path.exists(slot_dir(s))]
+    gone = [s for s in slots if not os.path.exists(slot_dir(s))]
+    log(f'removed copy slots {gone}' + (f'; could NOT remove {left}' if left else ''))
+    return left
+
+
 def run_scenarios(ctx, names):
     ctx.selected = list(names)
     ctx.months_planned = planned_months(names)
@@ -3138,7 +3840,7 @@ def run_scenarios(ctx, names):
               f'only {hook.state["n"]} of {hook.state.get("need", 2)} months processed after its setup')
 
 
-def summary(names, open_s, ctx, saves_ok, left, ev_left=()):
+def summary(names, open_s, ctx, saves_ok, left, ev_left=(), copies_left=()):
     print()
     log('==== summary ====')
     for name in names:
@@ -3159,7 +3861,8 @@ def summary(names, open_s, ctx, saves_ok, left, ev_left=()):
                   f'{str(s["pkg"]):>11}{str(s["cmem"]):>11}{str(s["hmem"]):>9}')
     print(f'  game open: {open_s:.0f} s; saves {"restored" if saves_ok else "NOT RESTORED (see above)"}; '
           + (f'still running: {left}' if left else 'no started copy left running') + '; '
-          + (f'event cooldown files LEFT: {list(ev_left)}' if ev_left else 'no events_*.ini left'))
+          + (f'event cooldown files LEFT: {list(ev_left)}' if ev_left else 'no events_*.ini left')
+          + (f'; copy slots LEFT: {list(copies_left)}' if copies_left else ''))
     n = len(results)
     print(f'{n - len(failed)}/{n} checks passed', flush=True)
     return not failed
@@ -3184,7 +3887,11 @@ def main(argv=None):
             ap.error(f'unknown scenario(s) {bad}; known: {names}')
         names = [n for n in names if n in want or n == 'session']
     g1 = os.path.join(SAVE, f'Game{HOST_SLOT}')
-    problems = preflight(g1)
+    copy_slots = ()
+    if 'player_copy' in names:
+        _button_slot[0] = next((s for s in BUTTON_SLOTS if not os.path.exists(slot_dir(s))), None)
+        copy_slots = COPY_SLOTS + ((_button_slot[0],) if _button_slot[0] else ())
+    problems = preflight(g1, COPY_SLOTS if copy_slots else ())
     for p in problems:
         log('cannot start:', p)
     if problems:
@@ -3197,7 +3904,7 @@ def main(argv=None):
     log('backed up save slot', HOST_SLOT, '| scenarios:', ', '.join(names))
     ctx, procs, t_open = Ctx(), PROCS, time.time()
     ctx.fixture = saved_intel(save_path(HOST_SLOT))
-    saves_ok, left, ev_left = False, [], []
+    saves_ok, left, ev_left, copies_left = False, [], [], []
     try:
         procs.append(launch(H))
         time.sleep(4)
@@ -3226,11 +3933,12 @@ def main(argv=None):
             log(f'!! could not restore save slot {HOST_SLOT} ({err}); the backup is kept at {BACKUP}')
         if not remove_client_slot():
             log(f'!! could not remove Game{CLIENT_SLOT}')
+        copies_left = remove_copy_slots(copy_slots) if copy_slots else []
         ev_left = remove_event_files('after the run')
         if ev_left:
             log('!! could not delete the event cooldown files', ev_left)
-    passed = summary(names, open_s, ctx, saves_ok, left, ev_left)
-    return 0 if passed and saves_ok and not left and not ev_left else 1
+    passed = summary(names, open_s, ctx, saves_ok, left, ev_left, copies_left)
+    return 0 if passed and saves_ok and not left and not ev_left and not copies_left else 1
 
 
 if __name__ == '__main__':

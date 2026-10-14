@@ -451,3 +451,65 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   war that DoPeace ends and resets its EnemyVP marker. This was test interference, not a mod bug.
 - Gotcha: `battlevp` is synchronous on the host's main thread: run it from a thread and answer dialogs meanwhile.
   GetLogAdjustedVP does not depend on the current score (2000 -> 214 from EnemyVP 0 and from 101).
+## Fix 2026-10-13: a joined player's "Copy game" played the host's nation (v0.2.7)
+- Report (0.2.0): "non host player can copy save but the save is only for the host player nation".
+- Game model (1.01.44): `btbnSaveToOtherSlotClick` -> `TdlgInputNumber` -> `CopyGameToOtherSlot(aFromSlot, aToSlot)`
+  (register arguments only) copies RTWGame<n>.bcs/.sta/.off, MapData<n>.dat, DesignFiles0..8.des, Autosave.sac/.off
+  and BattleInfo.bbi. The game always plays nation 0 of a save (the player's [Nation0] sections, DesignFiles0,
+  [General] War/EnemyVP, the .off officers and divisions, [EUT], the .sta month records). On a joined player's PC the
+  open slot (77) is the host's campaign, so the copy played the host's nation.
+- Nation numbers in a save (from the save routines' key strings): [Nation<i>*] sections; `Tension`/`Allied`/
+  `TechSharing` (relation with nation 0) and `AITension<j>`/`AIAlliance<j>` (j = 1..8, self cell 0, symmetric);
+  `Ship<n>BuildingNationIdx`; `AU<n>Nation`, `AT<n>Nation`; [General] BattleAlliedNationIdx/BattleEnemyAlliedNationIdx;
+  MapData `MapArea<a>MineLevel<i>` and `MapArea<a>Possession<p>TakenFrom`; DesignFiles<i>.des. Names (possession
+  Owner, Enemy1/Enemy2) need nothing. `DoPeace` resets InvasionTarget, EnemyInvasionTarget, ArmyOffensive,
+  RevolutionPending, LastMissionIdx (20), EnemyVP, TFW (1), TotalWar, HasBeenBattle, AutoBuildSubs.
+- Fix: a CopyGameToOtherSlot hook. When the source is the joined player's slot and the copied .bcs is
+  byte-identical to it, `saveio::MakeNationPlayer` swaps nation 0 and K everywhere above, rebuilds the relations
+  from K's point of view (the model of the joined player's events), clears the commanders of the host's old ships,
+  keeps only divisions of the new player's ships, sets War/EnemyVP for K and the end-of-war values when only the
+  host was at war, writes K's own event cooldowns into [EUT], and deletes the host's battle-in-progress files. The
+  nation K comes from the session, or from `rtw3mp_player.ini` in slot 77 after leaving it. Kept as they are:
+  officers (the player's pool), the .sta month records, intel reports, IDNo.
+- Bridge: `copygame <slot>` (the game's routine through the hook). An offline harness (saveio + util built as a
+  console program) checked the transform against the 1900 fixture with doctored wars, alliance, VP, mines,
+  TakenFrom, commanders and divisions.
+## Testing 2026-10-14: joined players' Copy game (v0.2.7)
+- Validation of the report against 0.2.6 (0.2.6 code + the test-only `copygame`; log `RTW3MP 0.2.6 starting`):
+  session as in `session` (host Great Britain = nation 0, client Germany = nation 1, Aug 1900), client `copygame 78`
+  -> the game's `TMessageForm` "Rule the Waves III" [OK]; Game78 `[Nation0] Name=Great Britain`, `[Nation1]
+  Name=Germany`, RTWGame78.bcs byte-identical to RTWGame77.bcs, DesignFiles0 the host's, `[General] War=-68`; no log
+  line; slot 77 unchanged, the client still in slot 77 as nation 1. Bug confirmed: the copy plays the host's nation.
+  A second `copygame 78` showed the overwrite prompt: `TMessageForm` "Confirm" [Cancel, OK]; Cancel copied nothing.
+  Game open 24 s, slot 1 restored (ReportNo=3420), Game77/Game78 and the cooldown file deleted.
+- Scenario `player_copy` (the last one, one session month + one single-player month; see the catalog in the
+  regression agent): a) the client's in-session copy compared key by key with an expectation written from the
+  specification (`expected_copy`/`expected_map`/`expected_off`; checked offline first against the mod's own
+  transform, harness `MakeNationPlayer`, on three doctored fixtures: identical, incl. 24 cleared commanders, 34 map
+  fields, a division kept and one dropped, both war branches), b) slot 77 and slot 1 untouched, c) the host's own
+  copy untouched, d) a copy cancelled at "Confirm", g) the real "Copy game" button, a session month, e) leave + `load
+  77 0` + `copygame 80` (nation from `rtw3mp_player.ini`), f) the copy loaded and one month played in single player.
+  26 checks + 8 month checks.
+- Results (0.2.7): `--only player_copy` 41/41 (session 7, player_copy 34) in 66 s; full suite 346/346 (session 7,
+  intel_reports 10, file_lock 7, events 32, merge 17, doctrine 17, design_study 31, diplomacy 68, victory_points 50,
+  treaty 73, player_copy 34), 8 processed months (13-17 s each) + the copy's month (10 s), game open 311 s.
+- Observed in the full run (Mar 1901, after `treaty`: Germany at peace with everyone, the host's War -2): `player
+  copy in slot 78: Germany is the player nation, Great Britain is nation 1 (AI); 5 sections, 26 commanders, 32 map
+  fields, divisions 0 kept / 0 dropped, at peace`; War -2 kept, EnemyVP 0; [EUT] took the client's cooldowns
+  (EUT1=5, EUT5=5, EUT34=9) instead of the host's (EUT32=5); 154 nation numbers swapped. The mod's box: "Slot 78 is
+  your own copy of the campaign: you play Germany. Great Britain, the host's nation, is run by the computer in this
+  copy. The multiplayer session is not affected." Loaded as nation 0: Germany 38082 funds / 37 ships, Great Britain
+  33009 / 51 (the session's values with 0 and 1 swapped), relations in memory = the file. Its month (Mar -> Apr
+  1901, 10 s): two "Confirm" boxes, two picture messages, an event for Germany ("Event - April 1901"), the turn report;
+  afterwards Germany 44741 funds, Great Britain (AI) 54 ships and its 35 possessions, no exception. The `--only` run
+  (Aug 1900) gave the same picture (22 commanders, Germany 3934 -> 4043, Great Britain 51 -> 52 ships, 35 -> 35
+  possessions). MapData TakenFrom had no 0/1 values in either run (only the 32 mine lines changed); the offline
+  harness covers it.
+- No mod bug found. The first `--only` run failed 2 of 34 on test problems: the button test typed 81 into
+  `TdlgInputNumber`, which the game runs with 1-9 (the form resource says 4-20) and clamped to 9, so the copy went to
+  Game9 (created by the run, deleted by hand); and the game does not write the slot at the end of a single-player
+  month, so a file-date wait timed out although the month had been played. Now the button uses the highest free slot
+  of 3-9 (chosen before the run, deleted after) and the month ends at the turn report, then `save` + the file date.
+- Gotchas: never answer a copy's dialogs with `dismiss_dialogs` ("Confirm" is OK/Cancel, OK overwrites; the
+  dialog's default slot is 1, the host's slot on a test PC); the mod's box is a Win32 `#32770` whose text is
+  readable through its Static child.

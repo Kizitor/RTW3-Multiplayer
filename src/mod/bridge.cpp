@@ -78,6 +78,12 @@ static std::string Execute(const std::string& line) {
         return "ok";
     }
     if (cmd == "applydiplo") return RunOnMainThread([] { mp::DebugApplyDiplomacy(); }), "ok";
+    if (cmd == "copygame") {  // copygame <to slot>: the game's "Copy game" of the open slot (shows the game's dialogs)
+        int to = atoi(arg(1, "0").c_str());
+        if (to <= 0) return "error slot";
+        RunOnMainThread([to] { game::CopyGame(to); });
+        return "ok";
+    }
     if (cmd == "eventnow") {  // eventnow [index]: client rolls this month's event now (shows the game's dialog)
         if (game::EventActive()) return "error an event dialog is open";
         int idx = atoi(arg(1, "-1").c_str());

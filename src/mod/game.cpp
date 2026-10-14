@@ -49,7 +49,7 @@ struct Api {
         fPossOwner = -1, fBaseResources = -1, fPrestige = -1, fVP = -1, fEnemyVP = -1, fBattleOpp = -1;
     void *mChangeOwner = nullptr, *mAdjacent = nullptr, *mRemoveShipInPeace = nullptr, *mShowTreaty = nullptr,
          *mSLCreate = nullptr, *mFree = nullptr, *mBattleAftermath = nullptr,
-         *mAIBattle = nullptr, *mRaiderBattle = nullptr, *mUpdateVPNumbers = nullptr;
+         *mAIBattle = nullptr, *mRaiderBattle = nullptr, *mUpdateVPNumbers = nullptr, *mCopyGame = nullptr;
     int* scaleVar = nullptr;  // the game's scale value used in its war-progress thresholds (100*G + 300/500)
     bool treaties = false;
 } A;
@@ -105,6 +105,7 @@ static void ResolveTreaties() {
     A.mAIBattle = dl::Method("TfrmBuildCamp", "DoBattleBetweenAINations");
     A.mRaiderBattle = dl::Method("TfrmBuildCamp", "QuickResolveRaiderBattle");
     A.mUpdateVPNumbers = dl::Method("TfrmBuildCamp", "UpdateVPNumbers");
+    A.mCopyGame = dl::Method("TfrmBuildCamp", "CopyGameToOtherSlot");
     // RemoveShipInPeace (unnamed): NegotiatePeace hands the player's ships to an enemy with
     // `call GetRandomEnemy; mov ecx,eax; mov eax,[ebp-4]; mov edx,[eax+PlayerNation]; mov eax,[ebp-4]; call X`.
     void* negotiate = dl::Method("TfrmBuildCamp", "NegotiatePeace");
@@ -1709,6 +1710,33 @@ extern "C" __declspec(naked) void d_DoPeace() {  // (Self)
     }
 }
 
+// CopyGameToOtherSlot(Self, aFromSlot, aToSlot): the "Copy game" button (register arguments only).
+extern "C" void* o_CopyGame = nullptr;
+
+extern "C" void __stdcall CB_AfterCopyGame(int from, int to) {
+    try {
+        hookcb::OnAfterCopyGame(from, to);
+    } catch (...) {
+        Log("exception in OnAfterCopyGame");
+    }
+}
+
+extern "C" __declspec(naked) void d_CopyGame() {
+    __asm {
+        push ecx
+        push edx
+        call dword ptr [o_CopyGame]
+        call CB_AfterCopyGame
+        ret
+    }
+}
+
+void CopyGame(int toSlot) {
+    void* f = BuildCamp();
+    if (!f || !A.mCopyGame || EventActive()) return;
+    dl::Call(A.mCopyGame, (uint32_t)(uintptr_t)f, (uint32_t)CurrentSlot(), (uint32_t)toSlot);  // through the hook
+}
+
 extern "C" __declspec(naked) void d_AIMoves() {
     __asm {
         push eax
@@ -1821,6 +1849,7 @@ bool InstallHooks() {
     if (A.mAIMoves) Hook(A.mAIMoves, (void*)&d_AIMoves, &o_AIMoves, "AIStrategicMoves");
     if (A.diplomacy && A.mHandleAIPeace) Hook(A.mHandleAIPeace, (void*)&d_AIPeace, &o_AIPeace, "HandleAIPeace");
     if (A.diplomacy && A.mDoPeace && A.fPrestige >= 0) Hook(A.mDoPeace, (void*)&d_DoPeace, &o_DoPeace, "DoPeace");
+    if (A.mCopyGame) Hook(A.mCopyGame, (void*)&d_CopyGame, &o_CopyGame, "CopyGameToOtherSlot");
     if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)

@@ -48,4 +48,15 @@ bool ReadDate(const std::wstring& slotDir, int slot, int& year, int& month);
 // Read [General] IDNo from a slot's .bcs (-1 if unavailable).
 long long ReadIdNo(const std::wstring& slotDir, int slot);
 
+// A joined player's own copy of the campaign (the game's "Copy game" of slot 77): nation K becomes the player nation
+// (index 0) and the host's nation an AI nation at index K. eventCooldowns: K's own [EUT] values (100), or empty.
+struct PlayerCopyFiles {
+    std::string bcs, map, off;
+    bool hasMap = false, hasOff = false;
+};
+bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& eventCooldowns, std::string& summary,
+                           std::string& err);
+bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::vector<int>& eventCooldowns,
+                      std::string& summary, std::string& err);
+
 }  // namespace saveio

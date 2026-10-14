@@ -433,4 +433,302 @@ long long ReadIdNo(const std::wstring& slotDir, int slot) {
     return v.empty() ? -1 : atoll(v.c_str());
 }
 
+// ---------------------------------------------------------------------------------------------
+// A joined player's own copy of the campaign. The game always plays nation 0 of a save; nation K and nation 0 trade
+// places everywhere the save refers to nations by number, and the relations are rebuilt from K's point of view
+// (the same model as the joined player's events, game::RunClientEvent).
+
+static int SwapIdx(int v, int K) { return v == 0 ? K : v == K ? 0 : v; }
+
+static bool SplitKV(const std::string& line, std::string& k, std::string& v) {
+    size_t eq = line.find('=');
+    if (eq == std::string::npos || eq == 0) return false;
+    k = line.substr(0, eq);
+    v = line.substr(eq + 1);
+    return true;
+}
+
+static bool AllDigits(const std::string& s, size_t from, size_t to) {
+    if (from >= to) return false;
+    for (size_t i = from; i < to; i++)
+        if (!isdigit((unsigned char)s[i])) return false;
+    return true;
+}
+
+static bool IsInt(const std::string& v) { return AllDigits(v, !v.empty() && v[0] == '-' ? 1 : 0, v.size()); }
+
+// "<prefix><number><suffix>"
+static bool KeyShape(const std::string& k, const char* prefix, const char* suffix) {
+    size_t p = strlen(prefix), s = strlen(suffix);
+    return k.size() > p + s && k.compare(0, p, prefix) == 0 && k.compare(k.size() - s, s, suffix) == 0 &&
+           AllDigits(k, p, k.size() - s);
+}
+
+// Air units ("AU<n>Nation") and aircraft types ("AT<n>Nation") name their nation by number.
+static bool AirNationKey(const std::string& k) {
+    if (k.size() < 9 || k.compare(k.size() - 6, 6, "Nation") != 0) return false;
+    size_t e = k.size() - 6, b = e;
+    while (b > 0 && isdigit((unsigned char)k[b - 1])) b--;
+    return b < e && b >= 2 && (k.compare(b - 2, 2, "AU") == 0 || k.compare(b - 2, 2, "AT") == 0);
+}
+
+// "MapArea<a>MineLevel<n>": the mines each nation laid in a sea area.
+static bool MineKey(const std::string& k, std::string& area, int& n) {
+    if (k.compare(0, 7, "MapArea") != 0) return false;
+    size_t p = 7;
+    while (p < k.size() && isdigit((unsigned char)k[p])) p++;
+    if (p == 7 || k.compare(p, 9, "MineLevel") != 0 || !AllDigits(k, p + 9, k.size())) return false;
+    area = k.substr(0, p);
+    n = atoi(k.c_str() + p + 9);
+    return true;
+}
+
+static bool SetExisting(IniDoc& d, const std::string& sec, const std::string& key, const std::string& value) {
+    IniSection* s = d.Find(sec);
+    if (!s) return false;
+    for (auto& l : s->lines)
+        if (KeyIs(l, key)) {
+            l = key + "=" + value;
+            return true;
+        }
+    return false;
+}
+
+bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& eventCooldowns, std::string& summary,
+                           std::string& err) {
+    if (K < 1 || K > 8) {
+        err = "not a joined player's nation";
+        return false;
+    }
+    IniDoc d = ParseIni(f.bcs);
+    const std::string n0 = "Nation0", nk = "Nation" + std::to_string(K);
+    if (!d.Find(n0) || !d.Find(nk) || !d.Find("General")) {
+        err = "the save has no " + nk;
+        return false;
+    }
+    auto geti = [&](const std::string& sec, const std::string& key) { return atoi(d.Get(sec, key, "0").c_str()); };
+    auto sec = [](int i) { return "Nation" + std::to_string(i); };
+
+    // Relations before the swap: rel(a, b) with nation 0 = the other nation's Tension/Allied, between nations
+    // 1..8 = AITension<b>/AIAlliance<b>.
+    int T[9], Al[9], AIT[9][9] = {}, AIA[9][9] = {};
+    for (int i = 0; i < 9; i++) {
+        T[i] = geti(sec(i), "Tension");
+        Al[i] = geti(sec(i), "Allied");
+        for (int j = 1; j < 9; j++) {
+            AIT[i][j] = geti(sec(i), "AITension" + std::to_string(j));
+            AIA[i][j] = geti(sec(i), "AIAlliance" + std::to_string(j));
+        }
+    }
+    auto rel = [&](int a, int b, bool alliance) {
+        if (a == b) return 0;
+        if (a == 0) return alliance ? Al[b] : T[b];
+        if (b == 0) return alliance ? Al[a] : T[a];
+        return alliance ? AIA[a][b] : AIT[a][b];
+    };
+    // The player nation's own values of these keys (unused by the game) stay with index 0.
+    std::map<std::string, std::string> playerOwn;
+    for (auto& l : d.Find(n0)->lines) {
+        std::string k, v;
+        if (SplitKV(l, k, v) && (k == "Tension" || k == "Allied" || k == "TechSharing" || KeyShape(k, "AITension", "") ||
+                                 KeyShape(k, "AIAlliance", "")))
+            playerOwn[k] = v;
+    }
+
+    // Nation sections ([Nation0], [Nation0Ships], [Nation0Losses], ...) trade places with nation K's.
+    int swapped = 0;
+    for (auto& s : d.sections) {
+        if (s.name.compare(0, 7, "Nation0") != 0 || (s.name.size() > 7 && isdigit((unsigned char)s.name[7]))) continue;
+        IniSection* other = d.Find(nk + s.name.substr(7));
+        if (!other) continue;
+        std::swap(s.lines, other->lines);
+        swapped++;
+    }
+
+    for (int x = 1; x < 9; x++) {
+        int sx = SwapIdx(x, K);
+        SetExisting(d, sec(x), "Tension", std::to_string(rel(sx, K, false)));
+        SetExisting(d, sec(x), "Allied", std::to_string(rel(sx, K, true)));
+        SetExisting(d, sec(x), "TechSharing", "0");  // tech-sharing deals were the host's
+        for (int y = 1; y < 9; y++) {
+            int sy = SwapIdx(y, K);
+            SetExisting(d, sec(x), "AITension" + std::to_string(y), std::to_string(x == y ? 0 : rel(sx, sy, false)));
+            SetExisting(d, sec(x), "AIAlliance" + std::to_string(y), std::to_string(x == y ? 0 : rel(sx, sy, true)));
+        }
+    }
+    for (auto& p : playerOwn) SetExisting(d, n0, p.first, p.second);
+
+    // Nation numbers inside the sections: where ships were built, the air units' and aircraft types' nations. The
+    // host's ships (now nation K) lose their commanders: officers belong to the player.
+    int commanders = 0;
+    for (auto& s : d.sections) {
+        bool hostShips = s.name.compare(0, nk.size(), nk) == 0 && s.name.size() > nk.size() &&
+                         !isdigit((unsigned char)s.name[nk.size()]);
+        for (auto& l : s.lines) {
+            std::string k, v;
+            if (!SplitKV(l, k, v) || !IsInt(v)) continue;
+            if (KeyShape(k, "Ship", "BuildingNationIdx") || AirNationKey(k)) {
+                l = k + "=" + std::to_string(SwapIdx(atoi(v.c_str()), K));
+            } else if (hostShips && KeyShape(k, "Ship", "CommanderId") && v != "-1") {
+                l = k + "=-1";
+                commanders++;
+            }
+        }
+    }
+
+    // [General]: the player's war state and score belong to nation K now.
+    bool kAtWar = false;
+    int enemyVP = 0;
+    for (int x = 1; x < 9; x++)
+        if (geti(sec(x), "Tension") > 40) {
+            kAtWar = true;
+            enemyVP += std::max(0, geti(sec(x), "VP"));
+        }
+    int war = geti("General", "War");
+    bool hostAtWar = war > 0;
+    SetExisting(d, "General", "War", std::to_string(kAtWar ? (war > 0 ? war : 1) : (war > 0 ? -12 : war)));
+    SetExisting(d, "General", "EnemyVP", std::to_string(enemyVP));
+    SetExisting(d, "General", "ScenarioInProgress", "-1");  // a battle in progress was the host's
+    for (const char* key : {"BattleAlliedNationIdx", "BattleEnemyAlliedNationIdx"}) {
+        std::string v = d.Get("General", key, "");
+        if (IsInt(v)) SetExisting(d, "General", key, std::to_string(SwapIdx(atoi(v.c_str()), K)));
+    }
+    // The host's invasion plans and army offensives (the game's end-of-war values).
+    SetExisting(d, "General", "InvasionTargetName", "XXX");
+    SetExisting(d, "General", "EnemyInvasionTargetName", "XXX");
+    SetExisting(d, "General", "ArmyOffensive", "0");
+    SetExisting(d, "General", "RevolutionPending", "0");
+    SetExisting(d, "General", "LastMissionIdx", "20");
+    if (hostAtWar && !kAtWar) {  // the host's war is over for this campaign: as the game's DoPeace leaves it
+        SetExisting(d, "General", "TotalWar", "0");
+        SetExisting(d, "General", "TFW", "1");
+        SetExisting(d, "General", "HasBeenBattle", "0");
+        SetExisting(d, "General", "AutoBuildSubs", "0");
+    }
+    if (eventCooldowns.size() == 100 && d.Find("EUT"))
+        for (int j = 0; j < 100; j++) SetExisting(d, "EUT", "EUT" + std::to_string(j), std::to_string(eventCooldowns[j]));
+
+    // The new player's ships (for its divisions).
+    std::set<std::string> playerShipIds;
+    if (const IniSection* ps = d.Find("Nation0Ships"))
+        for (auto& l : ps->lines) {
+            std::string k, v;
+            if (SplitKV(l, k, v) && KeyShape(k, "Ship", "Id")) playerShipIds.insert(v);
+        }
+    std::string playerName = d.Get(n0, "Name"), hostName = d.Get(nk, "Name");
+    f.bcs = WriteIni(d);
+
+    // Map: mines per nation, and the nation a possession was taken from.
+    int mapFields = 0;
+    if (f.hasMap) {
+        IniDoc m = ParseIni(f.map);
+        auto fix = [&](std::vector<std::string>& lines) {
+            for (auto& l : lines) {
+                std::string k, v, area;
+                int n;
+                if (!SplitKV(l, k, v)) continue;
+                if (MineKey(k, area, n) && (n == 0 || n == K)) {
+                    l = area + "MineLevel" + std::to_string(SwapIdx(n, K)) + "=" + v;
+                    mapFields++;
+                } else if (k.compare(0, 7, "MapArea") == 0 && k.size() > 9 &&
+                           k.compare(k.size() - 9, 9, "TakenFrom") == 0 && IsInt(v)) {
+                    int t = atoi(v.c_str());
+                    if (t == 0 || t == K) {
+                        l = k + "=" + std::to_string(SwapIdx(t, K));
+                        mapFields++;
+                    }
+                }
+            }
+        };
+        fix(m.head);
+        for (auto& s : m.sections) fix(s.lines);
+        f.map = WriteIni(m);
+    }
+
+    // Officers stay (the player's); divisions are kept only if all their ships are the new player's.
+    int divKept = 0, divDropped = 0;
+    if (f.hasOff) {
+        IniDoc o = ParseIni(f.off);
+        if (IniSection* cd = o.Find("CampaignDivisions")) {
+            std::map<int, std::vector<std::pair<std::string, std::string>>> divs;  // number -> (field, value)
+            std::vector<std::string> other;
+            for (auto& l : cd->lines) {
+                std::string k, v;
+                size_t p = 7;
+                if (SplitKV(l, k, v) && k.compare(0, 7, "CampDiv") == 0) {
+                    while (p < k.size() && isdigit((unsigned char)k[p])) p++;
+                    if (p > 7 && p < k.size()) {
+                        divs[atoi(k.substr(7, p - 7).c_str())].push_back({k.substr(p), v});
+                        continue;
+                    }
+                    if (k == "CampDivNo") continue;
+                }
+                other.push_back(l);
+            }
+            std::vector<std::string> lines;
+            for (auto& dv : divs) {
+                bool mine = true;
+                for (auto& fv : dv.second)
+                    if (KeyShape(fv.first, "ShipId", "") && !playerShipIds.count(fv.second)) mine = false;
+                if (!mine) {
+                    divDropped++;
+                    continue;
+                }
+                for (auto& fv : dv.second) lines.push_back("CampDiv" + std::to_string(divKept) + fv.first + "=" + fv.second);
+                divKept++;
+            }
+            if (divs.size() || !other.empty()) {
+                std::vector<std::string> out = {"CampDivNo=" + std::to_string(divKept)};
+                out.insert(out.end(), lines.begin(), lines.end());
+                for (auto& l : other)
+                    if (!l.empty()) out.push_back(l);
+                cd->lines = out;
+            }
+            f.off = WriteIni(o);
+        }
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s is the player nation, %s is nation %d (AI); %d sections, %d commanders, %d map "
+             "fields, divisions %d kept / %d dropped, %s",
+             playerName.c_str(), hostName.c_str(), K, swapped, commanders, mapFields, divKept, divDropped,
+             kAtWar ? "at war" : "at peace");
+    summary = buf;
+    return true;
+}
+
+bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::vector<int>& eventCooldowns,
+                      std::string& summary, std::string& err) {
+    std::wstring s = SlotStr(slot);
+    std::wstring bcsPath = slotDir + L"RTWGame" + s + L".bcs", mapPath = slotDir + L"MapData" + s + L".dat",
+                 offPath = slotDir + L"RTWGame" + s + L".off";
+    PlayerCopyFiles f;
+    if (!ReadFileBytes(bcsPath, f.bcs)) {
+        err = "cannot read the copied save";
+        return false;
+    }
+    f.hasMap = ReadFileBytes(mapPath, f.map);
+    f.hasOff = ReadFileBytes(offPath, f.off);
+    if (!TransformNationPlayer(f, K, eventCooldowns, summary, err)) return false;
+    // The ship designs are stored per nation number too.
+    std::wstring des0 = slotDir + L"DesignFiles0.des", desK = slotDir + L"DesignFiles" + std::to_wstring(K) + L".des",
+                 tmp = slotDir + L"DesignFiles_swap.tmp";
+    bool has0 = FileExists(des0), hasK = FileExists(desK);
+    bool ok = (!has0 || MoveFileExW(des0.c_str(), tmp.c_str(), MOVEFILE_REPLACE_EXISTING)) &&
+              (!hasK || MoveFileExW(desK.c_str(), des0.c_str(), MOVEFILE_REPLACE_EXISTING)) &&
+              (!has0 || MoveFileExW(tmp.c_str(), desK.c_str(), MOVEFILE_REPLACE_EXISTING));
+    if (!ok) {
+        err = "cannot swap the design files (Windows error " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    if (!WriteFileBytes(bcsPath, f.bcs) || (f.hasMap && !WriteFileBytes(mapPath, f.map)) ||
+        (f.hasOff && !WriteFileBytes(offPath, f.off))) {
+        err = "cannot write the copied save";
+        return false;
+    }
+    // A battle in progress (the host's) can't be resumed in the copy.
+    for (const wchar_t* n : {L"Autosave.sac", L"Autosave.off", L"BattleInfo.bbi"}) DeleteFileW((slotDir + n).c_str());
+    Log("player copy in slot %d: %s", slot, summary.c_str());
+    return true;
+}
+
 }  // namespace saveio

@@ -114,6 +114,8 @@ int EnemyVP();    // the victory points of the host nation's enemies
 void SetNationVP(int idx, int vp);
 bool AtWarWithAnyone(int idx);
 void ShowEnemyVP(int vp);  // this PC's "Enemy VP" (a joined player's view: the points of its own enemies)
+// The game's "Copy game" from the open slot to another one (shows the game's own confirmations; tests).
+void CopyGame(int toSlot);
 // Test hook: the game's end-of-battle routine against `opp`, as after a tactical battle (VP before the log scale).
 std::string DebugBattleAftermath(int opp, int vp0, int vp1, const std::string& level);
 std::vector<PossessionInfo> Possessions(int ownerIdx);
@@ -167,4 +169,5 @@ void OnAfterDesignStudies(void* self);  // the game advanced the host nation's d
 void OnAfterReduceTimeLimits(void* self);  // the game counted down the host nation's pending changes this month
 void OnBattleVP(int a, int b, int vpA, int vpB);  // victory points a battle between nations a and b gave each side
 void OnHostPeace(bool after);  // the game's end of the host's last war (DoPeace), before and after
+void OnAfterCopyGame(int fromSlot, int toSlot);  // the game's "Copy game" finished (or was cancelled)
 }  // namespace hookcb

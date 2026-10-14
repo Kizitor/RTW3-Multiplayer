@@ -24,7 +24,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.6-win32.zip` from the
+2. Download `RTW3MP-0.2.7-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -82,6 +82,13 @@ player "Captain".
    save slot `Game77`, so your own saves are never touched.
 4. Plan your month and press **Submit**. You can keep changing orders and submit again until the host
    processes the turn.
+5. To keep your own copy of the campaign, use the game's **Copy game** button. The copy is made for your
+   nation: you play your nation in it, and the host's nation is run by the computer. It is a normal
+   single-player save and doesn't affect the multiplayer session. (This also works after you leave the
+   session, as long as slot 77 still holds the multiplayer game.)
+   - You keep your nation, its fleet, designs, possessions, budget, research, relations and wars.
+   - The host's officers come with the copy, unassigned; their divisions don't.
+   - Tech-sharing deals start over.
 
 To test on one PC, run two copies of the game and join `127.0.0.1` (`RTW3MP_SecondCopy.bat` from the
 release starts the second copy). Both copies share one settings

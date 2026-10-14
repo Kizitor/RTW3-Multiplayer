@@ -1533,6 +1533,11 @@ static void ClientApplyPendingState() {
         Notice("Cannot store the received game: " + err);
         return;
     }
+    {
+        KV mk;  // which nation this slot is played as (for "Copy game", also after leaving the session)
+        mk["nation"] = std::to_string(nation);
+        WriteFileBytes(dir + L"rtw3mp_player.ini", KVEncode(mk));
+    }
     g_clientIdStart = saveio::ReadIdNo(dir, g_clientSlot);
     if (!game::LoadCampaign(g_clientSlot, nation)) {
         Notice("Loading the received game failed.");
@@ -2494,6 +2499,49 @@ void OnAfterAIPeace() {
     if (g_peaceDepth > 0) return;
     for (auto& m : mp::g_peaceMask) game::SetTensionRaw(std::get<0>(m), std::get<1>(m), std::get<2>(m));
     mp::g_peaceMask.clear();
+}
+
+// The game copied the open save to another slot. On a joined player's PC the save is the host's campaign with the
+// host's nation as nation 0, which the game always plays: the copy is turned into the player's own campaign.
+void OnAfterCopyGame(int from, int to) {
+    using namespace mp;
+    if (from != g_clientSlot || to == from || to <= 0) return;
+    std::wstring src = game::SaveDir(from), dst = game::SaveDir(to);
+    int K = g_role == Role::Client && g_myNation > 0 ? g_myNation : -1;
+    if (K < 0) {  // not in a session (any more): the nation this slot was last played as
+        std::string s;
+        if (ReadFileBytes(src + L"rtw3mp_player.ini", s)) K = KVInt(KVDecode(s), "nation", -1);
+    }
+    if (K < 1 || K > 8) {
+        Log("copy of slot %d to %d: no joined nation known; left as it is", from, to);
+        return;
+    }
+    std::string a, b;
+    if (!ReadFileBytes(src + L"RTWGame" + std::to_wstring(from) + L".bcs", a) ||
+        !ReadFileBytes(dst + L"RTWGame" + std::to_wstring(to) + L".bcs", b) || a != b) {
+        Log("copy of slot %d to %d: not copied", from, to);
+        return;
+    }
+    std::vector<int> eut;
+    if (g_role == Role::Client && !g_evUsedKey.empty()) eut.assign(g_evUsed, g_evUsed + 100);
+    std::wstring mine = game::NationName(K), host = game::NationName(0);
+    std::string summary, err;
+    HWND owner = GetActiveWindow();
+    if (saveio::MakeNationPlayer(dst, to, K, eut, summary, err)) {
+        MessageBoxW(owner,
+                    (L"Slot " + std::to_wstring(to) + L" is your own copy of the campaign: you play " + mine + L".\n\n" +
+                     host + L", the host's nation, is run by the computer in this copy. The multiplayer session is "
+                     L"not affected.")
+                        .c_str(),
+                    L"Multiplayer", MB_OK | MB_ICONINFORMATION);
+    } else {
+        Log("copy of slot %d to %d for nation %d failed: %s", from, to, K, err.c_str());
+        MessageBoxW(owner,
+                    (L"The copy in slot " + std::to_wstring(to) + L" could not be changed to your nation (" + U2W(err) +
+                     L"). It plays as " + host + L", the host's nation.")
+                        .c_str(),
+                    L"Multiplayer", MB_OK | MB_ICONWARNING);
+    }
 }
 
 // The game ends the host's last war (DoPeace resets the host's VP and EnemyVP to 0): first share what the host's
