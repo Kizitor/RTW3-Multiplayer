@@ -513,3 +513,53 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Gotchas: never answer a copy's dialogs with `dismiss_dialogs` ("Confirm" is OK/Cancel, OK overwrites; the
   dialog's default slot is 1, the host's slot on a test PC); the mod's box is a Win32 `#32770` whose text is
   readable through its Static child.
+## Fix 2026-10-14: a joined player's Research screen showed and edited the host's research (v0.2.8)
+- Report (0.2.0): "Research prio is mirrored from host to non host player but not % of money spent".
+- Game model (1.01.44): research priorities and the research budget are per nation (`TBuilderNation.ResearchAreas`
+  +0x325: 25 records of 0x35 bytes, Advantage byte +0, Prio integer +1, saved as `Research<i>Prio`; `ResearchPct`
+  +0x1b0), so the turn merge already carried them. But `TfrmBuildCamp.btbnResearchClick` opens
+  `TfrmResearch.Execute(aNation)` with BuilderNations[0] (`mov eax,[ebx+0xae4]; xor edx,edx; call TList.Get`), not
+  PlayerNation. Execute loads `aNation.ResearchPct` into `seResearchBudget`, keeps aNation as
+  `CurrentResearchingNation` for the priority buttons, and writes the budget back on OK. On a joined player's PC
+  nation 0 is the host's nation: the player saw the host's priorities and budget, and their changes went to the
+  host's nation in their own copy (never merged, replaced the next month). A scan of the game's other screens for
+  nation-0 lookups (BuilderNations[0] and GetBNation(0) in click/execute handlers) found only the free-design,
+  new-game, debug and aircraft-request screens, which a joined player doesn't use in a campaign.
+- Fix: a `TfrmResearch.Execute` hook: when the nation passed is nation 0 and PlayerNation is another nation (only on
+  a joined player's PC), the screen opens for PlayerNation (log `research screen: opened for the player's nation K
+  instead of nation 0`). The host and the joined player's event dialogs (nation list swapped) are unchanged.
+- Bridge: `research <nation>` (budget % and the 25 priorities), `researchopen` (the Research button's handler).
+## Testing 2026-10-14: joined players' research screen (v0.2.8)
+- Validation of the report against 0.2.7 (0.2.7 code + the test-only `research`/`researchopen`; log `RTW3MP 0.2.7
+  starting`): session as in `session` (Aug 1900). Host and client: `research 0` -> `ok pct=8 prio=2,2,...,2,0,0` (all
+  Medium), `research 1` -> `ok pct=13 prio=1,2,2,2,2,2,2,2,2,2,3,2,3,2,2,3,2,...,0,0`. Client `researchopen` ->
+  `TfrmResearch` "Research": `seResearchBudget` "8" and every listed area "Medium" (nation 0's values; nation 1 would
+  show 12 and Low/High), no log line. The popup menu's "Low" on row 0 (Machinery development) and budget 7 + OK: client
+  `research 0` -> `ok pct=7 prio=1,2,...`, `research 1` unchanged (`pct=13`). After one month: the host's nations 0 and
+  1 unchanged (8 / 13 and their priorities), the client's nation 0 back to the host's `pct=8` all Medium, its nation 1
+  still 13, and its dialog again "8" / all Medium. Bug confirmed: the screen shows and edits the host's nation, the
+  player's own research never changes. The month had `AI suppressed: DetermineAINationResearch for nation 1` (and 2).
+  Game open 47 s; slot 1 restored (ReportNo=3420), Game77 and the cooldown file deleted.
+- Scenario `research` (after `merge`; shares the next processed month, `design_study 1` in the full run, one own month
+  when nothing later processes one): setup `nfield 1 ResearchPct 10` (<= 12, nation 0 has 8). a) client `researchopen`:
+  the log line, the dialog shows nation 1's budget and priorities, not nation 0's; b) popup "Low" on row 11 (Explosive
+  shells = area 12) and budget 7 + OK: nation 1 only; d) reopened it shows them, 15 % + OK -> the game's message box,
+  the dialog stays open, nothing written, WM_CLOSE leaves cleanly; c) host: no log line, nation 0 shown, budget 9 + OK
+  changes nation 0 only; after the month the host has 7 % / Low for nation 1 and its own 9 % for nation 0, the client
+  keeps its values and gets the host's nation 0, its dialog shows nation 1, the AI skip line for nation 1. 22 checks
+  (+ 8 month checks when it processes its own month). The host's nation 0 goes back to its own % afterwards (`nfield`).
+- Results (0.2.8): `--only research` 37/37 (session 7, research 30) in 43 s; full suite 368/368 (session 7,
+  intel_reports 10, file_lock 7, events 32, merge 17, research 22, doctrine 17, design_study 31, diplomacy 68,
+  victory_points 50, treaty 73, player_copy 34), 8 processed months (11-20 s each) + the copy's month (12 s), game open
+  322 s.
+- Observed: nation 1's research % is 13 in the fixture (set while it was an AI nation) and 14 after `merge`'s `nfield`;
+  the dialog's `seResearchBudget` (MaxValue 12) shows "12" for both, WM_CLOSE keeps 13/14, OK would write 12. The
+  over-budget box is a `TMessageForm` "Rule the Waves III" [OK] (its text is a TLabel, unreadable).
+- No mod bug found. The first `--only research` run failed 3 of 30 checks because of a wrong assumption in the test:
+  list row i is not area i. The list shows only the areas the era offers (1900: 0-10, 12, 13; 11 Anti submarine warfare
+  is not offered yet) plus a "Naval guns" row (the calibers). The test now maps rows by name through the game's own
+  `Data\ResearchAreas3.dat` headers (`[Explosive shells 12]`, "(Adv)" stripped) and doesn't compare "Naval guns".
+- Gotchas: `bnMedium`/`bnLow` are "All medium"/"All low" (every area); one area changes only through the list's
+  right-click menu: select the row with LVM_SETITEMSTATE, post `WM_CONTEXTMENU` (lParam -1) to the list, then post
+  VK_DOWN/VK_RETURN to the `#32768` menu window (the menu loop takes them; MN_GETHMENU + GetMenuState MF_HILITE to see
+  the highlight). Sync bridge commands work while the modal dialog is open (the dispatcher drains re-entrantly).

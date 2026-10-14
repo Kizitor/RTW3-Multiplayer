@@ -84,6 +84,7 @@ static std::string Execute(const std::string& line) {
         RunOnMainThread([to] { game::CopyGame(to); });
         return "ok";
     }
+    if (cmd == "researchopen") return RunOnMainThread([] { game::OpenResearch(); }), "ok";  // the Research button (modal)
     if (cmd == "eventnow") {  // eventnow [index]: client rolls this month's event now (shows the game's dialog)
         if (game::EventActive()) return "error an event dialog is open";
         int idx = atoi(arg(1, "-1").c_str());
@@ -192,6 +193,7 @@ static std::string ExecuteOnMain(const std::string& line) {
         }
         if (cmd == "terms") return mp::DebugTerms(atoi(arg(1).c_str()), atoi(arg(2).c_str()));  // host: terms <a> <b>
         if (cmd == "vpinfo") return mp::DebugVPInfo();
+        if (cmd == "research") return game::DebugResearch(atoi(arg(1, "0").c_str()));  // research <nation>: pct and priorities
         if (cmd == "enemyvpadd")  // host: enemyvpadd <n>: the host's enemies gain n VP outside a battle (as a blockade)
             return game::ShowEnemyVP(game::EnemyVP() + atoi(arg(1, "0").c_str())), mp::DebugVPInfo();
         if (cmd == "battlevp")  // host: battlevp <opponent> <vp host> <vp opponent> [Major|Minor|Marginal]: end-of-battle routine

@@ -853,10 +853,14 @@ def force_event(ctx, idx, probe=False, timeout=25):
 
 
 def planned_months(names):
-    """Months the selected scenarios process (doctrine and events process their own if no later scenario does)."""
+    """Months the selected scenarios process (doctrine, research and events process their own if no later scenario
+    does)."""
     n = sum(s[1] for s in SCENARIOS if s[0] in names)
     if 'doctrine' in names and 'design_study' not in names:
         n += 2
+    order = [s[0] for s in SCENARIOS]
+    if 'research' in names and planned_months([x for x in names if order.index(x) > order.index('research')]) == 0:
+        n += 1
     if 'events' in names and n == 0:
         n += 2
     return n
@@ -1195,6 +1199,323 @@ def scenario_merge(ctx):
     log('  e.g.', sup[:3])
     other = log_lines(hlog, rf'AI suppressed: .* for nation {AI_NATION}\b')
     check(f'host log: the AI still runs AI nation {AI_NATION}', not other, other[:3])
+
+
+# ---------------------------------------------------------------- research screen (0.2.8)
+
+PRIO = {'Low': 1, 'Medium': 2, 'High': 3}  # the Priority column of TfrmResearch.lvResearch <-> ResearchAreas[i].Prio
+RESEARCH_LINE = r"research screen: opened for the player's nation (\d+) instead of nation 0"
+RESEARCH_MAX = 12  # seResearchBudget.MaxValue; Button1Click refuses more with the game's own message
+MN_GETHMENU, TCM_GETCURSEL = 0x01E1, 0x130B
+_u32m = ctypes.WinDLL('user32')  # popup menus of a game copy (HMENU handles are valid across processes)
+_u32m.GetMenuItemCount.argtypes = [wt.HMENU]
+_u32m.GetMenuStringW.argtypes = [wt.HMENU, wt.UINT, wt.LPWSTR, ctypes.c_int, wt.UINT]
+_u32m.GetMenuState.argtypes = [wt.HMENU, wt.UINT, wt.UINT]
+_u32m.GetMenuState.restype = wt.UINT
+
+
+def research(port, nation):
+    """`research <nation>` as dict(pct, prio=[25 values]), or None."""
+    m = re.match(r'^ok pct=(-?\d+) prio=([-\d,]+)$', cmd(port, f'research {nation}'))
+    return dict(pct=int(m[1]), prio=[int(x) for x in m[2].split(',')]) if m else None
+
+
+def fmt_research(r):
+    return f'pct={r["pct"]} prio={",".join(map(str, r["prio"]))}' if r else str(r)
+
+
+def research_dialogs(pid):
+    return [h for h in windows_of(pid, 'TfrmResearch') if u.IsWindowVisible(h)]
+
+
+def message_forms(pid):
+    return [h for h in top_windows(pid) if e2e_test.class_name(h) == 'TMessageForm']
+
+
+def research_controls(dlg):
+    """TfrmResearch (form resource TFRMRESEARCH): lvResearch (report view: Research area, Last research, Priority,
+    Levels; PopupMenu High/Medium/Low/-/Details), seResearchBudget (TSpinEdit 0-12), tcResearch (tabs General, Naval
+    guns), Button1 "OK" (mrOK), bnMedium "All medium", bnLow "All low" (every area)."""
+    kids, k = children(dlg), e2e_test.class_name
+    return dict(dlg=dlg, lv=next((h for h in kids if k(h) == 'TListView'), None),
+                se=next((h for h in kids if k(h) == 'TSpinEdit'), None),
+                tc=next((h for h in kids if k(h) == 'TTabControl'), None),
+                ok=next((h for h in kids if k(h) == 'TButton' and caption(h) == 'OK'), None))
+
+
+def research_areas():
+    """{area name: index} from the game's own area table (`Data\\ResearchAreas3.dat`, read-only; headers `[Name i]`).
+    The dialog lists only the areas the era offers (1900: 0-10, 12, 13) plus a "Naval guns" row (gun calibers), which
+    is not in the table and not compared."""
+    try:
+        with open(os.path.join(ctl.GAME, 'Data', 'ResearchAreas3.dat'), encoding='latin-1') as f:
+            return {m[1]: int(m[2]) for m in re.finditer(r'^\[(.+) (\d+)\]\s*$', f.read(), re.M)}
+    except OSError:
+        return {}
+
+
+def research_view(pid, c):
+    """What the dialog shows: the budget text, the tab, and the General tab's rows (area name, Priority text) with the
+    area index of each row (None if not in the game's table) and its priority (Low/Medium/High = 1/2/3)."""
+    rows = [(t[0], t[2]) for _, _, t in lv_rows(pid, c['lv'], 4)] if c['lv'] else []
+    table = research_areas()
+    tab = _u32.SendMessageW(c['tc'], TCM_GETCURSEL, 0, 0) if c['tc'] else None
+    return dict(budget=text(c['se']) if c['se'] else None, rows=rows, tab=tab,
+                areas=[(table.get(re.sub(r' \(Adv\)$', '', n)), PRIO.get(p)) for n, p in rows])
+
+
+def shown_prio(view):
+    """{area index: priority shown} for the rows whose area the game's table names."""
+    return {i: p for i, p in (view or {}).get('areas', []) if i is not None}
+
+
+def shows(view, r):
+    """The dialog shows research values r: the budget and the priority of every listed area (at least 10 known)."""
+    sp = shown_prio(view)
+    return bool(view and r and view['budget'] == str(r['pct']) and len(sp) >= 10
+                and all(r['prio'][i] == p for i, p in sp.items()))
+
+
+def fmt_rview(view):
+    return f'budget "{view["budget"]}" prio {shown_prio(view)} other rows ' \
+           f'{[(n, p) for (n, p), (i, _) in zip(view["rows"], view["areas"]) if i is None]}' if view else str(view)
+
+
+def open_research(port, pid, timeout=8):
+    """`researchopen` (async: the Research button's handler on the main thread) -> (reply, controls or None)."""
+    r = cmd(port, 'researchopen')
+    dlg = wait_window(pid, 'TfrmResearch', timeout)
+    return r, research_controls(dlg) if dlg else None
+
+
+def close_research(pid, c, ok=False):
+    """OK (BM_CLICK on Button1: Execute writes the budget back) or WM_CLOSE (mrCancel: the budget is not written;
+    priorities change at once in the popup menu's handlers). True once the dialog is gone."""
+    u.PostMessageW(c['ok'] if ok else c['dlg'], 0x00F5 if ok else 0x0010, 0, 0)
+    return bool(wait_window(pid, 'TfrmResearch', 6, gone=True))
+
+
+def popup_priority(pid, lv, row, label):
+    """Set one area's priority without the mouse: select the row (LVM_SETITEMSTATE), post WM_CONTEXTMENU in its
+    keyboard form (lParam -1) to the list, which opens the game's TPopupMenu (TrackPopupMenu, a #32768 window); inside
+    the menu loop posted VK_DOWN/VK_UP move the highlight (checked with GetMenuState MF_HILITE on the menu's HMENU from
+    MN_GETHMENU) and VK_RETURN picks the item, whose OnClick sets the selected area's priority. Returns a description;
+    'picked' in it on success."""
+    lv_select(pid, lv, row)
+    time.sleep(0.3)
+    u.PostMessageW(lv, 0x007B, lv, -1)  # WM_CONTEXTMENU
+    end, menu = time.time() + 4, None
+    while time.time() < end and not menu:
+        time.sleep(0.2)
+        menu = next((h for h in top_windows(pid) if e2e_test.class_name(h) == '#32768'), None)
+    if not menu:
+        return f'no popup menu after WM_CONTEXTMENU; windows {describe_windows(pid)}'
+    hm = _u32.SendMessageW(menu, MN_GETHMENU, 0, 0)
+    n = _u32m.GetMenuItemCount(hm) if hm else 0
+    names = []
+    for i in range(max(0, n)):
+        b = ctypes.create_unicode_buffer(64)
+        _u32m.GetMenuStringW(hm, i, b, 64, 0x400)  # MF_BYPOSITION
+        names.append(b.value.replace('&', ''))
+    idx = names.index(label) if label in names else None
+    hil = None
+    for _ in range(10 if idx is not None else 0):
+        hil = next((i for i in range(n) if _u32m.GetMenuState(hm, i, 0x400) & 0x80), None)  # MF_HILITE
+        if hil == idx:
+            break
+        u.PostMessageW(menu, 0x0100, 0x28 if hil is None or hil < idx else 0x26, 0)  # WM_KEYDOWN VK_DOWN / VK_UP
+        time.sleep(0.25)
+    if idx is None or hil != idx:
+        u.PostMessageW(menu, 0x0100, 0x1B, 0)  # VK_ESCAPE
+        return f'menu {names}: could not highlight "{label}" (at {hil}); escaped'
+    u.PostMessageW(menu, 0x0100, 0x0D, 0)  # VK_RETURN
+    left = wait_until(lambda: [h for h in top_windows(pid) if e2e_test.class_name(h) == '#32768'], lambda v: not v, 4)
+    return f'menu {names}: picked "{label}" for row {row}' + (' (menu still open)' if left else '')
+
+
+def research_lines(port, mark):
+    return [x.split('] ', 1)[-1] for x in log_lines(log_since(port, mark), RESEARCH_LINE)]
+
+
+def scenario_research(ctx):
+    """0.2.8: the strategic screen's Research button opens TfrmResearch for BuilderNations[0]; on a joined player's PC
+    that is the host's nation, so the player saw and edited the host's research budget and priorities (0.2.0 report).
+    The mod's TfrmResearch.Execute hook opens the player's own nation there. Client: the dialog shows nation 1, a
+    priority (popup menu) and the budget changed in it reach nation 1 only, more than 12 % is refused by the game's
+    own message; host: the dialog is unchanged (nation 0). After the next processed month (shared; one own month if no
+    later scenario processes any): the host has the client's values for nation 1 and its own for nation 0, the client
+    still shows them."""
+    t0, cp, hp = time.time(), ctx.cp, ctx.hp
+    rc0, rc1, rh0, rh1 = research(C, 0), research(C, 1), research(H, 0), research(H, 1)
+    log(f'  research before: client 0 {fmt_research(rc0)} | client 1 {fmt_research(rc1)} | host 0 {fmt_research(rh0)} '
+        f'| host 1 {fmt_research(rh1)}')
+    if not check('research readable on host and client (25 areas each)',
+                 all(r and len(r['prio']) == 25 for r in (rc0, rc1, rh0, rh1)), f'{rc0} {rc1} {rh0} {rh1}'):
+        return
+    if rc1['pct'] > RESEARCH_MAX:  # e.g. an AI-era 13 (fixture) or merge's 14: what the dialog shows, then cancelled
+        r, c = open_research(C, cp)
+        if c:
+            log(f'  observed: nation 1 at {rc1["pct"]} % (> {RESEARCH_MAX}); the dialog shows "{text(c["se"])}"; '
+                f'closed with WM_CLOSE: {close_research(cp, c)}; nation 1 now {fmt_research(research(C, 1))}')
+    v = next(x for x in (10, 11, 9) if x != rc0['pct'])
+    r = cmd(C, f'nfield 1 ResearchPct {v}')
+    rc1 = research(C, 1)
+    diff = [i for i in range(25) if rc1['prio'][i] != rc0['prio'][i]]
+    check(f'setup: nation 1\'s research % set to {v} on the client (<= {RESEARCH_MAX}, nation 0 has {rc0["pct"]})',
+          value(r) == str(v) and rc1['pct'] == v, f'{r}; {fmt_research(rc1)}')
+    log(f'  nation 1 vs nation 0: pct {rc1["pct"]} vs {rc0["pct"]}, priorities differ in areas {diff}')
+
+    # a) the client's Research button opens nation 1
+    cm = log_mark(C)
+    r, c = open_research(C, cp)
+    if not check('a) client: researchopen opens TfrmResearch', r == 'ok' and c, f'{r}; {describe_windows(cp)}'):
+        return
+    view = research_view(cp, c)
+    sp = shown_prio(view)
+    log(f'  client dialog: tab {view["tab"]}, {fmt_rview(view)} ({len(view["rows"])} rows)')
+    ln = research_lines(C, cm)
+    check('a) client log: "research screen: opened for the player\'s nation 1 instead of nation 0"',
+          ln == ["research screen: opened for the player's nation 1 instead of nation 0"], ln)
+    check(f'a) client dialog shows nation 1\'s budget ({rc1["pct"]}), not nation 0\'s ({rc0["pct"]})',
+          view['budget'] == str(rc1['pct']) and view['budget'] != str(rc0['pct']), view['budget'])
+    shown_diff = [i for i in diff if i in sp]
+    check('a) client dialog shows nation 1\'s priorities' + (f', not nation 0\'s (areas {shown_diff})' if shown_diff
+                                                              else ''),
+          shows(dict(view, budget=str(rc1['pct'])), rc1) and all(sp[i] != rc0['prio'][i] for i in shown_diff),
+          f'shown {sp}; nation 1 {rc1["prio"]}; nation 0 {rc0["prio"]}')
+
+    # b) the player changes one priority (popup menu) and the budget, then OK. Preferably an area whose row is not its
+    # index (the list skips areas the era doesn't offer), so the row -> area mapping is exercised too.
+    rowof = {i: k for k, (i, _) in enumerate(view['areas']) if i is not None}
+    area = next((i for i in shown_diff if rowof[i] != i), shown_diff[0] if shown_diff else next(iter(sp), 0))
+    row = rowof.get(area, 0)
+    new_p = next(p for p in (3, 1, 2) if p not in (rc1['prio'][area], rc0['prio'][area]))
+    label = next(k for k, p in PRIO.items() if p == new_p)
+    how = popup_priority(cp, c['lv'], row, label)
+    time.sleep(0.5)
+    v2, mid1, mid0 = research_view(cp, c), research(C, 1), research(C, 0)
+    want = dict(pct=rc1['pct'], prio=rc1['prio'][:area] + [new_p] + rc1['prio'][area + 1:])
+    check(f'b) client: popup menu "{label}" on row {row} ({view["rows"][row][0] if row < len(view["rows"]) else "?"}, '
+          f'area {area}) changes nation 1 only (dialog open)',
+          'picked' in how and shown_prio(v2).get(area) == new_p and mid1 == want and mid0 == rc0,
+          f'{how}; shown {shown_prio(v2)}; nation 1 {fmt_research(mid1)} (want {fmt_research(want)}); nation 0 '
+          f'{fmt_research(mid0)}')
+    log(f'  {how}')
+    b = next(x for x in (7, 6, 5, 4) if x not in (rc1['pct'], rc0['pct']))
+    _u32t.SendMessageW(c['se'], 0x000C, 0, str(b))  # WM_SETTEXT
+    time.sleep(0.3)
+    typed = text(c['se'])
+    closed = close_research(cp, c, ok=True)
+    boxes = message_forms(cp)
+    check(f'b) client: budget {b} typed, OK closes the dialog without a message', typed == str(b) and closed and
+          not boxes, f'typed {typed!r}, closed {closed}, message boxes {len(boxes)}')
+    want['pct'] = b
+    a1, a0 = research(C, 1), research(C, 0)
+    check(f'b) client: nation 1 has the new budget and priority ({fmt_research(want)})', a1 == want,
+          fmt_research(a1))
+    check('b) client: nation 0 (the host\'s nation) unchanged', a0 == rc0, f'{fmt_research(a0)}, was {fmt_research(rc0)}')
+
+    # d) more than 12 % is refused by the game's own message; the dialog is left with WM_CLOSE (budget not written)
+    cm2 = log_mark(C)
+    r, c = open_research(C, cp)
+    v3 = research_view(cp, c) if c else None
+    check('d) client: reopened, the dialog shows the player\'s new values (log line again)',
+          c and shows(v3, want) and len(research_lines(C, cm2)) == 1,
+          f'{r}; {fmt_rview(v3)}; lines {research_lines(C, cm2)}')
+    if c:
+        _u32t.SendMessageW(c['se'], 0x000C, 0, str(RESEARCH_MAX + 3))
+        time.sleep(0.3)
+        u.PostMessageW(c['ok'], 0x00F5, 0, 0)  # BM_CLICK OK
+        boxes = wait_until(lambda: message_forms(cp), bool, 5)
+        info = [box_info(h) for h in boxes]
+        still = bool(research_dialogs(cp))
+        during = research(C, 1)
+        check(f'd) client: OK at {RESEARCH_MAX + 3} % -> the game\'s message box ("Research budget cannot be more '
+              f'than 12% of total budget!"), the dialog stays open, nothing written',
+              len(info) == 1 and info[0][0]['title'] == 'Rule the Waves III' and info[0][0]['buttons'] == ['OK']
+              and still and during == want,
+              f'{[i[0] for i in info]}; dialog open {still}; nation 1 {fmt_research(during)}')
+        for _, btns in info:
+            if btns:
+                u.PostMessageW(btns[0][1], 0x00F5, 0, 0)  # its OK
+        gone = wait_until(lambda: message_forms(cp), lambda v: not v, 4)
+        open_after = bool(research_dialogs(cp))
+        closed = close_research(cp, c)
+        after = research(C, 1)
+        st = ctl.status(C)
+        check('d) client: message answered, the dialog still open; WM_CLOSE leaves it cleanly (nation 1 unchanged, '
+              'no window left, bridge answers)',
+              not gone and open_after and closed and after == want and not message_forms(cp)
+              and not research_dialogs(cp) and st.get('phase') == 'planning',
+              f'message left {len(gone)}, open after answer {open_after}, closed {closed}, nation 1 '
+              f'{fmt_research(after)}, status {st.get("phase")}')
+
+    # c) the host's own Research screen: unchanged behaviour (nation 0, no log line)
+    hm = log_mark(H)
+    r, hc = open_research(H, hp)
+    if check('c) host: researchopen opens TfrmResearch', r == 'ok' and hc, f'{r}; {describe_windows(hp)}'):
+        hv = research_view(hp, hc)
+        hl = log_lines(log_since(H, hm), r'research screen:')
+        check('c) host: no "research screen:" line and the dialog shows nation 0',
+              not hl and shows(hv, rh0), f'lines {hl}; shown {fmt_rview(hv)}; nation 0 {fmt_research(rh0)}')
+        hb = rh0['pct'] + 1 if rh0['pct'] < RESEARCH_MAX else rh0['pct'] - 1
+        _u32t.SendMessageW(hc['se'], 0x000C, 0, str(hb))
+        time.sleep(0.3)
+        closed = close_research(hp, hc, ok=True)
+        h0, h1 = research(H, 0), research(H, 1)
+        hwant = dict(pct=hb, prio=rh0['prio'])
+        check(f'c) host: budget {hb} + OK changes the host\'s nation 0 only', closed and h0 == hwant and h1 == rh1,
+              f'closed {closed}; nation 0 {fmt_research(h0)} (want {fmt_research(hwant)}); nation 1 {fmt_research(h1)} '
+              f'(was {fmt_research(rh1)})')
+    else:
+        hb, hwant = None, rh0
+    log(f'  research set up in {time.time() - t0:.0f} s: client nation 1 {fmt_research(want)}, host nation 0 '
+        f'{fmt_research(hwant)}; checked after the next processed month')
+
+    st = dict(n=0, need=1)
+
+    def hook(ctx, label):
+        outer, _scenario[0] = _scenario[0], 'research'
+        try:
+            ctx.month_hooks.remove(hook)
+            st['n'] = 1
+            hmark, _ = ctx.month_marks
+            hlog = log_since(H, hmark)
+            h1, h0, c1, c0 = research(H, 1), research(H, 0), research(C, 1), research(C, 0)
+            log(f'  research after {label}: host 1 {fmt_research(h1)} | host 0 {fmt_research(h0)} | client 1 '
+                f'{fmt_research(c1)} | client 0 {fmt_research(c0)}')
+            check(f'month ({label}): the host has the client\'s budget and priority for nation 1', h1 == want,
+                  f'{fmt_research(h1)}, want {fmt_research(want)}; {log_lines(hlog, r"merge nation 1:")[:1]}')
+            check(f'month ({label}): the host\'s nation 0 keeps the host\'s own values (the client changed nothing '
+                  f'there)', h0 == hwant, f'{fmt_research(h0)}, want {fmt_research(hwant)}')
+            check(f'month ({label}): the client still has its nation 1 values in the new month', c1 == want,
+                  f'{fmt_research(c1)}, want {fmt_research(want)}')
+            check(f'month ({label}): the client got the host\'s nation 0 values', c0 == h0,
+                  f'client {fmt_research(c0)}, host {fmt_research(h0)}')
+            cm3 = log_mark(C)
+            r, c = open_research(C, ctx.cp)
+            v4 = research_view(ctx.cp, c) if c else None
+            closed = close_research(ctx.cp, c) if c else False
+            check(f'month ({label}): the client\'s Research screen shows nation 1\'s values in the new month',
+                  c and shows(v4, want) and len(research_lines(C, cm3)) == 1 and closed and research(C, 1) == want,
+                  f'{r}; {fmt_rview(v4)}; lines {research_lines(C, cm3)}; closed {closed}')
+            sup = log_lines(hlog, r'AI suppressed: DetermineAINationResearch for nation \d+')
+            ai = [x for x in sup if re.search(rf'for nation {AI_NATION}\b', x)]
+            if not sup:
+                log(f'  SKIP-note: no DetermineAINationResearch suppression in {label} (the game did not call it)')
+            check(f'month ({label}): host log "AI suppressed: DetermineAINationResearch for nation 1" (when the game '
+                  f'calls it), never for AI nation {AI_NATION}',
+                  (not sup or any(re.search(r'for nation 1$', x) for x in sup)) and not ai, sup[:3] or 'no line')
+            if hb is not None:  # the host's nation 0 back to its own value (affects nothing checked later)
+                log(f'  host nation 0 research % back to {rh0["pct"]}:', cmd(H, f'nfield 0 ResearchPct {rh0["pct"]}'))
+        finally:
+            _scenario[0] = outer
+
+    hook.scenario, hook.state = 'research', st
+    ctx.month_hooks.append(hook)
+    order = [s[0] for s in SCENARIOS]
+    if planned_months([n for n in ctx.selected if order.index(n) > order.index('research')]) == 0:
+        run_month(ctx, 'research')  # no later month to share
 
 
 def doctrine(port, nation):
@@ -3643,6 +3964,11 @@ SCENARIOS = [  # name, months processed, what it guards, function
                   'scenario processes any)', scenario_events),
     ('merge', 1, 'client research % and a ship order survive the host\'s month; AI suppressed for nation 1 only',
      scenario_merge),
+    ('research', 0, 'a joined player\'s Research screen (0.2.8): the Research button opens the player\'s own nation, not '
+                    'the host\'s (log line); a priority (popup menu, posted keys) and the budget changed there reach '
+                    'nation 1 only and the host after the month; > 12 % refused by the game\'s message; the host\'s '
+                    'own screen unchanged (nation 0). Checked after the next processed month (one own month if no '
+                    'later scenario processes any)', scenario_research),
     ('doctrine', 0, 'the player\'s Doctrine dialog (real button, posted clicks) makes a pending training change; a '
                     'joined nation\'s training and missile storage policy take effect on the host after their months '
                     '(chat + host log); the host\'s own change still applies; no countdown for AI nations. Checked '

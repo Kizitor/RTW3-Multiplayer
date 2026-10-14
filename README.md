@@ -24,7 +24,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.7-win32.zip` from the
+2. Download `RTW3MP-0.2.8-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -204,6 +204,8 @@ wins concessions.
 - If the host sees "<player>'s turn could not be applied", another program (usually antivirus or OneDrive) held
   a save file for more than 3 seconds; that nation keeps last month's orders. If it happens repeatedly, exclude
   `Documents\My Games\Rule the Waves 3\Save` from scanning/syncing.
+- If a joined player's **Research** screen shows the host's research priorities and budget (and changes
+  there don't stick), they are on 0.2.7 or older. Update to 0.2.8, then set research again.
 - If you see "different game version than the host", update both games through Steam.
 - If there is no **Multiplayer** button, check that `version.dll` and `RTW3MP.dll` are both next to
   `RTW3.exe`. Some antivirus programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name);

@@ -49,7 +49,9 @@ struct Api {
         fPossOwner = -1, fBaseResources = -1, fPrestige = -1, fVP = -1, fEnemyVP = -1, fBattleOpp = -1;
     void *mChangeOwner = nullptr, *mAdjacent = nullptr, *mRemoveShipInPeace = nullptr, *mShowTreaty = nullptr,
          *mSLCreate = nullptr, *mFree = nullptr, *mBattleAftermath = nullptr,
-         *mAIBattle = nullptr, *mRaiderBattle = nullptr, *mUpdateVPNumbers = nullptr, *mCopyGame = nullptr;
+         *mAIBattle = nullptr, *mRaiderBattle = nullptr, *mUpdateVPNumbers = nullptr, *mCopyGame = nullptr,
+         *mResearchExecute = nullptr, *mResearchClick = nullptr;
+    int fResearchPct = -1, fResearchAreas = -1, fBtbnResearch = -1;
     int* scaleVar = nullptr;  // the game's scale value used in its war-progress thresholds (100*G + 300/500)
     bool treaties = false;
 } A;
@@ -106,6 +108,11 @@ static void ResolveTreaties() {
     A.mRaiderBattle = dl::Method("TfrmBuildCamp", "QuickResolveRaiderBattle");
     A.mUpdateVPNumbers = dl::Method("TfrmBuildCamp", "UpdateVPNumbers");
     A.mCopyGame = dl::Method("TfrmBuildCamp", "CopyGameToOtherSlot");
+    A.mResearchExecute = dl::Method("TfrmResearch", "Execute");
+    A.mResearchClick = dl::Method("TfrmBuildCamp", "btbnResearchClick");
+    A.fResearchPct = dl::Field("TBuilderNation", "ResearchPct");
+    A.fResearchAreas = dl::Field("TBuilderNation", "ResearchAreas");
+    A.fBtbnResearch = dl::Field("TfrmBuildCamp", "btbnResearch");
     // RemoveShipInPeace (unnamed): NegotiatePeace hands the player's ships to an enemy with
     // `call GetRandomEnemy; mov ecx,eax; mov eax,[ebp-4]; mov edx,[eax+PlayerNation]; mov eax,[ebp-4]; call X`.
     void* negotiate = dl::Method("TfrmBuildCamp", "NegotiatePeace");
@@ -1737,6 +1744,53 @@ void CopyGame(int toSlot) {
     dl::Call(A.mCopyGame, (uint32_t)(uintptr_t)f, (uint32_t)CurrentSlot(), (uint32_t)toSlot);  // through the hook
 }
 
+// TfrmResearch.Execute(Self, aNation): the research screen. The game's Research button opens it for nation 0
+// (BuilderNations[0]), not for PlayerNation; on a joined player's PC that is the host's nation, so the player saw and
+// edited the host's research priorities and research budget. It opens the player's own nation instead.
+extern "C" void* o_ResearchExecute = nullptr;
+
+extern "C" void* __stdcall CB_ResearchNation(void* nation) {
+    __try {
+        void* player = PlayerNation();
+        if (nation && player && nation != player && nation == Nation(0)) {
+            Log("research screen: opened for the player's nation %d instead of nation 0", NationIndex(player));
+            return player;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return nation;
+}
+
+extern "C" __declspec(naked) void d_ResearchExecute() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        call CB_ResearchNation
+        mov edx, eax
+        pop ecx
+        pop eax
+        jmp dword ptr [o_ResearchExecute]
+    }
+}
+
+std::string DebugResearch(int idx) {
+    void* n = Nation(idx);
+    if (!n || A.fResearchAreas < 0 || A.fResearchPct < 0) return "error research unavailable";
+    // ResearchAreas: 25 records of 0x35 bytes (Advantage byte, Prio integer, ...), as TBuilderNation.SaveMe writes them.
+    std::string prio;
+    for (int i = 0; i < 25; i++)
+        prio += (i ? "," : "") + std::to_string(*(int*)((uint8_t*)n + A.fResearchAreas + i * 0x35 + 1));
+    return "ok pct=" + std::to_string(dl::At<int>(n, A.fResearchPct)) + " prio=" + prio;
+}
+
+void OpenResearch() {
+    void* f = BuildCamp();
+    void* btn = f && A.fBtbnResearch >= 0 ? dl::At<void*>(f, A.fBtbnResearch) : nullptr;
+    if (!f || !A.mResearchClick || EventActive()) return;
+    dl::Call(A.mResearchClick, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)btn);  // the button's handler
+}
+
 extern "C" __declspec(naked) void d_AIMoves() {
     __asm {
         push eax
@@ -1850,6 +1904,7 @@ bool InstallHooks() {
     if (A.diplomacy && A.mHandleAIPeace) Hook(A.mHandleAIPeace, (void*)&d_AIPeace, &o_AIPeace, "HandleAIPeace");
     if (A.diplomacy && A.mDoPeace && A.fPrestige >= 0) Hook(A.mDoPeace, (void*)&d_DoPeace, &o_DoPeace, "DoPeace");
     if (A.mCopyGame) Hook(A.mCopyGame, (void*)&d_CopyGame, &o_CopyGame, "CopyGameToOtherSlot");
+    if (A.mResearchExecute) Hook(A.mResearchExecute, (void*)&d_ResearchExecute, &o_ResearchExecute, "TfrmResearch.Execute");
     if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)

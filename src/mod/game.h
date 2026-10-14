@@ -116,6 +116,9 @@ bool AtWarWithAnyone(int idx);
 void ShowEnemyVP(int vp);  // this PC's "Enemy VP" (a joined player's view: the points of its own enemies)
 // The game's "Copy game" from the open slot to another one (shows the game's own confirmations; tests).
 void CopyGame(int toSlot);
+// Tests: a nation's research budget (% of the total) and its research priorities; the Research button's handler.
+std::string DebugResearch(int idx);
+void OpenResearch();
 // Test hook: the game's end-of-battle routine against `opp`, as after a tactical battle (VP before the log scale).
 std::string DebugBattleAftermath(int opp, int vp0, int vp1, const std::string& level);
 std::vector<PossessionInfo> Possessions(int ownerIdx);
