@@ -59,4 +59,16 @@ bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& ev
 bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::vector<int>& eventCooldowns,
                       std::string& summary, std::string& err);
 
+// Joined players' battles. The battle is fought in a battle slot made with MakeNationPlayer(K): K is nation 0 there and
+// the opponent J keeps its index (an AI nation, J != 0 and != K). ExtractBattleResult reads the battle slot before and
+// after the battle and returns the ship/loss sections of K, J and the nations allied to them in the battle under their
+// host names (nation numbers in them mapped back), plus the changes of K's VP/prestige/fleet morale and of J's VP.
+// ApplyBattleResult merges that into the host's save field by field (only what the battle changed relative to what was
+// sent, never the player's intel fields; ships no longer listed were sunk), for the nations in `allowed` only. It
+// changes `host` only if everything applies.
+bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterBcs, int K, int J, Bundle& out,
+                         std::string& summary, std::string& err);
+bool ApplyBattleResult(IniDoc& host, const std::string& sentBcs, int K, int J, const Bundle& result,
+                       const std::vector<int>& allowed, std::string& summary, std::string& err);
+
 }  // namespace saveio

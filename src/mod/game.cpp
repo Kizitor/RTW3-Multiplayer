@@ -50,8 +50,12 @@ struct Api {
     void *mChangeOwner = nullptr, *mAdjacent = nullptr, *mRemoveShipInPeace = nullptr, *mShowTreaty = nullptr,
          *mSLCreate = nullptr, *mFree = nullptr, *mBattleAftermath = nullptr,
          *mAIBattle = nullptr, *mRaiderBattle = nullptr, *mUpdateVPNumbers = nullptr, *mCopyGame = nullptr,
-         *mResearchExecute = nullptr, *mResearchClick = nullptr;
+         *mResearchExecute = nullptr, *mResearchClick = nullptr, *mDoResearch = nullptr;
     int fResearchPct = -1, fResearchAreas = -1, fBtbnResearch = -1;
+    // Tactical battles of joined players
+    void *mCheckAttack = nullptr, *mStrategicTurn = nullptr, *mDoBattle = nullptr;
+    void** frmMainVar = nullptr;  // the battle form (TfrmMain) unit variable
+    bool battles = false;
     int* scaleVar = nullptr;  // the game's scale value used in its war-progress thresholds (100*G + 300/500)
     bool treaties = false;
 } A;
@@ -59,6 +63,10 @@ struct Api {
 static void* g_buildCamp = nullptr;
 static void* g_startForm = nullptr;
 static bool g_inTurn = false;
+static bool g_noDefer = false;         // ResolveAIBattle: the game's own resolution runs
+static bool g_battleSlotMode = false;  // this PC fights a joined player's battle in its battle slot
+static bool g_battleAftermath = false; // HandleBattleAftermath ran in battle slot mode
+extern "C" int __stdcall CB_SkipCampaignStep(int which);
 
 #define REQ_FIELD(dst, cls, name)                              \
     do {                                                       \
@@ -110,9 +118,25 @@ static void ResolveTreaties() {
     A.mCopyGame = dl::Method("TfrmBuildCamp", "CopyGameToOtherSlot");
     A.mResearchExecute = dl::Method("TfrmResearch", "Execute");
     A.mResearchClick = dl::Method("TfrmBuildCamp", "btbnResearchClick");
+    A.mDoResearch = dl::Method("TfrmBuildCamp", "DoResearch");
     A.fResearchPct = dl::Field("TBuilderNation", "ResearchPct");
     A.fResearchAreas = dl::Field("TBuilderNation", "ResearchAreas");
     A.fBtbnResearch = dl::Field("TfrmBuildCamp", "btbnResearch");
+    A.mCheckAttack = dl::Method("TfrmBuildCamp", "CheckAttackLocation");
+    A.mStrategicTurn = dl::Method("TfrmBuildCamp", "DoStrategicTurn");
+    // DoBattle: mov ecx, [frmMain cell]; mov eax, [Application]; mov eax, [eax]; mov edx, [TfrmMain]; call CreateForm
+    if (void* doBattle = dl::Method("TfrmBuildCamp", "DoBattle")) {
+        A.mDoBattle = doBattle;
+        uint8_t* hit = dl::FindPattern((uint8_t*)doBattle, 0x200,
+                                       {0x8B, 0x0D, -1, -1, -1, -1, 0xA1, -1, -1, -1, -1, 0x8B, 0x00, 0x8B, 0x15});
+        uint32_t cell = hit ? *(uint32_t*)(hit + 2) : 0;
+        uint32_t var = cell && InImage(cell) ? *(uint32_t*)(uintptr_t)cell : 0;
+        if (var && InImage(var)) A.frmMainVar = (void**)(uintptr_t)var;
+    }
+    A.battles = A.mAIBattle && A.mCheckAttack && A.mStrategicTurn && A.frmMainVar && A.fMapAreas >= 0 &&
+                A.fAreaName >= 0 && A.mBattleAftermath;
+    Log("Joined players' battles: %s (frmMain=%p checkAttack=%p)", A.battles ? "ok" : "UNAVAILABLE", A.frmMainVar,
+        A.mCheckAttack);
     // RemoveShipInPeace (unnamed): NegotiatePeace hands the player's ships to an enemy with
     // `call GetRandomEnemy; mov ecx,eax; mov eax,[ebp-4]; mov edx,[eax+PlayerNation]; mov eax,[ebp-4]; call X`.
     void* negotiate = dl::Method("TfrmBuildCamp", "NegotiatePeace");
@@ -997,6 +1021,7 @@ extern "C" int __stdcall CB_BeforeVP(int kind, uint32_t edx, uint32_t ecx, void*
     VPCtx& c = g_vpStack[d];
     c.kind = kind;
     c.a = c.b = -1;
+    if (kind == 0 && g_battleSlotMode) g_battleAftermath = true;
     __try {
         if (!TreatiesAvailable()) return d;
         if (kind == 0) {  // HandleBattleAftermath: the host's battle against BattleOpponentIdx
@@ -1362,7 +1387,19 @@ bool LoadCampaign(int slot, int playerIdx) {
 
 bool InTurnProcessing() { return g_inTurn; }
 
+static bool SafeHasVmt(void* obj, uint32_t vmt) {
+    __try {
+        return obj && vmt && *(uint32_t*)obj == vmt;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool BattleActive() {
+    if (A.frmMainVar) {  // the battle form's unit variable (DoBattle creates the form into it)
+        void* form = *A.frmMainVar;
+        return SafeHasVmt(form, (uint32_t)(uintptr_t)dl::ClassVmt("TfrmMain")) && FormVisible(form);
+    }
     static void* frmMain = nullptr;
     static DWORD lastScan = 0;
     if (!StillValid(frmMain, "TfrmMain")) {
@@ -1539,12 +1576,19 @@ extern "C" void __stdcall CB_AfterDesignStudies(void* self) {
     }
 }
 
-// AdvanceDesignStudies(Self=EAX): run the game's routine, then the callback with Self.
+// AdvanceDesignStudies(Self=EAX): run the game's routine, then the callback with Self (skipped in a battle slot).
 extern "C" __declspec(naked) void d_DesignStudies() {
     __asm {
         push eax
+        push 2
+        call CB_SkipCampaignStep
+        test eax, eax
+        pop eax
+        jnz skipds
+        push eax
         call dword ptr [o_DesignStudies]
         call CB_AfterDesignStudies
+    skipds:
         ret
     }
 }
@@ -1774,6 +1818,60 @@ extern "C" __declspec(naked) void d_ResearchExecute() {
     }
 }
 
+// DoResearch(Self, aNationIdx, NoNonGunmessages), register arguments only: the monthly research of one nation. For
+// every nation above 0 it also runs the game's AI research choices: some priorities are set to High by chance, and with a
+// 5 % chance a month every priority is re-rolled (mostly Medium). A joined player's own priorities are put back.
+extern "C" void* o_DoResearch = nullptr;
+static int g_resPrio[25];
+static int g_resNation = -1;
+
+extern "C" void __stdcall CB_BeforeResearch(int idx) {
+    g_resNation = -1;
+    if (idx <= 0 || idx > 8 || A.fResearchAreas < 0) return;
+    try {
+        if (!hookcb::IsHumanRemoteNation(idx)) return;
+    } catch (...) {
+        return;
+    }
+    void* n = Nation(idx);
+    if (!n) return;
+    for (int i = 0; i < 25; i++) g_resPrio[i] = *(int*)((uint8_t*)n + A.fResearchAreas + i * 0x35 + 1);
+    g_resNation = idx;
+}
+
+extern "C" void __stdcall CB_AfterResearch() {
+    if (g_resNation < 0) return;
+    void* n = Nation(g_resNation);
+    int changed = 0;
+    for (int i = 0; n && i < 25; i++) {
+        int* p = (int*)((uint8_t*)n + A.fResearchAreas + i * 0x35 + 1);
+        if (*p != g_resPrio[i]) {
+            *p = g_resPrio[i];
+            changed++;
+        }
+    }
+    if (changed) Log("research priorities of player nation %d kept (%d changed by the game's AI choices)", g_resNation, changed);
+    g_resNation = -1;
+}
+
+extern "C" __declspec(naked) void d_DoResearch() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push edx  // aNationIdx
+        call CB_BeforeResearch
+        pop edx
+        pop ecx
+        pop eax
+        call dword ptr [o_DoResearch]
+        push eax
+        call CB_AfterResearch
+        pop eax
+        ret
+    }
+}
+
 std::string DebugResearch(int idx) {
     void* n = Nation(idx);
     if (!n || A.fResearchAreas < 0 || A.fResearchPct < 0) return "error research unavailable";
@@ -1784,11 +1882,216 @@ std::string DebugResearch(int idx) {
     return "ok pct=" + std::to_string(dl::At<int>(n, A.fResearchPct)) + " prio=" + prio;
 }
 
+// Tests: the game's monthly research of a nation `count` times (through the hook), logged as
+// "research test nation N x count: before <prio> after <prio>". It can show the game's research messages.
+void DebugDoResearch(int idx, int count) {
+    void* f = BuildCamp();
+    if (!f || !A.mDoResearch || idx < 1 || idx > 8 || count < 1 || EventActive()) {
+        Log("research test: not possible");
+        return;
+    }
+    std::string before = DebugResearch(idx);
+    for (int i = 0; i < count; i++) dl::Call(A.mDoResearch, (uint32_t)(uintptr_t)f, (uint32_t)idx, 1);
+    Log("research test nation %d x %d: before %s after %s", idx, count, before.c_str(), DebugResearch(idx).c_str());
+}
+
 void OpenResearch() {
     void* f = BuildCamp();
     void* btn = f && A.fBtbnResearch >= 0 ? dl::At<void*>(f, A.fBtbnResearch) : nullptr;
     if (!f || !A.mResearchClick || EventActive()) return;
     dl::Call(A.mResearchClick, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)btn);  // the button's handler
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tactical battles of joined players. A battle between a joined player's nation and an AI nation is one the game
+// resolves without a battle screen (DoBattleBetweenAINations, from CheckAIvsAIBattles). The host can defer it: the
+// player then fights it on their own PC, in a battle slot where their nation is the player nation, with the game's
+// own battle code (CheckAttackLocation -> DoBattle -> the battle screen -> the aftermath). The battle screen's
+// close runs the rest of a month (DoStrategicTurn), which a battle slot must not do.
+
+
+bool BattlesAvailable() { return A.battles && BuildCamp(); }
+void SetBattleSlotMode(bool on) {
+    g_battleSlotMode = on;
+    g_battleAftermath = false;
+}
+bool BattleSlotMode() { return g_battleSlotMode; }
+bool BattleAftermathSeen() { return g_battleAftermath; }
+
+static void* AreaByName(const std::wstring& name) {
+    void* f = BuildCamp();
+    if (!f || A.fMapAreas < 0 || A.fAreaName < 0 || name.empty()) return nullptr;
+    void* areas = dl::At<void*>(f, A.fMapAreas);
+    for (int i = 0; i < dl::ListCount(areas); i++) {
+        void* a = dl::ListItem(areas, i);
+        if (a && dl::ReadUStr(dl::At<void*>(a, A.fAreaName)) == name) return a;
+    }
+    return nullptr;
+}
+
+static std::wstring AreaNameOf(void* area) {
+    return area && A.fAreaName >= 0 ? dl::ReadUStr(dl::At<void*>(area, A.fAreaName)) : std::wstring();
+}
+
+extern "C" int __stdcall CB_DeferAIBattle(void* a, void* b, int countA, int countB, void* area) {
+    if (g_noDefer || !A.battles) return 0;
+    try {
+        return hookcb::OnAIBattle(NationIndex(a), NationIndex(b), countA, countB, AreaNameOf(area)) ? 1 : 0;
+    } catch (...) {
+        Log("exception in OnAIBattle");
+        return 0;
+    }
+}
+
+// DoBattleBetweenAINations(Self, NationA, NationB, ShipCountA, ShipCountB, anArea): Boolean, ret 12. A deferred
+// battle returns True like a fought one (CheckAIvsAIBattles then stops looking for another battle of the pair).
+extern "C" __declspec(naked) void d_AIBattleDefer() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push dword ptr [esp + 16]  // anArea
+        push dword ptr [esp + 24]  // ShipCountB
+        push dword ptr [esp + 32]  // ShipCountA
+        push ecx                   // NationB
+        push edx                   // NationA
+        call CB_DeferAIBattle
+        test eax, eax
+        pop edx
+        pop ecx
+        pop eax
+        jnz deferred
+        jmp d_AIBattle
+    deferred:
+        mov eax, 1
+        ret 12
+    }
+}
+
+// A game call from the battle code; a Delphi exception escaping it counts as a failure (ok = 0).
+static uint32_t GuardedCall(void* fn, uint32_t a, uint32_t d, uint32_t c, int n, const uint32_t* s, int* ok) {
+    __try {
+        uint32_t r = dl::Call(fn, a, d, c, n, s);
+        *ok = 1;
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *ok = 0;
+        return 0;
+    }
+}
+
+bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& areaName) {
+    void* f = BuildCamp();
+    void* na = Nation(a);
+    void* nb = Nation(b);
+    void* area = AreaByName(areaName);
+    if (!f || !na || !nb || !area || !A.mAIBattle || EventActive()) {
+        Log("ResolveAIBattle %d-%d in %s: not possible", a, b, W2U(areaName).c_str());
+        return false;
+    }
+    uint32_t stack[3] = {(uint32_t)countA, (uint32_t)countB, (uint32_t)(uintptr_t)area};
+    int ok = 0;
+    g_noDefer = true;
+    uint32_t r = GuardedCall(A.mAIBattle, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)na, (uint32_t)(uintptr_t)nb, 3,
+                             stack, &ok);
+    g_noDefer = false;
+    if (!ok) Log("ResolveAIBattle %d-%d: exception in the game's routine", a, b);
+    return ok && (r & 0xFF) != 0;
+}
+
+bool StartPlayerBattle(int attacker, int defender, const std::wstring& areaName) {
+    void* f = BuildCamp();
+    void* na = Nation(attacker);
+    void* nd = Nation(defender);
+    void* area = AreaByName(areaName);
+    if (!f || !na || !nd || !area || !A.mCheckAttack || EventActive()) {
+        Log("StartPlayerBattle %d-%d in %s: not possible", attacker, defender, W2U(areaName).c_str());
+        return false;
+    }
+    uint32_t stack[1] = {(uint32_t)(uintptr_t)area};
+    int ok = 0;
+    bool r = (GuardedCall(A.mCheckAttack, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)na, (uint32_t)(uintptr_t)nd, 1,
+                          stack, &ok) & 0xFF) != 0 && ok;
+    Log("StartPlayerBattle %d attacks %d in %s -> %s", attacker, defender, W2U(areaName).c_str(),
+        !ok ? "exception" : r ? "battle" : "none");
+    return r;
+}
+
+bool ModalOpen() {
+    void* app = Application();
+    return app && dl::At<int>(app, A.fModalLevel) > 0;
+}
+
+void SetStrategicEnabled(bool on) {
+    HWND h = FormHwnd(BuildCamp());
+    if (h) EnableWindow(h, on ? TRUE : FALSE);
+}
+
+std::vector<std::wstring> AreaNames() {
+    std::vector<std::wstring> out;
+    void* f = BuildCamp();
+    if (!f || A.fMapAreas < 0 || A.fAreaName < 0) return out;
+    void* areas = dl::At<void*>(f, A.fMapAreas);
+    for (int i = 0; i < dl::ListCount(areas); i++)
+        if (void* a = dl::ListItem(areas, i)) out.push_back(AreaNameOf(a));
+    return out;
+}
+
+// Steps of the campaign the battle screen's close runs; skipped in a battle slot (which = 1 DoStrategicTurn, 2
+// AdvanceDesignStudies).
+extern "C" int __stdcall CB_SkipCampaignStep(int which) {
+    if (!g_battleSlotMode) return 0;
+    Log("battle slot: %s skipped", which == 1 ? "DoStrategicTurn" : "AdvanceDesignStudies");
+    return 1;
+}
+
+extern "C" void* o_StrategicTurn = nullptr;
+
+// DoBattle(Self, anOpponentIndex, aMission, anArea, aPossession), ret 8: the game's battle setup (forces, the battle
+// preview, the battle screen). Counted, so a battle the player declined in the preview can be told from no battle.
+extern "C" void* o_DoBattle = nullptr;
+static volatile long g_doBattleCalls = 0;
+
+extern "C" void __stdcall CB_AfterDoBattle(int opp, int result) {
+    try {
+        hookcb::OnDoBattleDone(opp, (result & 0xFF) != 0);
+    } catch (...) {
+        Log("exception after DoBattle");
+    }
+}
+
+// Calls through (the callback sees the battle screen DoBattle opened, e.g. for a live battle against a player).
+extern "C" __declspec(naked) void d_DoBattle() {
+    __asm {
+        lock inc dword ptr [g_doBattleCalls]
+        push edx                   // anOpponentIndex
+        push dword ptr [esp + 12]  // anArea
+        push dword ptr [esp + 12]  // aPossession
+        call dword ptr [o_DoBattle]
+        pop edx
+        push eax
+        push eax
+        push edx
+        call CB_AfterDoBattle
+        pop eax
+        ret 8
+    }
+}
+
+int DoBattleCalls() { return (int)g_doBattleCalls; }
+
+extern "C" __declspec(naked) void d_StrategicTurn() {  // DoStrategicTurn(Self)
+    __asm {
+        push eax
+        push 1
+        call CB_SkipCampaignStep
+        test eax, eax
+        pop eax
+        jnz skip
+        jmp dword ptr [o_StrategicTurn]
+    skip:
+        ret
+    }
 }
 
 extern "C" __declspec(naked) void d_AIMoves() {
@@ -1905,17 +2208,25 @@ bool InstallHooks() {
     if (A.diplomacy && A.mDoPeace && A.fPrestige >= 0) Hook(A.mDoPeace, (void*)&d_DoPeace, &o_DoPeace, "DoPeace");
     if (A.mCopyGame) Hook(A.mCopyGame, (void*)&d_CopyGame, &o_CopyGame, "CopyGameToOtherSlot");
     if (A.mResearchExecute) Hook(A.mResearchExecute, (void*)&d_ResearchExecute, &o_ResearchExecute, "TfrmResearch.Execute");
+    if (A.mDoResearch && A.fResearchAreas >= 0) Hook(A.mDoResearch, (void*)&d_DoResearch, &o_DoResearch, "DoResearch");
     if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
         Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
     if (A.doctrine) Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");
     if (A.events) Hook(A.mLikelihood, (void*)&d_Likelihood, &o_Likelihood, "EventLikelihoodCheck");
+    bool aftermathHook = false, aiBattleHook = false;
     if (A.treaties) {
-        if (A.mBattleAftermath) Hook(A.mBattleAftermath, (void*)&d_BattleAftermath, &o_BattleAftermath, "HandleBattleAftermath");
-        if (A.mAIBattle) Hook(A.mAIBattle, (void*)&d_AIBattle, &o_AIBattle, "DoBattleBetweenAINations");
+        if (A.mBattleAftermath)
+            aftermathHook = Hook(A.mBattleAftermath, (void*)&d_BattleAftermath, &o_BattleAftermath, "HandleBattleAftermath");
+        if (A.mAIBattle) aiBattleHook = Hook(A.mAIBattle, (void*)&d_AIBattleDefer, &o_AIBattle, "DoBattleBetweenAINations");
         if (A.mRaiderBattle) Hook(A.mRaiderBattle, (void*)&d_RaiderBattle, &o_RaiderBattle, "QuickResolveRaiderBattle");
     }
+    // Joined players' battles need the aftermath and AI-battle hooks and the month-step skip in a battle slot.
+    A.battles = A.battles && aftermathHook && aiBattleHook &&
+                Hook(A.mStrategicTurn, (void*)&d_StrategicTurn, &o_StrategicTurn, "DoStrategicTurn");
+    if (A.battles && A.mDoBattle) Hook(A.mDoBattle, (void*)&d_DoBattle, &o_DoBattle, "DoBattle");
+    if (!A.battles) Log("Joined players' battles: UNAVAILABLE (hooks)");
     for (int i = 0; i < (int)(sizeof(g_skips) / sizeof(g_skips[0])); i++) {
         void* target = dl::Method(g_skips[i].cls, g_skips[i].method);
         void* thunk = target ? EmitSkipThunk(i) : nullptr;

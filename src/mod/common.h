@@ -14,8 +14,8 @@
 #include <deque>
 #include <functional>
 
-#define MP_MOD_VERSION "0.2.8"
-#define MP_PROTOCOL 2
+#define MP_MOD_VERSION "0.3.0"
+#define MP_PROTOCOL 3
 #define MP_DEFAULT_PORT 47624
 
 // Window messages used by the main-thread dispatcher.
@@ -50,3 +50,7 @@ std::string KVStr(const KV& kv, const char* key, const std::string& def = "");
 void RunOnMainThread(std::function<void()> fn);
 DWORD MainThreadId();
 HWND DispatcherHwnd();
+// True inside a dispatcher message that came from the game's outermost message loop (not from a modal dialog, a menu,
+// a message box or ProcessMessages nested in some game routine).
+bool AtOutermostDispatch();
+std::string DispatchDepthText();  // diagnostics: "depth/base"

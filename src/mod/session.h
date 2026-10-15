@@ -106,6 +106,12 @@ std::string DebugLastEvent();    // tests: last event sent (client) or applied (
 std::string DebugWarVP(int a, int b, int va, int vb, bool set);  // tests (host): read or set a war's victory points
 std::string DebugTerms(int a, int b);                            // tests (host): the peace terms right now
 std::string DebugVPInfo();  // tests: EnemyVP, what the host already gave the enemies of it, every nation's VP
+// Joined players fight their battles against AI nations (sent with the hello; set before joining).
+void SetFightBattles(bool on);
+bool FightBattles();
+std::string DebugBattles(const std::vector<std::string>& args);  // bridge `battles ...`
+// Live player-vs-player battles: bridge `ls ...` (session-level `ls enable 0|1`, `ls session`; the rest: lockstep.h).
+std::string DebugLockstep(const std::vector<std::string>& args);
 
 View GetView();
 const std::vector<std::string>& Chat();

@@ -1,4 +1,5 @@
 #include "saveio.h"
+#include <algorithm>
 
 // ---------------------------------------------------------------------------------------------
 // INI
@@ -728,6 +729,254 @@ bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::v
     // A battle in progress (the host's) can't be resumed in the copy.
     for (const wchar_t* n : {L"Autosave.sac", L"Autosave.off", L"BattleInfo.bbi"}) DeleteFileW((slotDir + n).c_str());
     Log("player copy in slot %d: %s", slot, summary.c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Joined players' battles: results
+
+// "Ship<n><Field>": the ship number and the field (which starts with a letter).
+static bool ShipKey(const std::string& line, int& n, std::string& field) {
+    if (line.compare(0, 4, "Ship") != 0) return false;
+    size_t p = 4;
+    while (p < line.size() && isdigit((unsigned char)line[p])) p++;
+    if (p == 4 || p >= line.size() || !isalpha((unsigned char)line[p])) return false;
+    n = atoi(line.c_str() + 4);
+    field = line.substr(p);  // "Field=value"
+    return true;
+}
+
+struct ShipBlock {
+    std::string id;
+    std::vector<std::string> fields;  // "Field=value"
+};
+
+// A ship section as blocks in their order, plus its other lines (e.g. CACount=).
+static void ParseShips(const IniSection& s, std::vector<ShipBlock>& ships, std::vector<std::string>& other) {
+    std::map<int, size_t> at;
+    for (auto& l : s.lines) {
+        int n;
+        std::string f;
+        if (!ShipKey(l, n, f)) {
+            if (!l.empty()) other.push_back(l);
+            continue;
+        }
+        auto it = at.find(n);
+        if (it == at.end()) {
+            at[n] = ships.size();
+            ships.push_back({});
+            it = at.find(n);
+        }
+        ShipBlock& b = ships[it->second];
+        if (f.compare(0, 3, "Id=") == 0) b.id = f.substr(3);
+        b.fields.push_back(f);
+    }
+}
+
+static std::vector<std::string> ShipLines(const std::vector<ShipBlock>& ships, const std::vector<std::string>& other) {
+    std::vector<std::string> out;
+    for (auto& l : other) out.push_back(l);
+    for (size_t i = 0; i < ships.size(); i++)
+        for (auto& f : ships[i].fields) out.push_back("Ship" + std::to_string(i) + f);
+    return out;
+}
+
+static const char* kBattleSections[] = {"Ships", "Losses", "CoastalArtillery"};
+
+static std::string JoinLines(const std::vector<std::string>& lines) {
+    std::string s;
+    for (auto& l : lines) s += l + "\n";
+    return s;
+}
+
+static std::vector<std::string> SplitLines(const std::string& s) {
+    std::vector<std::string> out;
+    size_t p = 0;
+    while (p < s.size()) {
+        size_t e = s.find('\n', p);
+        if (e == std::string::npos) e = s.size();
+        std::string l = s.substr(p, e - p);
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        if (!l.empty()) out.push_back(l);
+        p = e + 1;
+    }
+    return out;
+}
+
+bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterBcs, int K, int J, Bundle& out,
+                         std::string& summary, std::string& err) {
+    out.files.clear();
+    if (K < 1 || K > 8 || J < 1 || J > 8 || J == K) {
+        err = "bad nations";
+        return false;
+    }
+    IniDoc before = ParseIni(beforeBcs), after = ParseIni(afterBcs);
+    // In the battle slot K is nation 0, the host's nation is K and every other nation keeps its number. Besides K and
+    // J, the nations allied to either side in this battle ([General] Battle(Enemy)AlliedNationIdx) are sent too; the
+    // host only takes those that are AI nations.
+    auto toHost = [K](int slotIdx) { return slotIdx == 0 ? K : slotIdx == K ? 0 : slotIdx; };
+    std::vector<int> slotNations = {0, J};
+    for (const char* key : {"BattleAlliedNationIdx", "BattleEnemyAlliedNationIdx"}) {
+        int s = atoi(after.Get("General", key, "-1").c_str());
+        if (s > 0 && s <= 8 && s != K && std::find(slotNations.begin(), slotNations.end(), s) == slotNations.end())
+            slotNations.push_back(s);
+    }
+    for (int slotIdx : slotNations) {
+        int hostIdx = toHost(slotIdx);
+        for (const char* suffix : kBattleSections) {
+            const IniSection* s = after.Find("Nation" + std::to_string(slotIdx) + suffix);
+            if (!s) continue;
+            std::vector<std::string> lines = s->lines;
+            for (auto& l : lines) {
+                int n;
+                std::string f;
+                if (!ShipKey(l, n, f) || f.compare(0, 18, "BuildingNationIdx=") != 0) continue;
+                l = "Ship" + std::to_string(n) + "BuildingNationIdx=" + std::to_string(toHost(atoi(f.c_str() + 18)));
+            }
+            out.Add("sec:Nation" + std::to_string(hostIdx) + suffix, JoinLines(lines));
+        }
+    }
+    auto num = [](const IniDoc& d, const std::string& sec, const std::string& key) {
+        return atoi(d.Get(sec, key, "0").c_str());
+    };
+    KV kv;
+    kv["dVP_K"] = std::to_string(num(after, "Nation0", "VP") - num(before, "Nation0", "VP"));
+    kv["dPrestige_K"] = std::to_string(num(after, "Nation0", "Prestige") - num(before, "Nation0", "Prestige"));
+    kv["dMorale_K"] = std::to_string(num(after, "Nation0", "FleetMorale") - num(before, "Nation0", "FleetMorale"));
+    kv["dVP_J"] = std::to_string(num(after, "General", "EnemyVP") - num(before, "General", "EnemyVP"));
+    out.Add("deltas", KVEncode(kv));
+    summary = "VP " + kv["dVP_K"] + "/" + kv["dVP_J"] + ", prestige " + kv["dPrestige_K"] + ", morale " + kv["dMorale_K"];
+    return true;
+}
+
+static void AddToKey(IniDoc& d, const std::string& sec, const std::string& key, int delta) {
+    if (!delta || !d.Find(sec)) return;
+    d.Set(sec, key, std::to_string(atoi(d.Get(sec, key, "0").c_str()) + delta));
+}
+
+// Ship fields seen from the player's side (what the player knows about a ship); they are not the ship's state.
+static bool IntelField(const std::string& f) {
+    for (const char* k : {"PlayerIntel=", "EnemyClassName=", "EnemySpeed=", "EnemyBelt="})
+        if (f.compare(0, strlen(k), k) == 0) return true;
+    return false;
+}
+
+static std::string FieldKey(const std::string& f) { return f.substr(0, f.find('=')); }
+
+bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J, const Bundle& result,
+                       const std::vector<int>& allowed, std::string& summary, std::string& err) {
+    IniDoc sent = ParseIni(sentBcs);
+    IniDoc host = hostOut;  // committed only if everything applies
+    std::vector<std::pair<std::string, const std::string*>> secs;
+    int skipped = 0;
+    for (auto& f : result.files) {
+        if (f.first.compare(0, 4, "sec:") != 0) continue;
+        std::string name = f.first.substr(4);
+        int idx = name.size() > 6 && name.compare(0, 6, "Nation") == 0 && isdigit((unsigned char)name[6])
+                      ? atoi(name.c_str() + 6)
+                      : -1;
+        std::string suffix = idx >= 0 ? name.substr(6 + std::to_string(idx).size()) : "";
+        bool known = false;
+        for (const char* s : kBattleSections) known |= suffix == s;
+        if (idx < 1 || idx > 8 || !known) {
+            err = "unexpected section " + name;
+            return false;
+        }
+        if (std::find(allowed.begin(), allowed.end(), idx) == allowed.end()) {  // e.g. an ally that is a player
+            skipped++;
+            continue;
+        }
+        secs.push_back({name, &f.second});
+    }
+    int changedShips = 0, removedShips = 0, changedFields = 0;
+    for (auto& sp : secs) {
+        const std::string& name = sp.first;
+        int idx = atoi(name.c_str() + 6);
+        IniSection* hs = host.Find(name);
+        const IniSection* os = sent.Find(name);
+        if (!hs || !os) continue;
+        IniSection rs{name, SplitLines(*sp.second)};
+        bool ships = name.find("Losses") == std::string::npos;
+        if (!ships) {  // Losses: counters, add what the battle added
+            for (auto& l : rs.lines) {
+                size_t eq = l.find('=');
+                if (eq == std::string::npos) continue;
+                std::string key = l.substr(0, eq);
+                AddToKey(host, name, key, atoi(l.c_str() + eq + 1) - atoi(sent.Get(name, key, "0").c_str()));
+            }
+            continue;
+        }
+        std::vector<ShipBlock> hShips, oShips, rShips;
+        std::vector<std::string> hOther, oOther, rOther;
+        ParseShips(*hs, hShips, hOther);
+        ParseShips(*os, oShips, oOther);
+        ParseShips(rs, rShips, rOther);
+        std::map<std::string, const ShipBlock*> orig, res;
+        for (auto& b : oShips)
+            if (!b.id.empty()) orig[b.id] = &b;
+        for (auto& b : rShips)
+            if (!b.id.empty()) res[b.id] = &b;
+        if (orig.size() != oShips.size() || res.size() != rShips.size()) {
+            err = "ships without an id in " + name;
+            return false;
+        }
+        std::vector<ShipBlock> merged;
+        for (auto& b : hShips) {
+            auto o = orig.find(b.id);
+            if (o == orig.end()) {  // not in the battle's game
+                merged.push_back(b);
+                continue;
+            }
+            auto r = res.find(b.id);
+            if (r == res.end()) {  // sunk in the battle (no longer in the list)
+                removedShips++;
+                continue;
+            }
+            // Only the fields the battle changed (relative to what was sent), never the player's intel.
+            std::map<std::string, std::string> was;
+            for (auto& f : o->second->fields) was[FieldKey(f)] = f;
+            ShipBlock nb = b;
+            int n = 0;
+            for (auto& f : r->second->fields) {
+                std::string key = FieldKey(f);
+                auto w = was.find(key);
+                if ((w != was.end() && w->second == f) || IntelField(f)) continue;
+                bool set = false;
+                for (auto& hf : nb.fields)
+                    if (FieldKey(hf) == key) {
+                        hf = f;
+                        set = true;
+                    }
+                if (!set) nb.fields.push_back(f);
+                n++;
+            }
+            if (n) {
+                changedShips++;
+                changedFields += n;
+            }
+            merged.push_back(nb);
+        }
+        // The counts of the section's own lines (CACount=) or of the nation's ShipCount.
+        if (name.find("CoastalArtillery") != std::string::npos) {
+            for (auto& l : hOther)
+                if (l.compare(0, 8, "CACount=") == 0) l = "CACount=" + std::to_string(merged.size());
+        } else {
+            host.Set("Nation" + std::to_string(idx), "ShipCount", std::to_string(merged.size()));
+        }
+        hs->lines = ShipLines(merged, hOther);
+    }
+    const std::string* d = result.Get("deltas");
+    KV kv = d ? KVDecode(*d) : KV();
+    std::string nk = "Nation" + std::to_string(K), nj = "Nation" + std::to_string(J);
+    AddToKey(host, nk, "VP", KVInt(kv, "dVP_K"));
+    AddToKey(host, nk, "Prestige", KVInt(kv, "dPrestige_K"));
+    AddToKey(host, nk, "FleetMorale", KVInt(kv, "dMorale_K"));
+    AddToKey(host, nj, "VP", KVInt(kv, "dVP_J"));
+    hostOut = host;
+    summary = std::to_string(changedShips) + " ships changed (" + std::to_string(changedFields) + " fields), " +
+              std::to_string(removedShips) + " removed, VP " + KVStr(kv, "dVP_K", "0") + "/" + KVStr(kv, "dVP_J", "0") +
+              ", prestige " + KVStr(kv, "dPrestige_K", "0") +
+              (skipped ? ", " + std::to_string(skipped) + " section(s) of other players skipped" : "");
     return true;
 }
 

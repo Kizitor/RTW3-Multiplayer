@@ -1,9 +1,11 @@
 #include "common.h"
 #include "delphi.h"
 #include "game.h"
+#include "lockstep.h"
 #include "net.h"
 #include "session.h"
 #include "ui.h"
+#include <intrin.h>
 
 void BridgeStart();  // bridge.cpp
 
@@ -13,9 +15,20 @@ static HWND g_dispatcher = nullptr;
 static HHOOK g_msgHook = nullptr;
 static std::mutex g_callMx;
 static std::deque<std::function<void()>> g_calls;
+static uint32_t g_dispBaseSp = 0, g_dispCurSp = 0;  // the dispatcher's outermost / current stack position
 
 DWORD MainThreadId() { return g_mainTid; }
 HWND DispatcherHwnd() { return g_dispatcher; }
+
+// A nested message loop adds at least several hundred bytes of frames (the window procedure chain of the routine that
+// runs it, the loop, DispatchMessage); the outermost loop reaches the dispatcher at the same depth every time.
+bool AtOutermostDispatch() { return g_dispCurSp && g_dispCurSp + 256 >= g_dispBaseSp; }
+
+std::string DispatchDepthText() {
+    char b[48];
+    snprintf(b, sizeof(b), "%ld/%08x", g_dispCurSp ? (long)(g_dispBaseSp - g_dispCurSp) : -1L, g_dispBaseSp);
+    return b;
+}
 
 void RunOnMainThread(std::function<void()> fn) {
     {
@@ -46,7 +59,17 @@ static void DrainCalls() {
 }
 
 static LRESULT CALLBACK DispatcherProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    // The dispatcher's stack depth: the outermost message loop calls it at the highest address (it is reached the same
+    // way every time); a nested loop (a modal dialog, a menu, ProcessMessages) calls it deeper.
+    uint32_t sp = (uint32_t)(uintptr_t)_AddressOfReturnAddress();
+    if (sp > g_dispBaseSp) g_dispBaseSp = sp;
+    struct Depth {
+        uint32_t prev;
+        ~Depth() { g_dispCurSp = prev; }
+    } depth{g_dispCurSp};
+    g_dispCurSp = sp;
     try {
+        lockstep::PruneStale();  // battle routines an exception unwound (their hook frames never closed)
         switch (m) {
             case WM_TIMER:
                 mp::Tick();

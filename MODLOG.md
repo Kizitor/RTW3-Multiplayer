@@ -563,3 +563,323 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   right-click menu: select the row with LVM_SETITEMSTATE, post `WM_CONTEXTMENU` (lParam -1) to the list, then post
   VK_DOWN/VK_RETURN to the `#32768` menu window (the menu loop takes them; MN_GETHMENU + GetMenuState MF_HILITE to see
   the highlight). Sync bridge commands work while the modal dialog is open (the dispatcher drains re-entrantly).
+## Investigation 2026-10-14: tactical battles (joined players vs AI, live-lockstep PvP)
+- Question: can joined players fight their battles on their own PC, and can two players fight one battle in lockstep
+  (same start state + seed, only orders travel, shared clock, per-minute checksum, resync)? Research only, no player
+  change; POC behind `poc*` bridge commands (`src/mod/poc_battle.cpp`, nothing runs without them). Full report with
+  addresses and the design in the caller's session folder (`battle-investigation.md`).
+- Campaign side (1.01.44, RVAs):
+  - `CheckForBattles2` (0x4bcb10) runs in DoTurn2 after AreaMoveShips, not in DoEndOfTurn: at most one player battle a
+    month (invasion, raider, area/enemy rolls → CheckAttackLocation → DoHomeAreaBattle/DoPossessionBattle → DoBattle).
+  - `DoBattle` (0x483b24; ECX = a 0x207-byte TWarMission from `PlayerNation.WarInfo + (opp-1)*0x1665 + 4 + m*0x207`):
+    DoAutosaveBeforeBattle, CreateForm(TfrmMain) (FormCreate calls Randomize), setup 0x3abccc → side modifiers
+    0x3ad8dc (side 0 from **GetBNation(0)**), generation 0x3b2de0 (TdlgBattlePreview, ends with `TfrmMain.Execute('BC')`
+    = `Show`, non-modal), `frmBuildCamp.Hide`. The month continues from `TfrmMain.FormClose` → `DoStrategicTurn`.
+  - End: EndOfTurnProcedures' end checks → SinkAllSinking 0x586e18 → ShowResultScreen 0x594154 → 0x5bc0e0 calls
+    `TransferCampaignShipDamage(ship, LossRisk)` for every ship (FindCShipWithId by CShipRefId; log entries, Fate,
+    officers, SinkShip, `SetRepairTime` from damage %) → HandleBattleAftermath (VP, prestige). Damage becomes RepairTime.
+  - Setup and aftermath use PlayerNation ~100 times and GetBNation(0) in the side modifiers, ResetUsedShips and the
+    result text: a joined player's battle needs K as nation 0 → fight in a battle slot made with the 0.2.7 Copy-game
+    transform, not with a long-lived in-memory swap.
+  - Joined-vs-AI battles: DoStrategicTurn → CheckAIvsAIBattles → CheckAivsAIBattleInArea → DoBattleBetweenAINations
+    (synchronous, modal "Firing.jpg" on the host). Intercept by recording a request and resolving it in a battle phase
+    after DoEndOfTurn; blocking inside with a message pump is not recommended.
+- Battle engine:
+  - Minute = `StartMinute` 0x57b630 (MinutesLeft--, Finished=0) → `tmrMoveIntervalTimer` intervals (MoveTorpedoes
+    0x575ee0 only at speed <= 2, MoveAllShips 0x55c2f4) → `EndOfTurnProcedures` 0x57f83c (sighting, gunnery, AI, breaks
+    = PauseGame, Finished=1, autosave every prefs+0x46 minutes, end conditions). `tmrRunMinuteTimer` starts a minute
+    when MinutesLeft > 0 and Finished; `StartRun(n)` 0x57e9e0 is behind every Run button (Run5 = 5 if Engaged else 60).
+  - **Game speed is simulation state**: GameSpeed -3..5 sets the timers and the seconds per interval (1..240 → 240..1
+    intervals a minute, global after `GetTravelDistInGU`); travel is rounded per interval, torpedoes move only at
+    speed <= 2 (torpedoes in the water cap it). Speed 2 vs 1 diverged at minute 1 in the POC.
+  - All randomness: `Random(n)` 0x7834 → `[Random32Proc]` (the only user of the cell; default = Delphi LCG on RandSeed).
+  - The human side global (`PlayerSide`, 355 uses) is simulation-relevant (ResolveMissileHit draws Random behind it):
+    flipping it on one copy desynced at the next minute. ForceIsHumanControlled/SeenByHumanControlledShips mostly gate
+    message text. Both sides human at once works.
+  - Display code draws Random: GlobeRender helpers, Globe2Render/tvShipsChange → GetTypeAndNameForEnemy →
+    IdentifyType/IdentifyClass (lazy identification), PlaySoundEffect, FillShipTree/FillReportList inside EOTP.
+  - `.sac` (SaveScenario 0x5a1010): UTF-8 INI, ~230 KB/49 ships, 0.4 s; positions rounded to 1", no targets or RNG,
+    absolute FlagFile paths. Resume = LoadBuildCampaign with ScenarioInProgress → LoadScenarioInProgress →
+    TfrmMain.Execute(file), 3.3 s, 6,454 draws.
+- POC results (slot 1 fixture, test battle GB vs Germany "Fleet Battle", 49 ships, seed 12345):
+  - Seeded RNG with display draws on a separate stream: identical per-minute state hashes over 30 minutes in separate
+    launches, with 10- or 1-minute steps and with repaints/resizes; two game copies at once, gated and released minute
+    by minute: 25/25 identical. A single shared stream + display activity diverged at minute 28.
+  - Orders as state at a boundary (`pocdiv` course/speed, `pocsideai` side control) on both copies: identical; the same
+    order on one copy only: caught at the next boundary.
+  - `tmrRunMinuteTimer` gate: the minute is held (bridge ping 15 ms), the simulation is unchanged.
+  - Two fresh processes resuming the same battle save with the same seed: identical after load and 10 more minutes
+    (resync model); the resumed state differs from the saved one (lossy).
+  - `pocplayerside 1` shows side 1's view (own ships named) but changes the simulation: swap it only around display code.
+- Gotchas:
+  - `Finished` is 0 before the first run of a battle; a driver waiting for Finished=1 hung (10 min of game-open time).
+  - The third dword of an empty TPointLL (DivisionObjective) is uninitialised: hash lat/long only.
+  - The list behind the cell at RVA 0x6f79d8 is the battle's all-ships list, not the air formations (those are the list `mov ebp, var` before
+    `TAirFormation.SaveMe`).
+  - Never pipe a driver into `Select-Object -First`: PowerShell kills the Python process and skips its restore
+    (slot 1 had to be restored from the backup by hand once).
+  - Risks not testable on one PC: x87 transcendental results across CPUs (trig is centralised in 7 helpers: SinCos,
+    ArcSin/Cos, ArcTan2, angle norm, Sin, Cos, globe distance; inline fsin in GetHitChance/GetBombHitChance) and the
+    preferences record (pointer cell at RVA 0x6f78b4; +0x2f, +0x46, +0x56, AI and realism levels gate simulation code), which two
+    copies on one PC share through config.ini.
+- Validation: build clean; `--only session,merge` 24/24. Game open ~20.6 min in total (including 10 min of the hung
+  first run).
+## Testing 2026-10-15: joined players' battles vs AI (build after 0.2.8, version string 0.2.8)
+- Build under test: a frozen snapshot of the WIP build (outside the repo; another agent kept developing meanwhile),
+  installed into the game folder; the runner's new `--dist <folder>` (or env `RTW3_DIST`) compares the installed DLLs
+  with it instead of `dist\` (default unchanged; the runner still never installs).
+- New scenario `battles` (after `diplomacy`, before `victory_points`): war 1-Spain by `settension 1 7 50` (Spain: the
+  AI nation with a possession, Northwestern Spain, in Northern Europe where Germany has 33 ships); injected battles
+  (`battles inject 1 7 Northern Europe`) and the battles the game finds by itself are driven on the client with posted
+  messages only (`BattleDriver`): map message Accept, preview Accept/Decline/held, the battle screen's auto-run (a
+  posted click on the TSpeedButton's panel, its `TdlgEventAnswer` "Yes"), results "Exit battle". Checks: the battle
+  phase (status, lock, `battles list`), the battle slot (slot 87, playerIdx 0, nation 0 Germany), the client's and the
+  host's log lines, the merge cross-checked field by field against Game87's save (read at `battle N: fought`) in the
+  host's merged save (read at `battle N applied`), VP/Prestige = sent + deltas, counts, the new month on both copies;
+  a declined battle, a battle held past `battles timeout 20`, the opt-out after a rejoin with `fightbattles 0`. 38 checks
+  + 8 per processed month (usually 3 months). Also: Game87 must not exist before a run and is deleted after it.
+- Results: `--only battles` 68/69 (3 months, game open 130 s); full run 437/438 (every other scenario passes: 368/368;
+  game open 599 s with a random host loop the harness now handles). A fought battle (Battle of Ferrol, 33 s on auto-run):
+  `battle 1 applied: 18 ships changed (128 fields), 0 removed, VP 136/106, prestige 0`; e.g. Victoria Louise CrewQuality
+  9 -> 14, RepairTime 0 -> 1, BattleStars 0 -> 1, log entries 2 -> 6 in Game87, in the merged save and after the month.
+- Mod issue: a battle declined in the game's preview is reported as `nobattle`, not `declined` (client `battle N:
+  nobattle`, chat "No battle came about"; host `battle N: resolved by the game (no battle came about)`). The game's
+  `CheckAttackLocation` returns DoPossessionBattle's result = DoBattle's, which is False after a declined preview, so
+  `StartPlayerBattle` returns false and `ClientStartBattle` takes the `nobattle` branch; its `declined` branch (True
+  without a battle screen) does not happen. The outcome (the host lets the game resolve it) is right; the reason, the
+  log and both chat lines are wrong. Fix idea: note that DoBattle was entered (it creates TfrmMain before the preview;
+  a DoBattle or TdlgBattlePreview.Execute hook that counts calls in battle slot mode) and report `declined` when it was
+  entered and no battle screen is up. Related, not verified: the game's own decline consequences (the battle slot's)
+  are discarded, so a player loses nothing by declining.
+- Observed: the AI avoids about 2 of 3 injected battles after the map message's Accept (a "Rule the Waves III" box,
+  `StartPlayerBattle ... -> none`), so the scenario injects two (fight) or three (decline, hold) candidates a month.
+  The game finds Germany-Spain battles by itself in most war months (`battle request N: nation 7 vs 1 in Northern
+  Europe (14:29 ships), fought by Captain`, also in the Mediterranean); a preview's Decline is sometimes disabled (also
+  for an injected battle), then the battle must be fought. The game's AI peace ended the war once at a month's end
+  (deferred battles of that month were still sent and resolved afterwards: they run after DoEndOfTurn). After a time
+  limit the host sends the next battle while the client still shows the old one. The "Add to history record" prompt
+  never appeared with auto-run. Client private memory +2.5-3 MB per campaign load (8 battles: +43 MB).
+- Harness fixes for random host dialogs that never came up before: an event answer that needs a nation
+  (`cbSelectNation`, "negotiating an agreement with") and "Select Officer" (`TdlgSelectOfficer`) looped forever on
+  OK; `answer_dialogs` now picks the first nation / officer first.
+## Feature 2026-10-15: joined players fight their battles against AI nations on their own PC (v0.3.0)
+- Request: every player fights tactical battles (after the investigation of 2026-10-14, idea 1).
+- Host:
+  - The `d_AIBattleDefer` thunk on `DoBattleBetweenAINations(Self, A, B, CountA, CountB, Area)` (ret 12, Boolean),
+    chained in front of the VP thunk `d_AIBattle`, asks `hookcb::OnAIBattle`.
+  - A battle of a connected joined player who fights battles (hello `battles=1`, the "Fight my battles"
+    checkbox) against an AI nation is recorded (`BattleReq`) and returns True. CheckAIvsAIBattles then stops looking
+    for another battle of that pair, as after a fought one.
+  - After DoEndOfTurn, the battle phase runs before ApplyDiplomacy/BroadcastState:
+    1. SaveGame and lock the strategic screen (`SetStrategicEnabled(false)`; the Tick waits only for modal dialogs).
+    2. `MSG_BATTLE` (header + the slot bundle), one battle per player at a time.
+    3. Each `MSG_BATTLE_RESULT` is merged into the save file at once, so the player's next battle is built from it.
+    4. Reload, then the game's own resolution (`ResolveAIBattle`, the original routine through `g_noDefer` in a
+       `__try` helper) for battles that were declined, not fought, timed out (30 min) or whose player disconnected or
+       reconnected (peer changed).
+- Client:
+  1. The battle slot (client slot + 10 = 87) gets the month's files with `MakeNationPlayer(K)` (the Copy-game
+     transform, so K is nation 0 and every PlayerNation/index-0 use is right) and is loaded.
+  2. The battle starts through the game's `CheckAttackLocation(Self, attacker, defender, area)` (ret 4), which shows
+     the preview and then the non-modal battle screen.
+  3. In battle-slot mode, hooks skip `DoStrategicTurn` and `AdvanceDesignStudies`, which the battle screen's
+     FormClose runs.
+  4. The `DoBattle` hook counts setups, so a declined preview ("declined") is told from no battle ("nobattle").
+  5. After the result screen: SaveGame, `ExtractBattleResult` (the ship/loss/coastal sections of K, J and allied
+     nations, with BuildingNationIdx mapped back, plus the deltas of K's VP/Prestige/FleetMorale and of J's VP from
+     EnemyVP), the result is sent and slot 77 is reloaded.
+- Merge (`ApplyBattleResult`): field by field against the sent snapshot.
+  - Ships missing from the result were sunk.
+  - Intel fields (PlayerIntel, EnemyClassName/Speed/Belt) are never taken.
+  - Only `allowed` nations are merged (K, J and AI nations).
+  - Nothing changes unless everything applies.
+  - ShipCount and CACount are recounted.
+- Robustness (review): battle-slot mode is cleared on disconnect/Leave/Join; a quick reconnect counts as a disconnect;
+  the hooks are required for the feature; game calls go through `__try` helpers.
+- Bridge: `battles list|inject K J area|resolve id|all|timeout s|state`, `fightbattles 0|1`; env
+  `RTW3MP_BATTLE_TIMEOUT`, `RTW3MP_BATTLE_SLOT`.
+
+## Feature 2026-10-15: live player-vs-player battles in lockstep (v0.3.0)
+- Request: battles between players fought by both players simultaneously (design 2b of the investigation).
+  Implemented by the research agent in `src/mod/lockstep.cpp`; the full design is in its report (outside the repo).
+- Roles:
+  - A = the authority, side 0: the host for its own battle against a joined player (`DoBattle` from CheckForBattles2;
+    the `d_DoBattle` hook calls `hookcb::OnDoBattleDone`), or the first player's PC for two joined players (deferred
+    like idea 1; the host relays `MSG_LOCKSTEP` by battle id).
+  - B = side 1.
+- Start:
+  1. A holds the battle at minute 0 and saves it (SaveScenario `.sac` + SaveBuildCampaign with ScenarioInProgress).
+  2. It sends the slot's files, the seed, the speed, the battle-relevant preferences offsets and its x87 control word.
+  3. Both PCs (A too) recreate the battle form and load through `LoadCampaign` (the game's resume path) with the
+     seeded RNG, then compare READY hashes.
+- Determinism:
+  - `Random32Proc` is hooked: simulation draws use the shared seeded stream, display draws a local one.
+  - Context thunks mark the simulation routines (StartMinute, MoveTorpedoes, MoveAllShips, EndOfTurnProcedures,
+    DetachShip, ...) and the display routines (GlobeRender, FillShipTree, ...).
+  - The display wrote simulation fields: `Hidden`, the identification and the sighting fields (`SightingLevel`,
+    `RadarSightingLevel`, `LastSighted`, `SeenByHumanControlledShips`). Each ship keeps a simulation set and a
+    display set, swapped with PlayerSide.
+  - `ls leakcheck` flags any simulation change made between steps.
+- Per minute:
+  - A minute-start gate.
+  - Orders are state-synced: an order guard snapshots the order fields after each step, sends the local side's
+    changes as numbered batches and puts the agreed value back until the release.
+  - Detach actions are replayed.
+  - A owns the clock (run/pause/speed/end are requests).
+  - The hash per boundary includes the RNG state. A mismatch → resync from A's snapshot. More than 3 resyncs without
+    10 good minutes → the AI takes side 1.
+- Dialogs inside a minute: "keep the battle going" on both PCs. The end needs both players' End (the game's own
+  400-minute / enemy-near rule applies).
+- Failure handling:
+  - B silent ≥ 30 s at a boundary (5 min while busy) or disconnected → A hands side 1 to the AI and continues alone.
+  - A lost → B leaves and reloads slot 77.
+  - Watchdog for a minute that never finishes.
+  - Forms are freed only from a clean stack (outermost message loop, no menu or move loop, no capture).
+  - Flags are exception-safe.
+- Not available in live battles (chat line): air strikes, routine air ops, missiles, manual torpedoes, emergency
+  activation, change force, try for home, auto-run, save.
+- Bridge: `ls status|enable|session|timeout|desync|drop|resync|trace|leakcheck|guard|dispwrite|throw|stall|nest|...`,
+  `battles injectpvp`; env `RTW3MP_LIVE_BATTLES=0`.
+
+## Testing 2026-10-15: live PvP battles (lockstep) stress
+- Build under test: c06860f's `dist\` (a frozen copy given to the runner with `--dist`). Two to three game copies on
+  one PC, driven by the bridge and posted messages only. Game open in all: ~108 min (5 runs).
+- Runner (`tools/regression.py`; the scenarios `lockstep`, `lockstep_pvp`, `lockstep_month`, `lockstep_stress` and
+  `--stress` were started by an earlier regression agent and completed here):
+  - The leak check (`ls leakcheck 1`) is on in every copy for every live battle of the suite (`ls_leakcheck`: at
+    the start of each lockstep scenario, for a copy started again, for the third copy); `ls_log_scan` asserts no
+    `lockstep: LEAK` line (only the lines the guard's negative control provokes are excused).
+  - `lockstep` (default run, short): + a detach by the client replayed on the host, + `ls dispwrite` on each copy
+    kept out of the simulation by the sighting guard.
+  - `lockstep_stress` (`--stress`): + desync storms injected on the client and on the host (4 each: one DESYNC per
+    injected minute, the minute after each resync equal including the RNG part, the 4th hands side 1 to the AI),
+    + a client that never loads (15-s load timeout), + S7: `ls throw`, `ls stall`, `ls nest 8` on each copy and the
+    guard's negative control; the long battle f) now has every division on the AI.
+  - After-checks: slot 1's and slot 77's saves hold the copies' months. Driver fixes: after a refused agreed end
+    30 minutes are run with `ls_run_total` (battle breaks stop single runs after a minute), up to 20 end requests;
+    the spam ignores orders to divisions that no longer exist; MSLost (the month's trade war) is not a battle loss;
+    an `agree` battle may also be ended by the game itself; a `game` battle that reaches the 900-minute cap ends by
+    agreement.
+- Results (c06860f):
+  - `--only lockstep` 31/31; full default run 522/525 (863 s); full `--stress` run 615/619 (3005 s);
+    `--only lockstep_month,lockstep_stress --stress` 136/141 and `--only lockstep_month --stress` 60/61 while fixing.
+    Every failure left is a mod issue below, the `battles` c/d timing race (once: a "decline" candidate whose Decline
+    was disabled was fought for 71 s under `battles timeout 20`, the queued ones timed out meanwhile), or a test
+    expectation fixed since.
+  - The host's battle against the joined player inside a real processed month (CheckForBattles2 -> DoBattle ->
+    held -> sent -> the client loads it from slot 87 as B -> live -> end -> FormClose -> DoStrategicTurn ->
+    DoEndOfTurn -> the idea-1 battle phase -> the new month to the client) worked in 8 months: 424, 451, 424, 904,
+    499 and 529 minutes live with every minute's hash equal, plus 12 live minutes then the AI (default), plus the
+    client killed in the middle of a minute. Each: one DoEndOfTurn, one month package, no "turn did not advance", the
+    client's plans of the month kept, ships/battle fields/losses of both nations equal in the host's save and slot 77,
+    VP equal (e.g. "victory points: nation 1 +198 in its battle against the host"), sunk ships in both ("Sunk in
+    battle off Northwestern Spain with Spanish ships"); the idea-1 battles of the same month ran after it.
+  - No natural DESYNC and no LEAK in any run (thousands of live minutes; the spam: ~100 commands per copy in 40 s,
+    three times). Joined vs joined: two live battles in one month, roles both ways, 424 minutes each.
+  - Bad states that pass: spam; end requests during a resync, during the load, right after a drop; desync storms;
+    silent client/host; a client that never loads; exceptions, stalled minutes, nested message loops; the client
+    killed at a boundary and mid-minute (dropped in 0.1-1.1 s, the host's battle and month go on); the host killed
+    mid-minute (the client back in slot 77 in 0.8 s, slot mode off, strategic screen and Turn button enabled,
+    Leave/Join work, a new session from the restored slot 1); the opt-outs `fightbattles 0` and
+    `RTW3MP_LIVE_BATTLES=0` (the host fights its battle against the AI, no lockstep).
+  - Memory: every campaign load costs ~3-4 MB private memory (a live battle loads once at its start and once per
+    resync on both copies): nine stress battles in a row took the host 91 -> 179 MB and the client 103 -> 203 MB in
+    one run, 156 -> 258 / 227 -> 344 MB in the full `--stress` run (S7 with ~7 resyncs: +25-32 MB each). Linear, not
+    levelling off: a risk for very long sessions of the 32-bit game (the game's own per-load growth, multiplied by
+    battles and resyncs). Reported, not asserted beyond <= 25 MB per battle on average.
+- Mod issue 1 (medium): a live battle that the game ends by itself INSIDE a minute in a real month runs the host's
+  month inside the battle's simulation step. Seen twice in the `--stress` run (battles 100001 and 100002: "No opposing
+  ships are in sight of each other and scenario length is reached!" during a run). The host's results "Exit battle"
+  closes its battle screen inside that minute's EndOfTurnProcedures, so FormClose -> DoBattlePrestigeLoss ->
+  DoStrategicTurn run nested in the lockstep's K_SIM frame: their boxes go through the minute-box policy ("minute box
+  'The Prime Minister is annoyed that you cannot safeguard our coasts with adequate patrols'", "picture message 'War
+  budget means increased allocations to the navy!' (Parliament.jpg) skipped") and into the chat as "Battle: ...";
+  Yes/No questions of the month would get the battle's fixed answers; the month's random draws come from the battle
+  stream; "WARNING a network message handled inside a simulation step (EndOfTurnProcedures, 1 frames)"; the host logs
+  "live battle ended (abandoned): the battle screen was closed" while the client logs "The battle is over (the battle
+  is over)". The month itself completes correctly. Test battles (battle slot mode: FormClose returns at once) and
+  agreed ends at a boundary are not affected. Fix idea: when ShowResultScreen runs with EndGame set inside a step,
+  end the live battle normally there (send `done end=1`, leave the K_SIM frames/minute policy and the shared RNG for
+  everything nested under the results), or defer the battle form's close (post it) until EndOfTurnProcedures returns,
+  so FormClose runs from the outermost message loop.
+- Mod issue 2 (medium): a joined player who rejoins while the host's battle screen is open gets no nation, neither
+  then nor after the battle/month (`S6`, `P2`, also seen by the earlier agent on e674bf5). The hello handler gives a
+  returning player its reserved nation only `if (CampaignLoaded())`, which is false while the battle hides the
+  strategic screen; `SyncHostCampaign` re-matches reservations only in the lobby phase; so the player stays at nation
+  -1, the new month is not sent to it, and `claim 1` by index does nothing (its lobby list is empty); only `claim
+  <name>` after the host's battle works. Fix idea: use a campaign check that does not need the visible strategic
+  screen in the hello path (e.g. host slot set and NationCount >= 9), or re-run the reservation match in Tick for
+  welcomed players without a nation once `CampaignLoaded()` is true again, then send the month (`SendStateTo`).
+- Observations: after a test battle slot 1 holds the live battle's save (`ScenarioInProgress=1`) until the next month
+  saves it; a host battle in which nation 1 scores no VP logs no "in its battle against the host" line (the month's
+  EnemyVP still reaches it through the share line).
+
+## Testing 2026-10-15: v0.3.0 release candidate
+- Build under test: main a1a8484 (`dist\`, a frozen copy given with `--dist`), installed; both logs show `RTW3MP 0.3.0
+  starting (protocol 3)` (new `session` check against `src/mod/common.h`). Game open: ~70 min in five runs.
+- Runner changes (`tools/regression.py`):
+  - `lockstep_month --stress`: the second real-month battle is `endsoon` (after 6 live minutes A sends the new `ls
+    endsoon`; the game's "Scenario absolute time limit is reached!" ends the battle inside the next minute) instead of
+    `game`. New check of the deferred close on both PCs: `"Exit battle" in the results: the battle screen closes after
+    this minute` -> "The battle is over" -> "live battle ended (normal)" -> `closing the battle screen`; the host's month
+    after it with the game's own dialogs and no minute-box/"Battle: ..."/WARNING line before "DoEndOfTurn finished".
+  - Rejoin during the host's battle (`lockstep_stress` S6 a, P2 a) now expects the nation back, with the evidence of
+    the path (`rejoin_back`: the hello, myNation 1 during the battle and "* Captain joined as Germany", or the host's
+    `reservation: Captain gets nation 1 back` and "* Captain is back as Germany").
+  - Losses step by step: `StageWatcher` (a 0.1-s thread in `ls_month`) reads the host's save at `battle phase:`, after
+    each `battle N applied` and Game87 after each `battle N: fought` (Game87 is rewritten ~0.3 s later). The live
+    battle's losses are checked from its start to the battle phase start; a lost ship is one that is gone or whose
+    Fate is no longer "XXX" (taking part or not); counters of types without campaign ships (MSLost, AUXLost) are only
+    reported; new h2) every idea-1 merge of the month: merged [NationKLosses]/[NationJLosses] = Game87's.
+- Investigation of the research run's open failure (`lockstep_month`, "losses come with sunk ships", nation 1 DDLost
+  0 -> 1): test attribution, not a mod bug. Reproduced twice with the step-by-step saves: the live battle + DoEndOfTurn
+  and every idea-1 merge had no losses (merged Losses equal to the battle slot's), the loss came after the last merge
+  from the game's own resolution of an idea-1 battle the player did not fight ("battle 3 resolved by the game:
+  battle" after "no battle came about"; in the research run a declined one): DD V2 "Sunk in combat with Spanish
+  forces." (in --stress also Lübeck, G8, V3, Preussen: BLost/CLLost/DDLost +4 = 4 ships). The old check compared the
+  live battle's save with the save after the whole month, and counted a sunk ship only if it took part (the game's
+  AI-vs-AI resolution writes no battle star or "took part" entry). Sunk ships stay in the list with their Fate (idea-1
+  merges log `0 removed`).
+- Results: `--only lockstep_month --stress` 65/65 (402 s); full default 509/510 (826 s; the fail: the drop12 battle's
+  [Nation0Losses] AUXLost 0 -> 5 without a ship, a counter without campaign ships like MSLost: test bug, fixed;
+  `--only lockstep_month` 41/41 afterwards); full `--stress` 622/625 (2738 s): every lockstep scenario passes
+  (lockstep_month 57/57, lockstep_stress 90/90 with S6 a/P2 a, lockstep_pvp 23/23), the 3 fails are `research` below
+  (`--only research,doctrine,design_study` 78/78 on the rerun).
+- Mod issue (low-medium): a joined player's research priorities can be re-rolled during the host's month. The game's
+  `TfrmBuildCamp.DoResearch(aNationIdx)` (0xc9225c) runs an AI branch for every nation index > 0 (0xc922bb `cmp
+  [aNationIdx], 0; jle`): with Random(20) == 1 (5 % a month) it sets every area's Prio (+0x326 in the 0x35-byte
+  ResearchAreas records) to Medium (80 %) or Random(3)+1 (0xc92356-0xc923b4). The mod suppresses
+  DetermineAINationResearch only. Seen once: after the `design_study 1` month nation 1 kept ResearchPct 7 but every
+  Prio was 2 on host and client (wanted 1,..,3,..,1,..,3). Fix idea: hook DoResearch and, for joined/reserved nations,
+  restore Prio after the call (or skip the 0xc92356 block), keeping the rest of DoResearch.
+- Confirmed fixed in 0.3.0: the rejoin during the host's battle (both kill cases get nation 1 at once by the hello),
+  the game's end inside a minute (deferred close, normal end on both, normal host dialogs; also seen for an agreed
+  end), seen in 4 real-month battles.
+- Follow-up on ebfca72 (the DoResearch hook for the research finding above; `dist\` frozen and installed; game open
+  285 + 777 s):
+  - `research` e): host `researchrun 1 100` (new async bridge command: the game's DoResearch for a nation `count` times
+    through the hook) after the month in which nation 1 got the client's pattern (1,2,..,3,2,1,..,3: areas 0, 10, 12,
+    15): `before` == `after` == that pattern, and the hook logged 8 and 6 `research priorities of player nation 1 kept
+    (N changed by the game's AI choices)` lines in the two runs (N up to 10 = a full re-roll). Control `researchrun 8
+    100` (AI Austria-Hungary): 2 and 1 areas changed, no `kept` line. A real month also logged `research priorities of
+    player nation 2 kept (1 changed ...)` for the reserved stand-in nation.
+  - `--only research,doctrine,design_study,battles,lockstep`: 172/174. The 2 fails were the `battles` c/d race again,
+    a test bug, fixed: the "decline" candidate battle 7 had Decline disabled, was fought for 37 s under `battles timeout
+    20` and got the client notice "The host resolved this battle without you (time limit)"; the driver then released
+    the held battle 10 at once on that old notice (it was declined, not timed out). The driver now releases a held
+    preview only on a notice logged after the held battle became the current one, and d) reads only notices after
+    "battle N sent".
+  - Full default run: **520/520** (16 months, game open 777 s; research 24/24, battles 70/70).
+## Fix 2026-10-15: the game's AI research choices reset joined players' research priorities (v0.3.0)
+- Found by the v0.3.0 release-candidate regression run: after a month, nation 1 kept its research budget, but every
+  priority was back to Medium (intermittent).
+- Game model (1.01.44): `TfrmBuildCamp.DoResearch(Self, aNationIdx, NoNonGunmessages)` (0xc9225c, register arguments,
+  plain ret) runs an AI branch for every nation index above 0.
+  - It sets some priorities to High by chance (records at +0x3c5, +0x503, +0x538, +0x56d; Japan +0x503).
+  - With `Random(20) == 1` (5 % a month) it re-rolls every priority (mostly Medium; 0xc92356-0xc923b4).
+  - The mod's AI skip only covered `DetermineAINationResearch`, so this branch still ran for joined players.
+- Fix: a `DoResearch` hook. For a joined player's nation it snapshots the 25 Prio values before the game's routine and
+  puts them back after; the research progress is untouched (log `research priorities of player nation N kept (C changed
+  by the game's AI choices)`).
+- Bridge: `researchrun <nation> <count>` (async) runs the game's DoResearch through the hook and logs the priorities
+  before and after.

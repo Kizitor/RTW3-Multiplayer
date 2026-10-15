@@ -9,7 +9,7 @@
 namespace ui {
 
 enum {
-    IDC_NAME = 1001, IDC_IP, IDC_PORT, IDC_PW,
+    IDC_NAME = 1001, IDC_IP, IDC_PORT, IDC_PW, IDC_FIGHT,
     IDC_HOST = 1010, IDC_JOIN, IDC_FIND, IDC_LEAVE,
     IDC_ADDRS = 1020, IDC_STATUS,
     IDC_PLAYERS = 1030,
@@ -354,6 +354,8 @@ static void OnCommand(int id) {
             g_cfg["name"] = GetText(IDC_NAME);
             g_cfg["ip"] = Trim(GetText(IDC_IP));
             g_cfg["port"] = GetText(IDC_PORT);
+            g_cfg["battles"] = SendDlgItemMessageW(g_wnd, IDC_FIGHT, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0";
+            mp::SetFightBattles(g_cfg["battles"] == "1");
             SaveCfg();
             if (g_cfg["ip"].empty()) {
                 MessageBoxW(g_wnd, L"Enter the host's Hamachi (or LAN) IP address.", L"Multiplayer", MB_OK);
@@ -524,6 +526,8 @@ static void CreateMpWindow() {
     Ctl(L"EDIT", U2W(g_cfg["ip"]).c_str(), WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 85, y, 150, 22, IDC_IP);
     Ctl(L"STATIC", L"Port:", 0, 250, y + 3, 60, 18, -1);
     Ctl(L"EDIT", U2W(g_cfg["port"]).c_str(), WS_BORDER | WS_TABSTOP | ES_NUMBER, 315, y, 60, 22, IDC_PORT);
+    HWND fight = Ctl(L"BUTTON", L"Fight my battles", WS_TABSTOP | BS_AUTOCHECKBOX, 385, y + 2, 110, 20, IDC_FIGHT);
+    SendMessageW(fight, BM_SETCHECK, g_cfg.count("battles") && g_cfg["battles"] == "0" ? BST_UNCHECKED : BST_CHECKED, 0);
     y += 32;
     Ctl(L"BUTTON", L"Host game", WS_TABSTOP, 10, y, 110, 28, IDC_HOST);
     Ctl(L"BUTTON", L"Join game", WS_TABSTOP, 130, y, 110, 28, IDC_JOIN);
@@ -669,6 +673,7 @@ static void RefreshInner() {
     EnableWindow(GetDlgItem(g_wnd, IDC_IP), none);
     EnableWindow(GetDlgItem(g_wnd, IDC_PORT), none);
     EnableWindow(GetDlgItem(g_wnd, IDC_PW), none);
+    EnableWindow(GetDlgItem(g_wnd, IDC_FIGHT), none);
     EnableWindow(GetDlgItem(g_wnd, IDC_NATION), !none);
     EnableWindow(GetDlgItem(g_wnd, IDC_CLAIM),
                  !v.nations.empty() && (client || (host && !v.campaignLoaded && v.phase == mp::Phase::Lobby)));

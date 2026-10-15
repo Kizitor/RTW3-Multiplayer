@@ -21,7 +21,7 @@ cl %CFLAGS% /LD "%ROOT%src\proxy\version_proxy.cpp" /Fe"%ROOT%dist\version.dll" 
 cl %CFLAGS% /EHsc /std:c++17 /LD ^
   "%ROOT%src\mod\main.cpp" "%ROOT%src\mod\util.cpp" "%ROOT%src\mod\delphi.cpp" "%ROOT%src\mod\game.cpp" ^
   "%ROOT%src\mod\saveio.cpp" "%ROOT%src\mod\net.cpp" "%ROOT%src\mod\session.cpp" "%ROOT%src\mod\ui.cpp" ^
-  "%ROOT%src\mod\bridge.cpp" ^
+  "%ROOT%src\mod\bridge.cpp" "%ROOT%src\mod\poc_battle.cpp" "%ROOT%src\mod\lockstep.cpp" ^
   "%ROOT%third_party\minhook\src\buffer.c" "%ROOT%third_party\minhook\src\hook.c" ^
   "%ROOT%third_party\minhook\src\trampoline.c" "%ROOT%third_party\minhook\src\hde\hde32.c" ^
   /Fe"%ROOT%dist\RTW3MP.dll" /link /DEBUG /OPT:REF /PDB:"%ROOT%build\RTW3MP.pdb" /PDBALTPATH:%%_PDB%% ^

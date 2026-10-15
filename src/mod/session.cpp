@@ -1,11 +1,13 @@
 #include "session.h"
 #include "game.h"
+#include "lockstep.h"
 #include "net.h"
 #include "saveio.h"
 #include <iterator>
 #include <tuple>
 #include <climits>
 #include <random>
+#include <algorithm>
 
 namespace mp {
 
@@ -22,6 +24,8 @@ struct Player {
     bool submitted = false;
     bool hasState = false;
     int eventMonth = 0;  // Year*12+Month of the last random event applied for this player
+    bool battles = false;  // fights its own battles against AI nations (announced in its hello)
+    bool lockstep = false;  // can fight live battles against other players (lockstep.cpp; announced in its hello)
 };
 
 // The ten nations of the game, offered for lobby picks before the host has a campaign.
@@ -128,6 +132,63 @@ static std::vector<NationView> g_lobbyNations;
 static std::vector<PlayerView> g_lobbyPlayers;
 static bool g_remoteCampaignReady = false, g_remoteCampaignLoaded = false;
 static std::string g_myWant;
+static bool g_fightBattles = true;  // fight this nation's battles against AI nations (sent with the hello)
+
+// Tactical battles of joined players (see game.cpp). Host: battles of a joined player's nation against an AI nation are
+// recorded during the month instead of being resolved by the game; after the month the host sends each one to its
+// player (the month's files), waits for the results and merges them into the save, then sends the new month.
+struct BattleReq {
+    int id = 0;
+    int a = -1, b = -1, countA = 0, countB = 0;  // the game's call: a attacks b in `area`
+    std::wstring area;
+    int human = -1, opp = -1;  // the joined player's nation and its opponent
+    std::string player;
+    int peer = -1;
+    int state = 0;  // 0 queued, 1 sent, 2 result merged into the save, 3 to be resolved by the game, 4 resolved
+    DWORD sentTick = 0;
+    std::string why;      // why the game resolves it
+    std::string sentBcs;  // the host save as sent with this battle (the merge's reference)
+    // A battle between two players' nations fought live (lockstep.cpp): `human` fights it on its PC (A), `opp`'s
+    // player commands the other side from its PC (B); the host relays their messages.
+    bool pvp = false;
+    std::string player2;
+};
+static std::vector<BattleReq> g_battles;
+static int g_battleNextId = 1;
+static bool g_battlePhase = false, g_battleFinishing = false, g_battleMerged = false;
+static std::string g_battlePhaseBytes;  // the host save when the battle phase began (restored if a reload fails)
+static int g_battleTimeoutSec = 30 * 60;
+static DWORD g_battleStatusTick = 0;
+
+// Client: a battle of this player's nation, fought in a separate battle slot.
+static std::string g_battleIn;  // a received battle waiting for an idle moment
+static struct {
+    int id = -1, K = -1, opp = -1;
+    bool fighting = false, cancelled = false, starting = false;
+    std::wstring area;
+    std::string before;  // the battle slot's save before the battle
+} g_cb;
+static int g_battleSlot = 87;
+
+// Live player-vs-player battles (lockstep.cpp). The host's own battles against a player's nation start from the
+// game's DoBattle (host = A); battles between two players' nations from the battle phase (the first player = A).
+static bool g_lsEnabled = true;  // offer (host) / accept (client) live battles
+static struct {
+    int opp = -1, peer = -1, bid = -1;
+    std::string name;
+    DWORD since = 0, lastTry = 0;
+    bool testSlotMode = false;  // the battle was started outside a month (tests): its close must not run one
+} g_lsHost;
+static std::map<int, std::pair<int, int>> g_lsRelay;  // host: battle id -> the two players' peers
+static int g_lsNextBid = 100000;                     // host-vs-player battle ids (battle requests count from 1)
+static char g_lsRole = 0;                            // client: 'A' or 'B' while a live battle is set up here
+static bool g_lsLeave = false;                       // client B: leave the battle slot once the battle screen is closed
+static struct {
+    bool pending = false;
+    int bid = -1, opp = -1;
+    std::string p2;
+    DWORD since = 0, lastTry = 0;
+} g_lsClientA;
 
 // Random events of the joined player's nation (rolled on this PC when a new month arrives).
 static int g_eventRollSeq = -1;        // month (seq) whose event roll is still due
@@ -1257,6 +1318,275 @@ static bool AllSubmitted(std::string* missing) {
     return all;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Tactical battles of joined players (host side)
+
+static Player* PlayerOfNation(int n) {
+    for (auto& kv : g_players)
+        if (kv.second.nation == n && kv.second.connected && kv.second.welcomed) return &kv.second;
+    return nullptr;
+}
+
+static const char* BattleStateName(int s) {
+    return s == 0 ? "queued" : s == 1 ? "fighting" : s == 2 ? "fought" : s == 3 ? "to the game" : "resolved by the game";
+}
+
+static std::wstring HostBcsPath() { return game::SaveDir(g_hostSlot) + L"RTWGame" + std::to_wstring(g_hostSlot) + L".bcs"; }
+
+// Host: a live battle between two players' nations is over (or abandoned): stop relaying it; the player still in it
+// (B, or A if B was the one who left) hears that the other one is gone.
+static void LsEndRelay(int id, const std::string& why) {
+    auto it = g_lsRelay.find(id);
+    if (it == g_lsRelay.end()) return;
+    std::string msg = lockstep::PeerLostMessage(id, why);
+    net::Send(it->second.first, net::MSG_LOCKSTEP, msg);
+    net::Send(it->second.second, net::MSG_LOCKSTEP, msg);
+    g_lsRelay.erase(it);
+    Log("lockstep relay %d ended: %s", id, why.c_str());
+}
+
+static void BattleFallback(BattleReq& r, const std::string& why) {
+    if (r.state >= 2) return;
+    if (r.pvp) LsEndRelay(r.id, why);
+    if (r.state == 1 && PlayerOfNation(r.human)) {
+        KV c;
+        c["id"] = std::to_string(r.id);
+        c["why"] = why;
+        net::Send(r.peer, net::MSG_BATTLE_CANCEL, KVEncode(c));
+    }
+    r.state = 3;
+    r.why = why;
+    Log("battle %d: resolved by the game (%s)", r.id, why.c_str());
+}
+
+static void SendBattle(BattleReq& r) {
+    Player* p = PlayerOfNation(r.human);
+    if (!p) {
+        BattleFallback(r, "the player is not connected");
+        return;
+    }
+    Bundle b;
+    std::string err;
+    std::wstring dir = game::SaveDir(g_hostSlot);
+    // The save as it is now: the results of this phase's earlier battles are merged into it already.
+    if (!ReadFileBytes(HostBcsPath(), r.sentBcs) || !saveio::BuildStateBundle(dir, g_hostSlot, kIdStride * r.human, b, err)) {
+        BattleFallback(r, "cannot package the game: " + err);
+        return;
+    }
+    KV h;
+    h["id"] = std::to_string(r.id);
+    h["nation"] = std::to_string(r.human);
+    h["opp"] = std::to_string(r.opp);
+    h["a"] = std::to_string(r.a);
+    h["b"] = std::to_string(r.b);
+    h["countA"] = std::to_string(r.countA);
+    h["countB"] = std::to_string(r.countB);
+    h["area"] = W2U(r.area);
+    h["oppName"] = CampaignNationName(r.opp);
+    h["timeout"] = std::to_string(g_battleTimeoutSec);
+    Player* p2 = r.pvp ? PlayerOfNation(r.opp) : nullptr;
+    if (p2) {  // the other side is commanded live from p2's PC; the host relays the battle's messages
+        h["pvp"] = "1";
+        h["p2"] = p2->name;
+    }
+    std::string payload = PackHB(KVEncode(h), b.Pack());
+    if (payload.size() > net::MaxMessageBytes()) {
+        BattleFallback(r, "the game is too large to send");
+        return;
+    }
+    r.peer = p->peer;
+    r.state = 1;
+    r.sentTick = GetTickCount();
+    if (p2) g_lsRelay[r.id] = {p->peer, p2->peer};
+    net::Send(p->peer, net::MSG_BATTLE, payload);
+    Log("battle %d sent to %s (%u bytes)%s", r.id, p->name.c_str(), (unsigned)payload.size(),
+        p2 ? (", live against " + p2->name).c_str() : "");
+}
+
+// A battle between two players' nations: fought live when both players fight their battles and can play live ones.
+static bool HostDeferPvpBattle(int a, int b, int countA, int countB, const std::wstring& area) {
+    Player* pa = PlayerOfNation(a);
+    Player* pb = PlayerOfNation(b);
+    if (!g_lsEnabled || !pa || !pb || !pa->battles || !pb->battles || !pa->lockstep || !pb->lockstep) return false;
+    BattleReq r;
+    r.id = g_battleNextId++;
+    r.a = a;
+    r.b = b;
+    r.countA = countA;
+    r.countB = countB;
+    r.area = area;
+    r.human = a;
+    r.opp = b;
+    r.player = pa->name;
+    r.player2 = pb->name;
+    r.pvp = true;
+    g_battles.push_back(r);
+    Log("battle request %d: nation %d vs %d in %s (%d:%d ships), fought live by %s and %s", r.id, a, b,
+        W2U(area).c_str(), countA, countB, pa->name.c_str(), pb->name.c_str());
+    AddChat("* Battle! " + CampaignNationName(a) + " meets " + CampaignNationName(b) + " in " + W2U(area) + ". " +
+            pa->name + " and " + pb->name + " fight it live after the month.");
+    return true;
+}
+
+// The game resolves a battle between two nations it runs. A battle of a joined player's nation against an AI nation is
+// recorded instead (the player fights it after the month); everything else stays with the game.
+static bool HostDeferBattle(int a, int b, int countA, int countB, const std::wstring& area) {
+    if (g_role != Role::Host || !g_turnRunning || area.empty()) return false;
+    bool ha = hookcb::IsHumanRemoteNation(a), hb = hookcb::IsHumanRemoteNation(b);
+    if (ha && hb) return HostDeferPvpBattle(a, b, countA, countB, area);
+    if (ha == hb) return false;  // two AI nations, or two players (the game fights their wars without a battle screen)
+    int human = ha ? a : b, opp = ha ? b : a;
+    Player* p = PlayerOfNation(human);
+    if (!p || !p->battles) return false;
+    BattleReq r;
+    r.id = g_battleNextId++;
+    r.a = a;
+    r.b = b;
+    r.countA = countA;
+    r.countB = countB;
+    r.area = area;
+    r.human = human;
+    r.opp = opp;
+    r.player = p->name;
+    g_battles.push_back(r);
+    Log("battle request %d: nation %d vs %d in %s (%d:%d ships), fought by %s", r.id, a, b, W2U(area).c_str(), countA,
+        countB, p->name.c_str());
+    AddChat("* Battle! " + CampaignNationName(human) + " meets " + CampaignNationName(opp) + " in " + W2U(area) +
+            ". " + p->name + " fights it after the month.");
+    return true;
+}
+
+static bool BattlesDone() {
+    for (auto& r : g_battles)
+        if (r.state < 2) return false;
+    return true;
+}
+
+// Host, after the month and before the new month is sent: send each player its battles (one at a time) and wait. The
+// strategic screen is locked meanwhile: the save file is the campaign's state until the results are loaded.
+static void BattlePhaseTick() {
+    if (!g_battlePhase) {
+        if (!game::SaveGame() || !ReadFileBytes(HostBcsPath(), g_battlePhaseBytes)) {
+            for (auto& r : g_battles) BattleFallback(r, "the host could not save the month");
+            return;
+        }
+        g_battlePhase = true;
+        g_battleMerged = false;
+        game::SetStrategicEnabled(false);
+        Log("battle phase: %d battle(s)", (int)g_battles.size());
+    }
+    for (auto& r : g_battles) {
+        if (r.state == 1) {
+            Player* p = PlayerOfNation(r.human);
+            if (!p || p->peer != r.peer)
+                BattleFallback(r, r.player + " disconnected");
+            else if (g_battleTimeoutSec > 0 && GetTickCount() - r.sentTick > (DWORD)g_battleTimeoutSec * 1000)
+                BattleFallback(r, "time limit");
+        }
+    }
+    for (auto& r : g_battles) {  // one battle per player at a time (a live battle occupies both players)
+        if (r.state != 0) continue;
+        bool busy = false;
+        for (auto& o : g_battles) {
+            if (o.state != 1) continue;
+            auto has = [](const BattleReq& x, int n) { return x.human == n || (x.pvp && x.opp == n); };
+            busy |= has(o, r.human) || (r.pvp && has(o, r.opp));
+        }
+        if (!busy) SendBattle(r);
+    }
+    DWORD now = GetTickCount();
+    if (now - g_battleStatusTick > 3000) {
+        g_battleStatusTick = now;
+        std::string text;
+        for (auto& r : g_battles)
+            if (r.state == 1)
+                text += (text.empty() ? "" : "; ") + r.player + ": " + CampaignNationName(r.human) + " vs " +
+                        CampaignNationName(r.opp) + " in " + W2U(r.area);
+        if (!text.empty()) BroadcastStatus("Battles in progress: " + text);
+    }
+}
+
+// Host: load the save with the merged results, then let the game resolve the battles that weren't fought. False if
+// the campaign could not be loaded (the month is not sent then).
+static bool FinishBattlePhase() {
+    g_battleFinishing = true;
+    bool ok = true;
+    if (g_battleMerged && !game::LoadCampaign(g_hostSlot, 0)) {
+        Log("battle phase: loading the merged save failed; restoring the month without the battles");
+        for (auto& r : g_battles)
+            if (r.state == 2) {
+                r.state = 3;
+                r.why = "the results could not be loaded";
+            }
+        ok = WriteFileBytes(HostBcsPath(), g_battlePhaseBytes) && game::LoadCampaign(g_hostSlot, 0);
+    }
+    game::SetStrategicEnabled(true);
+    if (!ok) {
+        Notice("The month could not be loaded after the battles. Load the save and host again.");
+        g_battles.clear();
+        g_battlePhase = g_battleFinishing = false;
+        return false;
+    }
+    for (auto& r : g_battles) {
+        if (r.state == 2) {
+            AddChat("* The battle of " + CampaignNationName(r.human) + " against " + CampaignNationName(r.opp) + " in " +
+                    W2U(r.area) + " was fought by " + r.player + ".");
+            continue;
+        }
+        if (r.state != 3) continue;
+        r.state = 4;  // resolved once, even if the game's routine fails
+        bool fought = game::ResolveAIBattle(r.a, r.b, r.countA, r.countB, r.area);
+        AddChat("* The battle of " + CampaignNationName(r.human) + " against " + CampaignNationName(r.opp) + " in " +
+                W2U(r.area) + " was resolved by the game (" + r.why + ").");
+        Log("battle %d resolved by the game: %s", r.id, fought ? "battle" : "no battle");
+    }
+    g_battles.clear();
+    g_battlePhase = g_battleFinishing = g_battleMerged = false;
+    g_battlePhaseBytes.clear();
+    return true;
+}
+
+// A fought battle's result is merged into the save file at once, so the player's next battle is built from it.
+static void HostOnBattleResult(Player& p, const std::string& data) {
+    KV h;
+    std::string body;
+    if (!UnpackHB(data, h, body)) return;
+    int id = KVInt(h, "id", -1);
+    for (auto& r : g_battles) {
+        if (r.id != id || r.state != 1 || r.peer != p.peer) continue;
+        std::string outcome = KVStr(h, "outcome");
+        Bundle b;
+        if (outcome != "fought" || !b.Unpack(body)) {
+            BattleFallback(r, outcome == "declined"   ? p.name + " declined it"
+                              : outcome == "nobattle" ? "no battle came about"
+                                                      : "it was not fought (" + KVStr(h, "why", outcome) + ")");
+            return;
+        }
+        std::vector<int> allowed = {r.human, r.opp};  // and the AI nations allied to either side
+        for (int n = 1; n <= 8 && n < game::NationCount(); n++)
+            if (!hookcb::IsHumanRemoteNation(n)) allowed.push_back(n);
+        std::string bytes, summary, err;
+        IniDoc host;
+        bool ok = ReadFileBytes(HostBcsPath(), bytes);
+        if (ok) {
+            host = ParseIni(bytes);
+            ok = saveio::ApplyBattleResult(host, r.sentBcs, r.human, r.opp, b, allowed, summary, err) &&
+                 WriteFileBytes(HostBcsPath(), WriteIni(host));
+        }
+        if (!ok) {
+            Log("battle %d NOT applied: %s", id, err.empty() ? "cannot read or write the save" : err.c_str());
+            BattleFallback(r, "its result could not be applied");
+            return;
+        }
+        r.state = 2;
+        g_battleMerged = true;
+        if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
+        Log("battle %d applied: %s (player: %s)", id, summary.c_str(), KVStr(h, "summary").c_str());
+        return;
+    }
+    Log("battle result %d from %s ignored", id, p.name.c_str());
+}
+
 static void RunHostTurn();
 
 static void TryStartHostTurn() {
@@ -1322,6 +1652,100 @@ static Player* PlayerByPeer(int peer) {
     return it == g_players.end() ? nullptr : &it->second;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Live battles (host side): the host's own battle against a player's nation (host = A), and the relay of battles
+// between two players' nations.
+
+static void HostTryStartLockstep() {
+    if (g_lsHost.opp < 0 || !lockstep::IsHolding()) return;
+    g_lsHost.lastTry = GetTickCount();
+    Player* p = PlayerByPeer(g_lsHost.peer);
+    if (!p || !p->welcomed) {
+        lockstep::ReleaseHold(g_lsHost.name + " is not connected");
+        g_lsHost.opp = -1;
+        return;
+    }
+    lockstep::StartInfo si;
+    si.bid = g_lsHost.bid;  // allocated once for this battle (a retry or a failed start never reuses it)
+    si.slot = game::CurrentSlot();
+    si.opp = g_lsHost.opp;
+    si.myName = g_myName;
+    si.peerName = p->name;
+    si.sideNames[0] = CampaignNationName(0);
+    si.sideNames[1] = CampaignNationName(g_lsHost.opp);
+    int peer = p->peer;
+    si.send = [peer](const std::string& s) { net::Send(peer, net::MSG_LOCKSTEP, s); };
+    std::string err;
+    bool retry = false;
+    if (lockstep::StartAsA(si, err, retry)) {
+        Log("live battle %d started with %s", si.bid, p->name.c_str());
+        return;
+    }
+    if (retry && GetTickCount() - g_lsHost.since < 60000) return;  // Tick tries again
+    if (retry) lockstep::ReleaseHold("the game stayed busy");
+    Log("live battle with %s not started: %s", p->name.c_str(), err.c_str());
+    g_lsHost.opp = -1;
+}
+
+// The game opened a battle screen on the host (DoBattle): against a player's nation whose player fights live battles,
+// that player commands the other side from its PC.
+static void HostOnBattleStarted(int opp) {
+    if (g_role != Role::Host || !g_lsEnabled || lockstep::Active() || g_battlePhase) return;
+    Player* p = PlayerOfNation(opp);
+    if (!p) return;
+    if (!p->battles || !p->lockstep) {
+        Log("battle against %s: fought against the AI (%s)", p->name.c_str(),
+            !p->battles ? "the player doesn't fight battles" : "no live battles on the player's PC");
+        return;
+    }
+    g_lsHost = {};
+    g_lsHost.opp = opp;
+    g_lsHost.peer = p->peer;
+    g_lsHost.name = p->name;
+    g_lsHost.since = GetTickCount();
+    g_lsHost.bid = g_lsNextBid++;
+    g_lsHost.testSlotMode = !g_turnRunning;
+    if (g_lsHost.testSlotMode) game::SetBattleSlotMode(true);  // outside a month (tests): the close must not run one
+    lockstep::Hold("waiting for " + p->name + " (" + CampaignNationName(opp) + ") to join the battle", g_lsHost.bid);
+    if (!lockstep::IsHolding()) {
+        g_lsHost.opp = -1;
+        return;
+    }
+    RunOnMainThread(HostTryStartLockstep);
+}
+
+// A player's PC sent a live battle message: the host's own live battle, or a relayed one.
+static void HostOnLockstep(Player& p, const std::string& data) {
+    int bid = lockstep::MessageBattleId(data);
+    auto it = g_lsRelay.find(bid);
+    if (it != g_lsRelay.end()) {
+        int to = p.peer == it->second.first ? it->second.second : p.peer == it->second.second ? it->second.first : -1;
+        if (to >= 0) net::Send(to, net::MSG_LOCKSTEP, data);
+        for (auto& r : g_battles)  // a live battle whose players still talk is not timed out by the battle phase
+            if (r.id == bid && r.state == 1) r.sentTick = GetTickCount();
+        return;
+    }
+    if (bid >= 0 && bid == lockstep::BattleId() && p.peer == g_lsHost.peer) {
+        int peer = p.peer;
+        lockstep::OnMessage(data, [peer](const std::string& s) { net::Send(peer, net::MSG_LOCKSTEP, s); });
+    }
+}
+
+// A player disconnected: its live battles lose that side.
+static void HostLsPeerGone(int peer, const std::string& name) {
+    if (g_lsHost.opp >= 0 && g_lsHost.peer == peer) {
+        if (lockstep::IsHolding())
+            lockstep::ReleaseHold(name + " disconnected");
+        else
+            lockstep::OnPeerLost(name + " disconnected");
+        g_lsHost.opp = -1;
+    }
+    std::vector<int> ids;
+    for (auto& r : g_lsRelay)
+        if (r.second.first == peer || r.second.second == peer) ids.push_back(r.first);
+    for (int id : ids) LsEndRelay(id, name + " disconnected");
+}
+
 static void HostOnMessage(net::Msg& m) {
     Player* p = PlayerByPeer(m.peer);
     switch (m.type) {
@@ -1335,6 +1759,7 @@ static void HostOnMessage(net::Msg& m) {
         case net::EV_DISCONNECTED: {
             if (p) {
                 if (p->welcomed) AddChat("* " + p->name + " disconnected (" + m.data + ")");
+                HostLsPeerGone(m.peer, p->name);
                 g_players.erase(m.peer);
                 g_submissions.erase(m.peer);
                 BroadcastLobby();
@@ -1372,9 +1797,13 @@ static void HostOnMessage(net::Msg& m) {
             p->name = name;
             p->connected = true;
             p->welcomed = true;
-            if (CampaignLoaded()) {
+            p->battles = KVInt(kv, "battles") != 0;
+            p->lockstep = KVInt(kv, "ls") != 0;
+            // A returning player gets their nation back. Once the session runs, the campaign is the host's even while
+            // its strategic screen is hidden (a battle).
+            if (CampaignLoaded() || (g_phase != Phase::Lobby && g_hostSlot > 0 && game::NationCount() >= 9)) {
                 for (auto& r : g_reserved) {
-                    if (r.second == name) {  // returning player gets their nation back
+                    if (r.second == name) {
                         p->nation = r.first;
                         p->want = CampaignNationName(r.first);
                     }
@@ -1501,6 +1930,12 @@ static void HostOnMessage(net::Msg& m) {
         case net::MSG_EVENT:
             if (p && p->welcomed) HostApplyEvent(*p, KVDecode(m.data));
             break;
+        case net::MSG_BATTLE_RESULT:
+            if (p && p->welcomed) HostOnBattleResult(*p, m.data);
+            break;
+        case net::MSG_LOCKSTEP:
+            if (p && p->welcomed) HostOnLockstep(*p, m.data);
+            break;
         case net::MSG_ACK:
             break;
         case net::MSG_BYE:
@@ -1516,6 +1951,8 @@ static void HostOnMessage(net::Msg& m) {
 
 static void ClientApplyPendingState() {
     if (g_pendingState.empty() || game::IsBusy() || game::BattleActive()) return;
+    if (g_cb.fighting || g_cb.starting || !g_battleIn.empty()) return;  // a battle slot is in use (see below)
+    if (lockstep::Busy() || g_lsLeave) return;                          // a live battle uses the battle slot
     std::string payload;
     payload.swap(g_pendingState);
     KV h;
@@ -1564,6 +2001,182 @@ static void ClientApplyPendingState() {
     Notice("New month " + g_date + ": you command " + KVStr(h, "nationName") +
            ". Press Submit when your orders are ready.");
     g_eventRollSeq = seq;  // this month's event roll happens as soon as the game is idle
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tactical battles of joined players (player side). The battle is fought in a separate battle slot made from the
+// month's files with this player's nation as the player nation (the Copy-game transform); its result goes back to the
+// host, then the normal slot is loaded again.
+
+static int g_battleInId = -1;
+
+static void SendBattleResult(int id, const std::string& outcome, const std::string& why, const Bundle* b,
+                             const std::string& summary) {
+    KV h;
+    h["id"] = std::to_string(id);
+    h["outcome"] = outcome;
+    h["why"] = why;
+    h["summary"] = summary;
+    net::Send(0, net::MSG_BATTLE_RESULT, PackHB(KVEncode(h), b ? b->Pack() : std::string()));
+    Log("battle %d: %s%s%s", id, outcome.c_str(), why.empty() ? "" : " - ", why.c_str());
+}
+
+static void LeaveBattleSlot() {
+    game::SetBattleSlotMode(false);
+    g_cb.fighting = g_cb.starting = false;
+    g_cb.id = -1;
+    std::wstring own = game::SaveDir(g_clientSlot) + L"RTWGame" + std::to_wstring(g_clientSlot) + L".bcs";
+    if (g_myNation > 0 && FileExists(own) && !game::LoadCampaign(g_clientSlot, g_myNation))
+        Notice("Loading your game again failed; it loads with the next month.");
+}
+
+// The session ended (left, disconnected): forget queued battles. A battle being fought goes on as a single-player
+// battle in the battle slot; Tick ends the battle slot mode when it is over.
+static void ClientDropBattle() {
+    if (g_cb.fighting || g_cb.starting) {
+        g_cb.cancelled = true;
+        Log("battle %d: the session ended during the battle", g_cb.id);
+    }
+    g_cb.fighting = g_cb.starting = false;
+    g_cb.id = -1;
+    g_battleIn.clear();
+    g_battleInId = -1;
+}
+
+static void ClientStartBattle() {
+    std::string payload;
+    payload.swap(g_battleIn);
+    g_battleInId = -1;
+    KV h;
+    std::string body;
+    Bundle b;
+    if (!UnpackHB(payload, h, body) || !b.Unpack(body)) {
+        Notice("Received a damaged battle from the host.");
+        return;
+    }
+    int id = KVInt(h, "id", -1), K = KVInt(h, "nation", -1), opp = KVInt(h, "opp", -1);
+    int a = KVInt(h, "a", -1), bb = KVInt(h, "b", -1);
+    std::wstring area = U2W(KVStr(h, "area"));
+    if (K != g_myNation || K < 1 || opp < 1 || opp > 8 || opp == K) {
+        SendBattleResult(id, "failed", "not this player's nation", nullptr, "");
+        return;
+    }
+    if (!game::BattlesAvailable()) {
+        SendBattleResult(id, "failed", "battles are not available with this game version", nullptr, "");
+        return;
+    }
+    std::wstring dir = game::SaveDir(g_battleSlot);
+    std::string err, summary;
+    if (dir.empty() || !saveio::ApplyStateBundle(b, dir, g_battleSlot, err) ||
+        !saveio::MakeNationPlayer(dir, g_battleSlot, K, {}, summary, err) ||
+        !ReadFileBytes(dir + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", g_cb.before)) {
+        SendBattleResult(id, "failed", "cannot prepare the battle slot: " + err, nullptr, "");
+        return;
+    }
+    g_cb.id = id;
+    g_cb.K = K;
+    g_cb.opp = opp;
+    g_cb.area = area;
+    g_cb.cancelled = false;
+    g_cb.starting = true;
+    if (!game::LoadCampaign(g_battleSlot, 0)) {
+        SendBattleResult(id, "failed", "cannot load the battle slot", nullptr, "");
+        LeaveBattleSlot();
+        return;
+    }
+    game::SetBattleSlotMode(true);
+    auto sw = [K](int v) { return v == 0 ? K : v == K ? 0 : v; };
+    AddChat("* Battle! " + W2U(game::NationName(0)) + " meets " + KVStr(h, "oppName") + " in " + W2U(area) + ".");
+    int setups = game::DoBattleCalls();
+    bool started = game::StartPlayerBattle(sw(a), sw(bb), area);
+    bool entered = game::DoBattleCalls() != setups;  // the game set the battle up (its preview was shown)
+    if (g_role != Role::Client || g_cb.id != id) {  // the session ended during the battle preview
+        Log("battle %d: the session ended while it started (%s)", id, started ? "fought as single player" : "no battle");
+        return;
+    }
+    g_cb.starting = false;
+    if (!started || !game::BattleActive()) {
+        bool declined = entered && !game::BattleActive();
+        SendBattleResult(id, declined ? "declined" : "nobattle", "", nullptr, "");
+        AddChat(declined ? "* You declined the battle; the game resolves it." : "* No battle came about; the game resolves it.");
+        LeaveBattleSlot();
+        return;
+    }
+    g_cb.fighting = true;
+    Log("battle %d: fighting nation %d vs %d in %s (slot %d)", id, K, opp, W2U(area).c_str(), g_battleSlot);
+    if (KVInt(h, "pvp") && g_lsEnabled && lockstep::Available()) {  // the other side is a player: a live battle
+        g_lsClientA = {};
+        g_lsClientA.pending = true;
+        g_lsClientA.bid = id;
+        g_lsClientA.opp = opp;
+        g_lsClientA.p2 = KVStr(h, "p2", "the other player");
+        g_lsClientA.since = GetTickCount();
+        g_lsRole = 'A';
+        lockstep::Hold("waiting for " + g_lsClientA.p2 + " to join the battle", g_lsClientA.bid);
+        if (!lockstep::IsHolding()) {
+            g_lsClientA.pending = false;
+            g_lsRole = 0;
+        }
+    }
+}
+
+// Client A of a live battle between two players' nations: start it once the battle screen is up and idle.
+static void ClientTryStartLockstep() {
+    if (!g_lsClientA.pending || !lockstep::IsHolding()) {
+        g_lsClientA.pending = false;
+        return;
+    }
+    g_lsClientA.lastTry = GetTickCount();
+    lockstep::StartInfo si;
+    si.bid = g_lsClientA.bid;
+    si.slot = g_battleSlot;
+    si.opp = g_lsClientA.opp;
+    si.myName = g_myName;
+    si.peerName = g_lsClientA.p2;
+    si.sideNames[0] = W2U(game::NationName(0));  // the battle slot: this player's nation is nation 0
+    si.sideNames[1] = W2U(game::NationName(g_lsClientA.opp));
+    si.send = [](const std::string& s) { net::Send(0, net::MSG_LOCKSTEP, s); };
+    std::string err;
+    bool retry = false;
+    if (lockstep::StartAsA(si, err, retry)) {
+        g_lsClientA.pending = false;
+        return;
+    }
+    if (retry && GetTickCount() - g_lsClientA.since < 60000) return;
+    if (retry) lockstep::ReleaseHold("the game stayed busy");
+    g_lsClientA.pending = false;
+    g_lsRole = 0;
+    Log("battle %d: live start failed (%s); fought against the AI", g_lsClientA.bid, err.c_str());
+}
+
+static void ClientBattleTick() {
+    if (g_cb.fighting) {
+        if (game::BattleActive() || game::IsBusy() || lockstep::Busy()) return;
+        // The battle screen and the dialogs after it are closed.
+        int id = g_cb.id;
+        if (g_cb.cancelled) {
+            Log("battle %d: finished after the host resolved it; result not sent", id);
+        } else if (!game::BattleAftermathSeen()) {
+            SendBattleResult(id, "failed", "the battle was left before its end", nullptr, "");
+            AddChat("* The battle was left before its end; the game resolves it.");
+        } else {
+            std::string after, summary, err;
+            Bundle res;
+            game::SaveGame();
+            if (ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", after) &&
+                saveio::ExtractBattleResult(g_cb.before, after, g_cb.K, g_cb.opp, res, summary, err)) {
+                SendBattleResult(id, "fought", "", &res, summary);
+                AddChat("* Battle result sent to the host (" + summary + ").");
+            } else {
+                SendBattleResult(id, "failed", "cannot read the result: " + err, nullptr, "");
+            }
+        }
+        LeaveBattleSlot();
+        return;
+    }
+    if (!g_battleIn.empty() && !g_cb.starting && !game::IsBusy() && !game::BattleActive() && !game::EventActive() &&
+        !lockstep::Busy() && !g_lsLeave)
+        ClientStartBattle();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1751,6 +2364,8 @@ static void ClientOnMessage(net::Msg& m) {
             kv["build"] = game::BuildFingerprint();
             kv["name"] = g_myName;
             kv["pw"] = g_password;
+            kv["battles"] = g_fightBattles ? "1" : "0";
+            kv["ls"] = g_lsEnabled && lockstep::Available() ? "1" : "0";
             net::Send(0, net::MSG_HELLO, KVEncode(kv));
             Notice("Connected, waiting for the host...");
             break;
@@ -1763,8 +2378,13 @@ static void ClientOnMessage(net::Msg& m) {
             g_haveState = false;
             game::SetTurnButtonCaption(L"Turn");
             net::Shutdown();
+            lockstep::OnPeerLost("the connection to the host was lost");
+            ClientDropBattle();
             break;
         }
+        case net::MSG_LOCKSTEP:
+            lockstep::OnMessage(m.data, [](const std::string& s) { net::Send(0, net::MSG_LOCKSTEP, s); });
+            break;
         case net::MSG_REJECT:
             Notice("The host refused the connection: " + KVStr(KVDecode(m.data), "reason"));
             break;
@@ -1814,6 +2434,33 @@ static void ClientOnMessage(net::Msg& m) {
             Notice("Receiving the new month from the host...");
             ClientApplyPendingState();
             break;
+        case net::MSG_BATTLE: {
+            KV h;
+            std::string body;
+            if (!UnpackHB(m.data, h, body)) break;
+            g_battleIn = m.data;
+            g_battleInId = KVInt(h, "id", -1);
+            Notice("Battle! " + W2U(game::NationName(g_myNation)) + " meets " + KVStr(h, "oppName") + " in " +
+                   KVStr(h, "area") + ". The battle starts as soon as your game is free.");
+            break;
+        }
+        case net::MSG_BATTLE_CANCEL: {
+            KV kv = KVDecode(m.data);
+            int id = KVInt(kv, "id", -1);
+            std::string why = KVStr(kv, "why");
+            if (id == g_battleInId) {
+                g_battleIn.clear();
+                g_battleInId = -1;
+            }
+            if ((g_cb.fighting || g_cb.starting) && g_cb.id == id) {
+                g_cb.cancelled = true;
+                Notice("The host resolved this battle without you (" + why +
+                       "). Finish or leave the battle; its result is not used.");
+            } else {
+                AddChat("* The host resolved your battle without you (" + why + ").");
+            }
+            break;
+        }
         case net::MSG_FORCE_SUBMIT:
             if (g_haveState && !g_submitted) {
                 g_forceSubmitPending = true;
@@ -1837,6 +2484,120 @@ void Init() {
     }
     if (GetEnvironmentVariableA("RTW3MP_EVENT_CHANCE", buf, sizeof(buf)) > 0)
         g_eventChancePct = std::max(0, std::min(100, atoi(buf)));
+    g_battleSlot = g_clientSlot + 10;
+    if (GetEnvironmentVariableA("RTW3MP_BATTLE_SLOT", buf, sizeof(buf)) > 0) {
+        int s = atoi(buf);
+        if (s >= 50 && s < 1000 && s != g_clientSlot) g_battleSlot = s;
+    }
+    if (GetEnvironmentVariableA("RTW3MP_BATTLE_TIMEOUT", buf, sizeof(buf)) > 0) g_battleTimeoutSec = std::max(0, atoi(buf));
+    if (GetEnvironmentVariableA("RTW3MP_LIVE_BATTLES", buf, sizeof(buf)) > 0) g_lsEnabled = atoi(buf) != 0;
+    lockstep::Hooks lh;
+    lh.chat = [](const std::string& s) { AddChat(s); };
+    lh.notice = [](const std::string& s) { Notice(s); };
+    lh.onEnded = [](bool normal, const std::string& why) {
+        Log("live battle ended (%s): %s", normal ? "normal" : "abandoned", why.c_str());
+        if (g_role == Role::Host || g_lsHost.opp >= 0) g_lsHost.opp = -1;
+        if (g_lsRole == 'B') g_lsLeave = true;  // back to this player's own game once the battle screen is closed
+        g_lsRole = 0;
+        g_lsClientA.pending = false;
+    };
+    lh.canLoad = [](std::string& why) {
+        if (g_role != Role::Client || !g_lsEnabled)
+            why = "live battles are off on this PC";
+        else if (g_cb.fighting || g_cb.starting || g_lsLeave)
+            why = "the player is fighting another battle";
+        return why.empty();
+    };
+    lh.loadReady = [] {  // a dialog or event of the player's game: the battle loads once it is closed
+        if (game::IsBusy() || game::BattleActive() || game::EventActive()) return false;
+        if (g_haveState && !g_submitted && game::CurrentSlot() == g_clientSlot) game::SaveGame();  // keep the plans
+        return true;
+    };
+    lh.battleSlot = [] { return g_battleSlot; };
+    lh.slotMode = [](bool on) {
+        game::SetBattleSlotMode(on);
+        if (on) g_lsRole = 'B';
+    };
+    lockstep::SetHooks(lh);
+}
+
+void SetFightBattles(bool on) { g_fightBattles = on; }
+bool FightBattles() { return g_fightBattles; }
+
+// Tests and diagnostics: battles of joined players.
+//   host:   list | inject <K> <J> <area...> | resolve <id|all> | timeout <seconds>
+//   client: state
+std::string DebugBattles(const std::vector<std::string>& a) {
+    std::string cmd = a.size() > 1 ? a[1] : "list";
+    if (cmd == "state") {
+        std::string s = g_cb.fighting ? "fighting" : g_cb.starting ? "starting" : !g_battleIn.empty() ? "pending" : "none";
+        return "ok state=" + s + " id=" + std::to_string(g_cb.fighting ? g_cb.id : g_battleInId) +
+               " nation=" + std::to_string(g_cb.K) + " opp=" + std::to_string(g_cb.opp) + " area=" + W2U(g_cb.area) +
+               " slot=" + std::to_string(g_battleSlot) + " slotMode=" + (game::BattleSlotMode() ? "1" : "0") +
+               " aftermath=" + (game::BattleAftermathSeen() ? "1" : "0") + " fight=" + (g_fightBattles ? "1" : "0");
+    }
+    if (g_role != Role::Host) return "error host only";
+    if (cmd == "list") {
+        std::string s = "ok phase=" + std::string(g_battlePhase ? "1" : "0") + " timeout=" +
+                        std::to_string(g_battleTimeoutSec) + " battles=";
+        for (auto& r : g_battles)
+            s += std::to_string(r.id) + ":" + std::to_string(r.human) + "-" + std::to_string(r.opp) + ":" + W2U(r.area) +
+                 ":" + BattleStateName(r.state) + (r.why.empty() ? "" : ":" + r.why) + "; ";
+        return s;
+    }
+    if (cmd == "timeout" && a.size() > 2) {
+        g_battleTimeoutSec = std::max(0, atoi(a[2].c_str()));
+        return "ok";
+    }
+    if (cmd == "resolve" && a.size() > 2) {
+        if (g_battleFinishing) return "error the battles are being finished";
+        int n = 0;
+        for (auto& r : g_battles)
+            if (r.state < 2 && (a[2] == "all" || atoi(a[2].c_str()) == r.id)) {
+                BattleFallback(r, "host decision");
+                n++;
+            }
+        return "ok " + std::to_string(n);
+    }
+    if (cmd == "inject" && a.size() > 4) {  // a battle as if the game had found it this month (processed at month end)
+        if (g_afterTurnPending || g_battlePhase) return "error not while the month or its battles are processed";
+        int K = atoi(a[2].c_str()), J = atoi(a[3].c_str());
+        std::string areaName;
+        for (size_t i = 4; i < a.size(); i++) areaName += (i > 4 ? " " : "") + a[i];
+        std::wstring area = U2W(areaName);
+        auto names = game::AreaNames();
+        if (std::find(names.begin(), names.end(), area) == names.end()) return "error no sea area '" + areaName + "'";
+        if (!hookcb::IsHumanRemoteNation(K) || hookcb::IsHumanRemoteNation(J) || J < 1 || J > 8)
+            return "error K must be a joined player's nation and J an AI nation";
+        Player* p = PlayerOfNation(K);
+        if (!p || !p->battles) return "error no connected player who fights battles for nation " + std::to_string(K);
+        BattleReq r;
+        r.id = g_battleNextId++;
+        r.a = K;
+        r.b = J;
+        r.countA = r.countB = 3;
+        r.area = area;
+        r.human = K;
+        r.opp = J;
+        r.player = p->name;
+        g_battles.push_back(r);
+        Log("battle request %d injected: nation %d vs %d in %s", r.id, K, J, areaName.c_str());
+        return "ok " + std::to_string(r.id);
+    }
+    if (cmd == "injectpvp" && a.size() > 4) {  // a live battle between two players' nations (processed at month end)
+        if (g_afterTurnPending || g_battlePhase) return "error not while the month or its battles are processed";
+        int K = atoi(a[2].c_str()), J = atoi(a[3].c_str());
+        std::string areaName;
+        for (size_t i = 4; i < a.size(); i++) areaName += (i > 4 ? " " : "") + a[i];
+        std::wstring area = U2W(areaName);
+        auto names = game::AreaNames();
+        if (std::find(names.begin(), names.end(), area) == names.end()) return "error no sea area '" + areaName + "'";
+        if (!hookcb::IsHumanRemoteNation(K) || !hookcb::IsHumanRemoteNation(J) || K == J)
+            return "error K and J must be two joined players' nations";
+        if (!HostDeferPvpBattle(K, J, 3, 3, area)) return "error both players must be connected and fight live battles";
+        return "ok " + std::to_string(g_battles.back().id);
+    }
+    return "error usage: battles list|inject K J area|injectpvp K J area|resolve id|all|timeout s|state";
 }
 
 bool Host(const std::string& name, int port, const std::string& password, int turnLimitMin, std::string& err) {
@@ -1857,6 +2618,9 @@ bool Host(const std::string& name, int port, const std::string& password, int tu
     g_hostSlot = -1;
     g_lastCampaignKey.clear();  // SyncHostCampaign picks up the open campaign and its saved assignments
     if (turnLimitMin > 0) g_turnLimitSec = turnLimitMin * 60;
+    g_lsHost = {};
+    g_lsRelay.clear();
+    if (g_lsEnabled && !lockstep::Prepare()) Log("live battles unavailable: %s", lockstep::Missing().c_str());
     AddChat("* Hosting on port " + std::to_string(port));
     Notice("Hosting. Everyone can pick a nation now.");
     BroadcastLobby();
@@ -1878,7 +2642,10 @@ bool Join(const std::string& name, const std::string& ip, int port, const std::s
 }
 
 void Leave() {
-    if (g_role == Role::None) return;
+    if (g_role == Role::None) {
+        ClientDropBattle();  // a disconnect already ended the session
+        return;
+    }
     net::SendAll(net::MSG_BYE, "");
     Sleep(50);
     net::Shutdown();
@@ -1902,6 +2669,18 @@ void Leave() {
     g_pendingState.clear();
     g_hostWantsTurn = g_turnRunning = g_afterTurnPending = false;
     g_autoStart = false;
+    if (g_battlePhase) game::SetStrategicEnabled(true);
+    g_battles.clear();
+    g_battlePhase = g_battleFinishing = g_battleMerged = false;
+    g_battlePhaseBytes.clear();
+    ClientDropBattle();
+    if (lockstep::IsHolding())
+        lockstep::ReleaseHold("the session ended");
+    else
+        lockstep::OnPeerLost("the session ended");
+    g_lsHost = {};
+    g_lsRelay.clear();
+    g_lsClientA.pending = false;
     AddChat("* Left the session");
     Notice("Not connected.");
 }
@@ -1959,6 +2738,37 @@ void ClaimNation(const std::string& nationName) {
 }
 
 // Host: match lobby picks to the campaign once one is open, and restore saved assignments of that campaign.
+// Host, during a session: a connected player without a nation whose name holds a reservation gets it back (e.g. one who
+// rejoined while the campaign wasn't on screen). Checked every few seconds; the month goes to them as usual.
+static void RematchReservations() {
+    static DWORD last = 0;
+    DWORD now = GetTickCount();
+    if (g_role != Role::Host || g_phase == Phase::Lobby || g_hostSlot <= 0 || now - last < 2000) return;
+    last = now;
+    if (game::NationCount() < 9) return;
+    bool changed = false;
+    for (auto& kv : g_players) {
+        Player& p = kv.second;
+        if (!p.welcomed || !p.connected || p.nation > 0) continue;
+        for (auto& r : g_reserved) {
+            if (r.second != p.name || PlayerOfNation(r.first)) continue;
+            p.nation = r.first;
+            p.want = CampaignNationName(r.first);
+            changed = true;
+            AddChat("* " + p.name + " is back as " + p.want);
+            Log("reservation: %s gets nation %d back", p.name.c_str(), r.first);
+            if (g_phase == Phase::Planning && !g_turnRunning && !game::BattleActive() && game::SaveGame()) {
+                int y = 0, mo = 0;
+                std::wstring dir = game::SaveDir(g_hostSlot);
+                saveio::ReadDate(dir, g_hostSlot, y, mo);
+                SendStateTo(p, dir, y, mo);
+            }
+            break;
+        }
+    }
+    if (changed) BroadcastLobby();
+}
+
 static void SyncHostCampaign() {
     if (g_role != Role::Host || g_phase != Phase::Lobby) return;
     std::string key = CampaignLoaded() ? CampaignKey() : "";
@@ -2215,6 +3025,33 @@ void DebugEventChance(int pct) { g_eventChancePct = std::max(0, std::min(100, pc
 
 std::string DebugLastEvent() { return g_role == Role::Host ? g_lastHostEvent : g_lastEvent; }
 
+// Tests and diagnostics: live battles (`ls ...`, see lockstep::Debug). Session-level: `ls enable 0|1`, `ls session`.
+std::string DebugLockstep(const std::vector<std::string>& a) {
+    std::string c = a.size() > 1 ? a[1] : "status";
+    if (c == "enable") {
+        g_lsEnabled = a.size() < 3 || a[2] != "0";
+        if (g_lsEnabled && g_role == Role::Host) lockstep::Prepare();
+        return std::string("ok enabled=") + (g_lsEnabled ? "1" : "0");
+    }
+    if (c == "session") {
+        std::string out = std::string("ok enabled=") + (g_lsEnabled ? "1" : "0") + " available=" +
+                          (lockstep::Available() ? "1" : "0") + " role=" + (g_lsRole ? std::string(1, g_lsRole) : "-") +
+                          " hostOpp=" + std::to_string(g_lsHost.opp) + " hostBid=" + std::to_string(g_lsHost.bid) +
+                          " testSlotMode=" + (g_lsHost.testSlotMode ? "1" : "0") + " leave=" + (g_lsLeave ? "1" : "0") +
+                          " clientA=" + (g_lsClientA.pending ? "1" : "0") + " slotMode=" +
+                          (game::BattleSlotMode() ? "1" : "0") + " relays=";
+        for (auto& r : g_lsRelay)
+            out += std::to_string(r.first) + ":" + std::to_string(r.second.first) + "/" + std::to_string(r.second.second) + ",";
+        out += " players=";
+        for (auto& kv : g_players)
+            if (kv.second.welcomed)
+                out += kv.second.name + "(" + std::to_string(kv.second.nation) + (kv.second.battles ? ",b" : "") +
+                       (kv.second.lockstep ? ",ls" : "") + ");";
+        return out;
+    }
+    return lockstep::Debug(a);
+}
+
 void OnNet() {
     net::Msg m;
     while (net::Pop(m)) {
@@ -2231,8 +3068,23 @@ void OnNet() {
 
 void Tick() {
     DWORD now = GetTickCount();
+    lockstep::Tick();
+    // Client B of a live battle: back to the player's own game once the battle screen is closed.
+    if (g_lsLeave && !game::BattleActive() && !game::IsBusy() && !lockstep::Busy()) {
+        g_lsLeave = false;
+        Log("live battle: leaving the battle slot");
+        LeaveBattleSlot();
+    }
+    // A battle slot's battle that outlived its session (left or disconnected) ends as a single-player battle.
+    if (g_role != Role::Client && game::BattleSlotMode() && !game::BattleActive() && !game::IsBusy() &&
+        !lockstep::Busy()) {
+        game::SetBattleSlotMode(false);
+        Log("battle slot mode ended (no session)");
+    }
     if (g_role == Role::Host) {
+        if (g_lsHost.opp >= 0 && lockstep::IsHolding() && now - g_lsHost.lastTry > 500) HostTryStartLockstep();
         SyncHostCampaign();
+        RematchReservations();
         if (g_autoStart && g_phase == Phase::Lobby && CampaignReady() && !game::IsBusy()) StartSession();
         if (g_phase == Phase::Planning && g_deadline && (int)(now - g_deadline) >= 0 && !g_forced) {
             g_forced = true;
@@ -2248,13 +3100,31 @@ void Tick() {
         if (g_runTurnWhenIdle && g_phase == Phase::Planning && !game::IsBusy()) RunHostTurn();
         if (g_turnRunning) {
             if (g_afterTurnPending) {
-                if (!game::IsBusy() && !game::BattleActive()) {
-                    g_afterTurnPending = false;
-                    g_turnRunning = false;
-                    ApplyDiplomacy();
-                    BroadcastState();
+                // During the battle phase the strategic screen is locked (IsBusy), so only a modal dialog waits it.
+                bool idle = g_battlePhase ? !game::ModalOpen() && !game::BattleActive()
+                                          : !game::IsBusy() && !game::BattleActive();
+                if (idle && !lockstep::Busy()) {
+                    if (!g_battles.empty() && !BattlesDone()) {
+                        BattlePhaseTick();  // the players fight their battles; the new month waits for them
+                    } else if (g_battles.empty() || FinishBattlePhase()) {
+                        g_afterTurnPending = false;
+                        g_turnRunning = false;
+                        ApplyDiplomacy();
+                        BroadcastState();
+                    } else {
+                        g_afterTurnPending = false;
+                        g_turnRunning = false;
+                    }
                 }
-            } else if (!game::IsBusy() && !game::BattleActive()) {
+            } else if (lockstep::BattleLost() && !game::BattleActive()) {
+                // A live battle's screen could not be restored: the month is half done; it goes on once the host
+                // loads the battle save (resending the old month now would undo it).
+                g_idleSinceTick = 0;
+                if (now - g_lastStatusTick > 5000) {
+                    g_lastStatusTick = now;
+                    BroadcastStatus("The host must load the battle save to finish the battle...");
+                }
+            } else if (!game::IsBusy() && !game::BattleActive() && !lockstep::Busy()) {
                 // The game finished the click without ending the month (cancelled, or waiting after a battle).
                 if (!g_idleSinceTick) g_idleSinceTick = now;
                 if (now - g_idleSinceTick > 4000 && now - g_turnStartTick > 4000) {
@@ -2288,6 +3158,8 @@ void Tick() {
             game::ShowPeaceTreaty(lines);
         }
     } else if (g_role == Role::Client) {
+        ClientBattleTick();
+        if (g_lsClientA.pending && now - g_lsClientA.lastTry > 500) ClientTryStartLockstep();
         if (!g_pendingState.empty()) ClientApplyPendingState();
         if (g_forceSubmitPending && !g_submitted && g_haveState && !game::IsBusy()) SubmitTurn();
         // This month's event roll (once per calendar month, see ClientRunEvent).
@@ -2641,6 +3513,15 @@ void OnAfterAIMoves(void* self) {
         if (n) Log("AI moves undone for nation %d: %d ships", s.first, n);
     }
     mp::g_aiMoveSnaps.clear();
+}
+
+bool OnAIBattle(int a, int b, int countA, int countB, const std::wstring& area) {
+    return mp::HostDeferBattle(a, b, countA, countB, area);
+}
+
+void OnDoBattleDone(int opp, bool result) {
+    Log("DoBattle(opponent %d) -> %d, battle screen %s", opp, result ? 1 : 0, game::BattleActive() ? "open" : "closed");
+    if (game::BattleActive()) mp::HostOnBattleStarted(opp);
 }
 
 }  // namespace hookcb

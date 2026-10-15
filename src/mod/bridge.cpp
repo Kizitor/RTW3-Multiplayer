@@ -4,7 +4,9 @@
 #include "common.h"
 #include "delphi.h"
 #include "game.h"
+#include "lockstep.h"
 #include "net.h"
+#include "poc_battle.h"
 #include "session.h"
 #include "ui.h"
 #include <thread>
@@ -85,6 +87,11 @@ static std::string Execute(const std::string& line) {
         return "ok";
     }
     if (cmd == "researchopen") return RunOnMainThread([] { game::OpenResearch(); }), "ok";  // the Research button (modal)
+    if (cmd == "researchrun") {  // researchrun <nation> <count>: the game's monthly research, logged (may show messages)
+        int n = atoi(arg(1, "0").c_str()), c = atoi(arg(2, "1").c_str());
+        RunOnMainThread([n, c] { game::DebugDoResearch(n, c); });
+        return "ok";
+    }
     if (cmd == "eventnow") {  // eventnow [index]: client rolls this month's event now (shows the game's dialog)
         if (game::EventActive()) return "error an event dialog is open";
         int idx = atoi(arg(1, "-1").c_str());
@@ -96,6 +103,14 @@ static std::string Execute(const std::string& line) {
         EnumWindows(ListWin, (LPARAM)&out);
         return "ok " + out;
     }
+    if (cmd.compare(0, 3, "poc") == 0 && poc::IsAsync(cmd)) {  // research POC (battles) that may open game dialogs
+        RunOnMainThread([args] { Log("%s -> %s", args[0].c_str(), poc::Command(args).c_str()); });
+        return "ok";
+    }
+    if (cmd == "ls" && lockstep::DebugIsAsync(args)) {  // live battles: commands that load or may open dialogs
+        RunOnMainThread([args] { Log("ls %s -> %s", args.size() > 1 ? args[1].c_str() : "", mp::DebugLockstep(args).c_str()); });
+        return "ok";
+    }
     return RunSync(line);
 }
 
@@ -106,6 +121,7 @@ static std::string ExecuteOnMain(const std::string& line) {
     // While a joined player's event dialog is open the nation list is reordered: only read-only commands.
     static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview"};
     if (game::EventActive() && !kReadOnly.count(cmd)) return "error an event dialog is open";
+    if (cmd.compare(0, 3, "poc") == 0) return poc::Command(args);  // research POC (battles), see poc_battle.cpp
     {
         std::string err;
         if (cmd == "eventchance") return mp::DebugEventChance(atoi(arg(1, "33").c_str())), "ok";
@@ -194,6 +210,9 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "terms") return mp::DebugTerms(atoi(arg(1).c_str()), atoi(arg(2).c_str()));  // host: terms <a> <b>
         if (cmd == "vpinfo") return mp::DebugVPInfo();
         if (cmd == "research") return game::DebugResearch(atoi(arg(1, "0").c_str()));  // research <nation>: pct and priorities
+        if (cmd == "battles") return mp::DebugBattles(args);  // joined players' battles (see session.cpp)
+        if (cmd == "ls") return mp::DebugLockstep(args);      // live player-vs-player battles (see lockstep.cpp)
+        if (cmd == "fightbattles") return mp::SetFightBattles(arg(1, "1") != "0"), "ok";  // before join
         if (cmd == "enemyvpadd")  // host: enemyvpadd <n>: the host's enemies gain n VP outside a battle (as a blockade)
             return game::ShowEnemyVP(game::EnemyVP() + atoi(arg(1, "0").c_str())), mp::DebugVPInfo();
         if (cmd == "battlevp")  // host: battlevp <opponent> <vp host> <vp opponent> [Major|Minor|Marginal]: end-of-battle routine

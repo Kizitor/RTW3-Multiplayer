@@ -20,11 +20,12 @@ Built for Rule the Waves 3 **1.01.44** (Steam). All players need the same game v
 - Players can ally with each other, declare war and make peace with buttons in the Multiplayer window
   (see [Diplomacy between players](#diplomacy-between-players)). A war between players ends with peace
   terms for the winner, as in single player: land, ships and reparations.
-- Tactical battles are fought on the host's PC.
+- Every player fights their own nation's tactical battles on their own PC; battles between players are
+  fought live by both players at the same time (see [Tactical battles](#tactical-battles)).
 
 ## Install (every player)
 1. Close the game.
-2. Download `RTW3MP-0.2.8-win32.zip` from the
+2. Download `RTW3MP-0.3.0-win32.zip` from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract everything
    into the game folder, next to `RTW3.exe`. (If you build from source, copy `version.dll` and `RTW3MP.dll`
    from `dist\` instead.)
@@ -156,12 +157,54 @@ wins concessions.
 - When the month is processed, both players get the game's peace treaty window with the terms, and
   everyone sees them in the chat. Withdrawing an agreed peace before then also drops its terms.
 
-## Known limitations (v0.2)
+## Tactical battles
+Every player fights their own nation's battles on their own PC, with the game's own battle screen.
+**Fight my battles** (next to the port, on by default; set it before you join) turns this on for you. Without
+it, the game resolves your battles as before.
+
+### Battles against AI nations
+- When the game finds a battle between a joined player's nation and an AI nation during the month, the
+  battle is kept for that player. After the month, before the new month is sent, the host sends each
+  player their battles, one at a time. The host's screen shows "Battles in progress" and is locked
+  until they are done.
+- On your PC the battle opens with the game's battle preview, as in single player. Fight it to its end,
+  close the results, and the result goes back to the host: damage, sinkings, crew experience, victory
+  points and prestige. Then your own game loads again, and the new month follows.
+- If you decline the battle in the preview, leave it before its end, disconnect, or don't finish within
+  the time limit (30 minutes per battle), the game resolves the battle the old way.
+
+### Battles between players (live)
+When the host's nation fights a joined player's nation, or two joined players' nations fight each other,
+both players fight the same battle **at the same time**, each on their own PC and each commanding their
+own ships.
+- **How it works:** both PCs run the same battle, minute by minute, and exchange their orders. If the two
+  ever disagree, the battle is reloaded on both from the leading PC's state (a short pause; orders given
+  in the last minute are dropped).
+- **The clock is shared.** *Run one minute*, *Run 5 minutes*, *Run until break*, *Pause* and the game
+  speed work for both players: the battle advances when both are ready, and stops for both when one
+  pauses or the game stops for a sighting. Orders given while a minute is running take effect at the
+  next minute.
+- **Fog of war:** each player sees their own ships and only what they have sighted of the enemy.
+- **Ending:** both players press *End game* (the game's own rule still applies: at least half the battle
+  and 400 minutes, and no enemy close). The game's own end conditions (both fleets far apart, one side
+  gone, the time limit) end it for both. The result counts like any battle and the month goes on.
+- **If a player leaves:** if a player disconnects or doesn't respond for 30 seconds, the computer takes
+  over their ships for the rest of the battle.
+- **Not available in live battles yet:** air strikes and routine air operations, missiles, manual torpedo
+  salvoes, emergency activation, change force, try for home, auto-run and save. Pressing them shows a
+  line in the chat.
+- Both PCs hold the whole battle, so a determined player could read the enemy's positions from memory:
+  play with people you trust. The battle log on the second player's PC is written from the first side's
+  point of view.
+
+## Known limitations (v0.3)
 - **Wars and battles:**
-  - Battles involving the host's nation are fought tactically by the host.
-  - Wars between a joined player's nation and an AI nation are resolved by the game's AI-vs-AI
-    battle model.
-  - Joined players don't fight tactical battles yet.
+  - Battles between a joined player's nation and the host's nation, or another joined player's nation,
+    are fought live by both players (see [Tactical battles](#tactical-battles)). Battles against AI
+    nations are fought by the player after the month. Raider interceptions and submarine attacks are
+    still resolved by the game.
+  - Battles of two joined players' nations whose players don't fight their battles are resolved by the
+    game's AI-vs-AI battle model.
   - **Victory points:** a joined player's *VP* counts what their nation scored in its wars, including
     battles against the host; *Enemy VP* counts the points of the nations at war with them. (The game
     itself only keeps the host's view, so the mod fills in a joined player's.) Points the host's enemies
@@ -189,10 +232,12 @@ wins concessions.
   nation's point of view. The Diplomacy list in the Multiplayer window shows your own relations with the
   other players.
 - **Version and slots:** the host and every player must run the same game build and mod version (the mod
-  checks this; 0.1 and 0.2 can't play together). Joined players use save slot 77.
+  checks this; 0.1, 0.2 and 0.3 can't play together). Joined players use save slot 77, and slot 87 for
+  their battles.
 - **Memory over long sessions:** the game's memory use grows by about 3 MB per processed month (the game
-  doesn't fully free a campaign when it's reloaded, and multiplayer reloads it every month). The game is
-  limited to 2 GB, so after a few hundred months in one sitting, save, close the game and rejoin.
+  doesn't fully free a campaign when it's reloaded, and multiplayer reloads it every month and for every
+  battle a joined player fights). The game is limited to 2 GB, so after a few hundred months in one sitting,
+  save, close the game and rejoin.
 - **Hosting video:** it shows the Multiplayer window of version 0.1, before the Diplomacy list was added.
 
 ## Troubleshooting
@@ -205,8 +250,16 @@ wins concessions.
   a save file for more than 3 seconds; that nation keeps last month's orders. If it happens repeatedly, exclude
   `Documents\My Games\Rule the Waves 3\Save` from scanning/syncing.
 - If a joined player's **Research** screen shows the host's research priorities and budget (and changes
-  there don't stick), they are on 0.2.7 or older. Update to 0.2.8, then set research again.
+  there don't stick), they are on 0.2.7 or older. Update to 0.2.8, then set research again. If a joined
+  player's priorities sometimes fall back to Medium after a month, the game's AI research choices reset them
+  (0.2.8 and older); 0.3.0 keeps them.
 - If you see "different game version than the host", update both games through Steam.
+- If the host's screen stays locked with "Battles in progress", a player is fighting a battle. Each battle
+  has a 30-minute limit; after it (or if the player disconnects) the game resolves the battle and the month
+  goes on.
+- In a live battle, a short pause with the battle reloading means the two PCs disagreed and were brought
+  back in step; if it happens often, the computer takes over the second player's ships. The log lines
+  start with `lockstep:`.
 - If there is no **Multiplayer** button, check that `version.dll` and `RTW3MP.dll` are both next to
   `RTW3.exe`. Some antivirus programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name);
   restore it or add an exception for the game folder.

@@ -22,6 +22,10 @@ enum : uint16_t {
     MSG_ACK,
     MSG_DIPLO,
     MSG_EVENT,
+    MSG_BATTLE,         // host -> player: fight this battle (header + the month's files)
+    MSG_BATTLE_RESULT,  // player -> host: the battle's result (sections + deltas), or why there was none
+    MSG_BATTLE_CANCEL,  // host -> player: the battle was resolved without them (time limit, host decision)
+    MSG_LOCKSTEP,       // live player-vs-player battles (relayed by the host)
     EV_CONNECTED = 0xFF00,
     EV_DISCONNECTED = 0xFF01,
 };

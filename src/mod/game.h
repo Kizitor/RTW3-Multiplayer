@@ -116,9 +116,23 @@ bool AtWarWithAnyone(int idx);
 void ShowEnemyVP(int vp);  // this PC's "Enemy VP" (a joined player's view: the points of its own enemies)
 // The game's "Copy game" from the open slot to another one (shows the game's own confirmations; tests).
 void CopyGame(int toSlot);
+// Tactical battles of joined players (see game.cpp). A battle of a joined player's nation against an AI nation is
+// deferred by hookcb::OnAIBattle; the host resolves it later with the game's own routine (ResolveAIBattle) or the
+// player fights it in a battle slot (StartPlayerBattle: the game's CheckAttackLocation -> battle preview -> battle).
+bool BattlesAvailable();
+void SetBattleSlotMode(bool on);  // a battle slot: the battle screen's close doesn't run the rest of a month
+bool BattleSlotMode();
+bool BattleAftermathSeen();       // the battle ended with the game's aftermath (VP, prestige) in battle slot mode
+bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& area);
+bool StartPlayerBattle(int attacker, int defender, const std::wstring& area);
+std::vector<std::wstring> AreaNames();
+bool ModalOpen();                  // a modal game dialog is open
+void SetStrategicEnabled(bool on); // the host's strategic screen accepts input (off while battles are fought)
+int DoBattleCalls();               // how often the game's battle setup (DoBattle) was entered
 // Tests: a nation's research budget (% of the total) and its research priorities; the Research button's handler.
 std::string DebugResearch(int idx);
 void OpenResearch();
+void DebugDoResearch(int idx, int count);  // tests: the game's monthly research of a nation, `count` times (logged)
 // Test hook: the game's end-of-battle routine against `opp`, as after a tactical battle (VP before the log scale).
 std::string DebugBattleAftermath(int opp, int vp0, int vp1, const std::string& level);
 std::vector<PossessionInfo> Possessions(int ownerIdx);
@@ -173,4 +187,8 @@ void OnAfterReduceTimeLimits(void* self);  // the game counted down the host nat
 void OnBattleVP(int a, int b, int vpA, int vpB);  // victory points a battle between nations a and b gave each side
 void OnHostPeace(bool after);  // the game's end of the host's last war (DoPeace), before and after
 void OnAfterCopyGame(int fromSlot, int toSlot);  // the game's "Copy game" finished (or was cancelled)
+// The game resolves a battle between two nations it runs (DoBattleBetweenAINations); true = defer it (host).
+bool OnAIBattle(int a, int b, int countA, int countB, const std::wstring& area);
+// The game's DoBattle returned (opp = the opponent's nation index); the battle screen is open if it was fought.
+void OnDoBattleDone(int opp, bool result);
 }  // namespace hookcb
