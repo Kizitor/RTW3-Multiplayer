@@ -1,8 +1,100 @@
 # MODLOG — Rule the Waves 3 multiplayer mod
 
-Journal for the RTW3 multiplayer mod. Paths, versions, names, formats, failures, next steps.
+The engineering log of the mod, oldest entry first: game facts and reverse engineering (addresses, offsets), design
+decisions, fixes, test results and gotchas, as they were found. It is append-only in spirit: entries are not
+rewritten later, and a fact that turned out wrong gets a dated correction note next to it.
 
-## Game facts (recon 2026-10-04)
+- Entry headings: `## <Kind> <date>: <title> (vX.Y.Z)`, with Kind = Feature, Fix, Testing, Investigation or Docs. The
+  version is the one the work went into (0.1.0 = the development version before the first release).
+- The current design is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), the game facts to rely on in
+  [docs/GAME-INTERNALS.md](docs/GAME-INTERNALS.md), and the user-facing changes in [CHANGELOG.md](CHANGELOG.md).
+- Testing: [docs/TESTING.md](docs/TESTING.md). Older entries point to the regression agent file for the scenario
+  catalog and the bridge commands; both moved to docs/TESTING.md on 2026-10-16.
+- Addresses: RVAs are marked as such; other addresses are in the analysis image with base 0x830000 (see
+  [how to read the addresses](docs/GAME-INTERNALS.md#how-to-read-the-addresses)). Short hashes such as e674bf5,
+  c06860f, a1a8484 and ebfca72 are development builds of 0.3.0 that were squashed into the release commit f6ee827.
+
+## Index
+By version (the version the work went into) and kind, oldest first.
+
+- **0.1.0** (development version, never released)
+  - Feature:
+    [multiplayer design v1, historical](#feature-2026-10-04-multiplayer-design-v1-historical-v010);
+    [implementation status, historical](#feature-2026-10-04-implementation-status-historical-v010)
+  - Fix:
+    [nation selection in the lobby](#fix-2026-10-04-nation-selection-in-the-lobby-v010);
+    [window close, Start session, Give to AI (user report from a second PC)](#fix-2026-10-04-window-close-start-session-give-to-ai-user-report-from-a-second-pc-v010)
+  - Investigation:
+    [game facts](#investigation-2026-10-04-game-facts-v010);
+    [Delphi RTTI, a huge win](#investigation-2026-10-04-delphi-rtti-a-huge-win-v010);
+    [route](#investigation-2026-10-04-route-v010);
+    [save format of 1.01.44](#investigation-2026-10-04-save-format-of-10144-v010);
+    [live experiments](#investigation-2026-10-04-live-experiments-v010);
+    [turn pipeline of 1.01.44](#investigation-2026-10-04-turn-pipeline-of-10144-v010);
+    [gotchas, each cost a debugging round](#investigation-2026-10-04-gotchas-each-cost-a-debugging-round-v010)
+  - Testing:
+    [verified in the real game](#testing-2026-10-04-verified-in-the-real-game-v010)
+  - Docs:
+    [host walkthrough video (docs\hosting.mp4 + 4 stills in the README)](#docs-2026-10-04-host-walkthrough-video-docshostingmp4--4-stills-in-the-readme-v010)
+- **0.2.0** (first public release)
+  - Feature:
+    [diplomacy between players, protocol 2](#feature-2026-10-04-diplomacy-between-players-protocol-2-v020)
+- **0.2.1**
+  - Fix:
+    [joined players' design studies never advanced](#fix-2026-10-05-joined-players-design-studies-never-advanced-v021)
+- **0.2.2**
+  - Fix:
+    [intel reports doubled every month -> "no memory" and "protocol error"](#fix-2026-10-05-intel-reports-doubled-every-month---no-memory-and-protocol-error-v022)
+  - Testing:
+    [intel-report regression coverage](#testing-2026-10-05-intel-report-regression-coverage-v022)
+- **0.2.3**
+  - Fix:
+    [joined players' doctrine/training never took effect](#fix-2026-10-05-joined-players-doctrinetraining-never-took-effect-v023);
+    [a player's turn could be dropped when a save file was briefly locked](#fix-2026-10-05-a-players-turn-could-be-dropped-when-a-save-file-was-briefly-locked-v023)
+  - Testing:
+    [doctrine regression coverage](#testing-2026-10-05-doctrine-regression-coverage-v023);
+    [file-lock regression coverage](#testing-2026-10-05-file-lock-regression-coverage-v023)
+- **0.2.4**
+  - Feature:
+    [random events for joined players](#feature-2026-10-06-random-events-for-joined-players-v024)
+  - Testing:
+    [joined players' random events](#testing-2026-10-06-joined-players-random-events-v024)
+- **0.2.5**
+  - Feature:
+    [peace terms for wars between players](#feature-2026-10-06-peace-terms-for-wars-between-players-v025)
+  - Testing:
+    [peace treaties between players](#testing-2026-10-12-peace-treaties-between-players-v025)
+- **0.2.6**
+  - Fix:
+    [joined players' victory points never rose against the host](#fix-2026-10-12-joined-players-victory-points-never-rose-against-the-host-v026)
+  - Testing:
+    [victory points of joined players](#testing-2026-10-12-victory-points-of-joined-players-v026)
+- **0.2.7**
+  - Fix:
+    [a joined player's "Copy game" played the host's nation](#fix-2026-10-13-a-joined-players-copy-game-played-the-hosts-nation-v027)
+  - Testing:
+    [joined players' Copy game](#testing-2026-10-14-joined-players-copy-game-v027)
+- **0.2.8**
+  - Fix:
+    [a joined player's Research screen showed and edited the host's research](#fix-2026-10-14-a-joined-players-research-screen-showed-and-edited-the-hosts-research-v028)
+  - Testing:
+    [joined players' research screen](#testing-2026-10-14-joined-players-research-screen-v028)
+- **0.3.0**
+  - Feature:
+    [joined players fight their battles against AI nations on their own PC](#feature-2026-10-15-joined-players-fight-their-battles-against-ai-nations-on-their-own-pc-v030);
+    [live player-vs-player battles in lockstep](#feature-2026-10-15-live-player-vs-player-battles-in-lockstep-v030)
+  - Fix:
+    [the game's AI research choices reset joined players' research priorities](#fix-2026-10-15-the-games-ai-research-choices-reset-joined-players-research-priorities-v030)
+  - Investigation:
+    [tactical battles (joined players vs AI, live-lockstep PvP)](#investigation-2026-10-14-tactical-battles-joined-players-vs-ai-live-lockstep-pvp-v030)
+  - Testing:
+    [joined players' battles vs AI](#testing-2026-10-15-joined-players-battles-vs-ai-v030);
+    [live PvP battles (lockstep) stress](#testing-2026-10-15-live-pvp-battles-lockstep-stress-v030);
+    [release candidate](#testing-2026-10-15-release-candidate-v030)
+  - Docs:
+    [documentation restructured](#docs-2026-10-16-documentation-restructured-v030)
+
+## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
 - Version: 1.01.44 (Launcher.exe.config `GameVersion`, window caption "Rule the Waves III - Version 1.01.44").
 - `RTW3.exe`: native x86 Delphi (Embarcadero, VCL), 11.2 MB. ASLR on (seen at base 0x830000, preferred 0x400000).
@@ -17,7 +109,7 @@ Journal for the RTW3 multiplayer mod. Paths, versions, names, formats, failures,
 - Saves: `<Documents>\My Games\Rule the Waves 3\Save\Game<N>` (slot dirs).
   Back up `<Documents>\My Games\Rule the Waves 3` before testing (the test scripts back up and restore slot 1).
 
-## Delphi RTTI (huge win)
+## Investigation 2026-10-04: Delphi RTTI, a huge win (v0.1.0)
 - 797 classes recovered from VMTs (vmtSelfPtr -88, name -56, size -52, parent -48, methods -64, fields -68).
 - Extended RTTI present: field names/offsets/types for private fields, public method names+addresses+signatures.
   Tools: `rtw3-decomp\delphi_rtti.py`, `rtti_full.py` -> `rtw3-decomp\rtti\<Class>.txt`.
@@ -34,12 +126,12 @@ Journal for the RTW3 multiplayer mod. Paths, versions, names, formats, failures,
   LoadBuildCampaign(aFileName) 0x4698c4, AIMonthlyBuild(aNation) 0x47a34c, DoBattle 0x483b24,
   DoBattleBetweenAINations 0x502104, CheckAIvsAIBattles 0x502a50, GetSaveDirectory(aGameIdx) 0x51c0d0.
 
-## Route
+## Investigation 2026-10-04: route (v0.1.0)
 Native: proxy DLL (system DLL name loaded from the game dir) -> loads `RTW3MP.dll` -> resolves targets by
 Delphi RTTI name at runtime (no hard-coded offsets) -> inline hooks. Win32 UI for the MP lobby. TCP over
 Hamachi/any LAN VPN. Host authoritative.
 
-## Save format (1.01.44)
+## Investigation 2026-10-04: save format of 1.01.44 (v0.1.0)
 - Slot dir `Save\Game<slot>\`: `RTWGame<slot>.bcs` (INI, UTF-8 BOM, CRLF, ~770 KB), `RTWGame<slot>.off` (player officers),
   `RTWGame<slot>.sta`, `MapData<slot>.dat` (INI: map areas, possessions with Owner by name, BaseValue, BuildingBase),
   `DesignFiles0..8.des` (per nation designs, positional text).
@@ -51,13 +143,13 @@ Hamachi/any LAN VPN. Host authoritative.
   `AITension1..8`/`AIAlliance1..8` between AIs).
 - Ship ids are global (from IDNo); ships reference areas by name (LocationAreaName/OrderedAreaName/DestinationAreaName).
 
-## Live experiments
+## Investigation 2026-10-04: live experiments (v0.1.0)
 - Writing `PlayerNation` (+0x3204) to BuilderNations[1] and refreshing the ship tab shows Germany's fleet:
   the strategic UI follows the pointer. => clients can play their nation on a copy of the host state.
 - Posted WM_LBUTTONDOWN/UP to VCL panels and BM_CLICK to buttons drive the UI without touching the user's input.
 - frmBuildCamp global var at RVA 0x723000 (1.01.44, dev only; the mod finds the instance by HWND/hook capture).
 
-## Turn pipeline (1.01.44)
+## Investigation 2026-10-04: turn pipeline of 1.01.44 (v0.1.0)
 btbnTurnClick -> (StartBuild 0/1 initial phases with AIBuildInitialFleet/AIMonthlyBuild for 1..8) -> DoTurn2:
 PlayerChecksBeforeTurn, SaveBuildCampaign(autosave), officers, AI strategic moves (unnamed, RVA 0x4c024c,
 writes ship OrderedArea/LocationArea/Status for nations>0), StopBlockadedMoves, AreaMoveShips (executes orders for all),
@@ -65,7 +157,9 @@ CheckForBattles2 (true => battle, strategic turn continues later) -> DoStrategic
 AIMonthlyBuild ..., ComputeExpenses: every nation Funds += GetMonthlyBalance, CheckTurnEvents, DoResearch per nation,
 CheckAIvsAIBattles, raiders) -> DoEndOfTurn (CheckForWar, AdvanceDesignStudies, UI).
 
-## Multiplayer design (v1)
+## Feature 2026-10-04: multiplayer design v1, historical (v0.1.0)
+> Historical: the design as of 0.1.0. The current design is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> Since 0.3.0 joined players fight their own battles, so the last line (battles) no longer holds.
 Host authoritative, simultaneous planning, per-nation merge:
 1. Host plays nation 0 in its normal slot. Clients claim AI nations 1..8.
 2. Each month host saves, sends the slot files to every client (IDNo offset per client so new ids never collide).
@@ -76,13 +170,15 @@ Host authoritative, simultaneous planning, per-nation merge:
 5. After DoEndOfTurn the host saves and broadcasts the new month.
 Battles: fought on the host (host's nation); client nations' wars resolve via the game's AI-vs-AI logic (v1 limit).
 
-## Implementation status (v0.1.0, 2026-10-04)
+## Feature 2026-10-04: implementation status, historical (v0.1.0)
+> Historical: the state of 0.1.0. The current implementation is described in
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - version.dll proxy -> RTW3MP.dll; all targets resolved by RTTI name at runtime (1033 classes found).
 - Unnamed AI fleet-move routine found as "the call before StopBlockadedMoves in DoTurn2".
 - Save-slot global found from `mov edx,[ptr]; mov edx,[edx]` at the start of SaveBuildCampaign.
 - Instances (frmBuildCamp etc.) found by scanning committed heap for the VMT + Owner is TApplication.
 
-## Gotchas (each cost a debugging round)
+## Investigation 2026-10-04: gotchas, each cost a debugging round (v0.1.0)
 1. Never read the game image before the VCL `TApplication` window exists (DRM stub still unpacking).
 2. Bounds checks on candidate pointers must guard against wraparound: `np=0xFFFFFFFF` passed `np+1<=end`.
 3. No implicit TLS in the mod DLL (`thread_local`, MSVC magic statics => build with /Zc:threadSafeInit-).
@@ -92,7 +188,8 @@ Battles: fought on the host (host's nation); client nations' wars resolve via th
 7. `UpdateUIValues(True,True)` assumes the "ships in service" tab; use (False,False) + `TabControl1Change`.
 8. Event dialogs (TdlgEventAnswer) need an answer radio selected before OK closes them (test automation).
 
-## Verified in the real game (two local instances, loopback, posted messages only)
+## Testing 2026-10-04: verified in the real game (v0.1.0)
+*Two local instances, loopback, posted messages only.*
 - Title screen "Multiplayer" entry -> MP window; host/join/claim/start over TCP.
 - Client (Germany) changed research % and ordered a ship to the Mediterranean -> host merged, ran the month:
   values kept, ship moved, AI routines for Germany suppressed (logged), new month auto-sent (Jan->Feb).
@@ -101,7 +198,8 @@ Battles: fought on the host (host's nation); client nations' wars resolve via th
 - Client on "Ships under construction" tab receives Mar->Apr without UI error; rejoin restores nation.
 Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_buildship.py.
 
-## Fix 2026-10-04 evening: nation selection in the lobby
+## Fix 2026-10-04: nation selection in the lobby (v0.1.0)
+*In the evening.*
 - Bug (user report, reproduced live with the real window): the nation list was empty until the host had a
   campaign loaded AND past the initial-fleet steps; the host had no pick at all. Joining showed nothing to claim.
 - Now: picks by nation name from the 10 game nations before any campaign exists (host can plan one too);
@@ -112,7 +210,8 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   dropdown -> host loads Game 1 through the real Load Game screen -> picks resolve -> Start session ->
   client plays Germany in Apr 1900.
 
-## Fix 2026-10-04 night: window close, Start session, Give to AI (user report from a second PC)
+## Fix 2026-10-04: window close, Start session, Give to AI (user report from a second PC) (v0.1.0)
+*At night.*
 - [x] did not close the Multiplayer window: reproduced only with REAL mouse input (posted-message replays
   don't trigger Windows' title-button tracking, not even on a control window). Cause: ui::PreTranslate ran
   IsDialogMessage for every message inside the WH_GETMESSAGE hook and swallowed the mouse-up that the
@@ -123,7 +222,10 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   Joined players no longer see host-only buttons; a player whose nation is given to the AI is told.
 - Verified with tools\realmouse_test.py (real clicks, ~40 s of game time, 11/11 checks).
 
-## Docs 2026-10-05: host walkthrough video (docs\hosting.mp4 + 4 stills in the README)
+## Docs 2026-10-04: host walkthrough video (docs\hosting.mp4 + 4 stills in the README) (v0.1.0)
+*Correction 2026-10-16: this entry was dated 2026-10-05, but it was committed in the evening of 2026-10-04 (local
+time), before the diplomacy entry below. The video and the stills show the Multiplayer window of 0.1: no Diplomacy
+list and no Fight my battles checkbox.*
 - tools\record_hosting.py drives two copies (host + "Captain") through the bridge/posted messages only, so the
   user's mouse/keyboard are untouched, and composes frames from PrintWindow captures of the host process's
   windows only (never a screen capture: an earlier screen-capture take leaked another app and was deleted).
@@ -132,7 +234,8 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - ctypes: HWND_TOPMOST (-1) must be passed as a pointer-sized value on 64-bit Python.
 - ffprobe isn't on PATH, so `um video probe/contact` fail; call the bundled ffmpeg directly.
 
-## Feature 2026-10-04 late: diplomacy between players (v0.2.0, protocol 2)
+## Feature 2026-10-04: diplomacy between players, protocol 2 (v0.2.0)
+*Late in the day.*
 - Game model (1.01.44, all resolved by name; offsets only as documentation):
   - TBuilderNation +0x256 + 4*j = tension towards nation j (j=0 is `Tension`, with the player); >40 = war.
     `SetAITension(Idx,v)` writes both directions (j in 1..8). `IsAtAIWar`, `IsEnemy`, `NationIsAtWar` all test >40.
@@ -198,6 +301,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   Add via RTTI. Network: precise drop reasons (`message too large`, `protocol error (bad frame length N)`),
   bad_alloc in the receive path drops the peer instead of crashing, the host refuses to send an oversized month.
 - Bridge: `intel` (count / distinct entries in memory).
+
 ## Testing 2026-10-05: intel-report regression coverage (v0.2.2)
 - `tools/regression.py`: scenario `intel_reports` (repair on load of the bloated slot 1 fixture, two more loads
   before hosting, clean saves at the session start) and 6 checks after every processed month (`intel` count ==
@@ -229,6 +333,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   and logs the Windows error. MergeSubmission prepares all files first and restores already-written ones if a
   later write fails (all-or-nothing). A rejected turn is now in the host log and a host notice.
   Bridge: `writetest <slot> <file> <bytes>` for the lock test.
+
 ## Testing 2026-10-05: doctrine regression coverage (v0.2.3)
 - Scenario `doctrine`: the real Doctrine button and TdlgDoctrine (posted messages; layout read from the form
   resource `TDLGDOCTRINE` in RTW3.exe, opened read-only as a data file) make the pending change; nation 1
@@ -274,6 +379,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   the merge replaces [NationK]). One event per player per month on both sides. While an event dialog is open,
   LoadCampaign/SaveGame/SetPlayerNation and state-changing bridge commands refuse.
 - Bridge: `eventlist`, `eventnow [idx]`, `eventlast`, `eventchance <pct>`; env `RTW3MP_EVENT_CHANCE`.
+
 ## Testing 2026-10-06: joined players' random events (v0.2.4)
 - The client copy now runs with `RTW3MP_EVENT_CHANCE=0`; `run_month` waits for the client's monthly roll line
   (answering its event dialog) before any other client command, and every month checks one roll
@@ -300,6 +406,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Gotcha: drive `TdlgEventAnswer` by screen position (RadioButton1..3 top to bottom in Panel1, hidden
   `cbSelectNation`, OK); `Data\Events.dat` (plain text, read-only) gives each answer's budget/prestige/tension
   numbers in `eventlist` order.
+
 ## Feature 2026-10-06: peace terms for wars between players (v0.2.5)
 - Report (0.2.0): "there is no peace deal for either player in a player-vs-player war". The user chose: the winner
   picks the possessions like in single player; if they don't pick before the month ends, they are picked
@@ -336,6 +443,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   - `DoPeace` (end of the host's last war) sets Prestige of nations 1..8 to 0. AI nations don't use it; the
     joined players' nations did lose theirs at every end of the host's last war, since 0.2.0. A DoPeace hook now
     restores the prestige of human nations (log `end of war: prestige of player nation N kept at P`).
+
 ## Testing 2026-10-12: peace treaties between players (v0.2.5)
 - Scenario `treaty` (after `diplomacy`, one own month; `events` now finds diplomacy's war month in run order). War
   1-2 by the client + `applydiplo`, `warvp` for a major victory, peace offered/accepted, claim validation on the
@@ -381,6 +489,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   safe, so the scenario uses `applydiplo` treaties after its last month.
 - Gotcha: the game's treaty dialog is `TdlgTotalLog` captioned "Peace treaty" (RichEdit + OK); `DoPeace` takes 1
   host Prestige when a war ends without a major battle ("Navy prestige takes a dent", a TMessageForm).
+
 ## Fix 2026-10-12: joined players' victory points never rose against the host (v0.2.6)
 - Report (0.2.0): "VP for non host player does not increase when fighting the host".
 - Game model (1.01.44): the strategic screen shows `stVP` = PlayerNation.VP (TBuilderNation +0x175, `[NationK] VP=`)
@@ -405,6 +514,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   host's VP included), then `UpdateVPNumbers`. `[General]` is never merged back, so this only changes the view.
 - Bridge: `vpinfo`, `battlevp <opp> <vpHost> <vpOpp> [level]` (the real HandleBattleAftermath through the hook),
   `enemyvpadd <n>`.
+
 ## Testing 2026-10-12: victory points of joined players (v0.2.6)
 - Validation of the report against 0.2.5 (0.2.5 code + the test-only `vpinfo`/`battlevp`; log `RTW3MP 0.2.5 starting`,
   `Peace treaties: ok (... battleHooks=1/1/1)`): session as in `session`, host `diplo war 1` (`diplomacy request 0
@@ -451,6 +561,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   war that DoPeace ends and resets its EnemyVP marker. This was test interference, not a mod bug.
 - Gotcha: `battlevp` is synchronous on the host's main thread: run it from a thread and answer dialogs meanwhile.
   GetLogAdjustedVP does not depend on the current score (2000 -> 214 from EnemyVP 0 and from 101).
+
 ## Fix 2026-10-13: a joined player's "Copy game" played the host's nation (v0.2.7)
 - Report (0.2.0): "non host player can copy save but the save is only for the host player nation".
 - Game model (1.01.44): `btbnSaveToOtherSlotClick` -> `TdlgInputNumber` -> `CopyGameToOtherSlot(aFromSlot, aToSlot)`
@@ -474,6 +585,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Bridge: `copygame <slot>` (the game's routine through the hook). An offline harness (saveio + util built as a
   console program) checked the transform against the 1900 fixture with doctored wars, alliance, VP, mines,
   TakenFrom, commanders and divisions.
+
 ## Testing 2026-10-14: joined players' Copy game (v0.2.7)
 - Validation of the report against 0.2.6 (0.2.6 code + the test-only `copygame`; log `RTW3MP 0.2.6 starting`):
   session as in `session` (host Great Britain = nation 0, client Germany = nation 1, Aug 1900), client `copygame 78`
@@ -513,6 +625,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Gotchas: never answer a copy's dialogs with `dismiss_dialogs` ("Confirm" is OK/Cancel, OK overwrites; the
   dialog's default slot is 1, the host's slot on a test PC); the mod's box is a Win32 `#32770` whose text is
   readable through its Static child.
+
 ## Fix 2026-10-14: a joined player's Research screen showed and edited the host's research (v0.2.8)
 - Report (0.2.0): "Research prio is mirrored from host to non host player but not % of money spent".
 - Game model (1.01.44): research priorities and the research budget are per nation (`TBuilderNation.ResearchAreas`
@@ -529,6 +642,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   a joined player's PC), the screen opens for PlayerNation (log `research screen: opened for the player's nation K
   instead of nation 0`). The host and the joined player's event dialogs (nation list swapped) are unchanged.
 - Bridge: `research <nation>` (budget % and the 25 priorities), `researchopen` (the Research button's handler).
+
 ## Testing 2026-10-14: joined players' research screen (v0.2.8)
 - Validation of the report against 0.2.7 (0.2.7 code + the test-only `research`/`researchopen`; log `RTW3MP 0.2.7
   starting`): session as in `session` (Aug 1900). Host and client: `research 0` -> `ok pct=8 prio=2,2,...,2,0,0` (all
@@ -563,7 +677,8 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   right-click menu: select the row with LVM_SETITEMSTATE, post `WM_CONTEXTMENU` (lParam -1) to the list, then post
   VK_DOWN/VK_RETURN to the `#32768` menu window (the menu loop takes them; MN_GETHMENU + GetMenuState MF_HILITE to see
   the highlight). Sync bridge commands work while the modal dialog is open (the dispatcher drains re-entrantly).
-## Investigation 2026-10-14: tactical battles (joined players vs AI, live-lockstep PvP)
+
+## Investigation 2026-10-14: tactical battles (joined players vs AI, live-lockstep PvP) (v0.3.0)
 - Question: can joined players fight their battles on their own PC, and can two players fight one battle in lockstep
   (same start state + seed, only orders travel, shared clock, per-minute checksum, resync)? Research only, no player
   change; POC behind `poc*` bridge commands (`src/mod/poc_battle.cpp`, nothing runs without them). Full report with
@@ -624,7 +739,9 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
     copies on one PC share through config.ini.
 - Validation: build clean; `--only session,merge` 24/24. Game open ~20.6 min in total (including 10 min of the hung
   first run).
-## Testing 2026-10-15: joined players' battles vs AI (build after 0.2.8, version string 0.2.8)
+
+## Testing 2026-10-15: joined players' battles vs AI (v0.3.0)
+*A development build of 0.3.0, made after 0.2.8; its version string was still 0.2.8.*
 - Build under test: a frozen snapshot of the WIP build (outside the repo; another agent kept developing meanwhile),
   installed into the game folder; the runner's new `--dist <folder>` (or env `RTW3_DIST`) compares the installed DLLs
   with it instead of `dist\` (default unchanged; the runner still never installs).
@@ -651,6 +768,9 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   a DoBattle or TdlgBattlePreview.Execute hook that counts calls in battle slot mode) and report `declined` when it was
   entered and no battle screen is up. Related, not verified: the game's own decline consequences (the battle slot's)
   are discarded, so a player loses nothing by declining.
+- *Note 2026-10-16: fixed in 0.3.0. The `DoBattle` hook counts the game's battle setups, so a declined preview is
+  reported as `declined` (see the [feature entry](#feature-2026-10-15-joined-players-fight-their-battles-against-ai-nations-on-their-own-pc-v030),
+  client step 4); the `battles` scenario passed 70/70 in the full default run of ebfca72.*
 - Observed: the AI avoids about 2 of 3 injected battles after the map message's Accept (a "Rule the Waves III" box,
   `StartPlayerBattle ... -> none`), so the scenario injects two (fight) or three (decline, hold) candidates a month.
   The game finds Germany-Spain battles by itself in most war months (`battle request N: nation 7 vs 1 in Northern
@@ -662,6 +782,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Harness fixes for random host dialogs that never came up before: an event answer that needs a nation
   (`cbSelectNation`, "negotiating an agreement with") and "Select Officer" (`TdlgSelectOfficer`) looped forever on
   OK; `answer_dialogs` now picks the first nation / officer first.
+
 ## Feature 2026-10-15: joined players fight their battles against AI nations on their own PC (v0.3.0)
 - Request: every player fights tactical battles (after the investigation of 2026-10-14, idea 1).
 - Host:
@@ -741,7 +862,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
 - Bridge: `ls status|enable|session|timeout|desync|drop|resync|trace|leakcheck|guard|dispwrite|throw|stall|nest|...`,
   `battles injectpvp`; env `RTW3MP_LIVE_BATTLES=0`.
 
-## Testing 2026-10-15: live PvP battles (lockstep) stress
+## Testing 2026-10-15: live PvP battles (lockstep) stress (v0.3.0)
 - Build under test: c06860f's `dist\` (a frozen copy given to the runner with `--dist`). Two to three game copies on
   one PC, driven by the bridge and posted messages only. Game open in all: ~108 min (5 runs).
 - Runner (`tools/regression.py`; the scenarios `lockstep`, `lockstep_pvp`, `lockstep_month`, `lockstep_stress` and
@@ -810,11 +931,13 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   <name>` after the host's battle works. Fix idea: use a campaign check that does not need the visible strategic
   screen in the hello path (e.g. host slot set and NationCount >= 9), or re-run the reservation match in Tick for
   welcomed players without a nation once `CampaignLoaded()` is true again, then send the month (`SendStateTo`).
+- *Note 2026-10-16: both mod issues above were fixed in 0.3.0; see "Confirmed fixed in 0.3.0" in
+  [Testing 2026-10-15: release candidate](#testing-2026-10-15-release-candidate-v030).*
 - Observations: after a test battle slot 1 holds the live battle's save (`ScenarioInProgress=1`) until the next month
   saves it; a host battle in which nation 1 scores no VP logs no "in its battle against the host" line (the month's
   EnemyVP still reaches it through the share line).
 
-## Testing 2026-10-15: v0.3.0 release candidate
+## Testing 2026-10-15: release candidate (v0.3.0)
 - Build under test: main a1a8484 (`dist\`, a frozen copy given with `--dist`), installed; both logs show `RTW3MP 0.3.0
   starting (protocol 3)` (new `session` check against `src/mod/common.h`). Game open: ~70 min in five runs.
 - Runner changes (`tools/regression.py`):
@@ -870,6 +993,7 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
     preview only on a notice logged after the held battle became the current one, and d) reads only notices after
     "battle N sent".
   - Full default run: **520/520** (16 months, game open 777 s; research 24/24, battles 70/70).
+
 ## Fix 2026-10-15: the game's AI research choices reset joined players' research priorities (v0.3.0)
 - Found by the v0.3.0 release-candidate regression run: after a month, nation 1 kept its research budget, but every
   priority was back to Medium (intermittent).
@@ -883,3 +1007,39 @@ Test tools: tools\rtw3ctl.py, e2e_test.py, run_turn.py, verify_tabs.py, ui_build
   by the game's AI choices)`).
 - Bridge: `researchrun <nation> <count>` (async) runs the game's DoResearch through the hook and logs the priorities
   before and after.
+
+## Docs 2026-10-16: documentation restructured (v0.3.0)
+- Request: audit the documentation, restructure it and fix errors; no change to the mod.
+- New files: `CHANGELOG.md` (per version, from the release notes), `docs/ARCHITECTURE.md` (the current design),
+  `docs/TESTING.md` (how to run the suite, the environment variables, the tools inventory; the bridge command
+  reference, the scenario catalog and the known traps moved there from the regression agent file),
+  `docs/GAME-INTERNALS.md` (the game facts and the battle knowledge moved there from the research agent file),
+  `.github/copilot-instructions.md`, the release texts `extras/RTW3MP_README.txt` (with a `{VERSION}` placeholder) and
+  `extras/RTW3MP_LICENSES.txt`, and `tools/package_release.ps1`.
+- README reorganized: contents, requirements, a version-agnostic install, uninstall, **Fight my battles** and Copy game
+  when joining, the current limitations, troubleshooting with an upgrade section, building and tests.
+- This log: a header, an index, entry headings in one format; the 0.1.0 design and status sections marked as
+  historical.
+- Corrections, each checked in the source:
+  - The README and the release README said the mod never modifies "your normal save slots". The host's campaign slot
+    is saved and merged into every month (`RunHostTurn` -> `saveio::MergeSubmission`; also `rtw3mp_session.ini`), and
+    joined players use slots 77 and 87. Both texts now say so.
+  - The README said the mod checks that everyone runs the same game build and mod version. The host compares the
+    protocol (`MP_PROTOCOL`) and the game build fingerprint, not the version string (`MSG_HELLO` in `session.cpp`).
+  - The README did not say that a live battle needs both players to fight their battles: otherwise the host fights
+    its battle against the computer, and a battle between two joined players' nations is resolved by the game
+    (`HostOnBattleStarted`, `HostDeferPvpBattle`).
+  - The README said the hosting video shows 0.1's window "before the Diplomacy list was added"; it also lacks the
+    **Fight my battles** checkbox. It also called the host's nation "nation #1" (it is the save's player nation,
+    index 0), and its list of test scenarios was still the one of 0.2.1.
+  - The research agent said all save files are UTF-8 INI with CRLF; `DesignFiles<i>.des` is positional text (see the
+    save format entry above).
+  - The regression agent's trap "a declined preview is reported as `nobattle`" no longer holds since 0.3.0 (the
+    `DoBattle` setup count); its bridge reference lacked `release`, `limit`, `chat`, `setplayer`, `savedir` and some
+    `status` fields.
+  - The README's caption **Claim land…** is **Claim land...** in the mod (`ui.cpp`).
+  - The hosting video's entry was dated 2026-10-05; it is from 2026-10-04 (corrected above).
+- Packaging check: `tools/package_release.ps1` run against the 0.3.0 `dist\` gives the five entry names of the 0.3.0
+  release zip in the same order. The DLLs and `RTW3MP_LICENSES.txt` are byte-identical; `RTW3MP_SecondCopy.bat` differs
+  only in its line endings (now CRLF throughout), `RTW3MP_README.txt` only in the intended edits (a CHANGELOG pointer,
+  the uninstall note) and its line endings.
