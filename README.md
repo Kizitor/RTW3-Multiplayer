@@ -20,6 +20,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 - [Troubleshooting](#troubleshooting)
 - [Building from source](#building-from-source)
 - [Credits](#credits)
+- [License](#license)
 
 ## How it plays
 - One monthly turn at a time, with everyone planning at once:
@@ -327,7 +328,14 @@ battle between two joined players' nations is resolved by the game.
 
 ## Credits
 - Rule the Waves 3 is by NWS / Matrix Games. This is an unofficial fan mod and ships no game files.
-- Hooking uses [MinHook](https://github.com/TsudaKageyu/minhook) (BSD 2-Clause, see
-  `third_party/minhook/LICENSE.txt`; the release zip has it as `RTW3MP_LICENSES.txt`).
+- Hooking uses [MinHook](https://github.com/TsudaKageyu/minhook) (see [License](#license)).
 - Built with AI assistance (GitHub Copilot): reverse engineering through the game's Delphi RTTI, the code, the tests
   and the documentation.
+
+## License
+- The mod's code is available under the MIT license: see [LICENSE](LICENSE).
+- MinHook, in `third_party/minhook/`, is under the BSD 2-Clause license: see
+  [third_party/minhook/LICENSE.txt](third_party/minhook/LICENSE.txt).
+- The release zip has both licenses in `RTW3MP_LICENSES.txt`.
+- Rule the Waves 3 and its artwork belong to NWS / Matrix Games. The screenshots and the video in `docs/` show the
+  game; the MIT license covers only the mod's own code and text.

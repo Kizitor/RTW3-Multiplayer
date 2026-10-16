@@ -26,7 +26,7 @@ Files
 - RTW3MP.dll                 the mod
 - RTW3MP_SecondCopy.bat      optional: starts a second copy of the game to try multiplayer on one PC
 - RTW3MP_README.txt          this file
-- RTW3MP_LICENSES.txt        third-party license (MinHook)
+- RTW3MP_LICENSES.txt        licenses: the mod's code (MIT) and MinHook (BSD 2-Clause)
 
 Log file: Documents\My Games\Rule the Waves 3\RTW3MP\rtw3mp.log
 

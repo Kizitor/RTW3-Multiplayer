@@ -41,7 +41,8 @@ fight their own tactical battles, and battles between players are fought live by
 ## Documentation map
 | File | Audience | Content | Notes |
 |---|---|---|---|
-| `README.md` | players and hosts | what the mod does, requirements, install/uninstall, network setup, hosting, joining, diplomacy, peace terms, tactical battles, limitations, troubleshooting (with upgrade notes), building, credits; a license line only once the user has chosen a license | plain language, no internal routine names, version-agnostic where possible |
+| `README.md` | players and hosts | what the mod does, requirements, install/uninstall, network setup, hosting, joining, diplomacy, peace terms, tactical battles, limitations, troubleshooting (with upgrade notes), building, credits, license | plain language, no internal routine names, version-agnostic where possible |
+| `LICENSE` | everyone | the MIT license of the mod's own code (MinHook keeps its BSD 2-Clause license in `third_party/minhook/`) | the standard MIT text; change only on the user's decision |
 | `CHANGELOG.md` | players | per version, newest first: New / Fixed / Changed, upgrade notes | matches the GitHub release notes |
 | `MODLOG.md` | developers and agents | chronological engineering log: game facts, reverse engineering (addresses, offsets), design decisions, fixes, test results | append-only in spirit: never drop a fact; correct a wrong one with a dated note; headings `## <Kind> <date>: <title> (vX.Y.Z)` (Feature, Fix, Testing, Investigation, Docs), and add each new entry to the index at the top |
 | `docs/` | developers, agents, players | `ARCHITECTURE.md` (the current design), `GAME-INTERNALS.md` (reverse-engineered game facts), `TESTING.md` (the suite, environment variables, tools inventory, scenario catalog, bridge commands, known traps), and the hosting video and stills | the README links here instead of repeating; the video and stills show 0.1's Multiplayer window |
@@ -108,8 +109,8 @@ Never guess. Leave an unresolved item out of the docs, and list it under "Open q
 5. Package `RTW3MP-<version>-win32.zip` with `tools/package_release.ps1 -OutDir <folder outside the repo>`. It reads
    `MP_MOD_VERSION` from `src/mod/common.h`, stops if `dist\RTW3MP.dll` was built from another version, and writes
    `RTW3MP.dll`, `version.dll` (from `dist\`), `RTW3MP_SecondCopy.bat`, `RTW3MP_README.txt` (`{VERSION}` replaced)
-   and `RTW3MP_LICENSES.txt` (MinHook's license, from `extras\`), text files with CRLF. It prints the entries and the
-   SHA-256 of the zip and both DLLs. Compare the entries with the previous release's zip.
+   and `RTW3MP_LICENSES.txt` (the mod's MIT license, then MinHook's, from `extras\`), text files with CRLF. It prints
+   the entries and the SHA-256 of the zip and both DLLs. Compare the entries with the previous release's zip.
 6. Release notes: a one-line summary with the update note, then **New**, **Fixed**, **Not available yet** (if any),
    **Install**, **Testing**.
 7. After approval: `git push origin main`, then `gh release create vX.Y.Z <zip> dist\RTW3MP.dll dist\version.dll

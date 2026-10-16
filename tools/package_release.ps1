@@ -7,7 +7,7 @@ Reads MP_MOD_VERSION from src\mod\common.h and writes RTW3MP-<version>-win32.zip
   RTW3MP.dll, version.dll   from dist\ (build them first with build.bat)
   RTW3MP_SecondCopy.bat     from extras\
   RTW3MP_README.txt         from extras\, with {VERSION} replaced by the version
-  RTW3MP_LICENSES.txt       from extras\ (MinHook's license)
+  RTW3MP_LICENSES.txt       from extras\ (the mod's MIT license, then MinHook's)
 Text files go into the zip as UTF-8 without BOM, with CRLF line endings. The script stops if dist\RTW3MP.dll was
 not built from this version. It changes nothing in the repository and uploads nothing; at the end it prints the
 zip's entries and the SHA-256 of the zip and the two DLLs (for the release notes).

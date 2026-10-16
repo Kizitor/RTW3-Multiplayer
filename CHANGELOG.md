@@ -7,6 +7,9 @@ in [MODLOG.md](MODLOG.md).
 
 The *protocol* is the version of the network messages: a host refuses players whose mod uses another protocol.
 
+## Unreleased
+- The mod's code is available under the MIT license (see [LICENSE](LICENSE)).
+
 ## 0.3.0 (2026-10-16)
 Tactical battles for every player, and live battles between players. **Everyone (host and joined players) must
 update:** protocol 3, so older versions can't play with 0.3.0.

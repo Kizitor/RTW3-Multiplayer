@@ -1043,3 +1043,7 @@ list and no Fight my battles checkbox.*
   release zip in the same order. The DLLs and `RTW3MP_LICENSES.txt` are byte-identical; `RTW3MP_SecondCopy.bat` differs
   only in its line endings (now CRLF throughout), `RTW3MP_README.txt` only in the intended edits (a CHANGELOG pointer,
   the uninstall note) and its line endings.
+- Later the same day, the user's decisions: the mod's code is under the MIT license (`LICENSE`; `RTW3MP_LICENSES.txt`
+  now starts with it), and the 0.1 test scripts `live_lobby_test.py`, `repro_issues.py`, `run_turn.py`,
+  `verify_tabs.py`, `ui_buildship.py` and the wrapper `diplomacy_test.py` were removed from `tools/` (the entries
+  above still mention them).
