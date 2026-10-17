@@ -90,9 +90,13 @@ By version (the version the work went into) and kind, oldest first.
   - Testing:
     [joined players' battles vs AI](#testing-2026-10-15-joined-players-battles-vs-ai-v030);
     [live PvP battles (lockstep) stress](#testing-2026-10-15-live-pvp-battles-lockstep-stress-v030);
-    [release candidate](#testing-2026-10-15-release-candidate-v030)
+    [release candidate](#testing-2026-10-15-release-candidate-v030);
+    [war score of live battles between joined players](#testing-2026-10-16-war-score-of-live-battles-between-joined-players-v030)
   - Docs:
     [documentation restructured](#docs-2026-10-16-documentation-restructured-v030)
+- **0.3.1**
+  - Fix:
+    [live battles between joined players didn't count in their war score](#fix-2026-10-16-live-battles-between-joined-players-didnt-count-in-their-war-score-v031)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -1047,3 +1051,84 @@ list and no Fight my battles checkbox.*
   now starts with it), and the 0.1 test scripts `live_lobby_test.py`, `repro_issues.py`, `run_turn.py`,
   `verify_tabs.py`, `ui_buildship.py` and the wrapper `diplomacy_test.py` were removed from `tools/` (the entries
   above still mention them).
+
+## Testing 2026-10-16: war score of live battles between joined players (v0.3.0)
+- Suspected mod issue, found by reading the code: the war score of a war between two players (the host's per-pair
+  ledger behind the peace terms: `warvp`, `terms`, the outlook, the treaty level) is fed only by the host's battle
+  hooks (`hookcb::OnBattleVP` from HandleBattleAftermath, DoBattleBetweenAINations, QuickResolveRaiderBattle). Since
+  0.3.0 a battle between two joined players who both fight their battles is fought live on their PCs and merged into
+  the host's save (`HostOnBattleResult` -> `saveio::ApplyBattleResult`). The merge adds the VP to both nations' `VP`
+  fields but credits nothing to the ledger. Before 0.3.0 the host's game resolved those battles
+  (DoBattleBetweenAINations) and the hook credited the ledger.
+- Build under test: the released v0.3.0 DLLs (a frozen copy given with `--dist`), installed; both logs `RTW3MP 0.3.0
+  starting (protocol 3)`.
+- Runner change (`tools/regression.py`): new check `lockstep_pvp` f) (`pvp_war_score_check`).
+  - Host `warvp 1 2` before and after the month with the live battle(s).
+  - Expected rise: the VP of every live battle 1-2 merged that month (`battle N applied: ... VP a/b`; a = the battle's
+    own nation K, the first player's, from `battle request N: nation K vs J ..., fought live by ...`; mapped onto 1, 2)
+    plus the host's own credits of the month (`war score 1-2: +x/+y -> A:B`).
+  - Also: still at war, the score not restarted (`starts at`, `first battle`); a `SKIP-note` when the live battles gave
+    0 VP. A fix's own credit line for a merged battle (e.g. `war score 1-2: +x/+y from a battle fought on a player's PC
+    -> A:B`) is not counted twice, so the check passes once the ledger is credited.
+- Result: `--only lockstep_pvp` (with `session`) **29/31**, game open 105 s, one processed month (Aug -> Sep 1900).
+  **Confirmed.**
+  - The injected battle came about: `battle request 1: nation 1 vs 2 in Northern Europe (3:3 ships), fought live by
+    Captain and Bot`; Captain A, Bot B, 10 live minutes with equal hashes, then A dropped B and finished on auto-run.
+  - Host log: `war score 1-2 starts at 0:0` (at the injection, before the month), `battle phase: 1 battle(s)`, `battle 1
+    sent to Captain (1769743 bytes), live against Bot`, `lockstep relay 1 ended: the battle's result arrived`, `battle 1
+    applied: 12 ships changed (72 fields), 0 removed, VP 180/147, prestige 0 (player: VP 180/147, prestige 0, morale
+    0)`. No `war score 1-2:` line in the month.
+  - `warvp 1 2`: `1:0 2:0` before and after the month; expected 180:147. f) fails; the other 22 `lockstep_pvp` checks
+    pass.
+  - The second fail is `session`'s version check: the tree's `src/mod/common.h` already says 0.3.1 (work in progress on
+    main), the installed build is 0.3.0. Expected with a frozen older build (new known trap in docs/TESTING.md).
+- The same pattern in an earlier 0.3.0 run's host log (2026-10-15): the game-found live battle 15 (23:29 ships) was
+  merged with `VP 140/246`, and the month's only credit was the game's resolution of the unfought injected battle 14:
+  `war score 1-2: +2/+12 -> 2:12`.
+- Impact: in a war between two joined players who both fight their battles, the peace terms ignore every live battle.
+  Only battles the game resolves on the host count: unfought requests, raider battles, and the battles of a pair in
+  which a player doesn't fight battles. The nations' own `VP` fields do get the battle's points (the merge, by the
+  code; not read in this run).
+- Fix direction (for the caller): after the merge in `HostOnBattleResult`, credit the ledger with the merged deltas
+  (dVP_K, dVP_J) when both nations are players at war. f) then passes.
+- Follow-up on 0.3.1, the fix: after a successful merge `HostOnBattleResult` calls the new `CreditWarScore(K, J,
+  dVP_K, dVP_J)`; for two human nations at war it adds the points to the pair's score (host log `war score a-b: +x/+y
+  from a battle fought on a player's PC -> A:B`); battles against AI nations are ignored; protocol 3 unchanged. DLLs:
+  a frozen copy of main's `dist\` (`--dist`), installed; both logs `RTW3MP 0.3.1 starting (protocol 3)`. Game open
+  138 + 225 + 763 s in three runs, every check passed.
+  - `--only lockstep_pvp`: **40/40**, two months. Aug -> Sep 1900: the injected battle 1 found "no battle came about"
+    and the game resolved it (`war score 1-2: +4/+13 -> 4:13`). Sep -> Oct 1900: requests 2 (injected), 3 and 4 (found
+    by the game); 2 and 3 found "no battle came about"; battle 4 (`nation 2 vs 1 ... fought live by Bot and Captain`:
+    Bot's copy was A, the roles reversed) was merged with `VP 0/230`, followed by `war score 1-2: +230/+0 from a battle
+    fought on a player's PC -> 234:13`; the game's resolutions of 2 and 3 added `+0/+1 -> 234:14` and `+5/+12 ->
+    239:26`. f): `warvp 1 2` 4:13 before, 239:26 after = 4:13 + 230:0 (battle 4: K = 2 scored 0, nation 1 scored 230)
+    + 0:1 + 5:12. Passes.
+  - `--only treaty,victory_points,battles`: **193/193** (battles 62/62, victory_points 50/50, treaty 73/73; 5 months).
+    `treaty`'s war-score checks hold as before: b) a new war at 0:0, `warvp 1 2 900 100` -> major for 1; c) the session
+    file keeps `warVP 1-2:900:100`; k) the treaty month's lines (no 1-2 battle that month); h) 600:700 -> minor for 2;
+    i) `warvp 0 1 900 100` -> major for the host; j) 300:300 -> compromise. They set the score with `warvp` and count
+    the host's hook lines only. The idea-1 battle of `battles` (nation 1 vs Spain, `battle 2 applied: ... VP 60/246`)
+    gave no war-score line: battles against AI nations stay out.
+  - Full default run: **512/512** (16 processed months plus the copy's single-player month, game open 763 s).
+    `lockstep_pvp` 23/23: battle 9 (Captain A) merged with `VP 518/193`, `war score 1-2: +518/+193 from a battle fought
+    on a player's PC -> 518:193`, `warvp 1 2` 0:0 -> 518:193. `victory_points` g) counted a 1-2 battle the host's game
+    resolved (`war score 1-2: +0/+22 -> 0:22`, nation 2 VP 129 -> 151); `treaty` 73/73 (no 1-2 battle in its month); the
+    idea-1 merge of `battles` (`VP 190/134` vs Spain) and the host's live battle of `lockstep_month` (`war score 0-1:
+    +43/+149 -> 43:149`, the hook path) as before.
+
+## Fix 2026-10-16: live battles between joined players didn't count in their war score (v0.3.1)
+- Found by the docs agent while auditing the documentation (code reading); confirmed live by the regression agent on
+  v0.3.0 (see the Testing entry above): a live battle between nations 1 and 2 was merged with `VP 180/147`, and
+  `warvp 1 2` stayed at `0:0`.
+- Cause: the war score of a war between two players (`g_warVP`, the peace terms) is fed by `hookcb::OnBattleVP`, which
+  the host's battle hooks call (HandleBattleAftermath, DoBattleBetweenAINations, QuickResolveRaiderBattle). Since
+  0.3.0 a battle between two joined players who both fight their battles is fought live on their PCs; the host only
+  merges its result into the save file (`HostOnBattleResult` -> `saveio::ApplyBattleResult`), so no hook fires.
+  Before 0.3.0 the game resolved such battles on the host and the hook counted them.
+- Fix: after a successful merge, `HostOnBattleResult` calls `CreditWarScore(K, J, dVP_K, dVP_J)` with the result's
+  deltas. For a pair of human nations at war it adds them to the pair's score. A score created at that moment starts
+  from the nations' points in memory, which don't hold the merged battle yet (the campaign is reloaded at the end of
+  the battle phase), so the battle is added even then; `OnBattleVP` skips that case because the game has already
+  added the points to memory there. Battles against AI nations don't count (not a pair of players). Host log `war
+  score a-b: +x/+y from a battle fought on a player's PC -> A:B`.
+- Only the host's code changed; protocol 3 is unchanged, so 0.3.0 players can join a 0.3.1 host.

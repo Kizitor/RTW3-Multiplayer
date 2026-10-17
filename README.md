@@ -173,8 +173,9 @@ relation, the tension value of the relation bar, and anything pending. Select a 
 A war between two players ends like a war against the AI in single player: the side that is clearly ahead wins
 concessions.
 - **War score:** the **Tension** column of a war shows the victory points (VP) both sides scored in this war (*VP
-  yours:theirs*), counted from the battles between the two nations: the host's tactical battles and the battles the
-  game resolves on its own. The label above the list tells you what a peace would bring now.
+  yours:theirs*), counted from every battle between the two nations: the host's battles, live battles between
+  players and the battles the game resolves on its own. The label above the list tells you what a peace would bring
+  now.
 - **Who wins:** the game's own rules for "winning the war" are used. A side with at least twice the enemy's points and
   a clear margin wins a *major victory*; a side with a smaller lead but enough points wins a *minor victory*;
   otherwise the peace is a compromise without terms. The margin grows with the era, as in single player.

@@ -7,7 +7,17 @@ in [MODLOG.md](MODLOG.md).
 
 The *protocol* is the version of the network messages: a host refuses players whose mod uses another protocol.
 
-## Unreleased
+## 0.3.1 (2026-10-16)
+War score of live battles between joined players. Only the host's game changes: joined players on 0.3.0 can keep
+playing with a 0.3.1 host (same protocol), but updating everyone keeps things simple.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.3.1)
+
+### Fixed
+- **War score of live battles between joined players.** In 0.3.0, a live battle between two joined players' nations
+  was saved in the campaign but didn't count towards the war score that decides the peace terms between them. It now
+  counts like every other battle between them.
+
+### Changed
 - The mod's code is available under the MIT license (see [LICENSE](LICENSE)).
 
 ## 0.3.0 (2026-10-16)

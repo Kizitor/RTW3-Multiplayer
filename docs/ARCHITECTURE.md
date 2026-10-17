@@ -281,7 +281,8 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   the changes of VP, prestige and fleet morale) and loads slot 77 again.
 - **The merge (host):** `ApplyBattleResult` applies only what the battle changed, field by field, for the two
   nations and AI nations; ships missing from the result were sunk; the player's intel fields are never taken;
-  nothing changes unless everything applies.
+  nothing changes unless everything applies. A battle between two players' nations also counts for their war score
+  (`CreditWarScore`, since 0.3.1): the host's battle hooks never see a battle fought on a player's PC.
 - Details: [investigation](../MODLOG.md#investigation-2026-10-14-tactical-battles-joined-players-vs-ai-live-lockstep-pvp-v030),
   [feature](../MODLOG.md#feature-2026-10-15-joined-players-fight-their-battles-against-ai-nations-on-their-own-pc-v030),
   [tests](../MODLOG.md#testing-2026-10-15-joined-players-battles-vs-ai-v030).

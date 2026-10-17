@@ -6236,8 +6236,9 @@ def scenario_lockstep_pvp(ctx):
     other side (B, its battle slot), the host relays; runs and an order of B with equal hashes; default: 10 live
     minutes, then A drops B and fights on alone on auto-run; --stress: to the agreed end (>= 400 minutes) and an
     idea-1 battle of nation 1 against an AI nation injected into the same month (the host runs them one after the
-    other). c) the result merged, the new month on all three copies, ship counts equal. d) peace, the third copy
-    leaves (nation 2 stays reserved for Bot) and is closed."""
+    other). c) the result merged, the new month on all three copies, ship counts equal. f) the war score of 1-2
+    (`warvp 1 2` before and after the month) rose by the VP of the month's merged live battles 1-2 plus the host's own
+    `war score 1-2` credits. d) peace, the third copy leaves (nation 2 stays reserved for Bot) and is closed."""
     marks0 = {H: log_mark(H), C: log_mark(C)}
     stress = OPTS['stress']
     ls_ensure_session(ctx)
@@ -6274,6 +6275,7 @@ def scenario_lockstep_pvp(ctx):
             if rel(1, J).get('war') != '1':
                 cmd(H, f'settension 1 {J} 50')
             ibid, _ = inject(1, J, area)
+        ws0, wm = warvp(1, STANDIN), log_mark(H)  # f) the war score of 1-2 before the month
         rec = ls_month(ctx, f'lockstep_pvp M{attempt}', modes=[mode], k2=True)
         hlog = log_since(H, hm)
         lives = [b for b in rec['live'] if b['A'] in (C, K2)]
@@ -6281,7 +6283,9 @@ def scenario_lockstep_pvp(ctx):
         attempts.append((attempt, rp, [(b['bid'], b['mode'], b.get('error')) for b in lives], sorted(applied),
                          log_lines(hlog, r'battle \d+: resolved by the game')[:3]))
         if lives:
-            done = (rec, lives, hm, pbid, ibid)
+            ws = dict(before=ws0, after=warvp(1, STANDIN), war=rel(1, STANDIN).get('war'))
+            ws['log'] = log_since(H, wm)  # the month, and a restart of the score by the read after it
+            done = (rec, lives, hm, pbid, ibid, ws)
             break
     check(f'b) a live battle between nations 1 and 2 fought within 3 months (`battles injectpvp 1 2 {PVP_AREA}`; '
           f'attempts: month, inject, live battles, merged ids, resolved by the game)', done, attempts)
@@ -6299,7 +6303,7 @@ def scenario_lockstep_pvp(ctx):
     ls_log_scan('e)', marks0)
 
 
-def pvp_checks(ctx, stress, rec, lives, hm, pbid, ibid):
+def pvp_checks(ctx, stress, rec, lives, hm, pbid, ibid, ws):
     b = lives[0]
     A, B = b['A'], b['B']
     hlog = log_since(H, hm)
@@ -6346,6 +6350,7 @@ def pvp_checks(ctx, stress, rec, lives, hm, pbid, ibid):
           and s2.get('slot') == str(K2_SLOT) and s2.get('playerIdx') == str(STANDIN)
           and all(len(set(v)) == 1 and v[0] is not None for v in ships.values()),
           f'dates {sh.get("date")}/{s1.get("date")}/{s2.get("date")}; ships {ships}')
+    pvp_war_score_check(ws, hlog)
     if stress and ibid is not None:
         def t_of(lines):
             return log_secs(lines[0]) if lines else None
@@ -6360,6 +6365,50 @@ def pvp_checks(ctx, stress, rec, lives, hm, pbid, ibid):
               f'ran one after the other for Captain (one battle per player at a time, in the host\'s order) and both were '
               f'settled (the idea-1 battle merged or resolved by the game)', idone and apart,
               f'live sent {sentl[:1]} relay {relay[:1]} | idea-1 sent {isent[:1]} done {idone[:1]}')
+
+
+PVP_REQ_RE = r'battle request (\d+): nation (\d+) vs (\d+) in .* \(\d+:\d+ ships\), fought live by (\S+) and (\S+)'
+
+
+def pvp_war_score_check(ws, hlog):
+    """f) The war score of the war 1-2 (the host's per-pair ledger behind the peace terms, `warvp 1 2`), read before and
+    after the month with the live battle(s), must have risen by the VP of every live battle between 1 and 2 merged into
+    the host's save that month (`battle N applied: ... VP a/b`: a = the battle's own nation K, the first player's, b =
+    its opponent J, as in the request `battle request N: nation K vs J ..., fought live by ...`; mapped onto the pair
+    order 1, 2) plus the host's own credits of the month (`war score 1-2: +x/+y -> A:B` of its battle hooks: battles the
+    game resolved on the host, e.g. an unfought request). Before 0.3.0 the host's game fought such battles and its hooks
+    credited the ledger; since 0.3.0 they are fought on the players' PCs and merged into the save."""
+    w0, w1, wlog = ws.get('before'), ws.get('after'), ws.get('log', '')
+    req = {int(m[1]): (int(m[2]), int(m[3])) for m in re.finditer(PVP_REQ_RE, hlog)}
+    merged = []
+    for ln in log_lines(wlog, APPLIED_RE):
+        m = re.search(APPLIED_RE, ln)
+        kj = req.get(int(m[1]))
+        if not kj or sorted(kj) != [1, STANDIN]:
+            continue
+        a, b = max(0, int(m[5])), max(0, int(m[6]))  # the ledger counts gains only
+        merged.append(dict(bid=int(m[1]), K=kj[0], vp=(a, b), v12=(a, b) if kj[0] == 1 else (b, a), line=ln))
+    lines = log_lines(wlog, rf'war score 1-{STANDIN}\b')
+    hooks = [tuple(int(x) for x in re.search(WAR_SCORE_RE, ln).groups()[2:4]) for ln in lines
+             if re.search(WAR_SCORE_RE + '$', ln) and "player's PC" not in ln]
+    restart = [ln for ln in lines if re.search(r'starts at|first battle', ln)]
+    add = (sum(x['v12'][0] for x in merged) + sum(h[0] for h in hooks),
+           sum(x['v12'][1] for x in merged) + sum(h[1] for h in hooks))
+    want = (w0['a'] + add[0], w0['b'] + add[1]) if w0 else None
+    got = (w1['a'], w1['b']) if w1 else None
+    detail = (f'warvp 1 {STANDIN}: before {w0 and (w0["a"], w0["b"])}, after {got}, expected {want} = before + live '
+              f'battles merged {[(x["bid"], "K=%d" % x["K"], "VP %d/%d" % x["vp"], "1:+%d 2:+%d" % x["v12"]) for x in merged]}'
+              f' + host credits {hooks}; at war after the month: {ws.get("war")}; war score lines {lines}; applied '
+              f'{[x["line"] for x in merged]}')
+    log(f'  f) war score 1-{STANDIN}: {detail}')
+    if merged and not any(sum(x['vp']) for x in merged):
+        log('  SKIP-note f): the live battles gave 0 VP to both sides; the check cannot tell a missing credit from a '
+            'correct one')
+    return check(f'f) the war score of 1-{STANDIN} (host `warvp 1 {STANDIN}` before and after the month) rose by the VP '
+                 f'of the month\'s live battles between 1 and {STANDIN} merged into the host\'s save ("battle N applied: '
+                 f'... VP a/b", a = the first player\'s nation K) plus the host\'s own credits of that month ("war score '
+                 f'1-{STANDIN}: +x/+y -> A:B"); still at war, the score not restarted',
+                 w0 and w1 and merged and ws.get('war') == '1' and not restart and got == want, detail)
 
 
 def ls_war01(ctx):
@@ -7513,7 +7562,8 @@ SCENARIOS = [  # name, months processed, what it guards, function
                         '1-2, `battles injectpvp`, months (up to 3) until the battle phase fights it live (attacker A, '
                         'defender B, the host relays), equal hashes, an order of B; default: 10 live minutes, then A '
                         'drops B and finishes on auto-run; --stress: to the agreed end plus an idea-1 battle in the same '
-                        'month; result merged, the new month on all three copies; the third copy leaves and is closed',
+                        'month; result merged, the new month on all three copies; the war score of 1-2 (`warvp`) rose by '
+                        'the merged VP of the live battles; the third copy leaves and is closed',
      scenario_lockstep_pvp),
     ('lockstep_month', 2, 'the host\'s battle against the joined player inside a REAL processed month: the host at war '
                           'with nation 1, months (up to 8) until CheckForBattles2 starts it; preview, lockstep start, '

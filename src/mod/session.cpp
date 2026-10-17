@@ -1547,6 +1547,23 @@ static bool FinishBattlePhase() {
 }
 
 // A fought battle's result is merged into the save file at once, so the player's next battle is built from it.
+// A battle fought on a player's PC: its result is in the save file but not yet in the campaign in memory. The host's
+// battle hooks never saw it, so its points are counted here for the war score of a war between two players (the
+// peace terms). Battles against AI nations don't count there.
+static void CreditWarScore(int a, int b, int vpA, int vpB) {
+    if (!IsHumanNation(a) || !IsHumanNation(b) || !game::AtWar(a, b) || (vpA <= 0 && vpB <= 0)) return;
+    auto& vp = WarVP(a, b);  // a new score starts from the nations' points before this battle
+    if (a < b) {
+        vp.first += vpA;
+        vp.second += vpB;
+    } else {
+        vp.first += vpB;
+        vp.second += vpA;
+    }
+    Log("war score %d-%d: +%d/+%d from a battle fought on a player's PC -> %d:%d", std::min(a, b), std::max(a, b),
+        a < b ? vpA : vpB, a < b ? vpB : vpA, vp.first, vp.second);
+}
+
 static void HostOnBattleResult(Player& p, const std::string& data) {
     KV h;
     std::string body;
@@ -1582,6 +1599,9 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         g_battleMerged = true;
         if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
         Log("battle %d applied: %s (player: %s)", id, summary.c_str(), KVStr(h, "summary").c_str());
+        const std::string* deltas = b.Get("deltas");
+        KV dk = deltas ? KVDecode(*deltas) : KV();
+        CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K")), std::max(0, KVInt(dk, "dVP_J")));
         return;
     }
     Log("battle result %d from %s ignored", id, p.name.c_str());
