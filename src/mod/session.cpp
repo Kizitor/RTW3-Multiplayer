@@ -3544,4 +3544,8 @@ void OnDoBattleDone(int opp, bool result) {
     if (game::BattleActive()) mp::HostOnBattleStarted(opp);
 }
 
+void OnBattleSlotSkippedTurn() { lockstep::OnBattleSlotClosed(); }
+void OnStrategicTurnRuns() { lockstep::OnMonthRuns(); }
+void OnCampaignLoading() { lockstep::OnCampaignLoading(); }
+
 }  // namespace hookcb

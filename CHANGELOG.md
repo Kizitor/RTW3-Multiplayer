@@ -7,6 +7,52 @@ in [MODLOG.md](MODLOG.md).
 
 The *protocol* is the version of the network messages: a host refuses players whose mod uses another protocol.
 
+## 0.3.2 (2026-10-17)
+Fixes for live battles: battles with aircraft now start, the second player's ship list and air formations window show
+their own side, the speed controls, buttons that stayed pressed, the missile panel and battle windows left open. Each
+fix works on the PC that runs 0.3.2, so 0.3.1 and 0.3.2 play together (same protocol), but both players of a live
+battle should update to get all the fixes.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.3.2)
+
+### Fixed
+- **Live battles with aircraft never started.** From about 1915, when ships, seaplanes or airfields bring aircraft, a
+  live battle couldn't start: each time the battle was loaded, the aircraft of the previous load stayed, so the two
+  PCs never had the same battle, and after a few tries the computer took over the second player's ships. The battle's
+  data is now cleared before each load, as the game does when a battle screen closes (this also frees memory).
+- **The second player's ship list.** After every minute the second player's list of forces and ships showed the first
+  player's forces. It now shows your own.
+- **A month could be skipped after a live battle.** Loading a live battle moves the campaign's day and month to the
+  battle's own date. When the battle was brought back in step (a resync), the host's saved campaign kept that date, so
+  a battle dated in the next month skipped a month for everyone (the joined player's orders were rejected as "for
+  another month"). The host's saves now keep the campaign's own date, and the battle's results and the rest of the
+  month count in the campaign's month again (only the host needs this fix).
+- **The host's folders in the chat.** When the game saved the battle during a minute, the line "The battle paused
+  (Game saved! ...)" showed both players the full path of the host's save. Chat lines now show only the file name.
+- **The arrows next to the game speed box.** They changed the speed at once on one PC only, even in the middle of a
+  minute, which could make the two PCs disagree and reload the battle. They now work for both players like the speed
+  box: one step, from the next minute, and at most *Fast* while ships are in contact (the game's own rule).
+- **Fastest available.** The button is still not available in live battles, but it stayed pressed, and the game reads
+  it between minutes, so the two PCs could run a minute at different speeds. It now pops back up, and the chat says
+  "Fastest available is not available in a live battle yet; use the speed box."
+- **Other unavailable buttons that stayed pressed.** *Auto-run* and the division report's *land-based CAP* button
+  stayed pressed although nothing happened; the division report's *Ok* then requested land-based CAP on one PC only,
+  which could make the two PCs disagree. They now pop back up.
+- **The missile panel's *Fire at will* and *Fire mode*.** The game reads them on each PC for the first player's
+  ships, so different settings on the two PCs made them disagree in battles with missiles. They are now locked in live
+  battles until both PCs share them.
+- **Show air formations.** After a minute had run, the second player's window listed the first player's air
+  formations. It now lists your own.
+- **Battle windows left open during a reload.** Before a live battle is loaded again (at its start, when the two PCs
+  are brought back in step, or when the second player leaves it), the air formations window, a division report, the
+  force orders and the battle's other windows are now closed. They still pointed to ships and air formations that the
+  reload removes, which could crash the game.
+
+### Not available in live battles yet
+Air strikes and routine air operations; missiles (manual fire and the missile panel's settings); manual torpedo
+salvoes; change force, change lead and battle turn-away; the *Fastest available* button; auto-run and save. This
+corrects the list of 0.3.0: emergency activation and try for home don't exist in campaign battles (the game hides
+them, also in single player), and change lead, battle turn-away and *Fastest available* were missing.
+
 ## 0.3.1 (2026-10-16)
 War score of live battles between joined players. Only the host's game changes: joined players on 0.3.0 can keep
 playing with a 0.3.1 host (same protocol), but updating everyone keeps things simple.

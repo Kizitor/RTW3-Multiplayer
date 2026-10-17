@@ -226,17 +226,21 @@ battle between two joined players' nations is resolved by the game.
 - **How it works:** both PCs run the same battle, minute by minute, and exchange their orders. If the two ever
   disagree, the battle is reloaded on both from the leading PC's state (a short pause; orders given in the last minute
   are dropped).
-- **The clock is shared.** *Run one minute*, *Run 5 minutes*, *Run until break*, *Pause* and the game speed work for
-  both players: the battle advances when both are ready, and stops for both when one pauses or the game stops for a
-  sighting. Orders given while a minute is running take effect at the next minute.
+- **The clock is shared.** *Run one minute*, *Run 5 minutes*, *Run until break*, *Pause*, and the game speed box and
+  its arrows work for both players: the battle advances when both are ready, and stops for both when one pauses or
+  the game stops for a sighting. A new game speed, and orders given while a minute is running, take effect at the
+  next minute.
 - **Fog of war:** each player sees their own ships and only what they have sighted of the enemy.
 - **Ending:** both players press *End game* (the game's own rule still applies: at least half the battle and 400
   minutes, and no enemy close). The game's own end conditions (both fleets far apart, one side gone, the time limit)
   end it for both. The result counts like any battle and the month goes on.
 - **If a player leaves:** if a player disconnects or doesn't respond for 30 seconds, the computer takes over their
   ships for the rest of the battle.
-- **Not available in live battles yet:** air strikes and routine air operations, missiles, manual torpedo salvoes,
-  emergency activation, change force, try for home, auto-run and save. Pressing them shows a line in the chat.
+- **Not available in live battles yet:** air strikes and routine air operations; missiles (manual fire and the
+  missile panel's settings); manual torpedo salvoes; change force, change lead and battle turn-away; the *Fastest
+  available* button (use the speed box); auto-run and save. Pressing them shows a line in the chat. The missile
+  panel's *Fire at will* and *Fire mode* are locked: the two PCs don't share them yet.
+  Emergency activation and try for home don't exist in campaign battles: the game hides them, also in single player.
 - Both PCs hold the whole battle, so a determined player could read the enemy's positions from memory: play with
   people you trust. The battle log on the second player's PC is written from the first side's point of view.
 
@@ -298,6 +302,8 @@ battle between two joined players' nations is resolved by the game.
   [Known limitations](#known-limitations).
 
 ### Upgrading from an older version
+- **0.3.2** plays with 0.3.0 and 0.3.1 (protocol 3), but its fixes for live battles work only on the PCs that run it:
+  both players of a live battle should update.
 - **0.3.0 needs everyone to update:** older versions can't play with it (protocol 3).
 - **From 0.2.8 or older:** a joined player's research priorities sometimes fell back to Medium after a month (the
   game's AI research choices reset them); 0.3.0 keeps them.

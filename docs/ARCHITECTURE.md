@@ -1,6 +1,6 @@
 # Architecture
 
-How RTW3 Multiplayer works in the current version (0.3.0, protocol 3) on Rule the Waves 3 1.01.44. This is the
+How RTW3 Multiplayer works in the current version (0.3.2, protocol 3) on Rule the Waves 3 1.01.44. This is the
 developer view; players read the [README](../README.md). The history of each part, with the measurements and the
 dead ends, is in [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game facts (calling
 convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing is in
@@ -298,23 +298,57 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
 - **Determinism.** The game's `Random32Proc` is hooked: simulation draws come from the shared seeded stream, display
   draws from a local one. Context hooks mark the simulation routines and the display routines; the display fields
   that drawing code writes (`Hidden`, identification, sighting) are kept as a simulation set and a display set per
-  ship. `ls leakcheck` reports any simulation change made between steps.
+  ship. `ls leakcheck` reports any simulation change made between steps. Display routines see this PC's PlayerSide
+  even when the simulation calls them. Since 0.3.2 they include the *Show air formations* list
+  (`TdlgShowAirFormations.UpdateListSortedByBase`): EOTP refreshes the open window inside the minute, and the list
+  shows PlayerSide's formations (before, B's window listed side 0's).
 - **Every minute.** A releases each minute; both PCs run it with the game's own minute routine. Orders are field
   values of a side's own divisions and ships: a guard turns local edits into numbered batches that both apply before
   the next minute. After every minute both hash the battle state (including the RNG); on a mismatch A resyncs B from
   a new snapshot. More than 3 resyncs without 10 good minutes in between hand side 1 to the AI.
+- **The clock.** A owns it: run, pause, the game speed and the end are requests (`ClockRequest`; B sends them to A),
+  and a new speed takes effect with the next release on both PCs. The speed box (`cbGameSpeedChange`) and, since
+  0.3.2, its arrows (`UpDown1Click`) only make requests: an arrow asks for one step from the speed in use (on B, the
+  speed A announced last), by the game's own rule (at most *Fast* while ships are in contact). *Fastest available*
+  is blocked; VCL puts the toggle button down before the click handler runs, and the game's speed governor reads its
+  `FDown` at minute boundaries, so since 0.3.2 the blocker puts it up again with the game's own routine (the one the
+  down arrow calls). Every other blocked toggle speed button (auto-run, the division report's land-based CAP) is put
+  back as it was too (`PutToggleBack`: `TSpeedButton.SetDown(not FDown)` when `FGroupIndex` is not 0).
 - **Failures.** B silent for 30 s at a minute boundary (5 minutes while busy), not loaded within 120 s, or
   disconnected: A hands side 1 to the AI and goes on. A lost: B leaves and loads slot 77 again. A watchdog recovers
   a minute that never finishes (10 s). Forms are freed only from the outermost message loop; flags set around game
   calls are restored in `__finally`.
+- **Reloads.** `ResetBattleForm` frees the battle form and creates a new one before every load (the start, a
+  resync, A's recovery after a failed load) and when B leaves. Since 0.3.2 it first runs the game's own battle
+  teardown, as the screen's close (`FormClose`) does: `TfrmMain.ClearData(2, True)` and the air cleanup that frees the
+  battle's air formations (before, the global lists outlived the form, and every load appended another copy of the air
+  formations, so a battle with aircraft never had equal hashes). It also hides the battle's dialogs that keep pointers
+  to ships, divisions and air formations (`TdlgShowAirFormations`, `TdlgDivisionReport`, `TdlgForceOrders`,
+  `TdlgSelectLead`, `TdlgTorpTargets`, `TdlgStrike`, `TdlgMissileFire`); their unit variables are found once in the
+  image (`FormVarOf`).
+- **Display inside a minute.** The game refreshes the ship tree at the end of a minute with `FillShipTree(PlayerSide)`;
+  inside the simulation PlayerSide is the canonical 0, so since 0.3.2 the hook replaces that side argument with this
+  PC's own side.
+- **The campaign date.** The game's resume path writes the battle's own day and month into the campaign's date
+  variables, and a battle can be dated in the next month. Since 0.3.2 A records the campaign date when its battle
+  opens (`Hold`), every snapshot saves that date in the campaign file (`SaveSnapshot`), and a battle slot's close,
+  which runs no month, puts it back; otherwise a resync made the drift permanent and could skip a month.
 - **The end.** Both players' *End game* (the game's own rule applies) or the game's own end conditions. When the
   game ends the battle inside a minute, the battle screen's close is deferred to the end of that minute.
-- **Not available in live battles:** air strikes and routine air operations, missiles, manual torpedo salvoes,
-  emergency activation, change force, try for home, auto-run and save.
+- **Not available in live battles yet** (`g_blockers`: the click handler doesn't run, a chat line says why): air
+  strikes and routine air operations (CAP, search, land-based CAP); missiles (manual fire; the missile panel's *Fire
+  at will* and *Fire mode* aren't click handlers, but the simulation reads them on each PC, so since 0.3.2 they keep a
+  new battle screen's defaults and are disabled after every load and at every boundary, see
+  [GAME-INTERNALS.md](GAME-INTERNALS.md#battle-commands)); manual torpedo salvoes; change force, change lead and
+  battle turn-away; *Fastest available*; auto-run and save. The game's hidden developer items (try for home, enter
+  port, sink, teleport, ...) and handlers that no control calls are blocked too. Emergency activation needs no
+  blocker: its button is never shown and its click handler is empty.
 - Details: [feature](../MODLOG.md#feature-2026-10-15-live-player-vs-player-battles-in-lockstep-v030),
   [stress tests](../MODLOG.md#testing-2026-10-15-live-pvp-battles-lockstep-stress-v030),
-  [release candidate](../MODLOG.md#testing-2026-10-15-release-candidate-v030), and the battle facts in
-  [GAME-INTERNALS.md](GAME-INTERNALS.md#tactical-battles).
+  [release candidate](../MODLOG.md#testing-2026-10-15-release-candidate-v030),
+  [the limits of live battles](../MODLOG.md#investigation-2026-10-16-the-limits-of-live-battles-static-v031),
+  [the 0.3.2 fixes](../MODLOG.md#fix-2026-10-17-speed-controls-air-formations-window-and-battle-dialogs-in-live-battles-v032),
+  and the battle facts in [GAME-INTERNALS.md](GAME-INTERNALS.md#tactical-battles).
 
 ## Test bridge
 - A line-based command socket on 127.0.0.1, only when `RTW3MP_BRIDGE_PORT` is set when the game starts; with
@@ -324,10 +358,10 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
 - The command reference, the runner and the scenario catalog are in [TESTING.md](TESTING.md).
 
 ## Versions and protocol
-- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.3.0
+- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.3.2
   starting (protocol 3)`).
 - The host refuses a client with another protocol or another game build. Protocol history: 1 = 0.1.0, 2 =
-  0.2.0-0.2.8, 3 = 0.3.0. Within a protocol, versions can play together, but features may need both sides (see
+  0.2.0-0.2.8, 3 = 0.3.0-0.3.2. Within a protocol, versions can play together, but features may need both sides (see
   [CHANGELOG.md](../CHANGELOG.md)).
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

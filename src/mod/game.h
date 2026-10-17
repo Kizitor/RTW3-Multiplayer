@@ -191,4 +191,7 @@ void OnAfterCopyGame(int fromSlot, int toSlot);  // the game's "Copy game" finis
 bool OnAIBattle(int a, int b, int countA, int countB, const std::wstring& area);
 // The game's DoBattle returned (opp = the opponent's nation index); the battle screen is open if it was fought.
 void OnDoBattleDone(int opp, bool result);
+void OnBattleSlotSkippedTurn();  // a battle slot's close skipped DoStrategicTurn
+void OnStrategicTurnRuns();      // DoStrategicTurn runs (outside a battle slot)
+void OnCampaignLoading();        // LoadBuildCampaign is about to load a campaign
 }  // namespace hookcb

@@ -43,7 +43,11 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
    to (`player_copy`: Game78-80 and the button's slot; never a slot that existed before the run). Find Documents
    with `rtw3ctl.SAVE_DIR` (handles OneDrive redirection). The suite runner does this; keep it that way. A killed host
    (`lockstep_stress` b) leaves its live battle's save in slot 1: the runner puts slot 1 back from its backup
-   (`restore_slot1_copy`, the backup is kept for the final restore) before it starts the host again.
+   (`restore_slot1_copy`, the backup is kept for the final restore) before it starts the host again. `lockstep_air`
+   also backs up and restores save slot 9, the 1935 test campaign (a second fixture, kept outside the repo: TESTING.md,
+   "The 1935 test campaign"); never delete it and never let anything save into it outside a backed-up run (`pocbattle`
+   autosaves into the open slot). Any other slot that existed before the run (e.g. Game2) may be the user's own: never
+   read-modify, overwrite or delete it.
 6. **Never save outside a backed-up run.** Don't send the bridge `save` command, or anything else that saves
    (`start`, a processed month, `submit` on a client, claims while hosting), to a game copy unless it runs
    inside `tools/regression.py` (or another run that backed up the slot first). A diagnostic `save` once
@@ -85,6 +89,26 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
 - Save slot 1 must hold a campaign past its setup steps (host = nation 0); it is the intentionally bloated
   fixture (safety rule 7). Clients use slot 77, and slot 87 (`RTW3MP_BATTLE_SLOT`, default client slot + 10) for
   the battles they fight.
+- Save slot 9 holds the 1935 test campaign (Great Britain = nation 0, January 1935, never played) for live battles
+  with aircraft (`lockstep_air`: `pocbattle 2 0` against France, carriers and air stations on both sides; the scenario
+  is skipped with a SKIP line without it). Its pristine copy is outside the repo; TESTING.md says how it was made and
+  how to put it back.
+- Battle screen controls are tested with posted messages only (`click_tool`, `click_arrow`, `post_click`, tree views
+  and list views read cross-process) and the bridge probes `ls ctl`, `ls airwin`, `pocstate fastest=`; the battle's
+  modeless tool windows must be closed (`close_modeless`) before anything answers dialogs with `answer_dialogs`.
+- Evidence the runner logs for you: the text of every game box it answers (`(text: '...')`, read-only from the copy's
+  memory by `box_text`) and the saves' [General] dates (`gen_date`) before every turn and around test battles. A live
+  battle's load moves the host's campaign date to the battle's own; up to 0.3.2 3cc0628 a resync saved it (a turn `NOT
+  applied: submission is for another month` after a live battle was that, not a test race). Since d99e357 the
+  snapshots keep the campaign date; since 05b81f6 also in chains of test battles without a close, and since 919b40d
+  the host's battle results and month read the campaign's own date (MODLOG Testing 2026-10-17).
+- A slot read right after the client's log line can already be the NEXT step's file: the client copies its next battle
+  into slot 87 within a second of "battle N: fought" (`BattleDriver` compares the file's write time with the line).
+  Before calling a fail a mod bug, check the file's write time against the log (`file_time`) and the client's
+  `write ...: succeeded after N retries` lines (the mod's writes wait while the runner holds a file).
+- Open since 05b81f6: `lockstep_month`'s VP check can fail after a `drop12` battle in which the host's side scored 0.
+  The client's own load of a correct package gives nation 0 60-100 VP more. `vp_mismatch_probe`'s two log lines (the
+  files and both copies' reloads) are the evidence to report.
 
 ## How to work
 1. Read the change you're asked to test (diff, `MODLOG.md` entry) and decide which scenarios cover it (the scenario

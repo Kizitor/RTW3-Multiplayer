@@ -73,6 +73,13 @@ bool IsHolding();       // A: held at the start, waiting for StartAsA
 // A: hold the battle at its start (no minute may run) until StartAsA or ReleaseHold. bid = the battle id StartAsA will
 // use (messages for it, e.g. a relayed `peerlost`, are handled while held).
 void Hold(const std::string& why, int bid);
+// A battle slot's close skipped the campaign's month (tests, joined players' battle slots): put back the campaign date
+// recorded when this PC's live battle opened (the game's resume path writes the battle's day and month into it).
+void OnBattleSlotClosed();
+// The campaign's month runs (DoStrategicTurn), or a campaign is loaded outside this PC's live battle: the recorded
+// campaign date is dropped.
+void OnMonthRuns();
+void OnCampaignLoading();
 void ReleaseHold(const std::string& why);
 // A: the battle screen is up (minute 0): snapshot, send it to B, reload it here too and run in lockstep. False with
 // `retry` set: not now (a dialog is open), call again later.

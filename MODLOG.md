@@ -97,6 +97,13 @@ By version (the version the work went into) and kind, oldest first.
 - **0.3.1**
   - Fix:
     [live battles between joined players didn't count in their war score](#fix-2026-10-16-live-battles-between-joined-players-didnt-count-in-their-war-score-v031)
+  - Investigation:
+    [the limits of live battles (static analysis of 0.3.1)](#investigation-2026-10-16-the-limits-of-live-battles-static-v031)
+- **0.3.2**
+  - Fix:
+    [speed controls, air formations window and battle dialogs in live battles](#fix-2026-10-17-speed-controls-air-formations-window-and-battle-dialogs-in-live-battles-v032)
+  - Testing:
+    [0.3.2 hotfix (speed controls, air window, dialogs before reloads)](#testing-2026-10-17-032-hotfix-speed-controls-air-window-dialogs-before-reloads-v032)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -863,6 +870,10 @@ list and no Fight my battles checkbox.*
   - Flags are exception-safe.
 - Not available in live battles (chat line): air strikes, routine air ops, missiles, manual torpedoes, emergency
   activation, change force, try for home, auto-run, save.
+  - *Correction 2026-10-16: emergency activation is dead code in the game (its button is never shown and its click
+    handler is empty; no blocker) and try for home is a developer menu item that the game hides in every battle.
+    Change lead, battle turn-away and Fastest available were blocked too; the speed arrows were not blocked. See
+    [the limits of live battles](#investigation-2026-10-16-the-limits-of-live-battles-static-v031).*
 - Bridge: `ls status|enable|session|timeout|desync|drop|resync|trace|leakcheck|guard|dispwrite|throw|stall|nest|...`,
   `battles injectpvp`; env `RTW3MP_LIVE_BATTLES=0`.
 
@@ -1132,3 +1143,343 @@ list and no Fight my battles checkbox.*
   added the points to memory there. Battles against AI nations don't count (not a pair of players). Host log `war
   score a-b: +x/+y from a battle fought on a player's PC -> A:B`.
 - Only the host's code changed; protocol 3 is unchanged, so 0.3.0 players can join a 0.3.1 host.
+
+## Investigation 2026-10-16: the limits of live battles (static; v0.3.1)
+- Question: what does each battle command that live battles block do in the game, and how could it work in a live
+  battle? Three research agents read the 1.01.44 image (air operations; missiles and torpedoes; orders): static
+  analysis only, no game run, no code changed. Their reports and the plan the user approved stay outside the repo;
+  the durable facts are in [docs/GAME-INTERNALS.md](docs/GAME-INTERNALS.md#battle-commands). Image addresses (base
+  0x830000); "guess" as in the reports.
+- Not player features, so there is nothing to lift (the docs listed them):
+  - Emergency activation: `TfrmMain.sbEmergencyActClick` (0xdeed28) is a bare `ret`. The button is Visible=False and
+    Enabled=False in the form; only `CampaignScenario` (+0x7f4, never set to True in the image) or the unreachable
+    operational-campaign module `TfrmCampaign` would show it, and `LoadScenarioInProgress` (0xcd02b4, the resume
+    path the live battles use) hides it. The Force orders dialog's `sbEmergencyAct` has no OnClick and is visible
+    only for `CampaignScenario`; its label is always shown (guess: where the docs' item came from). No blocker exists
+    or is needed.
+  - Try for home (`TryforHome1Click` 0xe021e8: the AI's head-home routine 0xdc15ec, then the course in a message box)
+    and Enter port (`ShowAircraft1Click` 0xdfabe4 → the "division enters port" routine 0xdeccb0, which removes the
+    division from the battle; 14 `Random` sites): `TfrmMain.FormCreate` hides both with the other debug items
+    (0xd8ab47..0xd8abde), unconditionally, so in every battle, single player included.
+  - No control calls `TfrmMain.bnFireClick` (0xdb7200), `Launchstrike2Click` (0xdfb25c), `Bombship1Click` (0xdfebb0)
+    or `TdlgDivisionReport.bnFireMissilesClick` (0xae2dc4); only the RTTI method tables refer to them.
+- Blocked, but missing from the docs' list: change lead and battle turn-away (Force orders) and *Fastest available*.
+  Not blocked: the speed arrows (`UpDown1Click`), which change the speed at once (problem 3 below).
+- Where each real command commits (the routine both PCs would have to run):
+  - torpedo salvo: `TfrmMain.FireMount` (0xda8cc4, `ret 0x14`, 10 `Random` sites; `SetReloadTime` 0xe5598c, 7),
+    called by `TdlgTorpTargets.bnFireClick` (0xaddf75), whose angle jitter (8 sites) and firing-solution list (about
+    15) draw outside the simulation;
+  - missile salvo: `TfrmMain.FireMissileMount` (0xe04718, `ret 0x10`) → `FireSSM` (0xda6374), called by
+    `TdlgMissileFire.FireMissiles` (0xd80c98), which also writes `PendingMissileTarget` (+0xa93, at 0xd80b79) and
+    fires missile submarines with side 0 hard-coded (0xd8109b, 0xd810f7);
+  - air strike: LaunchSomeAircraft (0xea4a18) from `TdlgStrike.bnLaunchClick` (0xc294a7) and `bnReadyClick`
+    (0xc2b843); `bnLaunchClick` then draws `Random(10000)` for the GroupIndex (0xc294b3) and writes more fields
+    inline;
+  - routine air operations: `TdlgSearch.bnSaveClick` → 0xb4bef4 (9 `TForce` fields, then
+    `TForce.ProcessSearchDirectons`); land-based CAP: `TdlgDivisionReport.bnOkClick` writes `LandCAPDivision[0]`
+    (0xfb5920);
+  - change force: inline in `Changeforce2Click` (0xd8b9b0); change lead: `SetForceLeadDiv` (0xde42fc); turn-away:
+    `DoBattleTurnAway` (0xde4550). None of the three draws `Random`.
+- Problems found in the 0.3.x live battles (read from the code, to be confirmed live):
+  1. Carriers: the squadron picker of `CheckAIAirstrike` (0xdfd50c; the test at 0xdfdb33) skips PlayerSide's carrier
+     squadrons, and PlayerSide is 0 in the simulation: the AI flies side 1's carrier strikes and never side 0's.
+     `SetAIAirSearchPlan` in EOTP (0xdafa1f, every 120 minutes after minute 600) resets side 1's search sector and
+     CapLevel.
+  2. Missiles: EOTP reads *Fire at will* (`cbFireAtWill`, 0xda92d1) and *Fire mode* (`rgMissileDoctrine`, 0xda7d20,
+     0xda7d56) for side 0 from each PC's own screen: different settings desync the minutes with missile fire, and the
+     resync resets both controls (the battle form is created again). Side 1 always fires at will by the AI's rules.
+  3. Game speed: VCL puts the blocked *Fastest available* down before the click handler, and the speed governor reads
+     `FDown` at minute boundaries (the cap 0xdea00c, the contact update 0xe02d54); `UpDown1Click` (0xdd00d8) changed
+     the speed on one PC, also in the middle of a minute.
+  4. Fog of war, air: EOTP refreshes *Show air formations* inside the simulation (0xdb03dc, PlayerSide 0), so B's
+     window listed side 0's formations; its list keeps `TAirFormation` pointers across a reload.
+  5. Fog of war, missiles: `UpdateMissilePanel` (0xe032c8, EOTP) counts side 0's missile ships and targets, on B's
+     screen too.
+  - 0.3.2 fixes 3 and 4 (the next entry).
+- Gaps: the state hash has no torpedo or missile stocks and reload times, no `PendingMissileTarget`, no submarines,
+  no force membership or leads and no force air settings; of the air formations it has only the id, the numbers,
+  position, course, status, fuel and altitude. The battle save drops NightCAP, the formations' Altitude and CAP
+  links, and `PendingMissileTarget`, so a resync loses them.
+- Test beds: the test campaign (slot 1, 1900) has no aircraft. Air operations need a 1935 campaign (the game starts
+  campaigns in 1890, 1900, 1920 and 1935), missiles a battle after about 1950.
+- The plan (approved on 2026-10-16): the hotfix 0.3.2 and corrected docs first. Then commands that both PCs run at
+  the next release ("deferred actions": torpedo and missile salvoes, change force, change lead, turn-away), a
+  per-side "player side" inside the simulation (the AI air routines, missile fire), routine air operations as
+  orders, air strikes, auto-run per player, and *Save* as the host's crash checkpoint.
+
+## Fix 2026-10-17: speed controls, air formations window and battle dialogs in live battles (v0.3.2)
+- Problems 3 and 4 of the investigation above; the reload hazard of 4 also applies to the battle's other dialogs.
+  Every change acts on the PC that runs it (no new message or key): protocol 3 is unchanged, and 0.3.1 and 0.3.2
+  play together.
+- The speed arrows: `TfrmMain.UpDown1Click` gets a blocker with the new policy `B_ARROW`. It computes one step from
+  the speed in use by the game's rule (up only if `(speed < 5 and not Engaged) or speed < 2`, down to -3) and sends
+  it as the speed request the speed box makes (`ClockRequest("speed")`); A applies it with the next release. The
+  speed in use is A's pending or current speed; on B, the speed A announced last (`clockSpeed`, from the start,
+  release and info messages). The blocker thunk now also passes EDX (Sender) and ECX to `LS_Block`; ECX is the
+  arrow's `Button` (btNext 0, btPrev 1).
+- *Fastest available*: the new policy `B_FASTEST` puts the button up again with the game's own routine, the one the
+  down arrow calls (found in `UpDown1Click`: `cmp byte ptr [eax+FDown], 0; je +7; mov eax, ebx; call <routine>`,
+  which also gives the `FDown` offset), and says "Fastest available is not available in a live battle yet; use the
+  speed box." `cbFastestAvailableClick` stays blocked.
+- Other blocked toggle buttons: VCL flips a toggle speed button's `FDown` before its click handler runs, so a blocked
+  click left *Auto-run* and the division report's *land-based CAP* (`sbLandCAP`, GroupIndex 6) down; the report's
+  `bnOkClick` then wrote `LandCAPDivision[0]` (not an order field) on that PC only. `LS_Block` now wraps the decision
+  (`LS_BlockImpl`) and, for every blocked click except `B_FASTEST`, calls `PutToggleBack(Sender)`:
+  `TSpeedButton.SetDown(not FDown)` when the Sender is a `TSpeedButton` with `FGroupIndex` <> 0 (the offsets from
+  RTTI: `TCustomSpeedButton.FGroupIndex` +0x1e0, `FDown` +0x1e8, checked against the `UpDown1Click` pattern; `SetDown`
+  from the release routine's first call). The blocked handlers are only called by the VCL (no code references), so a
+  put-back always undoes a real toggle.
+- The missile panel: the simulation reads `cbFireAtWill.Checked` and `rgMissileDoctrine.ItemIndex` on each PC for
+  side 0's ships (problem 2 of the investigation). Each live load creates a new battle form (their defaults: unchecked,
+  Ripple), and `LockMissilePanel` disables both (`TControl.SetEnabled(False)`, the VMT slot from
+  `sbAutoRunBattleClick`) after every load and at every boundary, so neither player can change them. The asymmetry
+  stays until both PCs share these settings (0.4.0): side 1's missile ships fire at will under the AI's rules, side 0's
+  only when their force is under AI control and a nation value allows it (`[nation+0x149] < 2`; guess: missile tech).
+- *Show air formations*: `TdlgShowAirFormations.UpdateListSortedByBase` is a display context (`K_UI`), so the
+  refresh inside EOTP runs with this PC's PlayerSide and display set: B's window lists side 1's formations.
+- Dialogs before a load: `ResetBattleForm` (the start, every resync, A's recovery, B's leaving) first hides
+  (`TCustomForm.Hide`) each visible one of `TdlgShowAirFormations`, `TdlgDivisionReport`, `TdlgForceOrders`,
+  `TdlgSelectLead`, `TdlgTorpTargets`, `TdlgStrike` and `TdlgMissileFire`: they keep pointers to the
+  battle's ships, divisions and air formations, which the load frees. Their unit variables are found once by scanning
+  the image for `mov eax, [cell]; mov eax, [eax]` whose object has exactly that class's VMT (`FormVarOf`). Log:
+  `lockstep: battle dialogs resolved` (with `, not found: <classes>` if any is missing) and `lockstep: <class> hidden
+  before the battle is loaded again (ok|FAILED)`. (`TfrmTargets`, shown only by the orphan debug handler
+  `TfrmMain.bnFireClick`, has no variable the scan finds and was dropped from the list.)
+- The battle's data before a load (found by the regression tests: a 1935 battle never started, "the loaded battles
+  differ" with af 27x16 vs 27x15): `ResetBattleForm` freed the form, but the battle's global lists outlived it, and
+  the resume path (`sub_ea3f88`) appends the saved air formations to the global list (0xfb0108) without clearing it,
+  so every load added another copy. The screen's own close (`TfrmMain.FormClose` 0xdcd67c) clears them after
+  `DoStrategicTurn`: `mov cl, 1; mov edx, 2; mov eax, [ebp-4]; call ClearData; call 0xea16ac` (at +0x3d2; ClearData
+  frees ships, divisions, forces and more for all sides; 0xea16ac deletes and frees every formation whose +0x22 is 0).
+  `ResetBattleForm` now makes the same two calls before it frees the form (resolved from that pattern, the first call
+  checked against `TfrmMain.ClearData`). Log: `lockstep: battle data cleared (ok), air formations left <n>`.
+- The ship tree inside a minute (found by the regression tests: B's tree showed side 0's forces after every minute):
+  the end of a minute refills the tree with `FillShipTree(tvShips, PlayerSide, ...)`, and PlayerSide is the canonical
+  0 inside the simulation. `LS_CtxEnter` now replaces the side argument (ECX; the thunk's `popad` passes it on) with
+  this PC's own side when `FillShipTree` is entered inside the simulation with side 0.
+- The campaign date (found by the regression tests: the host's campaign ended up a month ahead of the joined player's,
+  "submission is for another month"; it happens on 0.3.1 too). Year, Month and Day are Word unit variables
+  (0xf531e0, 0xf531e4, 0xf531dc); the month advance starts from a separate TDateTime (0xf52fe8) that
+  `LoadBuildCampaign` sets from the save's [General] date before it calls `LoadScenarioInProgress`, and the `.sac`
+  reader (`sub_dd8f78`) then writes the battle's own day and month into the Word variables (never the year). The
+  battle's date is random (day `Random(28)+1`, plus hours until the light fits) and can fall into the next month. A
+  live battle's first load only moves the day/month (the month advance after the battle still starts from the right
+  date), but A's snapshot at a resync saved the moved day/month into [General], the reload took them into 0xf52fe8, and
+  a battle dated in the next month then skipped a month (August straight to October). Since 0.3.2, `Hold` records the
+  campaign date (the battle has just opened; no load has touched it), `SaveSnapshot` swaps the recorded date into the
+  variables around its `SaveBuildCampaign` (the snapshot's [General] keeps the campaign's own date; the battle still
+  runs with the `.sac`'s day and month on both PCs, as before), and a battle slot's close, which skips
+  `DoStrategicTurn` (tests), puts the recorded date back (`hookcb::OnBattleSlotSkippedTurn` ->
+  `lockstep::OnBattleSlotClosed`). Only A changes, so a 0.3.1 player can still be B. The variables are found in
+  `LoadBuildCampaign` (`mov ecx, [Day]; movzx ecx, word [ecx]; mov edx, [Month]; ... call EncodeDate; fstp qword ptr
+  [campaign date]`, once, at +0xaf8). Log: `lockstep: campaign date recorded: Y-MM-DD` and `campaign date ... put back`.
+  A record still set when the next battle opens (tests start a battle over another one without its close) is put back
+  into the variables instead of recording the moved date (`campaign date ... kept from the battle before`); a month
+  that runs (`DoStrategicTurn` outside a battle slot: `hookcb::OnStrategicTurnRuns`) and a campaign load that isn't
+  the live battle's own (`CB_BeforeLoad` -> `hookcb::OnCampaignLoading`, ignored while a live battle is on) drop it.
+  Because the battle itself runs with the `.sac`'s day and month, the host's date variables held the battle's month
+  until the month advanced, so the battle's aftermath (victory points, prestige, the month's record row) and the
+  month's steps before the advance could see the wrong month (a regression run found nation 0's VP 980 in the host's
+  memory but 1040 in the client's month package after a real-month battle dated in the next month). A puts the recorded
+  date back when the battle's result screen opens (`OnResultsEnter`, the `ShowResultScreen` context) and when the
+  month runs (before the record is dropped), as in a battle that was never reloaded. Only A changes.
+  (The battle running on the battle's own day and month is the subject of 0.4.0: both PCs will write the campaign's
+  date back after each load.)
+- Chat lines with a path (found by the regression tests): after the in-minute autosave the pause line went to both
+  players as "The battle paused (Game saved! <the host's full save path>)", and a quiet box of the mod's own snapshot
+  could be repeated as a stale reason after a resync. Box texts for the chat now go through `ChatSafe` (a drive path is
+  cut to its file name), and the mod's own quiet boxes no longer become the reason of a pause.
+- Bridge (tests): `ls airwin [show]` reports the window's visibility, its item count, the formations per side and the
+  first three columns of each row (`show` opens it as the toolbar button does); `ls ctl <form class> <field>` reports
+  a control's class, `enabled`, `visible` and, for speed buttons, `down` and `group` (a dialog's instance is found as
+  above); `pocstate` adds `fastest=<0|1>` (the button's `FDown`; -1 when it isn't resolved).
+- Docs: the lists of what live battles can't do yet (README, CHANGELOG, ARCHITECTURE) are corrected, and
+  GAME-INTERNALS has the battle commands.
+
+## Testing 2026-10-17: 0.3.2 hotfix (speed controls, air window, dialogs before reloads) (v0.3.2)
+- Regression agent. Builds (frozen copies, given with `--dist`): the released 0.3.1 for the confirmations and one
+  comparison, then the 0.3.2 work in progress: 085a0aa (speed arrows, Fastest available, air window, dialogs before
+  reloads), d042d71 (+ blocked toggle buttons put back, missile panel locked, `ls ctl`) and 3cc0628 (+ the battle's
+  teardown before every reload, the ship tree inside a minute, `TfrmTargets` dropped), the last one left installed.
+  Game open in all: ~127 min (four full or stress runs, the rest short runs and experiments).
+- **The 1935 test campaign (new fixture, outside the repo; docs/TESTING.md "The 1935 test campaign").** A USA campaign
+  can't host a test battle: `pocbattle` takes the opponent's build area if it is a home area of the host's nation (or
+  the reverse), else the possession the mission names, and the USA has neither against any nation (`pocbattle: no area
+  for mission 0 against 5`; only Guam against the Soviet Union, where DoBattle found no battle). Made instead: Great
+  Britain 1935 (title screen driven with posted messages, slot 9, saved once with `save`; slots 1 and 2 unchanged).
+  `pocbattle 2 0` against France (Fleet battle at Plymouth) has 43 air formations, 23 British (naval air stations
+  Grimsby and Plymouth, airbase Cork, carriers, floatplanes) and 20 French. The runner backs up and restores slot 9
+  like slot 1; `lockstep_air` skips without it.
+- **Confirmed on 0.3.1** (the 1900 fixture's test battle, posted clicks):
+  - B3a: B's arrow up 0.4 s into a running minute at speed -1 changed B's own speed at once (-1 -> 0, A -1): `DESYNC at
+    minute 2: here a3ca603bbad59d99-160d80c2, Captain 55dbea7c854b5021-2de9e8f7`, a resync (epoch 1 -> 2).
+  - B3b, only partly: the blocked click left the button down (`sbFastestAvailableClick is not available in a live
+    battle (this version).`) and B's own speed jumped to 5 at every boundary (pocstate speed 5, ivsec 240 vs A's -1/8;
+    2 vs 1 in contact), but no DESYNC in 52 minutes (7 without contact, 45 engaged): every release applies A's speed
+    before the minute.
+  - B4: not observable live; no battle with aircraft runs on 0.3.1 (below). Static evidence only. The land-CAP click
+    was blocked with its chat line; its stuck Down state isn't readable on 0.3.1 (static evidence only too).
+- **Found by the new checks and fixed in 3cc0628:**
+  - Live battles with aircraft never started (0.3.1 to d042d71): every load appended the saved air formations to the
+    game's global list, and A, which built the battle, loaded it once more: `the loaded battles differ: here
+    8e782827a2c4a2e1-5846b9c5, Captain fb8f764afd2dd03a-5846b9c5` at epochs 1-4, then `dropping Captain: the battles
+    could not be kept in sync` after 16 s; af host 43 -> 688, client 645 (43 x 16, x 15), and the client kept its 645
+    formations after leaving. 3cc0628: `battle data cleared (ok), air formations left 0` before every load, af 43/43.
+  - The second player's ship tree ("OB" tab) listed side 0's forces after every minute (`Great Britain Main force`,
+    `Great Britain Coastal forces`, with their divisions and ship names; its own right after a load): 0.3.1 and d042d71.
+  - `battle dialogs resolved, not found: TfrmTargets` on every copy (d042d71): dropped from the list.
+- **Recorded, not checked (0.4.0 material):** a resync hands side 1's divisions to the game's AI. `ls divs` on both
+  copies before `ls resync`: side 0 7 of 8 on the AI, side 1 0 of 15; after it on both copies side 1 15 of 15 `:ai`
+  (also the batteries), side 0 unchanged, hashes equal (d042d71; the same on 3cc0628: 0/14 -> 14/14, and in every
+  `lockstep_ui` run's NOTE). Both copies agree, so nothing desyncs, but the second player commands nothing after the
+  first resync.
+- **Found, open (0.3.0-0.3.2, not caused by 0.3.2): a live battle's load moves the host's campaign date.**
+  - The game's resume path sets the campaign [General] date to the battle's own when A loads the battle (its start and
+    every resync; B loads the same save). One `ls resync` right after the start: start save `1900/8/1 sip=1`, the
+    resync's save `1900/8/5` (A's in-memory date after its own load). Four test battles in a row: Day 14, 8, 27, 27 on
+    3cc0628 and 27, 21, 5, 10 on 0.3.1 (each battle a new random day, carried by the next saves and through months).
+  - Now and then the battle's date is in the next month. Full default run on 3cc0628: after `lockstep_ui`'s battle
+    slot 1 was saved as Sep 1901 (`ScenarioInProgress 1`) and the auto-run prompt said "Event - September 1901" while
+    the client planned Aug 1901; the next month `Captain's turn NOT applied: submission is for another month`
+    (`MergeSubmission` compares the submitted save's [General] Year/Month with the host's, saved just before), and as
+    the host merged Bot's turn (sent from the drifted save) it reloaded the Sep save: the month after was Oct, the
+    client skipped Sep. `--stress` f) (after S6 and a long battle to the game's own end): the same rejection; the host
+    then ran Aug -> Sep.
+  - Not a race of the tests: battles started from a settled strategic screen (new `host_settled`) do the same, and the
+    extra "Rule the Waves III" box at that battle's start was most likely the game's fuel message (the box the new
+    `box_text` read in that place since: "N destroyers unable to take part in battle due to lack of fuel, caused by
+    distance to closest base (103 nm).").
+  - Suggestion: keep the host's campaign date across a live battle's load (restore [General] Year/Month/Day after the
+    resume path, or merge by a session month counter instead of the save's date). A check "the host's month after a
+    live battle = before" would catch it at once; `ls_after_checks` j) now compares host and client months. (Later the
+    same day: fixed in d99e357 for battles that close before the next one; see the final candidate part below.)
+- **Minor, open:** "The battle paused (<text>)" names the last box the mod answered, which can be stale: the first
+  break after a resync names the resync's own quiet "Game saved! <the host's save path>" box, and that line goes to
+  both players' chat (the host's local save path, with its Windows user folder, shown to the other player). (Fixed in
+  d99e357, below.)
+- **Verified on 3cc0628** (`lockstep_ui` on the 1900 fixture, `lockstep_air` on the 1935 one):
+  - Speed arrows: B up and A down between minutes, B down inside a running minute at -1, A up inside one at -2: one
+    request each (`Germany set the game speed to -2 (from the next minute).` on both), the minute went on at the old
+    speed on both, both at the new speed from the next minute, no DESYNC; two clicks on B 1.5 s apart: requests 0 and
+    1; in contact (speed 1, engaged) 4 clicks: one request (2), then none (the game's rule).
+  - Fastest available and Auto-run, on A and on B: their chat lines, put up again (`ls ctl ... down=0 group=579/97`,
+    `pocstate fastest=0`, autorun 0), the same speed on both; 14 minutes in contact equal.
+  - Missile panel: `cbFireAtWill` and `rgMissileDoctrine` enabled=0 (visible=1) on both after the load, at a boundary
+    and after a resync.
+  - Air window and division report: `ls resync` with both open on both copies (the reports open since the start): each
+    copy logs `TdlgShowAirFormations hidden before the battle is loaded again (ok)` and `TdlgDivisionReport hidden ...
+    (ok)`, no crash, the window reopens; the land-CAP button put back after a click (`down=0 group=6`, 1900 and 1935),
+    the report's Ok, the next minutes equal. `battle dialogs resolved` without `not found` on every copy.
+  - Ship tree: B's top nodes list only its own forces after the load, the minutes and the resyncs.
+  - 1935 (B4): A's window lists 23 rows (side 0), B's 20 (side 1), no base in both, also after a minute; a resync with
+    the windows open keeps af0/af1/afx on both; 30 live minutes (8-37) with every division on the AI, every minute
+    equal, the same formations per side on both copies every 5 minutes, each window its own side; in the air: CAP only
+    (1 + 2 formations) in one battle, recon searches, CAP and a naval strike readying (af 23/20 -> 49/39, up to 27 + 19
+    formations in the air) in the others; a resync at minute 37 with them in the air: the same counts, still in the
+    air, 3 minutes equal; no LEAK.
+  - Memory: a load costs ~1-6 MB private memory per copy (1900 and 1935); nine battles in a row 81/81 -> 157/169 MB
+    (8.7/8.4 MB per battle; 0.3.0: 91/103 -> 179/203).
+- **Suite** (`tools/regression.py`): new scenarios `lockstep_ui` (default run, after `lockstep`, no month) and
+  `lockstep_air` (default run, last; the session moves to slot 9; SKIP without the fixture). The dialog answerer leaves
+  the battle screen's modeless tool windows alone while the screen is enabled (`LS_MODELESS`); new helpers for the
+  battle screen (tool bar clicks, the speed arrows, the OB tree, popup menus, the division report, `ls ctl`, `ls
+  airwin`), slot 9's backup and restore, `SKIP` in the summary. Diagnosis: every answered game box is logged with its
+  text (`box_text`: read-only from the copy's memory, the TLabel has no window), the saves' [General] dates
+  (`gen_date`) before every turn and around test battles, `host_settled` before a test battle from the strategic
+  screen, and `ls_after_checks` j) requires the host's month = the client's.
+- Results:
+  - 0.3.2 d042d71: `--only lockstep_ui,lockstep_air` 31/34 (196 s); full default run 537/540 (926 s; the 3 failures were
+    the issues fixed in 3cc0628; every older scenario passed); `--stress` stopped after S2 on request.
+  - 0.3.2 3cc0628: `--only lockstep_ui,lockstep_air` 46/46 (272 s); full default run 549/550 (1062 s; the fail: the
+    month, above) and, with the diagnosis, **558/558** (1052 s); `--only lockstep_ui,lockstep_stress --stress` 121/122
+    (1531 s; the fail: the month in f)).
+- Testing gotchas (docs/TESTING.md, Known traps): the modeless tool windows and the answerers; a hidden ship tree must
+  not be selected ("Cannot focus a disabled or invisible window."); the speed arrows are a TUpDown window; tool bar
+  buttons beyond a narrow battle window still take posted clicks; the speed falls back to 1 in contact; a box's text
+  needs `box_text`; the host's `status` date is its save file's.
+- **0.3.2 final candidate (d99e357: the host's snapshots keep the campaign date, chat lines without paths)**, installed
+  and left installed:
+  - Date check (a scratch run inside the runner, game open 293 s): 4 test battles in Aug 1900, each with 2 resyncs.
+    Battles closed by the host before the next one: every snapshot 1900/8/1, `campaign date recorded: 1900-08-01`, the
+    close `campaign date 1900-08-01 put back (was 1900-08-05 after the battle)` (and `-16`), the host's in-memory date
+    after the close (`save`) 1900/8/1; the month after merged the client's turn, Aug -> Sep.
+  - **Gap (test path):** a `pocbattle` that replaces a battle screen still open on the host (no close between the two
+    battles) records the previous battle's day: battle 4, started over battle 3's screen, recorded 1900-08-04 (battle
+    3's `.sac` day), and its snapshots and its close kept 1900/8/4. The stress cases chain their battles that way:
+    `recorded: 1900-08-01, -08, -31, -15, -13, -20, -21, -09, -13, -21`, slot 1 after S7 1900/8/13, and the campaign
+    kept day 21 from then on (Sep 21, Oct 21, ...). A chained battle dated in the next month would still move the
+    month. Real play closes every battle before the next one, so as far as known only the tests' chains are affected.
+    Suggestion: in `Hold`, keep (or first put back) a recorded date that is still set. (Fixed in 05b81f6, below.)
+  - Pause lines: 122 in the two runs' logs (5 of them the first break after a resync), none with a path or "Game
+    saved"; the mod's quiet boxes are no pause reason any more. No "Game saved!" box was ever answered inside a minute
+    in any run (no in-minute autosave box to test).
+  - New suite checks: `lockstep_ui` h) (every snapshot keeps the month's date, the close puts it back), `lockstep_air`
+    i) (snapshots keep Jan 1935), `lockstep_stress` g) (the date after the chained battles), and in `ls_log_scan` (every
+    lockstep scenario) the battle's chat lines without a file path or "Game saved".
+  - Results: full default run **556/558** (1141 s): every lockstep scenario passed (`lockstep` 25/25, `lockstep_ui`
+    27/27, `lockstep_pvp` 24/24, `lockstep_month` 34/34, `lockstep_air` 15/15); the 2 fails are `treaty` g): nation 1
+    also gained Norway in the treaty month, not by the treaty and not from nation 2 (the month's own processing gave it;
+    no log line names it), unrelated to 0.3.2. `--only lockstep_ui,lockstep_stress --stress` **127/128** (1561 s): the
+    fail is the stress g) date check (the gap above); f) and every real month merged the client's turn.
+  - Game open for this part ~50 min; in all ~177 min.
+- **0.3.2 final candidate e (05b81f6: the recorded date kept across chained test battles, dropped when a month runs or
+  a campaign is loaded)**, installed and left installed:
+  - `--only lockstep,lockstep_ui,lockstep_month,lockstep_stress --stress` **213/213** (1940 s). The stress g) date
+    check passes: `campaign date recorded: 1900-12-01` once, then nine `campaign date 1900-12-01 kept from the battle
+    before (the variables had 1900-12-26)` (-11, -18, -04, -15, -13, -05, ...), slot 1 after S7 1900/12/1.
+    `lockstep_month`'s new per-battle date check passes for both real-month battles (`recorded: 1900-09-01` and
+    `1900-10-01`, `the month runs: the recorded campaign date is dropped`, the next month with day 1). Host log:
+    recorded 8, kept 9, put back 4, dropped by a month 3, dropped by a campaign load 0.
+  - Full default run **574/575** (1034 s). `treaty` 73/73: g) did not recur. The same kind of event showed up in the
+    `merge` month: the picture message and the turn report said "Germany has taken over control of Shanghai.", and slot
+    1's MapData `Shanghai (MapArea5Possession9): Neutral -> Germany`. So the Norway of the d99e357 run (a neutral
+    possession, `MapArea0Possession5`, Owner Neutral in the fixture) was most likely the game's own "taken over control"
+    event in the treaty month. The runner now logs every month's possession changes, picture messages and turn reports.
+  - The fail (open, first seen): `lockstep_month` battle 1 (drop12, the Nov 1901 turn). VP of nation 0: host 980 (in
+    memory, `vpinfo`), client 1040 (its month package); nation 1 112 on both, ship counts equal; before the month 0:700,
+    1:2. The battle: "Great Britain has no ships left at sea! The scenario is over!", "The battle was a draw. Own VP: 0
+    Enemy VP: 0", then "The Prime Minister is annoyed that you cannot safeguard our coasts with adequate patrols Your
+    prestige suffers. (Not enough ships on trade protection)" and the Trade warfare summary. No `victory points:` line
+    that month; the campaign date was right (recorded 1901-11-01, dropped, then 1901/12/1). A repeat (`--only
+    lockstep_month`, 91 s) passed 43/43 (that war had just started: VP 0).
+  - A lead for it: the repeat logged the real-month battle's own date. The Aug 1900 turn's battle had `[Environment]`
+    1900/9/10 in its `.sac` while [General] stayed 1900/8/1. A live battle's load (on A too) writes that date into the
+    date variables, and in a real month nothing puts them back before `DoStrategicTurn` (05b81f6 only drops the record
+    there). So `RecordTurnData`/`MonthRecords` and the rest of the month before `IncMonth` see the battle's month,
+    unlike vanilla, whose generated battle never touches them. Suggestion: put the recorded date back when the month
+    runs (as at a battle slot's close), then drop it.
+  - Game open for this part ~51 min; in all ~228 min.
+- **0.3.2 final candidate f (919b40d: on A the battle's results and the month read the campaign's own date)**,
+  installed and left installed:
+  - `--only lockstep_month --stress` **70/70** (437 s), both real-month host battles in a war with VP already (battle
+    2: before 0:747 1:1031). The new aftermath check passed for both: every nation's VP the same in the host's memory,
+    its saved slot 1 and the client's month ({0: 993, 1: 1661, 7: 90}); `the battle's results: campaign date 1900-09-01
+    put back (the battle's date was 1900-09-13)`; `the month runs: campaign date ... put back, the record is dropped`;
+    the next month with day 1.
+  - Full default runs **561/567** (959 s), **565/567** (1110 s) and **559/559** (1022 s); `--only lockstep_stress
+    --stress` **101/101** (1326 s; g)'s date check passes).
+  - The VP mismatch came back in two of the three full runs, so it is not the date (open): `lockstep_month` battle 1
+    (`drop12`, the Oct 1901 turn; `.sac` dated 1901/10/29 and 1901/10/23, campaign 1901/10/01, the results line
+    present). Second run: nation 0 has 2329 in the host's memory, in its saved slot 1 and in the client's slot 77 file
+    as received (written 05:37:14.017); the client's memory has 2429 right after its `LoadCampaign slot 77 player 1`
+    (05:37:14.185, "victory points shown: own 979, enemy 2429"). Nation 1 has 979 everywhere. First run: 1308 vs 1388;
+    05b81f6's run: 980 vs 1040. So the package is right and the client's own load of it adds 60/80/100 to nation 0.
+    In all three, the host's side scored nothing in that battle ("The battle was a draw. Own VP: 0 Enemy VP: 0" twice,
+    "Enemy minor victory Own VP: 0 Enemy VP: 246"), and the client had been dropped at minute 12. In the clean run the
+    host scored 228. Before 05b81f6 (4 default runs, one with "+0/+90") it never happened. When it happens again, the
+    runner probes it (`vp_mismatch_probe`): it looks for repeated VP keys and the keys that differ between the two
+    files, then reloads each copy's own slot (`load 77 1` on the client, `load 1 0` on the host) and logs the VP
+    before and after. The same extra points on both copies would mean the game's load adds them; extra points only on
+    the client would point to its own state.
+  - Two other fails, first seen and not repeated: `battles` b) x2 was a test race. The client copies its next battle
+    into slot 87 0.34 s after "battle 2: fought". The bundle goes first, in the host's numbering, and the transform
+    after it; its write waited for the runner's read ("succeeded after 1 retries"). So the runner read the next battle's
+    host-numbered bundle ("34 sunk" = all of Germany; "4 changed" = Spain's ships changed by the merge). Fixed in the
+    runner: a slot 87 written after "fought" (before the read) counts as the next battle's copy, and the merge's own
+    changes stand in. `lockstep_ui` e): one DESYNC at minute 22 of its 14 AI minutes (pos/ord differ:
+    A `pos=cc9d1961 ord=57c99f72`, B `pos=649c68a0 ord=01f7085e`; dmg, ammo, sight, air, torp, ships and the RNG part
+    `8732549d` equal, sim draws 5564 on both, no LEAK line). It came right after two "Unknown ship sighted!" pauses,
+    in the minute where both copies' identification sets changed (ident A `2ab2952d -> b3cf60b2`, B
+    `3469119f -> dc3de5a0`). The resync repaired it; f) failed only because that resync had hidden the reports. It
+    didn't recur in the next 2 runs. A lead: an AI decision that reads the display's identification.
+  - Game open for this part ~81 min; in all ~309 min.

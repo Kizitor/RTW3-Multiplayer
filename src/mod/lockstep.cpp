@@ -16,6 +16,7 @@
 #include "game.h"
 #include "saveio.h"
 #include "../../third_party/minhook/include/MinHook.h"
+#include <commctrl.h>
 #include <intrin.h>
 #include <algorithm>
 #include <climits>
@@ -93,6 +94,12 @@ static struct Engine {
     int fCloseMain = -1;  // TfrmMain.CloseMainScreen: the results' "Exit battle" (EOTP then closes the screen)
     int* scenLenVar = nullptr;  // the scenario length (minutes; the absolute limit is length + min(length, 600))
     int fCbSpeed = -1, fTvShipsTree = -1;
+    void* releaseFastest = nullptr;  // TfrmMain: the "Fastest available" button up again (SetDown(False) + its glyph)
+    int fFastestBtn = -1, fDownOff = -1;  // TfrmMain.sbFastestAvailable; TSpeedButton.FDown (private)
+    void* setDown = nullptr;   // TSpeedButton.SetDown(Value)
+    int fGroupOff = -1;        // TSpeedButton.FGroupIndex (private; 0 = not a toggle button)
+    int setEnabledSlot = -1;   // TControl.SetEnabled's VMT offset
+    void *mClearData = nullptr, *airCleanup = nullptr;  // the battle screen's close: TfrmMain.ClearData(2, True) + air
 } E;
 
 static int g_speedGetIdx = -1;  // the speed combo box's GetItemIndex slot in its VMT (from cbGameSpeedChange)
@@ -281,6 +288,32 @@ bool Resolve() {
     if (!DualOk()) E.missing += "(identification swap) ";
     E.fCbSpeed = dl::Field("TfrmMain", "cbGameSpeed");
     E.fTvShipsTree = E.fTvShips;
+    // UpDown1Click (the arrows next to the speed box), down arrow: cmp byte ptr [eax+FDown], 0; je +7; mov eax, ebx;
+    // call <the Fastest available button up again>
+    if ((hit = Find(dl::Method("TfrmMain", "UpDown1Click"), 0x80,
+                    {0x80, 0xB8, -1, -1, 0x00, 0x00, 0x00, 0x74, 0x07, 0x8B, 0xC3, 0xE8}))) {
+        E.releaseFastest = CallTarget(hit + 11);
+        E.fDownOff = *(int32_t*)(hit + 2);
+    }
+    E.fFastestBtn = dl::Field("TfrmMain", "sbFastestAvailable");
+    // The release routine: mov eax, [ebx+sbFastestAvailable]; xor edx, edx; call TSpeedButton.SetDown
+    if (E.releaseFastest && (hit = Find(E.releaseFastest, 0x20, {0x33, 0xD2, 0xE8}))) E.setDown = CallTarget(hit + 2);
+    E.fGroupOff = dl::Field("TCustomSpeedButton", "FGroupIndex");
+    if (int fd = dl::Field("TCustomSpeedButton", "FDown"); fd >= 0 && fd != E.fDownOff) {
+        Log("lockstep: TSpeedButton.FDown at +%x (RTTI), +%x in UpDown1Click: the button helpers are off", fd, E.fDownOff);
+        E.setDown = nullptr;
+    }
+    // sbAutoRunBattleClick: mov eax, [eax+control]; xor edx, edx; mov ecx, [eax]; call [ecx+SetEnabled]
+    if ((hit = Find(dl::Method("TfrmMain", "sbAutoRunBattleClick"), 0x200, {0x33, 0xD2, 0x8B, 0x08, 0xFF, 0x91, -1, -1, 0x00, 0x00})))
+        E.setEnabledSlot = *(int32_t*)(hit + 6);
+    // TfrmMain.FormClose clears the battle's data before the screen goes: mov cl, 1; mov edx, 2; mov eax, [ebp-4];
+    // call ClearData; call <free the battle's air formations>
+    if ((hit = Find(dl::Method("TfrmMain", "FormClose"), 0x600,
+                    {0xB1, 0x01, 0xBA, 0x02, 0x00, 0x00, 0x00, 0x8B, 0x45, 0xFC, 0xE8, -1, -1, -1, -1, 0xE8})) &&
+        CallTarget(hit + 10) == dl::Method("TfrmMain", "ClearData")) {
+        E.mClearData = CallTarget(hit + 10);
+        E.airCleanup = CallTarget(hit + 15);
+    }
     // cbGameSpeedChange: mov eax, [ebx+cbGameSpeed]; mov edx, [eax]; call [edx+GetItemIndex]
     if ((hit = Find(speed, 0x40, {0x8B, 0x83, -1, -1, -1, -1, 0x8B, 0x10, 0xFF, 0x92, -1, -1, -1, -1})))
         g_speedGetIdx = *(int*)(hit + 10);
@@ -589,9 +622,12 @@ static CtxHook g_ctx[] = {
     {"TfrmMain", "PlayWave", K_UI, 0},                     // (FileName, Modus)
     {"TfrmMain", "tvShipsChange", K_UI, 0},                // (Sender, Node)
     {"TFightingShip", "GetTypeAndNameForEnemy", K_UI, 0},  // (var Result)
+    // (): the "Show air formations" list, which the end of a minute refreshes; it lists this PC's side
+    {"TdlgShowAirFormations", "UpdateListSortedByBase", K_UI, 0},
 };
 static const int kCtxHooks = sizeof(g_ctx) / sizeof(g_ctx[0]);
 static const int kManual = -1;  // a frame of the mod's own shared section
+static int g_ctxFillTree = -1;  // the index of FillShipTree in g_ctx
 
 struct Frame {
     uint32_t slot;  // the address of the caller's return address (shared sections: the owner's stack position)
@@ -621,13 +657,15 @@ static void OnSimFrameUnwound(int idx);
 static void LeakCheckEnter(int idx);
 static int g_outerIdxFwd();
 static void OnResultsExit();
+static void OnResultsEnter();
 
 static void FrameEnterCount(int kind, int dir) {
     if (kind == K_RES) {
-        if (dir > 0)
-            g_results++;
-        else if (g_results > 0)
+        if (dir > 0) {
+            if (++g_results == 1) OnResultsEnter();
+        } else if (g_results > 0) {
             g_results--;
+        }
         ApplyViewSide();
         return;
     }
@@ -691,6 +729,9 @@ extern "C" void __stdcall LS_CtxEnter(int idx, Regs* r, uint32_t slot) {
     __try {
         PruneBelow(slot, true, g_ctx[idx].name);
         if (g_nFrames < 512) g_frames[g_nFrames++] = {slot, idx, g_ctx[idx].kind};
+        // The end of a minute refills the ship tree for PlayerSide, which is the canonical side 0 inside the
+        // simulation: the tree is display only, so it shows this PC's own side (ECX = aSide; the thunk's popad uses it).
+        if (idx == g_ctxFillTree && g_sim > 0 && g_viewSide >= 0 && r->ecx == 0) r->ecx = (uint32_t)g_viewSide;
         if ((idx == H_DETACH || idx == H_CSDD) && g_sim == 0)
             OnActionEnter(idx, (void*)(uintptr_t)r->edx, (void*)(uintptr_t)r->ecx);
         if (g_sim == 0 && g_ctx[idx].kind == K_SIM) g_outerIdx = idx;
@@ -818,7 +859,7 @@ int __stdcall LS_StartRun(void* self, int n);
 int __stdcall LS_MsgDlg(const wchar_t* msg, int type, int buttons);
 int __stdcall LS_ShowPic(const wchar_t* text, const wchar_t* pic);
 int __stdcall LS_ExecGeneral(const wchar_t* prompt, int preselect);
-int __stdcall LS_Block(int idx, void* self);
+int __stdcall LS_Block(int idx, void* self, void* sender, uint32_t arg3);
 }
 
 extern "C" __declspec(naked) void LS_dStartMinute() {  // StartMinute(Self)
@@ -935,7 +976,7 @@ struct Blocker {
     int policy;  // see LS_Block
     void* orig;
 };
-enum { B_PAUSE, B_END, B_AUTORUN, B_DETACH, B_UNAVAILABLE, B_SAVE, B_SPEED };
+enum { B_PAUSE, B_END, B_AUTORUN, B_DETACH, B_UNAVAILABLE, B_SAVE, B_SPEED, B_ARROW, B_FASTEST };
 static Blocker g_blockers[] = {
     {"TfrmMain", "sbPauseClick", B_PAUSE},
     {"TfrmMain", "sbEndGameClick", B_END},
@@ -944,8 +985,9 @@ static Blocker g_blockers[] = {
     {"TdlgDivisionReport", "Detach1Click", B_DETACH},
     {"TfrmMain", "sbSaveClick", B_SAVE},
     {"TfrmMain", "cbGameSpeedChange", B_SPEED},
+    {"TfrmMain", "UpDown1Click", B_ARROW},
     {"TfrmMain", "cbFastestAvailableClick", B_UNAVAILABLE},
-    {"TfrmMain", "sbFastestAvailableClick", B_UNAVAILABLE},
+    {"TfrmMain", "sbFastestAvailableClick", B_FASTEST},
     {"TfrmMain", "sbStrikeClick", B_UNAVAILABLE},
     {"TfrmMain", "LaunchStrike1Click", B_UNAVAILABLE},
     {"TfrmMain", "Launchstrike2Click", B_UNAVAILABLE},
@@ -990,7 +1032,8 @@ static void* EmitBlockThunk(int idx) {
         p += 4;
     };
     b({0x50, 0x51, 0x52});  // push eax; push ecx; push edx
-    b({0x50, 0x68});        // push eax (Self); push idx
+    b({0x51, 0x52, 0x50});  // push ecx (the third register argument); push edx (Sender); push eax (Self)
+    b({0x68});              // push idx
     d((uint32_t)idx);
     b({0xB8});              // mov eax, LS_Block
     d(U((void*)&LS_Block));
@@ -1035,6 +1078,7 @@ bool EnsureHooks() {
     for (int i = 0; i < kCtxHooks; i++) {
         CtxHook& h = g_ctx[i];
         if (h.cls) h.target = dl::Method(h.cls, h.name);
+        if (h.cls && strcmp(h.name, "FillShipTree") == 0) g_ctxFillTree = i;
         h.thunk = h.target ? EmitCtxThunk(i) : nullptr;
         void* detour = i == H_STARTMINUTE ? (void*)&LS_dStartMinute : i == H_EOTP ? (void*)&LS_dEOTP : h.thunk;
         if (i == H_STARTMINUTE) g_lsThunkStartMinute = h.thunk;
@@ -1106,6 +1150,7 @@ static struct Session {
     int runLeft = 0;             // A: minutes still to release
     std::string runWhat = "paused";
     int wantSpeed = INT_MIN;  // A: game speed to apply with the next release
+    int clockSpeed = INT_MIN;  // B: the game speed A announced last (the speed arrows step from it)
     // the boundary hashes (A compares)
     std::string myHash;
     uint32_t myRng = 0;
@@ -2067,6 +2112,8 @@ static bool CleanStack(std::string* why = nullptr) {
     return r == nullptr;
 }
 
+static void SwapCampaignDate();
+
 static bool SaveSnapshot(std::string& err) {
     void* m = BattleForm();
     void* bc = E.buildCampVar ? *E.buildCampVar : nullptr;
@@ -2083,7 +2130,11 @@ static bool SaveSnapshot(std::string& err) {
     CanonBegin();  // the battle is saved with the simulation's state, not this PC's display set
     g_quiet++;
     SafeCall(E.saveScenario, U(m), p.ptr(), 0, 0, nullptr, &ok1);
-    if (ok1) SafeCall(E.mSaveCampaign, U(bc), (uint32_t)*E.inProgVar, 0, 1, st, &ok2);
+    if (ok1) {
+        SwapCampaignDate();  // the campaign's own date into [General], not the battle's day and month
+        SafeCall(E.mSaveCampaign, U(bc), (uint32_t)*E.inProgVar, 0, 1, st, &ok2);
+        SwapCampaignDate();
+    }
     g_quiet--;
     CanonEnd();
     Log("lockstep: battle saved into slot %d at t=%s (%s) in %lu ms", slot, ClockText().c_str(),
@@ -2092,13 +2143,73 @@ static bool SaveSnapshot(std::string& err) {
     return ok1 && ok2;
 }
 
+// The unit variable of a form the program creates at startup: code reads it with `mov eax, [cell]; mov eax, [eax]`, and
+// the variable holds an instance of exactly this class.
+static void** FormVarOf(const char* cls) {
+    uint32_t vmt = U(dl::ClassVmt(cls));
+    if (!vmt) return nullptr;
+    uint8_t* p = (uint8_t*)dl::g_base + 0x1000;
+    uint8_t* end = (uint8_t*)dl::g_base + dl::g_size - 8;
+    for (; p < end; p++) {
+        if (p[0] != 0xA1 || p[5] != 0x8B || p[6] != 0x00) continue;
+        void* var = VarFromCell(p + 1);
+        if (!var) continue;
+        __try {
+            void* obj = *(void**)var;
+            if (obj && *(uint32_t*)obj == vmt) return (void**)var;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    return nullptr;
+}
+
+// The battle's modeless dialogs keep pointers to its ships, divisions and air formations. Before the battle is loaded
+// again (start, resync, leaving) they are hidden, so none of them is used after a load freed those objects.
+static const char* kBattleDialogs[] = {"TdlgShowAirFormations", "TdlgDivisionReport", "TdlgForceOrders",
+                                       "TdlgSelectLead",        "TdlgTorpTargets",    "TdlgStrike",
+                                       "TdlgMissileFire"};
+static const int kBattleDialogCount = sizeof(kBattleDialogs) / sizeof(kBattleDialogs[0]);
+static void** g_dialogVars[kBattleDialogCount] = {};
+static bool g_dialogsResolved = false;
+
+static void ResolveBattleDialogs() {
+    if (g_dialogsResolved) return;
+    g_dialogsResolved = true;
+    std::string missing;
+    for (int i = 0; i < kBattleDialogCount; i++)
+        if (!(g_dialogVars[i] = FormVarOf(kBattleDialogs[i]))) missing += std::string(" ") + kBattleDialogs[i];
+    Log("lockstep: battle dialogs resolved%s", missing.empty() ? "" : (", not found:" + missing).c_str());
+}
+
+static void HideBattleDialogs() {
+    ResolveBattleDialogs();
+    if (!E.mHide) return;
+    for (int i = 0; i < kBattleDialogCount; i++) {
+        void* f = g_dialogVars[i] ? *g_dialogVars[i] : nullptr;
+        if (!f || !game::FormVisible(f)) continue;
+        bool ok = false;
+        SafeCall(E.mHide, U(f), 0, 0, 0, nullptr, &ok);
+        Log("lockstep: %s hidden before the battle is loaded again (%s)", kBattleDialogs[i], ok ? "ok" : "FAILED");
+    }
+}
+
 // The battle form as DoBattle makes it: free the old one, create a fresh (hidden) one into the unit variable.
 static bool ResetBattleForm() {
     void* app = E.appVar ? *E.appVar : nullptr;
     if (!app || !E.vmtMain || !E.frmMainVar) return false;
+    HideBattleDialogs();
     bool ok = true;
     void* f = *E.frmMainVar;
     if (f) {
+        // The game's own teardown, as the battle screen's close runs it: freeing the form alone leaves the battle's
+        // global lists behind, and the next load appends to them (the air formations doubled with every load).
+        if (E.mClearData) {
+            bool okClear = false, okAir = false;
+            SafeCall(E.mClearData, U(f), 2, 1, 0, nullptr, &okClear);
+            if (E.airCleanup) SafeCall(E.airCleanup, 0, 0, 0, 0, nullptr, &okAir);
+            Log("lockstep: battle data cleared (%s), air formations left %d", okClear && okAir ? "ok" : "FAILED",
+                dl::ListCount(List(E.airVar)));
+        }
         if (game::FormVisible(f)) SafeCall(E.mHide, U(f), 0, 0, 0, nullptr, &ok);
         SafeCall(E.mFree, U(f), 0, 0, 0, nullptr, &ok);
         *E.frmMainVar = nullptr;
@@ -2159,6 +2270,8 @@ static void ApplySpeed(int s) {  // inside a shared section
     Log("lockstep: game speed %d", s);
 }
 
+static void LockMissilePanel();
+
 // Loads the slot's battle with the shared seed (both PCs do exactly this). first = the first start of this battle.
 static bool LoadSnapshot(int slot, uint32_t seed, int speed, bool first, std::string& err) {
     DWORD t0 = GetTickCount();
@@ -2216,6 +2329,7 @@ static bool LoadSnapshot(int slot, uint32_t seed, int speed, bool first, std::st
     SetView(g_noView ? -1 : S.mySide);
     g_traceSeq.clear();
     RefreshView();
+    LockMissilePanel();
     Log("lockstep: battle loaded from slot %d (seed %u, minute %d, t=%s) in %lu ms", slot, seed, S.boundary,
         ClockText().c_str(), GetTickCount() - t0);
     return true;
@@ -2245,6 +2359,22 @@ static bool Contains(const std::wstring& s, const wchar_t* sub) {
 
 static void OnGameText(const std::wstring& text, bool proposal);
 
+// A box's text for the chat: file paths shortened to the file name (the battle's "Game saved! <path>" names the
+// player's own folders, and a pause line goes to both players).
+static std::string ChatSafe(const std::wstring& text) {
+    std::wstring s = text;
+    for (size_t i = 0; i + 2 < s.size(); i++) {
+        bool drive = iswalpha(s[i]) && s[i + 1] == L':' && (s[i + 2] == L'\\' || s[i + 2] == L'/') &&
+                     (i == 0 || !iswalnum(s[i - 1]));
+        if (!drive) continue;
+        size_t eol = s.find_first_of(L"\r\n", i);
+        if (eol == std::wstring::npos) eol = s.size();
+        size_t sep = s.find_last_of(L"\\/", eol - 1);
+        if (sep != std::wstring::npos && sep >= i) s.erase(i, sep + 1 - i);
+    }
+    return W2U(s);
+}
+
 extern "C" int __stdcall LS_MsgDlg(const wchar_t* msg, int type, int buttons) {
     if (g_results > 0 && !g_quiet) return -1;  // the result screen's questions are each player's own
     bool sim = g_sim > 0 && S.on;
@@ -2264,8 +2394,8 @@ extern "C" int __stdcall LS_MsgDlg(const wchar_t* msg, int type, int buttons) {
             proposal = Contains(text, L"end the scenario");
         }
     }
-    g_lastBox = W2U(text);
-    Log("lockstep: %s box '%s' answered %d", g_quiet ? "quiet" : g_answerYes ? "end" : "minute", g_lastBox.c_str(), r);
+    if (!g_quiet) g_lastBox = ChatSafe(text);  // the mod's own saves' boxes are never a reason for a pause
+    Log("lockstep: %s box '%s' answered %d", g_quiet ? "quiet" : g_answerYes ? "end" : "minute", W2U(text).c_str(), r);
     if (sim) OnGameText(text, proposal);
     return r;
 }
@@ -2432,8 +2562,39 @@ static int ReadSpeedCombo(void* self, void* m) {
     return want;
 }
 
-// Click handlers: 1 = handled here (the game's handler doesn't run).
-extern "C" int __stdcall LS_Block(int idx, void* self) {
+// A blocked click on a toggle speed button: VCL flipped its Down state before the handler ran; put it back, so the screen
+// and the code that reads the button (the division report's OK reads the land-CAP button) keep what is in effect.
+static void PutToggleBack(void* btn) {
+    if (!btn || !E.setDown || E.fDownOff <= 0 || E.fGroupOff <= 0 || !dl::IsInstanceOf(btn, "TSpeedButton")) return;
+    if (dl::At<int>(btn, E.fGroupOff) == 0) return;  // not a toggle button: nothing was flipped
+    bool down = dl::At<uint8_t>(btn, E.fDownOff) != 0;
+    bool ok = false;
+    SafeCall(E.setDown, U(btn), down ? 0 : 1, 0, 0, nullptr, &ok);
+}
+
+// The missile panel's "Fire at will" and "Fire mode" steer the first side's automatic missile fire inside the simulation,
+// but each PC reads its own. In a live battle they keep a new battle screen's defaults and are disabled, so both PCs
+// fire alike.
+static void LockMissilePanel() {
+    void* m = BattleForm();
+    if (!m || E.setEnabledSlot <= 0) return;
+    static int fFire = -2, fDoctrine = -2, fEnabled = -2;
+    if (fFire == -2) {
+        fFire = dl::Field("TfrmMain", "cbFireAtWill");
+        fDoctrine = dl::Field("TfrmMain", "rgMissileDoctrine");
+        fEnabled = dl::Field("TControl", "FEnabled");
+    }
+    for (int off : {fFire, fDoctrine}) {
+        void* c = off >= 0 ? dl::At<void*>(m, off) : nullptr;
+        if (!c || (fEnabled >= 0 && !dl::At<uint8_t>(c, fEnabled))) continue;
+        void** vt = *(void***)c;
+        bool ok = false;
+        SafeCall(vt[E.setEnabledSlot / 4], U(c), 0, 0, 0, nullptr, &ok);
+    }
+}
+
+// Click handlers: 1 = handled here (the game's handler doesn't run). sender and arg3 are the handler's EDX and ECX.
+static int LS_BlockImpl(int idx, void* self, void* sender, uint32_t arg3) {
     if (!S.on || idx < 0 || idx >= kBlockers) return 0;
     const Blocker& b = g_blockers[idx];
     void* m = BattleForm();
@@ -2454,6 +2615,28 @@ extern "C" int __stdcall LS_Block(int idx, void* self) {
             if (want >= -3 && want <= 5) RunOnMainThread([want] { ClockRequest("speed", want); });
             return 1;
         }
+        case B_ARROW: {  // UpDown1Click: one step from the speed in use, by the game's own rule, as a request
+            if (!m) return 1;
+            int base = S.isA ? (S.wantSpeed != INT_MIN ? S.wantSpeed : CurSpeed())
+                             : (S.clockSpeed != INT_MIN ? S.clockSpeed : CurSpeed());
+            bool engaged = E.fEngaged >= 0 && dl::At<uint8_t>(m, E.fEngaged) != 0;
+            int want = base;
+            if ((arg3 & 0xff) == 0) {  // btNext: up, at most Fast while ships are in contact
+                if ((base < 5 && !engaged) || base < 2) want = base + 1;
+            } else if ((arg3 & 0xff) == 1 && base > -3) {  // btPrev: down
+                want = base - 1;
+            }
+            if (want != base) RunOnMainThread([want] { ClockRequest("speed", want); });
+            return 1;
+        }
+        case B_FASTEST: {
+            // The button went down before this handler ran, and the game's speed governor reads it at every minute
+            // boundary: put it up again, or this PC's minutes could run at another speed than the other PC's.
+            bool ok = false;
+            if (m && E.releaseFastest) SafeCall(E.releaseFastest, U(m), 0, 0, 0, nullptr, &ok);
+            RunOnMainThread([] { Chat("Fastest available is not available in a live battle yet; use the speed box."); });
+            return 1;
+        }
         case B_AUTORUN:
             RunOnMainThread([] { Chat("Auto-run is not available in a live battle; use Run (until a break)."); });
             return 1;
@@ -2466,6 +2649,12 @@ extern "C" int __stdcall LS_Block(int idx, void* self) {
             return 1;
         }
     }
+}
+
+extern "C" int __stdcall LS_Block(int idx, void* self, void* sender, uint32_t arg3) {
+    int r = LS_BlockImpl(idx, self, sender, arg3);
+    if (r && g_blockers[idx].policy != B_FASTEST) PutToggleBack(sender);  // B_FASTEST puts its button up itself
+    return r;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2524,7 +2713,7 @@ static void ChatBoth(const std::string& s) {
 
 static void OnGameText(const std::wstring& text, bool proposal) {
     if (!S.isA || text.empty()) return;  // B: the texts are written for side 0
-    std::string t = W2U(text);
+    std::string t = ChatSafe(text);
     if (proposal) {
         S.proposal = true;
         RunOnMainThread([t] { ChatBoth("The game asks: \"" + t + "\" Press End on both sides to end the battle."); });
@@ -2779,6 +2968,7 @@ static void ApplyRelease(const KV& kv) {
         return;
     }
     S.atBoundary = false;
+    if (!S.isA) S.clockSpeed = speed;
     CheckFpu("release");
     int withActions = 0;
     S.inAction = true;
@@ -2913,6 +3103,7 @@ static void OnBoundary() {
     if (!S.on || S.st != St::Running || S.minuteRunning) return;
     void* m = BattleForm();
     if (!m) return;
+    LockMissilePanel();  // the game's missile panel refresh could have enabled them again
     S.boundary = Minute();
     S.brokenMinutes = 0;
     CheckFpu("minute");
@@ -3200,6 +3391,7 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
     S.epoch = epoch;
     S.seed = (uint32_t)strtoul(KVStr(h, "seed", "1").c_str(), nullptr, 10);
     S.startSpeed = KVInt(h, "speed", 1);
+    S.clockSpeed = S.startSpeed;
     S.prefsA = KVStr(h, "prefs");
     S.gameDirA = KVStr(h, "gd");
     S.cw0 = (unsigned)KVInt(h, "cw");
@@ -3306,6 +3498,7 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
         ApplyRelease(h);
     } else if (t == "info") {
         S.runLeft = KVInt(h, "left");
+        S.clockSpeed = KVInt(h, "speed", S.clockSpeed);
         S.endWant[0] = KVInt(h, "e0") != 0;
         S.endWant[1] = KVInt(h, "e1") != 0;
         std::string msg = KVStr(h, "msg");
@@ -3328,6 +3521,93 @@ bool IsAuthority() { return S.on && S.isA; }
 int BattleId() { return S.on ? S.bid : -1; }
 bool IsHolding() { return S.on && S.isA && S.st == St::Holding; }
 
+// The campaign date: Year, Month and Day are Word unit variables. The game's resume path (the `.sac` reader) writes the
+// battle's own day and month into them, and the campaign's month advance starts from a separate date that each load
+// sets from the save's [General] date. So A records the date when its battle opens, every snapshot saves that date
+// (else one resync makes the drift permanent, and a battle dated in the next month skips a month), and a battle slot's
+// close, which runs no month, puts it back.
+static uint16_t* g_dateVar[3] = {};  // year, month, day
+static uint16_t g_campDate[3] = {};
+static bool g_campDateSet = false;
+
+static bool ResolveDate() {
+    static bool tried = false;
+    if (tried) return g_dateVar[0] != nullptr;
+    tried = true;
+    // LoadBuildCampaign: mov ecx, [Day]; movzx ecx, word [ecx]; mov edx, [Month]; movzx edx, word [edx]; mov eax, [Year];
+    // movzx eax, word [eax]; call EncodeDate; fstp qword ptr [the campaign date]
+    uint8_t* hit = Find(dl::Method("TfrmBuildCamp", "LoadBuildCampaign"), 0x3000,
+                        {0x8B, 0x0D, -1, -1, -1, -1, 0x0F, 0xB7, 0x09, 0x8B, 0x15, -1, -1, -1, -1, 0x0F, 0xB7, 0x12,
+                         0xA1, -1, -1, -1, -1, 0x0F, 0xB7, 0x00, 0xE8, -1, -1, -1, -1, 0xDD, 0x1D});
+    if (hit) {
+        g_dateVar[2] = (uint16_t*)VarFromCell(hit + 2);
+        g_dateVar[1] = (uint16_t*)VarFromCell(hit + 11);
+        g_dateVar[0] = (uint16_t*)VarFromCell(hit + 19);
+    }
+    if (!g_dateVar[0] || !g_dateVar[1] || !g_dateVar[2]) g_dateVar[0] = g_dateVar[1] = g_dateVar[2] = nullptr;
+    if (g_dateVar[0])
+        Log("lockstep: campaign date at %p/%p/%p: %u-%02u-%02u", g_dateVar[0], g_dateVar[1], g_dateVar[2], *g_dateVar[0],
+            *g_dateVar[1], *g_dateVar[2]);
+    else
+        Log("lockstep: campaign date NOT found (a resync may move the host's campaign date)");
+    return g_dateVar[0] != nullptr;
+}
+
+static void RecordCampaignDate() {
+    if (!ResolveDate()) return;
+    if (g_campDateSet) {  // this PC's last live battle neither closed nor ran a month (tests start one over another)
+        Log("lockstep: campaign date %u-%02u-%02u kept from the battle before (the variables had %u-%02u-%02u)",
+            g_campDate[0], g_campDate[1], g_campDate[2], *g_dateVar[0], *g_dateVar[1], *g_dateVar[2]);
+        for (int i = 0; i < 3; i++) *g_dateVar[i] = g_campDate[i];
+        return;
+    }
+    for (int i = 0; i < 3; i++) g_campDate[i] = *g_dateVar[i];
+    g_campDateSet = true;
+    Log("lockstep: campaign date recorded: %u-%02u-%02u", g_campDate[0], g_campDate[1], g_campDate[2]);
+}
+
+// The campaign's month runs (DoStrategicTurn): it goes on from the campaign's own date. The variables get that date back
+// first (the steps before the month advance read them), then the record is done.
+void OnMonthRuns() {
+    if (!g_campDateSet) return;
+    if (g_dateVar[0])
+        for (int i = 0; i < 3; i++) *g_dateVar[i] = g_campDate[i];
+    Log("lockstep: the month runs: campaign date %u-%02u-%02u put back, the record is dropped", g_campDate[0],
+        g_campDate[1], g_campDate[2]);
+    g_campDateSet = false;
+}
+
+// The battle's result screen opens (the battle is over): the aftermath (victory points, prestige, the month's record row)
+// and the rest of the month read the campaign's own date, as in a battle that was never reloaded.
+static void OnResultsEnter() {
+    if (!g_campDateSet || !g_dateVar[0]) return;
+    if (*g_dateVar[0] == g_campDate[0] && *g_dateVar[1] == g_campDate[1] && *g_dateVar[2] == g_campDate[2]) return;
+    Log("lockstep: the battle's results: campaign date %u-%02u-%02u put back (the battle's date was %u-%02u-%02u)",
+        g_campDate[0], g_campDate[1], g_campDate[2], *g_dateVar[0], *g_dateVar[1], *g_dateVar[2]);
+    for (int i = 0; i < 3; i++) *g_dateVar[i] = g_campDate[i];
+}
+
+// A campaign load that isn't this PC's live battle's own: the recorded date belongs to another state.
+void OnCampaignLoading() {
+    if (S.on || !g_campDateSet) return;
+    Log("lockstep: a campaign is loaded: the recorded campaign date is dropped");
+    g_campDateSet = false;
+}
+
+// Swaps the recorded campaign date and the date in the variables (around the snapshot's campaign save).
+static void SwapCampaignDate() {
+    if (!g_campDateSet || !g_dateVar[0]) return;
+    for (int i = 0; i < 3; i++) std::swap(g_campDate[i], *g_dateVar[i]);
+}
+
+void OnBattleSlotClosed() {
+    if (!g_campDateSet || !g_dateVar[0]) return;
+    Log("lockstep: campaign date %u-%02u-%02u put back (was %u-%02u-%02u after the battle)", g_campDate[0], g_campDate[1],
+        g_campDate[2], *g_dateVar[0], *g_dateVar[1], *g_dateVar[2]);
+    for (int i = 0; i < 3; i++) *g_dateVar[i] = g_campDate[i];
+    g_campDateSet = false;
+}
+
 void Hold(const std::string& why, int bid) {
     if (S.on && S.st != St::Ended) return;
     if (!Available() || !EnsureHooks()) return;
@@ -3339,6 +3619,7 @@ void Hold(const std::string& why, int bid) {
     S.st = St::Holding;
     S.why = why;
     S.lastPeerMsg = GetTickCount();
+    RecordCampaignDate();  // the battle just opened: no load has touched the date yet
     Log("lockstep: battle held at its start (%s)", why.c_str());
     Chat("Live battle: " + why);
 }
@@ -3745,6 +4026,69 @@ std::string Debug(const std::vector<std::string>& a) {
         RefreshView();
         return ok && nd ? "ok " + W2U(ObjName(nd)) : "error detach";
     }
+    if (c == "ctl") {  // ls ctl <form class> <field>: a control's state (tests: blocked toggles put back, panel locks)
+        std::string cls = arg(2), fld = arg(3);
+        void* form = nullptr;
+        if (cls == "TfrmMain") {
+            form = Frm();
+        } else {
+            void** v = FormVarOf(cls.c_str());
+            form = v ? *v : nullptr;
+        }
+        if (!form) return "error no " + cls;
+        int off = dl::Field(cls.c_str(), fld.c_str());
+        void* ctl = off >= 0 ? dl::At<void*>(form, off) : nullptr;
+        if (!ctl) return "error no control " + fld;
+        static int fEn = dl::Field("TControl", "FEnabled"), fVis = dl::Field("TControl", "FVisible");
+        std::string out = std::string("ok class=") + dl::ClassNameOf(ctl);
+        if (fEn >= 0) out += " enabled=" + std::to_string(dl::At<uint8_t>(ctl, fEn));
+        if (fVis >= 0) out += " visible=" + std::to_string(dl::At<uint8_t>(ctl, fVis));
+        if (dl::IsInstanceOf(ctl, "TSpeedButton") && E.fDownOff > 0)
+            out += " down=" + std::to_string(dl::At<uint8_t>(ctl, E.fDownOff)) +
+                   (E.fGroupOff > 0 ? " group=" + std::to_string(dl::At<int>(ctl, E.fGroupOff)) : "");
+        return out;
+    }
+    if (c == "airwin") {  // ls airwin [show]: the "Show air formations" window and what it lists (tests: fog of war)
+        ResolveBattleDialogs();
+        void* dlg = g_dialogVars[0] ? *g_dialogVars[0] : nullptr;
+        if (!dlg) return "error no air formations window";
+        if (arg(2) == "show") {  // as the toolbar button does
+            void* m = Frm();
+            void* fn = dl::Method("TfrmMain", "sbAircraftClick");
+            if (!m || !fn) return "error no battle";
+            bool ok = false;
+            SafeCall(fn, U(m), 0, 0, 0, nullptr, &ok);
+            if (!ok) return "error the window did not open";
+        }
+        int bySide[3] = {0, 0, 0};
+        int fSide = dl::Field("TAirFormation", "Side");
+        void* air = List(E.airVar);
+        for (int i = 0; i < dl::ListCount(air) && fSide >= 0; i++)
+            if (void* af = dl::ListItem(air, i)) {
+                int sd = dl::At<int>(af, fSide);
+                bySide[sd == 0 ? 0 : sd == 1 ? 1 : 2]++;
+            }
+        int flv = dl::Field("TdlgShowAirFormations", "lvAirFormations");
+        void* lv = flv >= 0 ? dl::At<void*>(dlg, flv) : nullptr;
+        HWND h = lv ? game::FormHwnd(lv) : nullptr;
+        int n = h ? (int)SendMessageW(h, LVM_GETITEMCOUNT, 0, 0) : -1;
+        std::string out = "ok visible=" + std::to_string(game::FormVisible(dlg) ? 1 : 0) + " items=" + std::to_string(n) +
+                          " af0=" + std::to_string(bySide[0]) + " af1=" + std::to_string(bySide[1]) +
+                          " afx=" + std::to_string(bySide[2]);
+        for (int i = 0; i < n && i < 60; i++) {  // the first three columns of each row
+            out += " |";
+            for (int col = 0; col < 3; col++) {
+                wchar_t buf[128] = {};
+                LVITEMW it = {};
+                it.iSubItem = col;
+                it.pszText = buf;
+                it.cchTextMax = 127;
+                SendMessageW(h, LVM_GETITEMTEXTW, (WPARAM)i, (LPARAM)&it);
+                out += (col ? "~" : "") + W2U(buf);
+            }
+        }
+        return out;
+    }
     if (c == "divs") {  // ls divs: the divisions with their index, side and orders
         std::string out = "ok";
         void* divs = List(E.divisionsVar);
@@ -3805,13 +4149,15 @@ bool DumpState(const std::wstring& path) {
 
 std::string StateText() {
     void* m = Frm();
-    char b[760];
+    char b[800];
     if (!m) return "ok frm=0";
     HWND h = game::FormHwnd(m);
+    void* fastBtn = E.fFastestBtn >= 0 ? dl::At<void*>(m, E.fFastestBtn) : nullptr;
+    int fastest = fastBtn && E.fDownOff > 0 && E.fDownOff < 0x1000 ? dl::At<uint8_t>(fastBtn, E.fDownOff) : -1;
     snprintf(b, sizeof(b),
              "ok running=%d moving=%d frm=1 visible=%d t=%s min=%d left=%d finished=%d pause=%d autorun=%d endgame=%d "
              "engaged=%d speed=%d intervals=%d ivsec=%d playerSide=%d forces=%d divs=%d allships=%d af=%d torps=%d "
-             "draws=%llu/%llu/%llu gate=%d/%d ls=%s",
+             "draws=%llu/%llu/%llu gate=%d/%d ls=%s fastest=%d",
              TimerOn(m, E.fRunTimer) ? 1 : 0, TimerOn(m, E.fMoveTimer) ? 1 : 0, h && IsWindowVisible(h) ? 1 : 0,
              ClockText().c_str(), Minute(), dl::At<int>(m, E.fMinutesLeft), dl::At<uint8_t>(m, E.fFinished),
              dl::At<uint8_t>(m, E.fPause), E.fAutoRun >= 0 ? dl::At<uint8_t>(m, E.fAutoRun) : -1,
@@ -3821,7 +4167,7 @@ std::string StateText() {
              dl::ListCount(List(E.forcesVar)), dl::ListCount(List(E.divisionsVar)), dl::ListCount(List(E.allShipsVar)),
              dl::ListCount(List(E.airVar)), dl::ListCount(List(E.torpVar)), (unsigned long long)g_draws[0],
              (unsigned long long)g_draws[1], (unsigned long long)g_draws[2], g_pocGate ? 1 : 0, g_pocTokens,
-             S.on ? StName(S.st) : "off");
+             S.on ? StName(S.st) : "off", fastest);
     return b;
 }
 

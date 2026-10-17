@@ -1614,6 +1614,7 @@ extern "C" __declspec(naked) void d_ReduceTimeLimits() {
 extern "C" void __stdcall CB_BeforeLoad(void* self) {
     try {
         ClearIntelReports(self);
+        hookcb::OnCampaignLoading();
     } catch (...) {
         Log("exception clearing intel reports");
     }
@@ -2040,8 +2041,22 @@ std::vector<std::wstring> AreaNames() {
 // Steps of the campaign the battle screen's close runs; skipped in a battle slot (which = 1 DoStrategicTurn, 2
 // AdvanceDesignStudies).
 extern "C" int __stdcall CB_SkipCampaignStep(int which) {
-    if (!g_battleSlotMode) return 0;
+    if (!g_battleSlotMode) {
+        if (which == 1) {
+            __try {
+                hookcb::OnStrategicTurnRuns();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
+        return 0;
+    }
     Log("battle slot: %s skipped", which == 1 ? "DoStrategicTurn" : "AdvanceDesignStudies");
+    if (which == 1) {
+        __try {
+            hookcb::OnBattleSlotSkippedTurn();  // the month that would have reset the campaign date doesn't run
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
     return 1;
 }
 

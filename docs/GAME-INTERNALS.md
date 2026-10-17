@@ -10,6 +10,7 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
 - [Where the facts come from](#where-the-facts-come-from)
 - [The game and the mod: facts you can rely on](#the-game-and-the-mod-facts-you-can-rely-on)
 - [Tactical battles](#tactical-battles)
+  - [Battle commands](#battle-commands)
 
 ## How to read the addresses
 - The mod resolves everything by name at runtime. Addresses and offsets here and in MODLOG are documentation for
@@ -28,8 +29,9 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
   [peace terms](../MODLOG.md#feature-2026-10-06-peace-terms-for-wars-between-players-v025),
   [victory points](../MODLOG.md#fix-2026-10-12-joined-players-victory-points-never-rose-against-the-host-v026),
   [Copy game](../MODLOG.md#fix-2026-10-13-a-joined-players-copy-game-played-the-hosts-nation-v027),
-  [research](../MODLOG.md#fix-2026-10-15-the-games-ai-research-choices-reset-joined-players-research-priorities-v030)
-  and [the battle investigation](../MODLOG.md#investigation-2026-10-14-tactical-battles-joined-players-vs-ai-live-lockstep-pvp-v030).
+  [research](../MODLOG.md#fix-2026-10-15-the-games-ai-research-choices-reset-joined-players-research-priorities-v030),
+  [the battle investigation](../MODLOG.md#investigation-2026-10-14-tactical-battles-joined-players-vs-ai-live-lockstep-pvp-v030)
+  and [the limits of live battles](../MODLOG.md#investigation-2026-10-16-the-limits-of-live-battles-static-v031).
 - The offline analysis workspace (outside the repository; described in `.github/agents/rtw3-research.agent.md`):
   the game's memory image, an annotated disassembler with RTTI names, the RTTI dumps and the form layouts.
 
@@ -80,7 +82,7 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   it: guard against re-entry.
 
 ## Tactical battles
-What is known as of 2026-10-15 (0.3.0).
+What is known as of 2026-10-17 (0.3.2).
 
 - **The battle form.** `TfrmMain` is the battle screen. Its buttons:
   - `sbPlay` "Run one minute", `sbRun5` "Run 5 minutes if engaged, 20 if not", `sbRun` "Run until break";
@@ -102,7 +104,7 @@ What is known as of 2026-10-15 (0.3.0).
   - `[General] BattleAlliedNationIdx` / `BattleEnemyAlliedNationIdx` (allies in battle).
 - **Debug menu items** (possible test entry points): `Testbattle1Click`, `Testareabattle1Click`,
   `Generaterandombattle1Click`, `Battle1Click`.
-- **Today, in the mod (0.3.0):**
+- **Today, in the mod (0.3.2):**
   - Joined players fight their battles against AI nations on their own PC: the host defers `DoBattleBetweenAINations`,
     the player fights in a battle slot (client slot + 10) made with the Copy-game transform, and the host merges the
     result field by field (`saveio::ApplyBattleResult`).
@@ -120,3 +122,95 @@ What is known as of 2026-10-15 (0.3.0).
     under /EHsc.
   - **The game can end a battle inside a minute** (end conditions in EndOfTurnProcedures). Its close path runs
     FormClose → DoStrategicTurn, so defer the close until the minute is over.
+  - **A toggle button is down before its click handler runs.** VCL's `TSpeedButton` (with a `GroupIndex`) toggles
+    `FDown` in `MouseUp`, then calls `Click`: blocking the handler leaves the button down. If the game reads the
+    button, put it up again (0.3.2, *Fastest available*).
+  - **Modeless battle dialogs hold raw pointers** to ships, divisions and air formations. Hide them before the battle
+    is loaded again (0.3.2, `ResetBattleForm`).
+
+### Battle commands
+From a static reading of 1.01.44 on 2026-10-16 (no game run; summary and evidence in
+[MODLOG](../MODLOG.md#investigation-2026-10-16-the-limits-of-live-battles-static-v031)). Image addresses; "guess"
+marks what the disassembly doesn't prove.
+
+- **Player commands and the routine each one commits through.** The handlers work inline, often after message boxes.
+  - Manual torpedo salvo: the division report's *Fire torpedoes* opens `TdlgTorpTargets` (modeless); its *Fire*
+    calls `TfrmMain.FireMount(aMount, aShip, aTarget, FireAngle: Single, TorpSpeed, Range, Manual)` (0xda8cc4,
+    `ret 0x14`). The dialog draws `Random` itself (its firing solutions, the angle jitter); `FireMount` (10 sites)
+    and `TFightingTorpedoMount.SetReloadTime` (7) draw too. The AI fires through the same routine (`Manual = 0`).
+  - Manual missile salvo: the missile panel's *Manual fire* opens `TdlgMissileFire` (modal), which calls
+    `TfrmMain.FireMissileMount(aMount, aShip, aTargetShip, aTargetLocation, TargetBearing, NumberToFire): Integer`
+    (0xe04718, `ret 0x10`; it calls `FireSSM`, 0xda6374). The dialog also writes `TFightingShip.PendingMissileTarget`
+    (+0xa93; fired later by `FireAllGuns`; not in the battle save) and fires missile submarines with side 0
+    hard-coded (a game bug for a player on side 1).
+  - Air strike: the toolbar's `sbStrike` ("Order an airstrike") or the reports list's *Launch strike* opens
+    `TdlgStrike` (modeless). *Launch* and *Ready* call **LaunchSomeAircraft** (0xea4a18, named after its error
+    message; EAX = the squadron, EDX = the number, CL = the mission, 5 stack arguments, `ret 0x14`), which creates
+    the formation; `bnLaunchClick` then writes more fields inline (`GroupIndex := Random(10000)`, coordination,
+    priority target). *Stand down*, mission, loadout and number are plain field writes. The AI launches through the
+    same routine.
+  - Routine air operations: the toolbar's `sbRoutineAirOps` ("Manage CAP and air recon") or the ship tree's *Search
+    pattern* opens `TdlgSearch` (modal). Saving writes 9 `TForce` fields (CapLevel, NightCAP, SearchLimitLeft,
+    SearchLimitRight, SearchDistance, SearchInterval, TwoPhaseSearch, RepeatSearch, NightSearch; `sub_b4bef4`) and
+    calls `TForce.ProcessSearchDirectons`. These are settings: the simulation launches CAP and search aircraft from
+    them every minute, for both sides. NightCAP is not in the battle save.
+  - Land-based CAP: the division report's `sbLandCAP` button; when it is down, the report's OK writes the global
+    `LandCAPDivision[0]` (0xfb5920, one slot per side). Slot 0 only: the game assumes the human is side 0.
+  - Change force: the ship tree's popup *Change force* lists the side's other forces. `Changeforce2Click` (inline,
+    after a Yes/No) moves the division between the two forces' `Divisions` lists, sets `myForce` and lowers `Admin`
+    by 1. The menu needs a nation battle flag (`tech+0xdc`; guess: command capability).
+  - Change lead and battle turn-away: the Force orders dialog, then `TdlgSelectLead`'s OK, call
+    `TfrmMain.SetForceLeadDiv(aDivision)` (0xde42fc) and `TfrmMain.DoBattleTurnAway(aNewLeadDivision)` (0xde4550),
+    both with the implicit `frmMain.SelectedForce` and without `Random`. Both move the new lead to index 0 of
+    `Force.Divisions`; the list order decides the force flagship (the first lead division). The turn-away also
+    reverses the ship order of every division in the lead chain and starts a 15-minute cooldown (`TimeToTurnAway`);
+    its button needs `tech+0x80` (guess: the doctrine).
+- **Dead or developer-only** (no player reaches them, in any battle):
+  - Emergency activation: `TfrmMain.sbEmergencyActClick` is a bare `ret`. The button is hidden and disabled in the
+    form; only `CampaignScenario` (never set to True) or the unreachable operational-campaign module `TfrmCampaign`
+    would show it, and `LoadScenarioInProgress` (the resume path, also the live battles') hides it again. The Force
+    orders dialog's button has no handler and is shown only for `CampaignScenario`; its label is always visible.
+  - Try for home (`TryforHome1Click`: the AI's head-home course for the selected division, shown in a message box)
+    and Enter port (`ShowAircraft1Click`: forces the "division enters port" routine): developer menu items that
+    `TfrmMain.FormCreate` hides unconditionally, with Sink, Teleport, Create MTB, Blowup and the other debug items.
+  - `TfrmMain.bnFireClick` (a debug list of all divisions), `Launchstrike2Click`, `Bombship1Click` and
+    `TdlgDivisionReport.bnFireMissilesClick` (with it, the missile branch of `TdlgTorpTargets.bnFireClick`): only the
+    RTTI method tables refer to them. `cbFastestAvailableClick` has no control; only auto-run calls it.
+- **UI controls the simulation reads:**
+  - *Fire at will* (`cbFireAtWill`, missile panel): while it is unchecked, EOTP's automatic missile fire (0xda91fc,
+    years after 1940) skips PlayerSide's divisions (some AI-controlled forces excepted); the other side always fires
+    at will.
+  - *Fire mode* (`rgMissileDoctrine`: Ripple, Half, All): raises the chance that PlayerSide's ships keep firing from
+    40 % to 65 % or 95 % (0xda7ccc).
+  - *Fastest available* (`sbFastestAvailable`, a toggle: `AllowAllUp`, `GroupIndex` 579): the speed governor reads
+    its `FDown` (`TSpeedButton`+0x1e8) at minute boundaries (StartMinute, StartRun, the contact update in EOTP).
+    Down: speed 5 (*Ultra fast*) without contact, at most 2 (*Fast*) in contact; up: in contact a speed above 2 drops
+    to 1 (*Normal*).
+  - The arrows next to the speed box (`UpDown1Click`, 0xdd00d8) change the speed at once: up while `(GameSpeed < 5
+    and not Engaged) or GameSpeed < 2`, down to -3 (and *Fastest available* up).
+- **The AI's air operations follow PlayerSide, not the AI flags** (to be confirmed live).
+  - `CheckAIAirstrike(side)` (0xdfd50c, StartMinute, both sides) and its squadron picker skip PlayerSide's
+    squadrons unless their base is an airfield; nothing checks `AIControlled`. With PlayerSide 0 in the simulation,
+    the AI flies side 1's carrier strikes and never side 0's.
+  - `TfrmMain.SetAIAirSearchPlan` plans every force at battle generation. In EOTP, every 120 minutes after minute
+    600, it re-plans the search sector, distance and CapLevel of the forces again; it skips PlayerSide's, except
+    those led by an airfield.
+- **Air formations.**
+  - One global `TList` (0xfb0108) holds every `TAirFormation` of both sides. The key is `AFId` (+0x04): unique,
+    from the counter at 0xfb0120, kept in the battle save; Parent and Lead links are rebuilt from it on load. Names
+    are not unique.
+  - A squadron is itself a formation (status `asUnready`). A launch appends a child formation (ParentAirFormation =
+    the squadron) and takes its aircraft from the squadron; back on deck, `MergeAirFormationWithParent` gives them
+    back and the child is deleted and freed.
+  - During a battle only LaunchSomeAircraft and the parasite-fighter routine create formations (appended in creation
+    order), and only EOTP removes them (`MoveAircraft`, `TAirFormation.CheckStatus2`).
+  - *Show air formations* (`TdlgShowAirFormations`, display only) lists PlayerSide's formations; EOTP refreshes it
+    inside the minute. Its list and the strike dialog's hold raw `TAirFormation` pointers that EOTP or a load frees.
+- **Missiles are torpedo objects:** `TTorpedo` with `Calibre >= 30` (`IsMissile`), in the same global list as the
+  torpedoes. Missile launchers are `TFightingTorpedoMount`s with `MountType` 1-6 (heavy, medium and light SAM and
+  SSM).
+- **Eras** (reference years in the game's `Data\ResearchAreas3.dat`): land-based naval aircraft and seaplane carriers
+  1915, flight decks 1918, CVL 1920, CV 1921/1926, ship catapults 1923, night air operations 1930, two-phase search
+  1942; air-launched ASM 1943, SSM 1947, SAM 1953. The code runs automatic missile fire in years after 1940, the
+  missile panel after 1942 and missile submarines after 1950. Campaigns start in 1890, 1900, 1920 or 1935
+  (`TfrmSelectNation2`); the regression suite's test campaign (slot 1, 1900) has no aircraft.
