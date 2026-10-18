@@ -53,6 +53,8 @@ void SetDesignReadyForBuild(int nationIdx, int i, int months);
 
 // Entries in the campaign's intel report list (-1 if unavailable); `unique` = distinct non-empty entries.
 int IntelReportCount(int* unique = nullptr);
+// Air units in the game's global list (all nations); -1 if the list was not found. A load drops the units from before it.
+int AirUnitCount();
 
 // Doctrine (Doctrine button): training priorities and the missile storage policy change only after a number of
 // months (Pending* values). The game's monthly ReduceTimeLimits applies them for the host's nation only.

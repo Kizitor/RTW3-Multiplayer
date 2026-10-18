@@ -106,6 +106,11 @@ static int g_speedGetIdx = -1;  // the speed combo box's GetItemIndex slot in it
 static void* g_ustrAsg = nullptr;  // System._UStrAsg(var Dest; Source): refcounted string assignment
 static int g_fIdType = -1, g_fIdClass = -1, g_fHidden = -1;
 static bool DualOk() { return g_ustrAsg && g_fIdType >= 0 && g_fIdClass >= 0 && g_fHidden >= 0; }
+// The identification a ship has after a battle load: TFightingShip.Create's IdentifiedAsType (mov byte ptr
+// [ebx+IdentifiedAsType], imm8) and no IdentifiedAsClass; the battle save keeps neither. -1: not found in Create.
+static int g_idTypeDefault = -1;
+static bool g_identCanon = false;  // SetView after a live load: the first capture gives the simulation that identification
+static int g_identReset = 0;       // ships whose identification this PC's display had drawn during the load
 // Sighting fields the battle screen's own drawing also writes (GlobeRender, for this PC's side): the simulation keeps its
 // values, the display its own (and takes the simulation's new values), as for the identification fields.
 struct GuardField {
@@ -286,6 +291,14 @@ bool Resolve() {
     g_fIdClass = dl::Field("TFightingShip", "IdentifiedAsClass");
     g_fHidden = dl::Field("TFightingShip", "Hidden");
     if (!DualOk()) E.missing += "(identification swap) ";
+    // TFightingShip.Create: mov byte ptr [ebx+IdentifiedAsType], imm8 (0x16 in 1.01.44): every ship's type after a load
+    if (g_fIdType > 0 && g_fIdType < 0x10000 &&
+        (hit = Find(dl::Method("TFightingShip", "Create"), 0x400,
+                    {0xC6, 0x83, g_fIdType & 0xFF, (g_fIdType >> 8) & 0xFF, 0x00, 0x00, -1})))
+        g_idTypeDefault = hit[6];
+    else
+        Log("lockstep: WARNING the ships' initial identification was not found in TFightingShip.Create: after a load "
+            "the simulation keeps the identification this PC's display drew");
     E.fCbSpeed = dl::Field("TfrmMain", "cbGameSpeed");
     E.fTvShipsTree = E.fTvShips;
     // UpDown1Click (the arrows next to the speed box), down arrow: cmp byte ptr [eax+FDown], 0; je +7; mov eax, ebx;
@@ -624,10 +637,14 @@ static CtxHook g_ctx[] = {
     {"TFightingShip", "GetTypeAndNameForEnemy", K_UI, 0},  // (var Result)
     // (): the "Show air formations" list, which the end of a minute refreshes; it lists this PC's side
     {"TdlgShowAirFormations", "UpdateListSortedByBase", K_UI, 0},
+    // (ShipToSelect): the division report's ship list (its Execute, the torpedo dialog's Close and Fire); it lowers each
+    // listed ship's CurrentSpeed to its maximum speed in this weather, a simulation field (put back: ReportSpeeds*)
+    {"TdlgDivisionReport", "FillShipList", K_UI, 0},
 };
 static const int kCtxHooks = sizeof(g_ctx) / sizeof(g_ctx[0]);
 static const int kManual = -1;  // a frame of the mod's own shared section
 static int g_ctxFillTree = -1;  // the index of FillShipTree in g_ctx
+static int g_ctxReportFill = -1;  // the index of TdlgDivisionReport.FillShipList in g_ctx
 
 struct Frame {
     uint32_t slot;  // the address of the caller's return address (shared sections: the owner's stack position)
@@ -653,6 +670,8 @@ static void OnSimOuterExit();
 static void OnActionEnter(int idx, void* a, void* b);
 static void OnActionExit(int idx, void* result);
 static void OnSimFrameUnwound(int idx);
+static void ReportSpeedsSave();
+static void ReportSpeedsRestore();
 
 static void LeakCheckEnter(int idx);
 static int g_outerIdxFwd();
@@ -734,6 +753,7 @@ extern "C" void __stdcall LS_CtxEnter(int idx, Regs* r, uint32_t slot) {
         if (idx == g_ctxFillTree && g_sim > 0 && g_viewSide >= 0 && r->ecx == 0) r->ecx = (uint32_t)g_viewSide;
         if ((idx == H_DETACH || idx == H_CSDD) && g_sim == 0)
             OnActionEnter(idx, (void*)(uintptr_t)r->edx, (void*)(uintptr_t)r->ecx);
+        if (idx == g_ctxReportFill && g_sim == 0) ReportSpeedsSave();
         if (g_sim == 0 && g_ctx[idx].kind == K_SIM) g_outerIdx = idx;
         FrameEnterCount(g_ctx[idx].kind, +1);
         if (g_trace) {
@@ -768,6 +788,7 @@ extern "C" void __stdcall LS_CtxExit(int idx, Regs* r, uint32_t slot) {
             if (g_trace && g_ctx[idx].kind == K_SIM && g_sim == 1) TraceStateMark(idx, true);
             g_nFrames--;
             FrameEnterCount(g_ctx[idx].kind, -1);
+            if (idx == g_ctxReportFill && g_sim == 0) ReportSpeedsRestore();
         } else {
             Log("lockstep: context frame of %s not found at its exit", g_ctx[idx].name);
         }
@@ -1079,6 +1100,7 @@ bool EnsureHooks() {
         CtxHook& h = g_ctx[i];
         if (h.cls) h.target = dl::Method(h.cls, h.name);
         if (h.cls && strcmp(h.name, "FillShipTree") == 0) g_ctxFillTree = i;
+        if (h.cls && strcmp(h.name, "FillShipList") == 0) g_ctxReportFill = i;
         h.thunk = h.target ? EmitCtxThunk(i) : nullptr;
         void* detour = i == H_STARTMINUTE ? (void*)&LS_dStartMinute : i == H_EOTP ? (void*)&LS_dEOTP : h.thunk;
         if (i == H_STARTMINUTE) g_lsThunkStartMinute = h.thunk;
@@ -1274,10 +1296,16 @@ static void SwapShip(void* s, int side, bool view) {
         d.known = true;
         for (int g = 0; g < kGuard; g++)
             if (g_guard[g].off >= 0) d.simG[g] = d.dispG[g] = d.lastSimG[g] = GuardRead(s, g_guard[g]);
-        d.simType = d.dispType = d.lastSimType = type;
+        d.dispType = type;
         d.dispHidden = hid;
-        StrAsg(&d.simClass, *cls);
         StrAsg(&d.dispClass, *cls);
+        if (g_identCanon) {  // right after a live load (SetView): the simulation's identification is the battle save's
+            if (type != (uint8_t)g_idTypeDefault || *cls) g_identReset++;
+            type = (uint8_t)g_idTypeDefault;
+            StrAsg(cls, 0);
+        }
+        d.simType = d.lastSimType = type;
+        StrAsg(&d.simClass, *cls);
         d.lastSimClass = *cls;
         if (view) {  // the fields hold the simulation's values: switch to the display set below
         } else {
@@ -1383,7 +1411,18 @@ static void SetView(int side) {
     ReleaseDual();
     g_viewSide = side;
     g_viewOn = false;  // the fields hold the simulation's values (just loaded)
+    // The battle save keeps no identification and the load's own drawing identified enemy ships with this PC's display
+    // draws: the first capture gives the simulation the identification of a freshly loaded ship on both PCs
+    // (TFightingShip.Create's), this PC's display keeps what it drew. (Before, each PC kept its own as the simulation's,
+    // and the sighting reports' IdentifyClass/IdentifyType in EOTP then drew a different number of shared random numbers.)
+    g_identCanon = g_idTypeDefault >= 0 && DualOk();
+    g_identReset = 0;
     ApplyViewSide();
+    if (g_identCanon && !g_viewOn) WriteHumanFlags(false);  // (no swap yet: capture now, the fields stay the simulation's)
+    if (g_identCanon)
+        Log("lockstep: the simulation's ship identification as the battle save leaves it (type %d, no class); this PC's "
+            "display had identified %d ship(s) during the load and keeps that", g_idTypeDefault, g_identReset);
+    g_identCanon = false;
 }
 
 // The live battle is over on this PC: the display set stays in the ships (a single-player battle from here).
@@ -1398,6 +1437,73 @@ static void FreezeView() {
         ReleaseDual();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+}
+
+// TdlgDivisionReport.FillShipList (the division report's Execute, the torpedo dialog's Close and Fire) lowers each
+// listed ship's CurrentSpeed to its maximum speed in this weather (0xae1972..0xae1990): a display routine writing a
+// simulation field, on the PC where the report opens only (the leak check's `<ship>.CurrentSpeed` LEAK, then a DESYNC).
+// In a live battle every ship's CurrentSpeed is put back after it; the simulation lowers it at its next interval on both
+// PCs (TFightingShip.ChangeSpeed).
+static const int kReportSpeedsMax = 2048;
+static void* g_rsShip[kReportSpeedsMax];
+static int g_rsSpeed[kReportSpeedsMax];
+static int g_rsN = 0;
+struct SpeedChange {
+    void* ship;
+    int was, now;
+};
+
+static int CurrentSpeedOff() {
+    static const int off = dl::Field("TFightingShip", "CurrentSpeed");
+    return off;
+}
+
+static void ReportSpeedsSave() {
+    g_rsN = 0;
+    const int off = CurrentSpeedOff();
+    if (off <= 0 || !S.on || S.st == St::Ended || g_loading) return;
+    __try {
+        void* all = List(E.allShipsVar);
+        for (int i = 0, n = dl::ListCount(all); i < n && g_rsN < kReportSpeedsMax; i++)
+            if (void* sp = dl::ListItem(all, i)) {
+                g_rsShip[g_rsN] = sp;
+                g_rsSpeed[g_rsN++] = dl::At<int>(sp, off);
+            }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_rsN = 0;
+    }
+}
+
+static int ReportSpeedsPutBack(SpeedChange* ch, bool* fault) {
+    const int off = CurrentSpeedOff();
+    int n = 0;
+    __try {
+        for (int i = 0; i < g_rsN; i++) {
+            int& v = dl::At<int>(g_rsShip[i], off);
+            if (v == g_rsSpeed[i]) continue;
+            if (n < 3) {
+                ch[n].ship = g_rsShip[i];
+                ch[n].was = g_rsSpeed[i];
+                ch[n].now = v;
+            }
+            n++;
+            v = g_rsSpeed[i];
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *fault = true;
+    }
+    g_rsN = 0;
+    return n;
+}
+
+static void ReportSpeedsRestore() {
+    SpeedChange ch[3] = {};
+    bool fault = false;
+    int n = ReportSpeedsPutBack(ch, &fault);
+    for (int i = 0; i < n && i < 3; i++)
+        Log("lockstep: the division report lowered %s's current speed %d -> %d on this PC only: put back (the next "
+            "minute lowers it on both PCs)", W2U(ObjName(ch[i].ship)).c_str(), ch[i].was, ch[i].now);
+    if (fault) Log("lockstep: exception while putting back the ships' current speeds after the division report");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3978,6 +4084,20 @@ std::string Debug(const std::vector<std::string>& a) {
         return "ok length=" + std::to_string(*E.scenLenVar) + " minute=" + std::to_string(Minute());
     }
     if (c == "throw") return g_testThrow = true, "ok (an exception in this PC's next MoveAllShips)";
+    // ls testcurspeed <ship index> <knots> (TEST ONLY, between minutes, given on both PCs alike): a ship's CurrentSpeed,
+    // e.g. above its maximum as a worse weather leaves it (the division report then lowers it on its PC only)
+    if (c == "testcurspeed") {
+        void* sp = dl::ListItem(List(E.allShipsVar), atoi(arg(2, "-1").c_str()));
+        if (!sp || !dl::IsInstanceOf(sp, "TFightingShip")) return "error ship";
+        if (g_sim > 0 || S.minuteRunning) return "error not between minutes";
+        int off = CurrentSpeedOff();
+        if (off <= 0) return "error field";
+        int was = dl::At<int>(sp, off);
+        dl::At<int>(sp, off) = atoi(arg(3, "0").c_str());
+        if (g_exitHashOk) LeakCheckExit(g_exitFrame);  // (the leak check's baseline includes the test's own write)
+        Log("lockstep: TEST %s's current speed %d -> %d", W2U(ObjName(sp)).c_str(), was, dl::At<int>(sp, off));
+        return "ok ship=" + W2U(ObjName(sp)) + " was=" + std::to_string(was);
+    }
     if (c == "guard") {  // ls guard 0|1: the sighting fields' display/simulation sets (tests: 0 = the old leak)
         g_guardOn = arg(2, "1") != "0";
         return "ok guard=" + std::to_string(g_guardOn ? 1 : 0);

@@ -39,13 +39,14 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
 5. **Protect the saves.** Back up `<Documents>\My Games\Rule the Waves 3\Save\Game1` before launching and
    restore it afterwards, also when the run fails; delete `Game77` (the client slot), `Game87` (the client's battle
    slot, client slot + 10, written by the mod for every battle it is sent), `Game76`/`Game86` (the third copy's slot and
-   battle slot in `lockstep_pvp`) and every slot a test copied
+   battle slot in `lockstep_pvp`), `Game49` (`air_units`' copy of the 1935 test campaign) and every slot a test copied
    to (`player_copy`: Game78-80 and the button's slot; never a slot that existed before the run). Find Documents
    with `rtw3ctl.SAVE_DIR` (handles OneDrive redirection). The suite runner does this; keep it that way. A killed host
    (`lockstep_stress` b) leaves its live battle's save in slot 1: the runner puts slot 1 back from its backup
    (`restore_slot1_copy`, the backup is kept for the final restore) before it starts the host again. `lockstep_air`
    also backs up and restores save slot 9, the 1935 test campaign (a second fixture, kept outside the repo: TESTING.md,
-   "The 1935 test campaign"); never delete it and never let anything save into it outside a backed-up run (`pocbattle`
+   "The 1935 test campaign"; `air_units` backs it up too and only copies it, into the throwaway slot 49); never delete
+   it and never let anything save into it outside a backed-up run (`pocbattle`
    autosaves into the open slot). Any other slot that existed before the run (e.g. Game2) may be the user's own: never
    read-modify, overwrite or delete it.
 6. **Never save outside a backed-up run.** Don't send the bridge `save` command, or anything else that saves
@@ -82,7 +83,10 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
   `state seq N -> <name> (nation K, B bytes)`, `NOT sent`, `net:`, exceptions; events: client
   `event <idx> for nation K: <caption> | event=..`, `event: no event this month`, `event: this month was already
   rolled`, `event: event needs the host`; host `event of <name> (nation K, #idx '<caption>'): tension K-j a->b ...`,
-  `second event of <name> in <date> ignored (one per month)`, `event from ... ignored (...)`).
+  `second event of <name> in <date> ignored (one per month)`, `event from ... ignored (...)`; 0.3.3: `air units: N from
+  before the load dropped; the campaign's M kept` and `air units: K repeated units of the save dropped (...)` at
+  campaign loads, `lockstep: the simulation's ship identification as the battle save leaves it ...` at every live load,
+  `lockstep: the division report lowered <ship>'s current speed a -> b on this PC only: put back ...`).
 - Event cooldown files: the client keeps `events_<hash>.ini` (its event cooldowns and the calendar month it last
   rolled) in the same RTW3MP folder. The fixture campaign always starts at the same month, so a leftover file would
   mark that month as already rolled: the runner deletes every `events_*.ini` there before and after the run.
@@ -91,8 +95,9 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
   the battles they fight.
 - Save slot 9 holds the 1935 test campaign (Great Britain = nation 0, January 1935, never played) for live battles
   with aircraft (`lockstep_air`: `pocbattle 2 0` against France, carriers and air stations on both sides; the scenario
-  is skipped with a SKIP line without it). Its pristine copy is outside the repo; TESTING.md says how it was made and
-  how to put it back.
+  is skipped with a SKIP line without it) and, copied into slot 49 with every air unit doubled, for `air_units`' real
+  months (0.3.3: the air units no longer double at every load; also skipped without it). Its pristine copy is outside
+  the repo; TESTING.md says how it was made and how to put it back.
 - Battle screen controls are tested with posted messages only (`click_tool`, `click_arrow`, `post_click`, tree views
   and list views read cross-process) and the bridge probes `ls ctl`, `ls airwin`, `pocstate fastest=`; the battle's
   modeless tool windows must be closed (`close_modeless`) before anything answers dialogs with `answer_dialogs`.

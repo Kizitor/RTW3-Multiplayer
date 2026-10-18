@@ -1,6 +1,6 @@
 # Architecture
 
-How RTW3 Multiplayer works in the current version (0.3.2, protocol 3) on Rule the Waves 3 1.01.44. This is the
+How RTW3 Multiplayer works in the current version (0.3.3, protocol 3) on Rule the Waves 3 1.01.44. This is the
 developer view; players read the [README](../README.md). The history of each part, with the measurements and the
 dead ends, is in [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game facts (calling
 convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing is in
@@ -117,7 +117,7 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `DoResearch` | Puts a joined nation's research priorities back after the game's AI branch. |
 | `TfrmResearch.Execute` | On a joined player's PC, opens the Research screen for the player's nation instead of nation 0. |
 | `EventLikelihoodCheck` | Vetoes events that need the host while a joined player's event is rolled. |
-| `LoadBuildCampaign` | Clears the intel report list before a load and drops empty or repeated entries after it. |
+| `LoadBuildCampaign` | Clears the intel report list before a load and drops empty or repeated entries after it. Drops (and frees) the air units the global list held before the load once the load succeeded, and repeated air units of the save (the same `AirUnitId`): the game's `LoadAircraftData` appends without clearing, and the mod reloads in the same process every month and at every live battle load (0.3.3). |
 | `CopyGameToOtherSlot` | A joined player's copy becomes the player's own campaign (`MakeNationPlayer`). |
 
 The live battles add their own hooks (`Random32Proc`, the simulation and display routines) with the first live
@@ -301,7 +301,15 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   ship. `ls leakcheck` reports any simulation change made between steps. Display routines see this PC's PlayerSide
   even when the simulation calls them. Since 0.3.2 they include the *Show air formations* list
   (`TdlgShowAirFormations.UpdateListSortedByBase`): EOTP refreshes the open window inside the minute, and the list
-  shows PlayerSide's formations (before, B's window listed side 0's).
+  shows PlayerSide's formations (before, B's window listed side 0's). Since 0.3.3 the division report's ship list
+  (`TdlgDivisionReport.FillShipList`, also called by the torpedo dialog) is one too: it lowers listed ships'
+  `CurrentSpeed`, a simulation field, on the PC where the report opens, so in a live battle every ship's
+  `CurrentSpeed` is put back after it (before, opening a report could desync the battle). The battle save keeps no
+  ship identification, and the battle screen's first drawing during a load identifies enemy ships with this PC's own
+  display draws; since 0.3.3 the first capture after every live load gives the simulation the identification of a
+  freshly loaded ship (`TFightingShip.Create`'s type, no class) on both PCs, and the display keeps what it drew
+  (before, each PC kept its own as the simulation's, and the sighting reports' shared draws, which depend on it,
+  could make the battles drift apart now and then).
 - **Every minute.** A releases each minute; both PCs run it with the game's own minute routine. Orders are field
   values of a side's own divisions and ships: a guard turns local edits into numbered batches that both apply before
   the next minute. After every minute both hash the battle state (including the RNG); on a mismatch A resyncs B from
@@ -348,6 +356,7 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   [release candidate](../MODLOG.md#testing-2026-10-15-release-candidate-v030),
   [the limits of live battles](../MODLOG.md#investigation-2026-10-16-the-limits-of-live-battles-static-v031),
   [the 0.3.2 fixes](../MODLOG.md#fix-2026-10-17-speed-controls-air-formations-window-and-battle-dialogs-in-live-battles-v032),
+  [the 0.3.3 fixes](../MODLOG.md#fix-2026-10-17-air-units-doubled-with-every-reload-two-live-battle-desyncs-v033),
   and the battle facts in [GAME-INTERNALS.md](GAME-INTERNALS.md#tactical-battles).
 
 ## Test bridge
@@ -358,10 +367,10 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
 - The command reference, the runner and the scenario catalog are in [TESTING.md](TESTING.md).
 
 ## Versions and protocol
-- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.3.2
+- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.3.3
   starting (protocol 3)`).
 - The host refuses a client with another protocol or another game build. Protocol history: 1 = 0.1.0, 2 =
-  0.2.0-0.2.8, 3 = 0.3.0-0.3.2. Within a protocol, versions can play together, but features may need both sides (see
-  [CHANGELOG.md](../CHANGELOG.md)).
+  0.2.0-0.2.8, 3 = 0.3.0-0.3.3. Within a protocol, versions can play together, but features may need both sides (see
+  [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is sent but not checked.
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

@@ -35,6 +35,9 @@ struct Api {
     // intel reports (TStringList the game appends to on every load and never clears)
     int fIntelReports = -1, fSLList = -1, fSLCount = -1;
     void *mSLClear = nullptr, *mSLAdd = nullptr;
+    // air units (TList of TAirUnit the game appends to on every load and never clears): the cell of its unit variable
+    uint32_t airUnitsCell = 0;
+    void* mObjFree = nullptr;
     // pending doctrine changes (counted down by ReduceTimeLimits for the host's nation only)
     int fTraining = -1, fPendingTraining = -1, fPendingTrainingTime = -1;
     int fMissileStorage = -1, fPendingMissileStorage = -1, fMissileStorageTime = -1;
@@ -287,6 +290,25 @@ bool Resolve() {
     A.mSLAdd = dl::Method("TStringList", "Add");
     if (A.fIntelReports < 0 || A.fSLList < 0 || A.fSLCount < 0 || !A.mSLClear || !A.mSLAdd)
         Log("WARNING: intel report list not found; reloading a campaign will duplicate its intel reports");
+    // The air units' list: LoadAircraftData (mov eax, [cell]; mov eax, [eax]; mov edx, ebx; call TList.Add) and the
+    // game's own ClearAirData (push ebx; push esi; mov esi, [cell]) name the same cell.
+    {
+        uint8_t* lad = (uint8_t*)dl::Method("TfrmBuildCamp", "LoadAircraftData");
+        uint8_t* cad = (uint8_t*)dl::Method("TfrmBuildCamp", "ClearAirData");
+        uint32_t c1 = 0, c2 = 0;
+        for (int i = 0; lad && i < 0x100; i++)
+            if (lad[i] == 0xA1 && lad[i + 5] == 0x8B && lad[i + 6] == 0x00 && lad[i + 7] == 0x8B && lad[i + 8] == 0xD3 &&
+                lad[i + 9] == 0xE8) {
+                c1 = *(uint32_t*)(lad + i + 1);
+                break;
+            }
+        if (cad && cad[0] == 0x53 && cad[1] == 0x56 && cad[2] == 0x8B && cad[3] == 0x35) c2 = *(uint32_t*)(cad + 4);
+        A.mObjFree = dl::Method("TObject", "Free");
+        if (c1 && c1 == c2 && A.mObjFree)
+            A.airUnitsCell = c1;
+        else
+            Log("WARNING: air unit list not found; reloading a campaign will duplicate its air units");
+    }
     A.fTraining = dl::Field("TBuilderNation", "TrainingPriorities");
     A.fPendingTraining = dl::Field("TBuilderNation", "PendingTrainingPriorities");
     A.fPendingTrainingTime = dl::Field("TBuilderNation", "PendingTrainingTime");
@@ -471,6 +493,81 @@ static void DedupIntelReports(void* form) {
     }
     if (count - (int)keep.size() > 1)  // the game itself adds one empty entry on every load
         Log("intel reports: %d entries -> %d (empty and repeated entries removed)", count, (int)keep.size());
+}
+
+// Air units. LoadAircraftData (called by LoadBuildCampaign) appends the save's [AirUnits] to the global TAirUnit list
+// without clearing it (the game's own ClearAirData is called only by the quick battle). The mod reloads the campaign in
+// the same process every month (host: after merging the players' turns; client: the new month) and at every live
+// battle start and resync, so the list doubled with each save and load: the host's carriers soon failed the Turn's
+// check ("CV ... aircraft capacity exceeded!") and the air maintenance costs ran away. The units the list held before a
+// load are dropped and freed after the load succeeded (nothing else keeps TAirUnit pointers: the battle's formations
+// name aircraft types, the air group dialog clears its copy pointer when it opens).
+static std::vector<void*> g_airBefore;
+
+static void* AirUnitList() {
+    if (!A.airUnitsCell) return nullptr;
+    void* var = *(void**)(uintptr_t)A.airUnitsCell;
+    void* l = var ? *(void**)var : nullptr;
+    return l && dl::IsInstanceOf(l, "TList") ? l : nullptr;
+}
+
+int AirUnitCount() { return AirUnitList() ? dl::ListCount(AirUnitList()) : -1; }
+
+static void RememberAirUnits() {
+    g_airBefore.clear();
+    void* l = AirUnitList();
+    for (int i = 0, n = dl::ListCount(l); i < n; i++) g_airBefore.push_back(dl::ListItem(l, i));
+}
+
+static void DropOldAirUnits(bool loaded) {
+    std::vector<void*> old;
+    old.swap(g_airBefore);
+    void* l = AirUnitList();
+    if (!l || old.empty()) return;
+    int n = dl::ListCount(l), n0 = (int)old.size();
+    void** items = *(void***)((uint8_t*)l + 4);  // TList.FList, FCount at +8 (as dl::ListCount)
+    if (!loaded) {
+        Log("air units: the load failed; the %d units from before it stay (the list has %d)", n0, n);
+        return;
+    }
+    if (!items || n < n0 || !std::equal(old.begin(), old.end(), items)) {
+        Log("WARNING: air units: the list changed during the load (%d before, %d now); left as it is", n0, n);
+        return;
+    }
+    memmove(items, items + n0, (size_t)(n - n0) * sizeof(void*));
+    *(int*)((uint8_t*)l + 8) = n - n0;
+    for (void* o : old) dl::Call(A.mObjFree, (uint32_t)(uintptr_t)o);
+    Log("air units: %d from before the load dropped; the campaign's %d kept", n0, n - n0);
+}
+
+// A campaign saved by an earlier version may hold the same air units several times (AirUnitId is unique in a campaign
+// the game itself saved): the first of each id stays, the repeats are dropped and freed. The first copy is the one the
+// game treats as that unit: its only lookup by AirUnitId (0xe9f570) returns the first match from index 0, and the end
+// of every battle (0xea7abc) writes the battle's losses, aircrew experience, kills and hits to that copy (or deletes it
+// when its ship was sunk). The later copies, from later loads in the same game, differ only by what code that matches
+// a unit's base object changed after the first reload (desired sizes, transfers, the computer's air group growth):
+// orders that can be given again, unlike a battle's results.
+static void DedupAirUnits() {
+    static int fId = dl::Field("TAirUnit", "AirUnitId");
+    void* l = AirUnitList();
+    int n = dl::ListCount(l);
+    if (!l || n <= 0 || fId < 0 || !A.mObjFree) return;
+    void** items = *(void***)((uint8_t*)l + 4);
+    std::set<int> seen;
+    std::vector<void*> drop;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        void* u = items[i];
+        if (u && !seen.insert(dl::At<int>(u, fId)).second) {
+            drop.push_back(u);
+            continue;
+        }
+        items[k++] = u;
+    }
+    if (drop.empty()) return;
+    *(int*)((uint8_t*)l + 8) = k;
+    for (void* o : drop) dl::Call(A.mObjFree, (uint32_t)(uintptr_t)o);
+    Log("air units: %d repeated units of the save dropped (%d -> %d; a save of an earlier version)", (int)drop.size(), n, k);
 }
 
 int IntelReportCount(int* unique) {
@@ -1614,16 +1711,24 @@ extern "C" __declspec(naked) void d_ReduceTimeLimits() {
 extern "C" void __stdcall CB_BeforeLoad(void* self) {
     try {
         ClearIntelReports(self);
+        RememberAirUnits();
         hookcb::OnCampaignLoading();
     } catch (...) {
         Log("exception clearing intel reports");
     }
 }
-extern "C" void __stdcall CB_AfterLoad(void* self) {
+extern "C" void __stdcall CB_AfterLoad(void* self, uint32_t result) {
     try {
         DedupIntelReports(self);
     } catch (...) {
         Log("exception repairing intel reports");
+    }
+    try {
+        bool loaded = (result & 0xFF) != 0;
+        DropOldAirUnits(loaded);
+        if (loaded) DedupAirUnits();
+    } catch (...) {
+        Log("exception dropping the air units from before the load");
     }
 }
 
@@ -1638,7 +1743,8 @@ extern "C" __declspec(naked) void d_Load() {
         mov eax, [esp]
         call dword ptr [o_Load]
         push eax
-        push dword ptr [esp + 4]
+        push eax
+        push dword ptr [esp + 8]
         call CB_AfterLoad
         pop eax
         add esp, 4

@@ -300,8 +300,16 @@ battle between two joined players' nations is resolved by the game.
   computer takes over the second player's ships. The log lines start with `lockstep:`.
 - **"Out of memory" after a long session:** see *Memory over long sessions* in
   [Known limitations](#known-limitations).
+- **The host's turn stops with "CV <name> aircraft capacity exceeded!":** before 0.3.3, every reload of the campaign
+  (every month and every live battle) added another copy of every squadron. Update the host to 0.3.3 and load the
+  campaign again: it removes the copies. If the message stays, that carrier really carries more aircraft than it has
+  room for: open its air group and move squadrons to the reserve.
 
 ### Upgrading from an older version
+- **0.3.3** plays with 0.3.0, 0.3.1 and 0.3.2 (protocol 3). **Update the host first:** older versions added another
+  copy of every squadron each time the campaign was loaded again, and 0.3.3 repairs such a campaign the first time it
+  loads it. Its two live-battle fixes need the players of a live battle on 0.3.3 (the division report fix works on
+  the PC that runs it), so joined players should update too.
 - **0.3.2** plays with 0.3.0 and 0.3.1 (protocol 3), but its fixes for live battles work only on the PCs that run it:
   both players of a live battle should update.
 - **0.3.0 needs everyone to update:** older versions can't play with it (protocol 3).

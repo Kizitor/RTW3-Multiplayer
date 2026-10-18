@@ -7,6 +7,35 @@ in [MODLOG.md](MODLOG.md).
 
 The *protocol* is the version of the network messages: a host refuses players whose mod uses another protocol.
 
+## 0.3.3 (2026-10-17)
+A hotfix of 0.3.2. **Hosts should update first:** their game added another copy of every squadron each time it
+loaded the campaign again (every month and every live battle), until the host's turn stopped with "aircraft capacity
+exceeded!". 0.3.3 plays with 0.3.0, 0.3.1 and 0.3.2 (same protocol, nothing new on the network), but the live-battle
+fixes need the players of a live battle on 0.3.3, so everyone should update.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.3.3)
+
+### Fixed
+- **Squadrons doubled with every reload** (every version since 0.1.0, campaigns with aircraft). The game expects to
+  load a campaign once after it starts, but multiplayer loads it again in the same game: the host after merging the
+  players' turns every month, a joined player for every new month, and both players at every live battle start and
+  every time a live battle is brought back in step. Each of these loads added another copy of every squadron. The
+  host's *Turn* then stopped with "CV <name> aircraft capacity exceeded!", the air costs ran away and the save kept
+  growing. Squadrons are now kept once, and a campaign that already holds copies is repaired the first time 0.3.3
+  loads it. A host on 0.3.3 keeps the campaign right even when joined players still run 0.3.2, whose game multiplies
+  the squadrons only in its own copy of the campaign (that copy never goes back to the host). Joined players should
+  update too: their game sets up their own battles from that copy.
+- **Opening a division report during a live battle could reload the battle** (since 0.3.0). The report lowered its
+  ships' current speed to their maximum speed in the current weather, on that player's PC only, so the two PCs
+  disagreed and the battle was brought back in step. The report no longer changes the battle; the ships slow down in
+  the next minute on both PCs. This works on the PC that runs 0.3.3: a player on 0.3.2 still causes the reload with
+  their own reports.
+- **A rare reload of a live battle after "Unknown ship sighted!"** (since 0.3.0). When a live battle was loaded, each
+  PC kept the ship identifications its own screen had made while drawing the battle, and the battle then used them,
+  so now and then the two PCs disagreed and the battle was brought back in step. Both PCs now start every load of a
+  live battle with the same identifications; what each player sees on screen is unchanged. This needs both players of
+  the battle on 0.3.3. It removes one cause of these reloads, not every one: a live battle can still be brought back
+  in step now and then, automatically, in a few seconds.
+
 ## 0.3.2 (2026-10-17)
 Fixes for live battles: battles with aircraft now start, the second player's ship list and air formations window show
 their own side, the speed controls, buttons that stayed pressed, the missile panel and battle windows left open. Each

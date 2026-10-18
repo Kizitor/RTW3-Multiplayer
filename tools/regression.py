@@ -8,7 +8,7 @@ in order, then both copies are closed and the save slots restored.
 Requires Steam running, the mod installed in the game folder (env RTW3_DIR, see rtw3ctl.py) and a campaign in
 save slot 1 that is past its setup steps (the host plays nation 0). Refuses to start while RTW3.exe runs.
 `lockstep_air` also uses the 1935 test campaign in save slot 9 (skipped without it; the slot is backed up and restored
-like slot 1).
+like slot 1); `air_units` copies it into the throwaway slot 49 (which must not exist before the run; deleted after it).
 Host bridge 47701, client bridge 47702 (client save slot 77); nation 2 is reserved for a stand-in player "Bot".
 The client runs with RTW3MP_EVENT_CHANCE=0 (no random events unless a test asks for one); the client's event
 cooldown files (events_*.ini in the RTW3MP data folder) are deleted before and after the run.
@@ -51,6 +51,12 @@ results = []  # (scenario, check, ok, detail)
 _scenario = ['-']
 PROCS = []  # the game copies this run started (Popen)
 ANSWERED = []  # (time, who, 'Class:"title"->button') of every game dialog answer_dialogs answered
+BOX_SEEN = []  # (time, who, class, text) of every answered game box with a readable text (0.3.3: the capacity box)
+AIR_GROUP_PROMPT = 'go to the air groups screen'  # the host's pre-turn reminder for a carrier without air units: No
+# The game's own error boxes (its procedures' exception handlers, e.g. "Error in SaveBuildCampaign procedure! Access
+# violation at ..."): answered like any box, they would otherwise pass unnoticed (run_scenarios checks them).
+GAME_ERROR_RE = re.compile(r'Error in \w+ procedure|Access violation|Out of memory|Invalid pointer operation|'
+                           r'List index out of bounds|Range check error|Integer overflow|Abstract error', re.I)
 
 
 class Ctx:
@@ -225,7 +231,9 @@ def answer_dialogs(pid, who):
     """Answer the game's dialogs of one copy. The game reuses its dialog windows, so the per-window click guard of
     dismiss_dialogs is reset on every pass; the callers' timeouts bound their loops. A "Peace treaty" dialog is
     recorded (TREATY_SEEN) before it is answered. An event answer that names a nation gets the first nation picked
-    first (select_event_nation)."""
+    first (select_event_nation). The host's pre-turn reminder "<ship> has no air units assigned! Do you want to go to
+    the air groups screen?" (a carrier without an air group, 1935) gets No, alone in its pass: Yes opens the air group
+    screen and the game cancels the Turn."""
     capture_treaty(pid, who)
     select_event_nation(pid)
     select_officer(pid)
@@ -234,7 +242,18 @@ def answer_dialogs(pid, who):
     for t in top_windows(pid):  # read before the answers close them
         k = e2e_test.class_name(t)
         if k in _BOX_LABEL:
-            texts.setdefault(k, []).append(box_text(t))
+            bt = box_text(t)
+            bts = dlg_buttons(t) if k == 'TMessageForm' and AIR_GROUP_PROMPT in bt else {}
+            no = bts.get('no') or bts.get('ignore')
+            if no:
+                u.PostMessageW(no, 0x00F5, 0, 0)  # BM_CLICK
+                c = f'{k}:"{e2e_test.window_text(t)[:40]}"->{"No" if bts.get("no") else "Ignore"}'
+                ANSWERED.append((time.time(), who, c))
+                BOX_SEEN.append((time.time(), who, k, bt))
+                log(f'  {who} dialog answered: {c} (text: {bt[:300]!r})')
+                time.sleep(0.5)
+                return  # (dismiss_dialogs would press its Yes before the posted No arrives)
+            texts.setdefault(k, []).append(bt)
         elif k == 'TdlgCampTurnRep':
             texts.setdefault(k, []).append(' | '.join(turn_report(t)))
     for c in dismiss_dialogs(pid):
@@ -242,6 +261,8 @@ def answer_dialogs(pid, who):
         k = c.split(':', 1)[0]
         q = texts.get(k) or []
         bt = q.pop(0) if q else ''
+        if bt:
+            BOX_SEEN.append((time.time(), who, k, bt))
         log(f'  {who} dialog answered:', c + (f' (text: {bt[:3000 if k == "TdlgCampTurnRep" else 300]!r})' if bt else ''))
     for top in top_windows(pid):  # other forms with a "Not now" button (e.g. a design ready for construction)
         k = e2e_test.class_name(top)
@@ -445,16 +466,19 @@ def confirm(pid, title, timeout=5):
     return False
 
 
-def run_month(ctx, label, driver=None):
+def run_month(ctx, label, driver=None, slot=HOST_SLOT, checks=True):
     """Process one month: the client submits, the host waits for everyone, presses Turn and its dialogs (and the
     client's) are answered until the client plans the new month. Never polls the host's bridge meanwhile: its
     calls run on the game's main thread, which is busy with the month. Then the client's event roll of the new
     month is awaited (its dialog answered: an open event dialog refuses most bridge commands), and the per-month
     checks (intel reports, saved files, month package size, event roll) run.
     driver: a BattleDriver for a month with joined players' battles (it answers the client's dialogs, never
-    dismiss_dialogs); without one, a battle the month sends the client anyway is declined (battle_dialogs)."""
+    dismiss_dialogs); without one, a battle the month sends the client anyway is declined (battle_dialogs).
+    slot: the host's save slot. checks=False: a month of another campaign than the run's slot 1 session (`air_units`:
+    the 1935 copy in its own slot): no pre-month or month hooks and no month_checks (they follow slot 1 and nation 1);
+    the caller checks the month."""
     n_month = len(ctx.months) + 1
-    for hook in list(ctx.pre_month_hooks):
+    for hook in list(ctx.pre_month_hooks) if checks else ():
         hook(ctx, label, n_month)
     date0 = ctl.status(C).get('date')
     mark, cmark = log_mark(H), log_mark(C)
@@ -467,9 +491,9 @@ def run_month(ctx, label, driver=None):
     wait(C, lambda s: s.get('submitted') == '1', 30, 'client submitted', pids=(ctx.hp, ctx.cp))
     wait(H, lambda s: 'All players are ready' in s.get('status', ''), 30, 'host sees everyone ready',
          pids=(ctx.hp, ctx.cp))
-    log(f'  [General] before the turn: slot {HOST_SLOT} {gen_date(HOST_SLOT)}, slot {CLIENT_SLOT} (submitted) '
+    log(f'  [General] before the turn: slot {slot} {gen_date(slot)}, slot {CLIENT_SLOT} (submitted) '
         f'{gen_date(CLIENT_SLOT)}')
-    pf0 = poss_fields(HOST_SLOT)
+    pf0 = poss_fields(slot)
     cmd(H, 'turn')
     timeout = MONTH_TIMEOUT + (driver.extra_timeout if driver else 0)
     end = time.time() + timeout
@@ -492,14 +516,15 @@ def run_month(ctx, label, driver=None):
                 dt = time.time() - t0
                 ctx.months.append((label, date0, st.get('date'), dt))
                 log(f'month processed ({label}): {date0} -> {st.get("date")} in {dt:.0f} s')
-                pch = poss_changes(pf0, poss_fields(HOST_SLOT))
+                pch = poss_changes(pf0, poss_fields(slot))
                 if pch:
-                    log(f'  possessions that changed hands this month (slot {HOST_SLOT} MapData, before the turn -> after '
+                    log(f'  possessions that changed hands this month (slot {slot} MapData, before the turn -> after '
                         f'the month): {pch}')
                 wait_event_roll(ctx, cmark, ev_seen)
-                month_checks(ctx, label, mark, cmark)
-                for hook in list(ctx.month_hooks):
-                    hook(ctx, label)
+                if checks:
+                    month_checks(ctx, label, mark, cmark)
+                    for hook in list(ctx.month_hooks):
+                        hook(ctx, label)
                 return st.get('date')
         except OSError:
             pass
@@ -565,6 +590,13 @@ def scenario_session(ctx):
               s.get('slot') == str(CLIENT_SLOT), 120, 'client planning as nation 1', pids=(ctx.hp, ctx.cp))
     check('client plans nation 1 in slot 77', True, st.get('date'))
     time.sleep(1)
+    au = {who: (airunits(port), saved_airunits(slot), ls_lines(port, 0, r'air units: |' + AIR_BAD_RE))
+          for who, port, slot in (('host', H, HOST_SLOT), ('client', C, CLIENT_SLOT))}
+    check('0.3.3 air units: the list was found on both copies and each holds the [AirUnits] count of the save it loaded '
+          '(`airunits` = AirUnitNo of slot 1 / slot 77; the 1900 test campaign has none: 0, and then no `air units:` '
+          'line), no air-unit WARNING in either log', all(
+              n is not None and sv and n == sv['no'] and not [x for x in lines if n == 0 or re.search(AIR_BAD_RE, x)]
+              for n, sv, lines in au.values()), au)
     ctx.intel_prev = intel_snapshot(ctx, mark, 'session start')  # baseline of the per-month checks
     r = cmd(H, f'reserve {STANDIN} Bot')
     time.sleep(1.5)
@@ -935,8 +967,8 @@ def force_event(ctx, idx, probe=False, timeout=25):
 
 def planned_months(names):
     """Months the selected scenarios process (doctrine, research and events process their own if no later scenario
-    does)."""
-    n = sum(s[1] for s in SCENARIOS if s[0] in names)
+    does). `air_units`' months are another campaign's (OWN_CAMPAIGN): no other scenario shares them."""
+    n = sum(s[1] for s in SCENARIOS if s[0] in names and s[0] not in OWN_CAMPAIGN)
     if 'doctrine' in names and 'design_study' not in names:
         n += 2
     order = [s[0] for s in SCENARIOS]
@@ -5206,6 +5238,11 @@ K2_NAME = 'Bot'  # it joins as the stand-in player of `session`: the host gives 
 HOST_NAME, CLIENT_NAME = 'Admiral', 'Captain'
 PVP_AREA = 'Northern Europe'
 LS_HASH_RE = re.compile(r'lockstep hash ([AB]) t=(\S+) min=(\d+) all=([0-9a-f]+) .*? rng=([0-9a-f]+)')
+LS_IDENT_RE = re.compile(r'lockstep hash [AB] t=\S+ min=(\d+) all=[0-9a-f]+ .*? ident=([0-9a-f]+)')  # 0.3.3: compared
+IDENT_LINE_RE = (r"lockstep: the simulation's ship identification as the battle save leaves it \(type (\d+), no class\); "
+                 r"this PC's display had identified (\d+) ship\(s\) during the load and keeps that")  # 0.3.3, every load
+LS_LOADED_RE = r'lockstep: battle loaded from slot \d+ '
+IDENT_LOG = []  # 0.3.3: (scenario, what, minutes compared, minutes whose `ident=` differ) of ls_compare and ls_ready
 LS_BAD_RE = (r'lockstep: (FATAL|exception)|lockstep hook \S+(: no target| failed)|lockstep hooks: INCOMPLETE|'
              r'exception handling|load of slot \d+ FAILED|could not be loaded again|The live battle failed')
 LS_NOTE_RE = r'lockstep: WARNING|context frame .* dropped|FPU control word'
@@ -5349,6 +5386,8 @@ class LsAnswerer(threading.Thread):
         e = f'{e2e_test.class_name(top)}:"{e2e_test.window_text(top)[:40]}"->{what}'
         self.seen.append((time.time(), who, e))
         ANSWERED.append((time.time(), who, e))
+        if bt:
+            BOX_SEEN.append((time.time(), who, e2e_test.class_name(top), bt))
         log(f'  {who} dialog: {e}' + (f' (text: {bt!r})' if bt else ''))
         return True
 
@@ -5526,15 +5565,79 @@ def ls_hashes(port, mark):
     return out
 
 
+def ls_idents(port, mark):
+    """{minute: [ident]} of a copy's per-minute hash lines since the mark (`ident=`: the simulation's identification)."""
+    out = {}
+    for m in LS_IDENT_RE.finditer(log_since(port, mark)):
+        out.setdefault(int(m[1]), []).append(m[2])
+    return out
+
+
 def ls_compare(A, ma, B, mb, label=''):
     """Per-minute state hashes (`lockstep hash A|B ... min=<m> all=<state> ... rng=<rng>`) of both copies since the
-    marks: every minute both logged must be equal (the last line of a minute: a resync loads a minute again)."""
+    marks: every minute both logged must be equal (the last line of a minute: a resync loads a minute again). The
+    minutes whose `ident=` (the simulation's ship identification, not part of `all`) differ are returned too and
+    recorded for ls_log_scan's identification check (0.3.3: equal; up to 0.3.2 they differed in every minute)."""
     a, b = ls_hashes(A, ma), ls_hashes(B, mb)
     both = sorted(set(a) & set(b))
     differ = [m for m in both if a[m][-1] != b[m][-1]]
-    res = dict(minutes=len(both), first=both[0] if both else None, last=both[-1] if both else None, differ=differ)
-    log(f'  hashes {label}: {len(both)} minutes compared ({res["first"]}..{res["last"]}), differ {differ[:8]}')
+    ia, ib = ls_idents(A, ma), ls_idents(B, mb)
+    idiff = [m for m in both if (ia.get(m) or [None])[-1] != (ib.get(m) or [None])[-1]]
+    IDENT_LOG.append((_scenario[0], label, len(both), idiff))
+    res = dict(minutes=len(both), first=both[0] if both else None, last=both[-1] if both else None, differ=differ,
+               ident_differ=idiff)
+    log(f'  hashes {label}: {len(both)} minutes compared ({res["first"]}..{res["last"]}), differ {differ[:8]}, ident= '
+        f'differs {idiff[:8]}')
     return res
+
+
+def ls_ready(A, B, tag):
+    """0.3.3: right after a live load (the start or a resync, before any minute ran) `ls hash` on both copies: `all` and
+    the simulation's identification `ident=` equal (up to 0.3.2 each copy kept the identification its own display drew
+    during the load). Recorded for ls_log_scan's identification check; returns the two replies (None if the copies were
+    not idle at the same boundary within 30 s)."""
+    try:
+        ls_wait(lambda: ls_idle_equal(A, B), 30, f'{tag}: both idle at the boundary of the load')
+    except RuntimeError as e:
+        log(f'  !! {tag}: the READY hash is not compared: {e}')
+        return None
+    ha, hb = kvs(scmd(A, 'ls hash')), kvs(scmd(B, 'ls hash'))
+    if not ha.get('min') or ha.get('min') != hb.get('min'):
+        log(f'  !! {tag}: the READY hash is not compared: minute {ha.get("min")} / {hb.get("min")}')
+        return None
+    bad = [f'READY {k}' for k in ('ident', 'all') if not ha.get(k) or ha.get(k) != hb.get(k)]
+    IDENT_LOG.append((_scenario[0], f'{tag} READY', 1, bad))
+    log(f'  {tag}: READY (`ls hash` at minute {ha.get("min")}): all {ha.get("all")}/{hb.get("all")}, ident '
+        f'{ha.get("ident")}/{hb.get("ident")}' + (f' DIFFER: {bad}' if bad else ''))
+    return ha, hb
+
+
+def ident_loads(port, mark):
+    """0.3.3: a copy's live loads since the mark ("battle loaded from slot") and how many of them logged the simulation's
+    identification line right before: dict(loads, with_line, types, shown: ships its display had identified)."""
+    loads, good, types, shown, pending = 0, 0, set(), [], 0
+    for x in ls_lines(port, mark, f'{IDENT_LINE_RE}|{LS_LOADED_RE}'):
+        m = re.search(IDENT_LINE_RE, x)
+        if m:
+            pending += 1
+            types.add(m[1])
+            shown.append(int(m[2]))
+            continue
+        loads += 1
+        good += pending == 1
+        pending = 0
+    return dict(loads=loads, with_line=good, types=sorted(types), shown=shown[:12])
+
+
+def expected_ctx_hooks():
+    """The live-battle context hooks of this source tree (the entries of g_ctx[] in src/mod/lockstep.cpp, read only):
+    every copy logs `lockstep hooks: ok (N of N context hooks, ...)` (0.3.3: 19, TdlgDivisionReport.FillShipList new)."""
+    try:
+        with open(os.path.join(REPO, 'src', 'mod', 'lockstep.cpp'), encoding='utf-8') as f:
+            m = re.search(r'static CtxHook g_ctx\[\] = \{(.*?)\n\};', f.read(), re.S)
+    except OSError:
+        return None
+    return len(re.findall(r'\{(?:nullptr|"\w+"), "\w+", K_\w+, \d+\}', m[1])) if m else None
 
 
 def ls_divs(port):
@@ -5702,8 +5805,8 @@ def ls_start_test(ctx, tag, timeout=150):
     """The host's battle against nation 1 outside a month: `pocbattle 1 0` (the debug Test battle = the game's DoBattle;
     the answerer accepts its preview; battle slot mode, so its close runs no month). Waits until both copies run it in
     lockstep (first, from the strategic screen, until the host has settled: host_settled). Reports slot 1's [General]
-    date before the battle and in the battle's save, and the client's battle slot copy of it. Returns dict(hm, cm, t0,
-    dt, a, b)."""
+    date before the battle and in the battle's save, and the client's battle slot copy of it; compares both copies'
+    `ls hash` at the start (ls_ready, 0.3.3). Returns dict(hm, cm, t0, dt, a, b, gen0, gen1, ready)."""
     ans = ls_ans(ctx)
     ans.paused = False
     ls_wait(lambda: ls_client_back(ctx), 120, 'the client idle in slot 77 before a new battle')
@@ -5717,7 +5820,8 @@ def ls_start_test(ctx, tag, timeout=150):
     log(f'  battle {tag}: running on both after {dt:.1f} s ({r}); bid {a.get("bid")} epoch {a.get("epoch")}; '
         f'[General] slot 1 before {d0}, battle save {d1}, client slot {BATTLE_SLOT} '
         f'{gen_date(BATTLE_SLOT)}, slot {CLIENT_SLOT} {gen_date(CLIENT_SLOT)}')
-    return dict(hm=hm, cm=cm, t0=t0, dt=dt, a=a, b=b, gen0=d0, gen1=d1)
+    ready = ls_ready(H, C, f'battle {tag}')
+    return dict(hm=hm, cm=cm, t0=t0, dt=dt, a=a, b=b, gen0=d0, gen1=d1, ready=ready)
 
 
 def autorun_click(ctx, st, who, pid, frm, port=None):
@@ -5874,14 +5978,19 @@ def ls_after_checks(ctx, label):
 
 
 def ls_log_scan(label, marks):
-    """No lockstep error in the logs since the marks ({port: mark}); the hooks installed at most once per copy. The
-    battle's chat lines (pause reasons, "Battle: ...") name no file path and no "Game saved" box (0.3.2). And the
-    leak check (`ls leakcheck 1`, on in every live battle of the suite) logged no `lockstep: LEAK` line (lines a test
-    provoked on purpose are in LS_EXCUSED); its own `display wrote N sighting fields` lines (the guard kept a display
-    write out of the simulation) and WARNING lines are reported."""
+    """No lockstep error in the logs since the marks ({port: mark}); the hooks installed at most once per copy, each
+    time all context hooks of this source tree (expected_ctx_hooks). The battle's chat lines (pause reasons, "Battle:
+    ...") name no file path and no "Game saved" box (0.3.2). And the leak check (`ls leakcheck 1`, on in every live
+    battle of the suite) logged no `lockstep: LEAK` line (lines a test provoked on purpose are in LS_EXCUSED); its own
+    `display wrote N sighting fields` lines (the guard kept a display write out of the simulation) and WARNING lines are
+    reported. 0.3.3, the simulation's identification: every live load logged its line on each copy (ident_loads), and
+    `ident=` was equal on both copies at READY (ls_ready) and in every minute compared since the scenario's last scan
+    (IDENT_LOG, filled by ls_compare)."""
     bad = {who_of(p): [x for x in ls_lines(p, m, LS_BAD_RE) if LS_TEST_EXC not in x][:4] for p, m in marks.items()}
     notes = {who_of(p): ls_lines(p, m, LS_NOTE_RE)[:4] for p, m in marks.items()}
-    hooks = {who_of(p): len(log_lines(log_since(p), LS_HOOKS_RE)) for p in marks}
+    hooks = {who_of(p): [x.split('] ', 1)[-1] for x in log_lines(log_since(p), LS_HOOKS_RE)] for p in marks}
+    want = expected_ctx_hooks()
+    full = all(x.startswith(f'lockstep hooks: ok ({want} of {want} context hooks') for v in hooks.values() for x in v)
     leaks = {who_of(p): [x for x in ls_lines(p, m, LS_LEAK_RE) if x not in LS_EXCUSED] for p, m in marks.items()}
     excused = {who_of(p): sum(1 for x in ls_lines(p, m, LS_LEAK_RE) if x in LS_EXCUSED) for p, m in marks.items()}
     guard = {who_of(p): len(ls_lines(p, m, r'lockstep: the display wrote \d+ sighting fields')) for p, m in marks.items()}
@@ -5891,13 +6000,27 @@ def ls_log_scan(label, marks):
     log(f'  {label}: leak check {on}; guard catches (display wrote sighting fields) {guard}; LEAK lines provoked on '
         f'purpose {excused}')
     check(f'{label}: no lockstep error in the logs (FATAL, exception, hook failed/INCOMPLETE, load FAILED, battle '
-          f'failed); the lockstep hooks installed at most once per copy', not any(bad.values())
-          and all(v <= 1 for v in hooks.values()), f'{bad}; hooks lines {hooks}')
+          f'failed); the lockstep hooks installed at most once per copy, all {want} context hooks of this source tree',
+          not any(bad.values()) and all(len(v) <= 1 for v in hooks.values()) and want and full,
+          f'{bad}; hooks lines {hooks}')
     chatl = {who_of(p): ls_lines(p, m, r'lockstep: (The battle paused \(|Battle: )') for p, m in marks.items()}
     leaky = {w: [x for x in v if PATH_RE.search(x) or 'Game saved' in x] for w, v in chatl.items()}
     check(f'{label}: the battle\'s chat lines (pause reasons, "Battle: <the game\'s text>") name no file path and no '
           f'"Game saved" box (0.3.2: the mod\'s own saves are no pause reason, paths are cut to the file name)',
           not any(leaky.values()), f'{[(w, len(v)) for w, v in chatl.items()]} lines; {leaky}')
+    idl = {who_of(p): ident_loads(p, m) for p, m in marks.items()}
+    check(f'{label}: 0.3.3 every live load (the start, each resync) logged the simulation\'s identification on each copy '
+          f'right before "battle loaded from slot": "the simulation\'s ship identification as the battle save leaves it '
+          f'(type 22, no class); this PC\'s display had identified <n> ship(s) during the load and keeps that"',
+          all(v['loads'] == v['with_line'] and v['types'] in ([], ['22']) for v in idl.values()), idl)
+    mine = [e for e in IDENT_LOG if e[0] == _scenario[0]]
+    IDENT_LOG[:] = [e for e in IDENT_LOG if e[0] != _scenario[0]]
+    ready = [e for e in mine if e[1].endswith(' READY')]
+    minutes = sum(e[2] for e in mine if e not in ready)
+    diff = [(e[1], e[3][:6]) for e in mine if e[3]]
+    check(f'{label}: 0.3.3 the simulation\'s identification (`ident=`, not part of `all`) equal on both copies at READY '
+          f'(`ls hash` right after {len(ready)} load(s)) and in every per-minute hash compared ({minutes} minutes in '
+          f'{len(mine) - len(ready)} comparisons; up to 0.3.2 it differed in every minute)', not diff, diff[:6])
     return check(f'{label}: the leak check (`ls leakcheck 1` on every copy) found no display write into the simulation: '
                  f'no "lockstep: LEAK" line', all(v == 'ok leakcheck=1' for v in on.values())
                  and not any(leaks.values()), f'leak check {on}; LEAK lines {[(w, v[:3]) for w, v in leaks.items() if v]}')
@@ -6084,6 +6207,7 @@ def ls_drive_live(ctx, rec, A, B, mode):
     r = dict(A=A, B=B, bid=a.get('bid'), epoch=a.get('epoch'), mode=mode, t=time.time(), a0=a, b0=b, sA=lsn(A),
              sB=lsn(B), pA=pst(A), pB=pst(B), hostOpp=lsn(H).get('hostOpp') if A == H else None)
     log(f'  live battle {r["bid"]}: A={who_of(A)} B={who_of(B)}, mode {mode}; A {r["sA"]}; B {r["sB"]}')
+    r['ready'] = ls_ready(A, B, f'battle {r["bid"]}')
     if A == H:
         r['s_battle'] = read_save(save_path(HOST_SLOT))  # the campaign as the battle started (the live battle's save)
         env = (read_save(os.path.join(slot_dir(HOST_SLOT), f'RTWGame{HOST_SLOT}.sac')) or {}).get('Environment') or {}
@@ -6399,7 +6523,8 @@ def ls_recover(ctx):
 
 def ls_start_checks(tag, s):
     """b) a test battle started live: preview accepted, held, saved and sent by the host, loaded by the client from its
-    battle slot; roles, sides, ids; the host's battle in battle slot mode (outside a month)."""
+    battle slot; roles, sides, ids; the host's battle in battle slot mode (outside a month); each copy's hooks line has
+    all the context hooks of this source tree (expected_ctx_hooks)."""
     ans = _ANS[0]
     a, b = s['a'], s['b']
     prev = ls_answered(ans, 'host', s['t0'], 'TdlgBattlePreview')
@@ -6419,6 +6544,13 @@ def ls_start_checks(tag, s):
           f'A {a.get("role")}/{a.get("side")}/{a.get("bid")}/{a.get("epoch")} B {b.get("role")}/{b.get("side")}/'
           f'{b.get("bid")}/{b.get("epoch")}; playerSide {pa.get("playerSide")}/{pb.get("playerSide")}; host {hn}; '
           f'client {cn}')
+    want = expected_ctx_hooks()
+    hk = {who_of(p): [x.split('] ', 1)[-1] for x in log_lines(log_since(p), LS_HOOKS_RE)] for p in (H, C)}
+    check(f'{tag}: both copies installed the live-battle hooks once with all of them: "lockstep hooks: ok ({want} of '
+          f'{want} context hooks, ...)" ({want} = the context hooks of this source tree, src/mod/lockstep.cpp; 0.3.3 '
+          f'added TdlgDivisionReport.FillShipList: 18 -> 19)', want and all(
+              len(v) == 1 and v[0].startswith(f'lockstep hooks: ok ({want} of {want} context hooks') for v in hk.values()),
+          hk)
 
 
 def ls_orders_check(tag, A=H, B=C):
@@ -6445,11 +6577,12 @@ def ls_orders_check(tag, A=H, B=C):
 
 def ls_desync_check(tag, port, A=H, B=C):
     """An injected desync (`ls desync`: this copy's next minute differs) is caught at the next boundary and the battle
-    is synchronised again (a new epoch); the minutes after it are equal."""
+    is synchronised again (a new epoch; its READY hash compared, ls_ready); the minutes after it are equal."""
     mk, e0 = log_mark(A), int(lss(A).get('epoch') or 0)
     scmd(port, 'ls desync')
     ls_run(A, B, 1, A)
     ls_wait(lambda: int(lss(A).get('epoch') or 0) > e0 and ls_idle_equal(A, B), 120, f'resync after the {tag} desync')
+    ls_ready(A, B, f'{tag} resync')
     ma, mb = log_mark(A), log_mark(B)
     ls_run_total(A, B, 2, B)
     after = ls_compare(A, ma, B, mb, f'{tag} after the resync')
@@ -6714,15 +6847,16 @@ def divreport(pid):
     return next((h for h in top_windows(pid) if e2e_test.class_name(h) == 'TdlgDivisionReport'), None)
 
 
-def open_divreport(pid):
-    """A division report as a player opens it: the "OB" tab, the first division node of the ship tree selected
-    (TVM_SELECTITEM; the game's tvShipsChange follows), the tree's popup menu "Status..." (TfrmMain.Status1Click).
-    Returns (the report window or None, description)."""
+def open_divreport(pid, k=0):
+    """A division report as a player opens it: the "OB" tab, a division node of the ship tree selected (the first, or
+    the k-th, counted round; TVM_SELECTITEM; the game's tvShipsChange follows), the tree's popup menu "Status..."
+    (TfrmMain.Status1Click). Returns (the report window or None, description)."""
     tv = ob_tab(pid)
     if tv is None:
         return None, 'the ship tree is not shown'
     its = tv_items(pid, tv, expand=True)
-    node = next((i for i in its if i['lvl'] == 1), None)
+    nodes = [i for i in its if i['lvl'] == 1]
+    node = nodes[k % len(nodes)] if nodes else None
     if node is None:
         return None, f'no division in the tree: {[i["text"] for i in its][:6]}'
     _u32.SendMessageW(tv, TVM_ENSUREVISIBLE, 0, node['h'])
@@ -6731,6 +6865,140 @@ def open_divreport(pid):
     r = popup_pick(pid, tv, 'Status...')
     d = wait_until(lambda: divreport(pid), lambda v: v is not None, 5)
     return d, f'{node["text"]!r}: {r}'
+
+
+REPORT_SPEED_RE = (r"lockstep: the division report lowered (.+)'s current speed (-?\d+) -> (-?\d+) on this PC only: put "
+                   r"back \(the next minute lowers it on both PCs\)")  # 0.3.3 (accec95)
+TEST_SPEED = 45  # knots for `ls testcurspeed`: above every ship's maximum, as a worse weather leaves a ship's speed
+
+
+def dump_file(port):
+    """A path for a copy's `pocdump` without spaces (the bridge splits its arguments at spaces): the Windows temp folder
+    (by its short name if it has a space), or None."""
+    d = tempfile.gettempdir()
+    if ' ' in d:
+        b = ctypes.create_unicode_buffer(600)
+        if ctypes.windll.kernel32.GetShortPathNameW(d, b, 600):
+            d = b.value
+    p = os.path.join(d, f'rtw3mp_regression_dump_{port}.txt')
+    return None if ' ' in p else p
+
+
+def battle_ships(port):
+    """{division index: [dict(name, sunk, speed)]} of a copy's battle (`pocdump`: the hashed fields per division and ship,
+    read only; speed = CurrentSpeed in knots), {} if it can't be read. The dump file is deleted at once."""
+    p = dump_file(port)
+    if not p:
+        return {}
+    try:
+        if scmd(port, f'pocdump {p}') != 'ok':
+            return {}
+        with open(p, 'rb') as f:
+            txt = f.read().decode('utf-8', errors='replace')
+    except OSError:
+        return {}
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    out = {}
+    for ln in txt.splitlines():
+        m = re.match(r'\s+S(\d+)\.\d+ (.+?) ShipLocation=', ln)
+        sp, sunk = re.search(r' CurrentSpeed=([0-9a-f]{8})\b', ln), re.search(r' Sunk=([0-9a-f]{2})\b', ln)
+        if m and sp:
+            out.setdefault(int(m[1]), []).append(dict(name=m[2], sunk=bool(sunk and sunk[1] != '00'),
+                                                      speed=int.from_bytes(bytes.fromhex(sp[1]), 'little', signed=True)))
+    return out
+
+
+def ship_index(port, name, count):
+    """The index of a ship (by name) in a copy's all-ships list, found with `ls testcurspeed` (its reply names the ship):
+    each index tried gets its own speed back at once, so the copy's state does not change (between minutes only); the
+    ship found keeps TEST_SPEED. Returns (index, its speed before) or (None, the last reply)."""
+    r = ''
+    for i in range(count):
+        r = scmd(port, f'ls testcurspeed {i} {TEST_SPEED}')
+        m = re.match(r'^ok ship=(.*) was=(-?\d+)$', r)
+        if not m:
+            return None, r
+        if m[1] == name:
+            return i, int(m[2])
+        scmd(port, f'ls testcurspeed {i} {m[2]}')
+    return None, r
+
+
+def divreport_speed_check(ctx, tag, port, pid):
+    """0.3.3 (accec95): a division report opened in a live battle no longer lowers ships' current speed on that copy only
+    (TdlgDivisionReport.FillShipList clamps every listed ship's CurrentSpeed to its maximum in this weather: up to 0.3.2
+    a `LEAK <ship>.CurrentSpeed`, a DESYNC and a resync). A ship of the division the copy's report shows (its ship
+    tree's first division, open_divreport) gets a speed above its maximum on both copies (`ls testcurspeed <index> 45`,
+    as a worse weather leaves a ship); the copy opens the report: it logs "the division report lowered <ship>'s current
+    speed 45 -> n on this PC only: put back ...", the other copy logs none; with the report open the ship keeps 45 on
+    both and `ls hash` (all, ident) is equal (if opening the report gave the division an order, "orders #n (paused",
+    only `ord` may differ until the next minute applies it on both); report closed, 3 minutes: equal, no DESYNC, no
+    LEAK, and the ship below 45
+    on both copies again (the simulation's own ChangeSpeed, the same on both)."""
+    other, who, side = (C, 'host', 0) if port == H else (H, 'client', 1)
+    ls_wait(lambda: ls_idle_equal(H, C), 60, f'{tag}: both idle at a boundary')
+    close_modeless(pid)
+    tv = ob_tab(pid)
+    node = next((i for i in (tv_items(pid, tv, expand=True) if tv else []) if i['lvl'] == 1), None)
+    dname = re.sub(r' \([^()]*\)$', '', node['text']) if node else None
+    divs = [d for d in ls_divs(port) if d['side'] == side]
+    div = next((d for d in divs if d['name'] == dname), None) or \
+        next((d for d in divs if dname and dname.startswith(d['name'])), None)
+    ships = battle_ships(port).get(div['i']) if div else None
+    ship = next((s for s in ships or [] if not s['sunk']), None)
+    count = int(pst(port).get('allships') or 0)
+    idx, was = ship_index(port, ship['name'], count) if ship else (None, None)
+    if idx is None:
+        return check(f'{tag}: a ship afloat in the {who}\'s first division (its ship tree) for the division report test',
+                     False, f'node {node and node["text"]!r}; division {div}; ships {ships}; all-ships {count}; {was}')
+    ro = scmd(other, f'ls testcurspeed {idx} {TEST_SPEED}')
+    ma, mb = log_mark(H), log_mark(C)
+    mp, mo = (ma, mb) if port == H else (mb, ma)
+    d, how = open_divreport(pid)
+    put = wait_until(lambda: [x for x in ls_lines(port, mp, REPORT_SPEED_RE) if re.search(REPORT_SPEED_RE, x)[1]
+                              == ship['name']], bool, 6)
+    time.sleep(0.5)
+    speed = {who_of(p): next((s['speed'] for s in battle_ships(p).get(div['i'], []) if s['name'] == ship['name']), None)
+             for p in (H, C)}
+    ha, hb = kvs(scmd(H, 'ls hash')), kvs(scmd(C, 'ls hash'))
+    # Opening the report can give the division an order on that copy (e.g. its speed order lowered to the weather's
+    # maximum: "orders #n (paused, ...)"): sent to the other copy and applied by both from the next minute, so until then
+    # the `ord` group (and `all`) may differ; every other group must not.
+    orders = ls_lines(port, mp, r'lockstep: orders #\d+ \(paused')
+    rest = ('pos', 'dmg', 'ammo', 'sight', 'ident', 'air', 'torp', 'ships', 'sunk', 'divs', 'af', 'torps', 'rng')
+    same = bool(ha.get('all')) and (ha.get('all') == hb.get('all') or bool(orders) and all(
+        ha.get(g) is not None and ha.get(g) == hb.get(g) for g in rest))
+    hdiff = [g for g in ('ord',) + rest if ha.get(g) != hb.get(g)]
+    close_modeless(pid)
+    ran = ls_run_total(H, C, 3, H)
+    hc = ls_compare(H, ma, C, mb, f'{tag} after the report')
+    des = ls_lines(H, ma, r'DESYNC|Synchronising the battle again')
+    leaks = {who_of(p): ls_lines(p, m, LS_LEAK_RE) for p, m in ((H, ma), (C, mb))}
+    elsewhere = ls_lines(other, mo, REPORT_SPEED_RE)
+    after = {who_of(p): next((s['speed'] for s in battle_ships(p).get(div['i'], []) if s['name'] == ship['name']), None)
+             for p in (H, C)}
+    low = re.search(REPORT_SPEED_RE, put[0]) if put else None
+    return check(f'{tag}: a division report opened on the {who} ({how}) in a live battle: {ship["name"]} (all-ships index '
+                 f'{idx}, {was} knots) set to {TEST_SPEED} on both copies (`ls testcurspeed`); the {who} logs "the '
+                 f'division report lowered {ship["name"]}\'s current speed {TEST_SPEED} -> n on this PC only: put back", '
+                 f'the other copy no such line; with the report open {TEST_SPEED} on both and `ls hash` all/ident equal '
+                 f'(only `ord` may differ while an order the report gave is pending: "orders #n (paused"); '
+                 f'then {ran} minutes equal, no DESYNC, no LEAK, and the ship below {TEST_SPEED} knots on both (0.3.2: the '
+                 f'report lowered it on one copy: LEAK <ship>.CurrentSpeed, DESYNC)',
+                 d is not None and ro == f'ok ship={ship["name"]} was={was}' and low
+                 and int(low[2]) == TEST_SPEED and int(low[3]) < TEST_SPEED and not elsewhere
+                 and speed == {'host': TEST_SPEED, 'client': TEST_SPEED} and same
+                 and ha.get('ident') == hb.get('ident') and ran >= 3 and hc['minutes'] >= 3 and not hc['differ']
+                 and not hc['ident_differ'] and not des and not any(leaks.values()) and after['host'] is not None
+                 and after['host'] == after['client'] and after['host'] < TEST_SPEED,
+                 f'other copy {ro}; {put[:2]}; elsewhere {elsewhere[:2]}; open {speed}; ls hash all {ha.get("all")}/'
+                 f'{hb.get("all")} ident {ha.get("ident")}/{hb.get("ident")} groups that differ {hdiff}; '
+                 f'orders {orders[:2]}; hashes {hc}; {des[:2]}; LEAK '
+                 f'{ {w: v[:2] for w, v in leaks.items() if v} }; after {after}')
 
 
 def lsctl(port, cls, fld):
@@ -6844,8 +7112,10 @@ def scenario_lockstep_ui(ctx):
     a blocked click; `ls resync` with both open on both copies: "<class> hidden before the battle is loaded again (ok)"
     for both on each copy, no crash, both running, the air window opens again, 2 minutes equal; the land-CAP click + the
     report's Ok then 2 minutes equal; the missile panel locked again. g) B's ship tree lists only B's own forces after
-    each minute and after the reload (0.3.1/0.3.2: side 0's after every minute). h) the host drops the client and
-    finishes alone; after-checks; no lockstep error, no LEAK."""
+    each minute and after the reload (0.3.1/0.3.2: side 0's after every minute). k) 0.3.3: a division report's speed
+    write (divreport_speed_check: `ls testcurspeed` 45 on a ship of the report's division on both copies, the client's
+    report, then the host's: the put-back line on that copy only, equal hashes, no LEAK). h) the host drops the client
+    and finishes alone; after-checks; no lockstep error, no LEAK."""
     marks0 = {H: log_mark(H), C: log_mark(C)}
     ls_ensure_session(ctx)
     hs, cs = lsn(H), lsn(C)
@@ -6878,6 +7148,7 @@ def scenario_lockstep_ui(ctx):
         e0 = int(lss(H).get('epoch') or 0)
         scmd(H, 'ls resync')
         ls_wait(lambda: int(lss(H).get('epoch') or 0) > e0 and ls_idle_equal(H, C), 150, 'the first resync')
+        ls_ready(H, C, 'lockstep_ui a) the first resync')
         snaps.append(('the first resync', gen_date(HOST_SLOT)))
         after, mem1 = {who_of(p): ai_count(p) for p in (H, C)}, mem(ctx)
         log(f'  NOTE a) (not checked in 0.3.2) divisions on the AI per side (on the AI, all) before a resync {before}, '
@@ -7028,6 +7299,9 @@ def scenario_lockstep_ui(ctx):
         check('g) every load of this battle ran the game\'s battle teardown first ("battle data cleared (ok), air formations '
               'left 0": the start and the two resyncs on each copy)', all(len(v) >= 3 and all(ok and n == 0 for ok, n in v)
                                                                           for v in td.values()), td)
+        # k) 0.3.3: a division report's speed write stays out of the live battle (the client's report, then the host's)
+        divreport_speed_check(ctx, 'k) client', C, ctx.cp)
+        divreport_speed_check(ctx, 'k) host', H, ctx.hp)
         # h) the end
         scmd(H, 'ls drop')
         ls_wait(lambda: ls_client_back(ctx), 120, 'the client back in slot 77 after the drop')
@@ -7767,7 +8041,9 @@ def scenario_lockstep_stress(ctx):
     on the client and on the host (4 each: one DESYNC per injected minute, the minute after each resync equal including
     the RNG part, the 4th -> the AI takes side 1); S4 a silent client and a client that never loads (12-s / 15-s
     timeouts), S5 a silent host; S7 `ls throw` / `ls stall` / `ls nest` on each copy and the guard's negative control;
-    memory and log watch (no LEAK) over these 9 battles in a row; S6 the client killed at a boundary (the host drops it,
+    S8 (0.3.3) the reports of every division opened in turn on both copies through 45 live minutes (the natural clamp of
+    a ship's speed); memory and log watch (no LEAK) over these 10 battles in a row; S6 the client killed at a boundary
+    (the host drops it,
     goes on), started again and joining during the host's battle; f) a long battle (every division on the AI) at speed 5
     to its end, then a normal month. Real months (the host at war with nation 1): P1 the client opts out
     (`fightbattles 0`): the host's battle against it is fought against the AI; P2 the client killed in the middle of a
@@ -8090,10 +8366,55 @@ def scenario_lockstep_stress(ctx):
         ls_wait(lambda: ls_over(H), 30, 'the host alone after S7')
         log('  S7: the host dropped the client to end the case:', ls_lines(H, mk, r'dropping')[:1])
 
+    def s8():
+        """0.3.3 (accec95), the natural case of the division report's speed write: every division on the AI (contact,
+        damage), 45 live minutes in runs of 3; at each boundary each copy opens the report of its next division (its
+        ship tree's divisions in turn) and closes it. Every minute equal, no DESYNC, no LEAK (up to 0.3.2 a report that
+        clamped a ship's speed gave `LEAK <ship>.CurrentSpeed` and a DESYNC); the put-back lines (the clamps that
+        happened) are reported."""
+        ls_start_test(ctx, 'S8')
+        scmd(H, 'ls speed 3')
+        n_ai = ls_all_ai(H, C)
+        ma, mb = log_mark(H), log_mark(C)
+        opened, k, ran, t8 = {'host': 0, 'client': 0}, 0, 0, time.time()
+        while ran < 45 and not ls_over(H):
+            for who, pid in (('client', ctx.cp), ('host', ctx.hp)):
+                d, _ = open_divreport(pid, k)
+                opened[who] += d is not None
+                close_modeless(pid)
+            k += 1
+            ran += ls_run_total(H, C, 3, H)
+        # The game refuses the report of a division under the AI on the host's own side ("Division is under AI
+        # control!", answered OK): a round of the game's rule, not a failure.
+        refused = {w: sum(1 for ts, w2, _, t in BOX_SEEN if ts >= t8 and w2 == w and 'under AI control' in t)
+                   for w in opened}
+        hc = ls_compare(H, ma, C, mb, 'S8 division reports')
+        des = ls_lines(H, ma, r'DESYNC|Synchronising the battle again')
+        leaks = {who_of(p): ls_lines(p, m, LS_LEAK_RE) for p, m in ((H, ma), (C, mb))}
+        put = {who_of(p): ls_lines(p, m, REPORT_SPEED_RE) for p, m in ((H, ma), (C, mb))}
+        log(f'  S8: reports opened {opened} in {k} rounds (refused "Division is under AI control!": {refused}); put back '
+            f'(the clamps that happened): { {w: (len(v), v[:2]) for w, v in put.items()} }')
+        check(f'S8 the division report in a long live battle (0.3.3, natural case): {ran} minutes with every division on '
+              f'the AI ({n_ai} orders), each copy opened the report of its divisions in turn every 3 minutes ({opened}; '
+              f'the game refused {refused} as "Division is under AI control!"): every minute equal, no DESYNC, no LEAK; '
+              f'the clamps put back: host {len(put["host"])}, client {len(put["client"])} (reported)',
+              (ran >= 45 or ls_over(H)) and ran >= 9 and hc['minutes'] >= ran - 1
+              and not hc['differ'] and not des and not any(leaks.values()) and min(opened.values()) >= 1
+              and all(opened[w] + refused[w] >= max(1, k * 3 // 4) for w in opened),
+              f'{hc}; {des[:2]}; LEAK { {w: v[:2] for w, v in leaks.items() if v} }; opened {opened} of {k}, refused '
+              f'{refused}')
+        memory.append(('S8', *mem(ctx)))
+        mk = log_mark(H)
+        scmd(H, 'ls drop')
+        ls_wait(lambda: ls_client_back(ctx), 120, 'the client back after S8')
+        ls_wait(lambda: ls_over(H), 30, 'the host alone after S8')
+        log('  S8: the host dropped the client to end the case:', ls_lines(H, mk, r'dropping')[:1])
+
     for name, fn in (('S1 spam + end during a resync / after a drop', s1), ('S2 end during the load + client leaves', s2),
                      ('S3 desync counter reset + resync limit', s3), ('S3 desync storm on the client (B)', lambda: storm(C)),
                      ('S3 desync storm on the host (A)', lambda: storm(H)), ('S4 silent client + client never loads', s4),
-                     ('S5 silent host', s5), ('S7 robust: throw / stall / nested loop + guard off', s7)):
+                     ('S5 silent host', s5), ('S7 robust: throw / stall / nested loop + guard off', s7),
+                     ('S8 division reports through a battle (0.3.3, natural case)', s8)):
         ls_case(ctx, name, fn)
     for p in (H, C):
         scmd(p, 'ls timeout 30 30 120')
@@ -8408,6 +8729,214 @@ def air_sample(ctx):
                 kinds=sorted({(x[2], x[4]) for x in ra + rb if len(x) > 4}))
 
 
+# ---------------------------------------------------------------- 0.3.3: the campaign's air units (the 1935 campaign)
+AIR_SLOT = 49  # air_units' throwaway copy of the 1935 campaign (must not exist before the run; deleted after it); a host's
+#   campaign must be in slots 1-49 (the mod's CampaignLoaded: from 50 on the slots are joined players' own)
+AIR_MONTHS = (2, 3)  # air_units' real months with a merged turn: the default run, --stress
+OWN_CAMPAIGN = ('air_units',)  # their months are another campaign's: never shared with the slot 1 session's month hooks
+AIR_LOAD_RE = r"air units: (\d+) from before the load dropped; the campaign's (\d+) kept"
+AIR_REPAIR_RE = r'air units: (\d+) repeated units of the save dropped \((\d+) -> (\d+); a save of an earlier version\)'
+AIR_BAD_RE = (r'WARNING: air unit list not found|WARNING: air units: the list changed during the load|'
+              r'exception dropping the air units|air units: the load failed')
+CAPACITY_BOX = 'aircraft capacity exceeded'  # the game's Turn check "CV <name> aircraft capacity exceeded!"
+
+
+def airunits(port):
+    """`airunits` (0.3.3): the air units in a copy's global list (all nations), or None."""
+    m = re.match(r'^ok count=(-?\d+)', scmd(port, 'airunits'))
+    return int(m[1]) if m else None
+
+
+def saved_airunits(slot):
+    """[AirUnits] of a slot's saved campaign: dict(no=AirUnitNo, units=units (their AU<i>Id keys), ids=distinct
+    AirUnitIds); no=0 without the section, None if the file can't be read."""
+    try:
+        with open(save_path(slot), 'rb') as f:
+            txt = f.read().decode('utf-8-sig', errors='replace')
+    except OSError:
+        return None
+    m = re.search(r'^\[AirUnits\][^\n]*\n(.*?)(?=^\[|\Z)', txt, re.S | re.M)
+    if not m:
+        return dict(no=0, units=0, ids=0)
+    no = re.search(r'^AirUnitNo=(-?\d+)', m[1], re.M)
+    ids = re.findall(r'^AU(\d+)Id=(-?\d+)', m[1], re.M)
+    return dict(no=int(no[1]) if no else None, units=len({i for i, _ in ids}), ids=len({v for _, v in ids}))
+
+
+def no_doubling(before, kept):
+    """A load's "N from before the load dropped; the campaign's M kept": M within 25 % of N (up to 0.3.2 every load in the
+    same process added the save's M units to the N: x2 for the same campaign)."""
+    return 0 < kept <= 1.25 * before and before <= 1.25 * kept
+
+
+def air_lines(port, mark):
+    """[(N, M)] of a copy's "air units: N from before the load dropped; the campaign's M kept" lines since the mark."""
+    return [(int(a), int(b)) for a, b in re.findall(AIR_LOAD_RE, log_since(port, mark))]
+
+
+def air_after_load(tag, what, loads, need_line=True):
+    """0.3.3 (8f81c07): after a load on each copy ([(port, log mark before it, the slot it loaded)]) its `airunits` equals
+    that save's [AirUnits] count (AirUnitNo, every AirUnitId once), and the load logged "air units: N from before the load
+    dropped; the campaign's M kept" with M = that count and N within 25 % of M: required when the copy held air units
+    before it (need_line). Up to 0.3.2 every load in the same process appended the save's units to the list again."""
+    res = {}
+    for port, mark, slot in loads:
+        n, sv, lines = airunits(port), saved_airunits(slot) or {}, air_lines(port, mark)
+        res[who_of(port)] = dict(airunits=n, slot=slot, saved=sv, lines=lines, ok=bool(
+            n and n == sv.get('no') == sv.get('ids') and (lines or not need_line)
+            and all(no_doubling(a, b) for a, b in lines) and (not lines or lines[-1][1] == n)))
+    return check(f'{tag} 0.3.3 air units after {what}: each copy holds the [AirUnits] count of the save it loaded '
+                 f'(`airunits` = its AirUnitNo, every AirUnitId once) and its load logged "air units: N from before the '
+                 f'load dropped; the campaign\'s M kept" with M = that count, never doubled (up to 0.3.2: x2 at every '
+                 f'load)', all(v['ok'] for v in res.values()), res)
+
+
+def air_copy(src, dst):
+    """Save slot `src` copied to the throwaway slot `dst` (the slot number in the file names changed: RTWGame<n>.*,
+    MapData<n>.dat) with every [AirUnits] entry doubled, as 0.3.2 saved a campaign after one reload in the same process:
+    AU<i+N><Field> = AU<i><Field> for each of the N units, AirUnitNo = 2N (the file's BOM and line ends kept). Returns N."""
+    s, d = slot_dir(src), slot_dir(dst)
+    os.makedirs(d)
+    for fn in os.listdir(s):
+        m = re.fullmatch(rf'(RTWGame|MapData){src}(\.\w+)', fn)
+        shutil.copyfile(os.path.join(s, fn), os.path.join(d, f'{m[1]}{dst}{m[2]}' if m else fn))
+    p = save_path(dst)
+    with open(p, 'rb') as f:
+        raw = f.read()
+    bom = raw.startswith(b'\xef\xbb\xbf')
+    txt = raw[3 if bom else 0:].decode('utf-8', 'surrogateescape')
+    nl = '\r\n' if '\r\n' in txt else '\n'
+    sec = re.search(r'^\[AirUnits\]\r?\n(.*?)(?=^\[|\Z)', txt, re.S | re.M)
+    body = sec[1]
+    n = int(re.search(r'^AirUnitNo=(\d+)', body, re.M)[1])
+    extra = ''.join(f'AU{int(i) + n}{k}={v}{nl}' for i, k, v in re.findall(r'^AU(\d+)([A-Za-z]\w*)=(.*?)\r?$', body, re.M))
+    body = re.sub(r'^AirUnitNo=\d+', f'AirUnitNo={2 * n}', body, count=1, flags=re.M)
+    body += ('' if body.endswith(nl) else nl) + extra
+    with open(p, 'wb') as f:
+        f.write((b'\xef\xbb\xbf' if bom else b'') + (txt[:sec.start(1)] + body + txt[sec.end(1):]).encode(
+            'utf-8', 'surrogateescape'))
+    return n
+
+
+def scenario_air_units(ctx):
+    """0.3.3 (8f81c07): the campaign's air units no longer double with every load in the same process. The game's
+    LoadAircraftData appends a save's [AirUnits] to a global list that only the quick battle clears; since 0.1.0 the host
+    reloaded the campaign every month after merging the players' turns, a joined player every month (both also at every
+    live battle start and resync): x2 each time, until the host's Turn stopped at "CV <name> aircraft capacity
+    exceeded!". On the 1935 test campaign (slot 9; skipped without it) copied to the throwaway slot 49 with every air unit
+    doubled (a save of 0.3.2 after one reload): a) the host's first load repairs it ("air units: N repeated units of the
+    save dropped (2N -> N; a save of an earlier version)", `airunits` N); b) `save` writes N; c) the next load keeps N
+    ("N from before the load dropped; the campaign's N kept"); d) a session there (the client claims France, nation 2):
+    `airunits` on both = the saved counts = N; e) real months with a merged turn (AIR_MONTHS: 2, --stress 3): the host's
+    merge reload and the client's new month log the line, never doubled; `airunits` on both = the saves' counts, within
+    25 % of N; no capacity box; f) no air-unit WARNING. The session stays on the copy (lockstep_air moves it to slot 9)."""
+    ok, why = fixture1935()
+    if not ok:
+        SKIPPED['air_units'] = why
+        log(f'SKIP air_units: {why}. Make the 1935 test campaign as docs/TESTING.md describes ("The 1935 test campaign") '
+            f'and run again.')
+        return
+    K, nameK = F1935_NATION, F1935_NAME
+    marks0 = {H: log_mark(H), C: log_mark(C)}
+    ls_quiet(ctx)
+    if lss(H).get('on') == '1':
+        scmd(H, 'ls drop')
+        time.sleep(3)
+    for pid in (ctx.hp, ctx.cp):
+        close_modeless(pid)
+    if battle_up(ctx.hp):
+        ls_finish_host(ctx)
+        ls_quiet(ctx)
+    scmd(C, 'leave')
+    time.sleep(1.5)
+    scmd(H, 'leave')
+    time.sleep(1.5)
+    n = air_copy(F1935_SLOT, AIR_SLOT)
+    sv0 = saved_airunits(AIR_SLOT)
+    log(f'  the 1935 test campaign copied to slot {AIR_SLOT} with every air unit doubled: {sv0} (slot {F1935_SLOT}: '
+        f'{saved_airunits(F1935_SLOT)})')
+
+    def loaded(s):
+        return s.get('slot') == str(AIR_SLOT) and s.get('playerIdx') == '0' and s.get('startBuild') == '2'
+
+    # a) the first load repairs the doubled save
+    hm = log_mark(H)
+    r = cmd(H, f'load {AIR_SLOT} 0')
+    wait(H, loaded, 120, f'the host loads slot {AIR_SLOT}', pids=(ctx.hp,))
+    a1, rep = airunits(H), ls_lines(H, hm, AIR_REPAIR_RE)
+    check(f'a) the host\'s first load of the doubled copy (`load {AIR_SLOT} 0` {r}; its [AirUnits] {sv0}) repairs it: '
+          f'"air units: {n} repeated units of the save dropped ({2 * n} -> {n}; a save of an earlier version)", '
+          f'`airunits` {n} (0.3.2 kept {2 * n} and doubled them at every later load)',
+          r == 'ok' and sv0 == dict(no=2 * n, units=2 * n, ids=n) and a1 == n and len(rep) == 1
+          and re.search(AIR_REPAIR_RE, rep[0]).groups() == (str(n), str(2 * n), str(n)), f'airunits {a1}; {rep}')
+    # b) the repaired list saved
+    rs = cmd(H, 'save')
+    time.sleep(1)
+    drain(ctx.hp, 2)
+    sv1 = saved_airunits(AIR_SLOT)
+    check(f'b) `save` (slot {AIR_SLOT}, the throwaway copy) writes the repaired list: AirUnitNo {n}, every AirUnitId once',
+          rs == 'ok' and sv1 == dict(no=n, units=n, ids=n), f'{rs}; {sv1}')
+    # c) the next load in the same process keeps the count
+    hm = log_mark(H)
+    r2 = cmd(H, f'load {AIR_SLOT} 0')
+    wait(H, loaded, 120, f'the host loads slot {AIR_SLOT} again', pids=(ctx.hp,))
+    a2, kept, rep2 = airunits(H), air_lines(H, hm), ls_lines(H, hm, AIR_REPAIR_RE)
+    check(f'c) a second load in the same copy keeps the list: "air units: {n} from before the load dropped; the '
+          f'campaign\'s {n} kept", no repair line, `airunits` {n}', r2 == 'ok' and a2 == n and kept == [(n, n)]
+          and not rep2, f'airunits {a2}; {kept}; {rep2}')
+    # d) a session on the copy
+    rh = cmd(H, f'host {HOST_NAME} {MP_PORT} 0')
+    cm = log_mark(C)
+    rj = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {MP_PORT}')
+    time.sleep(3)
+    rc = cmd(C, f'claim {nameK}')
+    time.sleep(1.5)
+    cmd(H, 'start')
+    st = wait(C, lambda s: s.get('phase') == 'planning' and s.get('playerIdx') == str(K)
+              and s.get('slot') == str(CLIENT_SLOT), 120, f'the client plans {nameK} in slot {CLIENT_SLOT}',
+              pids=(ctx.hp, ctx.cp))
+    wait_event_roll(ctx, cm)
+    hs, cs, ah, ac = saved_airunits(AIR_SLOT), saved_airunits(CLIENT_SLOT), airunits(H), airunits(C)
+    check(f'd) a session on the copy: the host hosts ({rh}), the client joins ({rj}), claims {nameK} ({rc}) and plans '
+          f'nation {K} in slot {CLIENT_SLOT} ({st.get("date")}); `airunits` host {ah} = client {ac} = the saved counts '
+          f'of slot {AIR_SLOT} and slot {CLIENT_SLOT} = {n}', rh == rj == rc == 'ok' and ah == ac == n
+          and hs == cs == dict(no=n, units=n, ids=n), f'host {hs}; client {cs}')
+    # e) real months with a merged turn
+    months, t_m, done = AIR_MONTHS[1] if OPTS['stress'] else AIR_MONTHS[0], time.time(), 0
+    for k in range(1, months + 1):
+        label = f'air_units M{k}'
+        hm, cm = log_mark(H), log_mark(C)
+        try:
+            run_month(ctx, label, slot=AIR_SLOT, checks=False)
+        except RuntimeError as e:
+            check(f'{label}: the month on the copy completed', False,
+                  f'{e!r}; boxes {[(w, t[:160]) for ts, w, _, t in BOX_SEEN if ts >= t_m][-4:]}')
+            break
+        done += 1
+        hl, cl = log_since(H, hm), log_since(C, cm)
+        merged = log_lines(hl, r'host turn: \d+ submissions merged')
+        hk, ck = air_lines(H, hm), air_lines(C, cm)
+        rep = log_lines(hl, AIR_REPAIR_RE) + log_lines(cl, AIR_REPAIR_RE)
+        check(f'{label}: the host merged the client\'s turn and its reload of the merged campaign logged "air units: N '
+              f'from before the load dropped; the campaign\'s M kept" {hk}, the client\'s load of the new month too {ck}; '
+              f'M within 25 % of N every time (never x2), no repair line (the campaign stays clean)',
+              merged and hk and ck and all(no_doubling(a, b) for a, b in hk + ck) and not rep,
+              f'{[x.split("] ", 1)[-1] for x in merged[:1]]}; repair {rep[:2]}')
+        ah, ac, hs, cs = airunits(H), airunits(C), saved_airunits(AIR_SLOT), saved_airunits(CLIENT_SLOT)
+        check(f'{label}: after the month `airunits` host {ah} = slot {AIR_SLOT}\'s saved AirUnitNo {hs and hs["no"]} = '
+              f'client {ac} = slot {CLIENT_SLOT}\'s {cs and cs["no"]}, every AirUnitId once, within 25 % of the {n} at the '
+              f'start (0.3.2: x2 every month)', ah is not None and ah == ac and bool(hs and cs)
+              and hs['no'] == hs['units'] == hs['ids'] == ah and cs['no'] == cs['units'] == cs['ids'] == ac
+              and abs(ah - n) <= 0.25 * n, f'host {ah} {hs}; client {ac} {cs}')
+    boxes = [(w, t[:160]) for ts, w, _, t in BOX_SEEN if ts >= t_m and CAPACITY_BOX in t.lower()]
+    check(f'e) {done} of {months} months on the copy, the host\'s Turn never stopped at "CV <name> aircraft capacity '
+          f'exceeded!" (no such box on either copy; up to 0.3.2 once a carrier\'s doubled air group exceeded its '
+          f'capacity)', done == months and not boxes, boxes[:3])
+    bad = {who_of(p): ls_lines(p, m, AIR_BAD_RE) for p, m in marks0.items()}
+    check('f) no air-unit WARNING or failure in either log ("air unit list not found", "the list changed during the '
+          'load", "exception dropping the air units", "the load failed")', not any(bad.values()), bad)
+
+
 def scenario_lockstep_air(ctx):
     """Live battles with aircraft: the 1935 test campaign in save slot 9 (Great Britain = nation 0; the client plays
     France = nation 2), skipped with a SKIP line when the slot does not hold it (fixture1935). Runs last: the session
@@ -8425,7 +8954,10 @@ def scenario_lockstep_air(ctx):
     equal, the same formations per side on both copies every 5 minutes, each window its own side. g) `ls resync` with
     aircraft in the air on both sides: the same formations per side afterwards, still in the air, 3 minutes equal. h) the
     host drops the client, the client back in slot 77. i) every load logged the game's battle teardown ("battle data
-    cleared (ok)"); no lockstep error, no LEAK. Reported: private memory before/after each load."""
+    cleared (ok)"); no lockstep error, no LEAK. Reported: private memory before/after each load. 0.3.3: after every load
+    (a) the host's of slot 9 and the client's month, b) the start, d) and g) the resyncs, h) the client's return to slot
+    77) each copy holds the [AirUnits] count of the save it loaded and logged that it dropped the units from before the
+    load (air_after_load: up to 0.3.2 every load appended them again); the READY hash of b) and d) (ls_ready)."""
     ok, why = fixture1935()
     if not ok:
         SKIPPED['lockstep_air'] = why
@@ -8447,6 +8979,7 @@ def scenario_lockstep_air(ctx):
     time.sleep(1.5)
     scmd(H, 'leave')
     time.sleep(1.5)
+    hm_a = log_mark(H)
     r = cmd(H, f'load {F1935_SLOT} 0')
     wait(H, lambda s: s.get('slot') == str(F1935_SLOT) and s.get('playerIdx') == '0' and s.get('startBuild') == '2',
          120, 'the host loads the 1935 campaign', pids=(ctx.hp,))
@@ -8454,6 +8987,7 @@ def scenario_lockstep_air(ctx):
     scmd(C, 'fightbattles 1')
     if lsn(C).get('enabled') != '1':
         scmd(C, 'ls enable 1')
+    cm_a = log_mark(C)
     rj = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {MP_PORT}')
     time.sleep(3)
     rc = cmd(C, f'claim {nameK}')
@@ -8470,6 +9004,8 @@ def scenario_lockstep_air(ctx):
                  f'{CLIENT_SLOT} ({st.get("date")}); the host lists Captain({K},b,ls)', r == rh == rj == rc == 'ok'
                  and f'Captain({K},b,ls)' in hs.get('players', ''), hs):
         return
+    air_after_load('a)', f'the host\'s load of slot {F1935_SLOT} and the client\'s month in slot {CLIENT_SLOT}',
+                   [(H, hm_a, F1935_SLOT), (C, cm_a, CLIENT_SLOT)], need_line=False)
     ans = ls_ans(ctx)
     ans.paused = False
     scmd(H, f'settension 0 {K} 50')
@@ -8494,9 +9030,11 @@ def scenario_lockstep_air(ctx):
     sides = [(w.get('af0'), w.get('af1'), w.get('afx')) for w in (wa, wb)]
     td = {who_of(p): teardown_lines(p, mk) for p, mk in ((H, hm), (C, cm))}
     d1 = gen_date(F1935_SLOT)  # A's start snapshot
+    env = (read_save(os.path.join(slot_dir(F1935_SLOT), f'RTWGame{F1935_SLOT}.sac')) or {}).get('Environment') or {}
     log(f'  NOTE b) the start: teardown before the load {td}; private memory host/client {mem0} -> {mem1} MB; '
         f'[General] slot {F1935_SLOT} before {d0}, battle save {d1}, client slot {BATTLE_SLOT} '
-        f'{gen_date(BATTLE_SLOT)}')
+        f'{gen_date(BATTLE_SLOT)}; the battle\'s weather ([Environment] of its .sac): '
+        f'{ {k: env.get(k) for k in ("Hour", "Minute", "SeaState", "Windspeed", "Precipitation", "DaySightingDistance", "Squalls", "FogBanks", "MorningMist", "AirPriority0", "AirPriority1")} }')
     ok = res == 'running' and pa.get('af') == pb.get('af') and sides[0] == sides[1] \
         and all(x not in (None, '0') for x in sides[0][:2])
     if not check(f'b) the 1935 live battle with aircraft (`pocbattle {K} {F1935_MISSION}` {rb}: Great Britain vs {nameK}) '
@@ -8509,6 +9047,9 @@ def scenario_lockstep_air(ctx):
         ls_quiet(ctx)
         ls_log_scan('i)', marks0)
         return
+    ls_ready(H, C, 'lockstep_air b)')
+    air_after_load('b)', 'the battle\'s start (A loads its snapshot, B the battle slot)',
+                   [(H, hm, F1935_SLOT), (C, cm, BATTLE_SLOT)])
     # c) B4: each copy's air formations window lists its own side
     sa, sb = airwin(H, show=True), airwin(C, show=True)
     time.sleep(1)
@@ -8529,6 +9070,8 @@ def scenario_lockstep_air(ctx):
     r = scmd(H, 'ls resync')
     ls_wait(lambda: int(lss(H).get('epoch') or 0) > e0 and ls_idle_equal(H, C), 240, 'the resync with the windows open')
     mem3, snap_d = mem(ctx), gen_date(F1935_SLOT)
+    ls_ready(H, C, 'lockstep_air d)')
+    air_after_load('d)', 'the resync', [(H, ma, F1935_SLOT), (C, mb, BATTLE_SLOT)])
     hid = {who_of(p): ls_lines(p, mk, HIDDEN_RE) for p, mk in ((H, ma), (C, mb))}
     alive = all(sstatus(p) and lss(p).get('st') == 'running' for p in (H, C))
     sa3, sb3 = airwin(H, show=True), airwin(C, show=True)
@@ -8603,6 +9146,7 @@ def scenario_lockstep_air(ctx):
     r = scmd(H, 'ls resync')
     ls_wait(lambda: int(lss(H).get('epoch') or 0) > e0 and ls_idle_equal(H, C), 240, 'the resync with aircraft in the air')
     mem5, snap_g = mem(ctx), gen_date(F1935_SLOT)
+    air_after_load('g)', 'the resync with aircraft in the air', [(H, ma, F1935_SLOT), (C, mb, BATTLE_SLOT)])
     hid = {who_of(p): ls_lines(p, mk, HIDDEN_RE) for p, mk in ((H, ma), (C, mb))}
     airwin(H, show=True)
     airwin(C, show=True)
@@ -8625,9 +9169,11 @@ def scenario_lockstep_air(ctx):
     close_modeless(ctx.hp)
     close_modeless(ctx.cp)
     # h) the end (the last scenario: the host's battle stays open; the runner closes the copies)
+    cm_h = log_mark(C)
     scmd(H, 'ls drop')
     back = ls_wait(lambda: ls_back(C, ctx.cp, CLIENT_SLOT, K), 120, f'the client back in slot {CLIENT_SLOT}')
     check(f'h) the host drops the client: the client back in slot {CLIENT_SLOT} as {nameK}', back, back)
+    air_after_load('h)', f'the client\'s return to slot {CLIENT_SLOT}', [(C, cm_h, CLIENT_SLOT)])
     ls_quiet(ctx)
     td = {who_of(p): teardown_lines(p, marks0[p]) for p in (H, C)}
     check('i) every load ran the game\'s battle teardown first ("battle data cleared (ok)": the start, the two resyncs and '
@@ -8709,7 +9255,9 @@ SCENARIOS = [  # name, months processed, what it guards, function
                     'resynced, an end refused before minute 400, the host drops the client (AI takes side 1, the client '
                     'back in slot 77 with its unsubmitted plans), the host finishes alone without a month; one normal '
                     'month (the plans reach the host); no lockstep error and no LEAK in the logs (the leak check is on in '
-                    'every live battle of the suite; joins the session again if needed)',
+                    'every live battle of the suite; joins the session again if needed); 0.3.3: the hooks line has every '
+                    'context hook of this source tree, every live load logs the simulation\'s identification and '
+                    '`ident=` is equal at READY and in every minute (as in every lockstep scenario: ls_log_scan)',
      scenario_lockstep),
     ('lockstep_ui', 0, 'the battle screen\'s own controls in a live test battle (0.3.2): the speed arrows of both players '
                        '(posted clicks, between minutes and inside a running minute) become shared speed requests with no '
@@ -8717,7 +9265,9 @@ SCENARIOS = [  # name, months processed, what it guards, function
                        'put up again (`ls ctl`, `pocstate fastest=0`); 14 minutes in contact equal; the missile panel '
                        'disabled; the air formations window and a division report open during a resync are hidden before '
                        'the load (no crash) and open again; every load runs the game\'s battle teardown first; the second '
-                       'player\'s ship tree lists only its own forces',
+                       'player\'s ship tree lists only its own forces; 0.3.3: a division report (the client\'s, then the '
+                       'host\'s) with a ship above its maximum speed (`ls testcurspeed`) puts the speed back on its copy '
+                       'only, the minutes equal, no LEAK',
      scenario_lockstep_ui),
     ('lockstep_pvp', 1, 'live battle between two joined players (a third copy joins as "Bot", nation 2, slot 76): war '
                         '1-2, `battles injectpvp`, months (up to 3) until the battle phase fights it live (attacker A, '
@@ -8740,17 +9290,27 @@ SCENARIOS = [  # name, months processed, what it guards, function
                            'after a drop, the resync counter, desync storms on the client and on the host (the resync '
                            'limit, the RNG part equal after each resync), silent client / host, a client that never '
                            'loads, an exception / a stalled minute / a nested message loop on each copy, the guard\'s '
-                           'negative control, 9 live battles in a row (memory, logs, LEAK), the client killed at a '
+                           'negative control, every division\'s report opened in turn through 45 live minutes (0.3.3), '
+                           '10 live battles in a row (memory, logs, LEAK), the client killed at a '
                            'boundary and in the middle of a minute of a real month (it joins again during the host\'s '
                            'battle and gets nation 1 back), a long battle to its end, the '
                            'opt-outs fightbattles 0 and RTW3MP_LIVE_BATTLES=0 in real months, the host killed in a '
                            'battle (client not stuck, new session from the restored slot 1)', scenario_lockstep_stress),
+    ('air_units', AIR_MONTHS[0], '0.3.3: the campaign\'s air units no longer double with every load in the same process '
+                                 '(the 1935 test campaign copied to the throwaway slot 49 with every air unit doubled, '
+                                 'as 0.3.2 saved it; skipped without the fixture): the first load repairs it, `save` '
+                                 'writes the repaired count, the next load keeps it; a session there (the client plays '
+                                 'France) and real months with a merged turn (--stress: 3): the host\'s merge reload and '
+                                 'the client\'s new month keep the count (`airunits` = the saves\' [AirUnits]), no '
+                                 '"aircraft capacity exceeded!" at the host\'s Turn', scenario_air_units),
     ('lockstep_air', 0, 'live battles with aircraft, the 1935 test campaign (save slot 9, outside the repo; skipped '
                         'without it; runs last: the session moves to it): a live battle with carriers and air stations on '
                         'both sides runs on both copies (the same formations per side); each player\'s air formations '
                         'window lists only its own side, also after a minute; a resync with it open (hidden, no crash, '
                         'nothing piles up); the land-CAP button put up again and the report\'s Ok without a desync; 30+ '
-                        'live minutes with aircraft in the air on both sides, equal; a resync with aircraft in the air',
+                        'live minutes with aircraft in the air on both sides, equal; a resync with aircraft in the air; '
+                        '0.3.3: after every load (the session, the start, both resyncs, the client\'s return) each copy '
+                        'holds the [AirUnits] count of the save it loaded',
      scenario_lockstep_air),
 ]
 STRESS_ONLY = ('lockstep_stress',)  # not in the default run: --stress or --only
@@ -8783,7 +9343,7 @@ def tree_digest(d):
     return out
 
 
-def preflight(g1, copy_slots=(), k2_slots=()):
+def preflight(g1, copy_slots=(), k2_slots=(), air_slots=()):
     problems = []
     if running_pids('RTW3.exe'):
         problems.append(f'RTW3.exe is already running (PIDs {running_pids("RTW3.exe")}); close it first')
@@ -8802,6 +9362,10 @@ def preflight(g1, copy_slots=(), k2_slots=()):
         if os.path.exists(slot_dir(s)):
             problems.append(f'save slot {s} exists ({slot_dir(s)}); lockstep_pvp\'s third copy would overwrite and '
                             f'delete it: move it away first')
+    for s in air_slots:  # air_units' copy of the 1935 test campaign: deleted after the run
+        if os.path.exists(slot_dir(s)):
+            problems.append(f'save slot {s} exists ({slot_dir(s)}); air_units would overwrite and delete it: move it '
+                            f'away first')
     if os.path.exists(slot_dir(BATTLE_SLOT)):  # the client's battle slot: written by the mod, deleted after the run
         problems.append(f'save slot {BATTLE_SLOT} exists ({slot_dir(BATTLE_SLOT)}); the client\'s battles would '
                         f'overwrite it and the run deletes it: move it away first')
@@ -8918,10 +9482,16 @@ def remove_copy_slots(slots):
     return left
 
 
+def game_error_boxes(since):
+    """The game's own error boxes (GAME_ERROR_RE; message boxes only) answered on any copy since `since`: (who, text)."""
+    return [(w, t[:200]) for ts, w, k, t in BOX_SEEN if ts >= since and k == 'TMessageForm' and GAME_ERROR_RE.search(t)]
+
+
 def run_scenarios(ctx, names):
     ctx.selected = list(names)
     ctx.months_planned = planned_months(names)
     aborted = None
+    t_run = time.time()
     for name in names:
         _scenario[0] = name
         if aborted:
@@ -8929,6 +9499,7 @@ def run_scenarios(ctx, names):
             continue
         log(f'=== {name} ===')
         fn = next(s[3] for s in SCENARIOS if s[0] == name)
+        t_sc = time.time()
         try:
             fn(ctx)
         except (Exception, SystemExit) as e:
@@ -8938,10 +9509,19 @@ def run_scenarios(ctx, names):
                 log(f'  {who} windows:', describe_windows(pid))
             for port in (H, C):
                 log(f'  log {port} tail:\n    ' + '\n    '.join(log_since(port).splitlines()[-12:]))
+        errs = game_error_boxes(t_sc)
+        if errs:  # (the run's overall check below passes otherwise)
+            _scenario[0] = name
+            check(f'{name}: no game error box on either copy', False, errs[:4])
     for hook in ctx.month_hooks + ctx.pre_month_hooks:  # a scenario that shares later months never got them
         _scenario[0] = hook.scenario
         check(f'{hook.scenario}: its checks after the shared months ran', False,
               f'only {hook.state["n"]} of {hook.state.get("need", 2)} months processed after its setup')
+    _scenario[0] = 'session'
+    errs = game_error_boxes(t_run)
+    check('no game error box on either copy in the whole run (the game\'s "Error in <procedure> procedure!", access '
+          'violation, out of memory, ... boxes, which the dialog answerers would otherwise answer unnoticed)',
+          not errs, errs[:6])
 
 
 def summary(names, open_s, ctx, saves_ok, left, ev_left=(), copies_left=(), battle_left=False):
@@ -9012,7 +9592,8 @@ def main(argv=None):
         _button_slot[0] = next((s for s in BUTTON_SLOTS if not os.path.exists(slot_dir(s))), None)
         copy_slots = COPY_SLOTS + ((_button_slot[0],) if _button_slot[0] else ())
     k2_slots = (K2_SLOT, K2_SLOT + 10) if 'lockstep_pvp' in names else ()
-    problems = preflight(g1, COPY_SLOTS if copy_slots else (), k2_slots)
+    air_slots = (AIR_SLOT,) if 'air_units' in names else ()
+    problems = preflight(g1, COPY_SLOTS if copy_slots else (), k2_slots, air_slots)
     for p in problems:
         log('cannot start:', p)
     if problems:
@@ -9026,8 +9607,8 @@ def main(argv=None):
             os.remove(os.path.join(LOG_DIR, fn))
     shutil.copytree(g1, BACKUP)
     log('backed up save slot', HOST_SLOT, '| scenarios:', ', '.join(names))
-    g9 = slot_dir(F1935_SLOT) if 'lockstep_air' in names and fixture1935()[0] else None
-    if g9:  # the 1935 test campaign: the session start, the battle and its resyncs write it
+    g9 = slot_dir(F1935_SLOT) if ('lockstep_air' in names or 'air_units' in names) and fixture1935()[0] else None
+    if g9:  # the 1935 test campaign: lockstep_air's session start, battle and resyncs write it (air_units copies it)
         shutil.copytree(g9, F1935_BACKUP)
         log('backed up save slot', F1935_SLOT, '(the 1935 test campaign)')
     ctx, procs, t_open = Ctx(), PROCS, time.time()
@@ -9076,6 +9657,11 @@ def main(argv=None):
             log(f'!! could not remove the third copy\'s slots {k2_left}')
         battle_left = battle_left or bool(k2_left)
         copies_left = remove_copy_slots(copy_slots) if copy_slots else []
+        if air_slots:  # preflight made sure it did not exist before the run
+            air_left = [s for s in air_slots if not remove_slot(s)]
+            log(f'!! could not remove air_units\' slot {air_left}' if air_left else
+                f'removed air_units\' slot {list(air_slots)}')
+            copies_left = list(copies_left) + air_left
         ev_left = remove_event_files('after the run')
         if ev_left:
             log('!! could not delete the event cooldown files', ev_left)

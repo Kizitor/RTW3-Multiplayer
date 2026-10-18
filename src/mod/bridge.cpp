@@ -259,6 +259,10 @@ static std::string ExecuteOnMain(const std::string& line) {
             int unique = 0, count = game::IntelReportCount(&unique);
             return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count) + " unique=" + std::to_string(unique);
         }
+        if (cmd == "airunits") {  // airunits: the air units in the game's global list (all nations)
+            int count = game::AirUnitCount();
+            return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count);
+        }
         if (cmd == "doctrine") {  // doctrine <nation>: training priorities, pending ones, months left; missile storage
             game::DoctrineState d = game::GetDoctrine(atoi(arg(1).c_str()));
             if (!d.valid) return "error unavailable";

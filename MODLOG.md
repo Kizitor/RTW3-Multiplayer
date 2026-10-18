@@ -104,6 +104,9 @@ By version (the version the work went into) and kind, oldest first.
     [speed controls, air formations window and battle dialogs in live battles](#fix-2026-10-17-speed-controls-air-formations-window-and-battle-dialogs-in-live-battles-v032)
   - Testing:
     [0.3.2 hotfix (speed controls, air window, dialogs before reloads)](#testing-2026-10-17-032-hotfix-speed-controls-air-window-dialogs-before-reloads-v032)
+- **0.3.3**
+  - Fix:
+    [air units doubled with every reload; two live-battle desyncs](#fix-2026-10-17-air-units-doubled-with-every-reload-two-live-battle-desyncs-v033)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -1483,3 +1486,96 @@ list and no Fight my battles checkbox.*
     `3469119f -> dc3de5a0`). The resync repaired it; f) failed only because that resync had hidden the reports. It
     didn't recur in the next 2 runs. A lead: an AI decision that reads the display's identification.
   - Game open for this part ~81 min; in all ~309 min.
+
+## Fix 2026-10-17: air units doubled with every reload; two live-battle desyncs (v0.3.3)
+- A hotfix of 0.3.2: three bugs that the live proofs of the 0.6.0 development branch found (stages A, B and C) and
+  fixed there, backported with their log lines. Protocol 3, no new message or key, the per-minute hash unchanged.
+  The branch's other test probes stay there; only `ls testcurspeed` came along (to test the report fix on demand).
+  Main has no live-battle engine level, so the branch's level 11 (the identification fix) has no counterpart here.
+  The code is the branch's, proved live there; nothing of this entry ran in the game (live tests: open, below).
+- **1. Air units doubled with every reload (since 0.1.0).** `TfrmBuildCamp.LoadAircraftData` (0xd1d420, called only
+  by `LoadBuildCampaign`) creates a `TAirUnit` per `[AirUnits]` entry and adds it to the global list (cell 0xf27a88,
+  the list variable 0xfb0104) without clearing it; the game's own `ClearAirData` (0xd26700) runs only for the quick
+  battle, since the game loads a campaign only into a fresh process. The mod reloads in the same process: the host
+  after merging the players' turns every month, a joined player for every new month and around its battles (slot
+  87, then slot 77 again), both PCs at every live battle start and resync. Each save and reload doubled the list (the
+  branch's 1958 test campaign: `AirUnitNo` 595 -> 9520 = x16 after a session, a battle, two resyncs and one month):
+  the host's Turn stopped at `PlayerChecksBeforeTurn` -> `CheckAirBaseCapacity` (0xd20900) "CV <name> aircraft
+  capacity exceeded!", the air upkeep ran away, the save grew. New (static): the battle setup reads the same list:
+  `AddScenarioAirUnits` (0xbf71b8, named by its error text; from `DoBattle` via 0xbdbccc and 0xbe2de0) creates a
+  battle air formation for every unit based on the battle ship's campaign ship, so battles set up in such a process
+  most likely had extra squadrons (not seen live). Fix (`game.cpp`, the existing `LoadBuildCampaign` hook): the cell
+  is read from `LoadAircraftData` (`mov eax, [cell]; mov eax, [eax]; mov edx, ebx; call TList.Add`, at +0x7e) and
+  must equal `ClearAirData`'s (`push ebx; push esi; mov esi, [cell]`), else `WARNING: air unit list not found ...`
+  and nothing changes. Before a load the hook remembers the list's units; after a successful load (the result in AL,
+  now passed to `CB_AfterLoad`) it removes them from the front of the list and frees them (`TObject.Free`, as
+  `ClearAirData` does; a failed load keeps them, a list whose front changed is left alone with a WARNING), then drops
+  repeated units of the save: the first unit of each `AirUnitId` (+0x04) stays. The id is unique in a campaign the
+  game saved (a new unit takes the next value of the campaign's `[General] IDNo` counter: 0xd79de4 `mov eax,
+  [0xf5318c]; inc dword ptr [0xf5318c]`), so a campaign saved by an earlier version heals on its first load. New
+  (static): the reload never frees the old campaign's nations and ships (`BuilderNations.Clear`, 0xc99a91, then new
+  `TBuilderNation` objects), so an old unit's `HomeBase` kept pointing to an intact old ship and the next save wrote
+  the right base id for every copy; code that matches a unit by its base object (the capacity check, the air group
+  dialog's base views, `RemoveAllAirUnitsFromShip`, the AI's air group growth) reached only the copies of the latest
+  load until the next save and reload. Which copy the repair keeps was settled by reading every routine that walks the
+  list (GAME-INTERNALS "Duplicated air units: which copy the game changes"): the game's only lookup by `AirUnitId`
+  (0xe9f570) returns the first copy, and the end of every battle (0xea7abc) writes the battle's losses, aircrew
+  experience, kills and hits to it, or deletes it when its ship was sunk; the later copies differ only by orders made
+  through the base after the first reload (desired sizes, transfers, the computer's air group growth), which can be
+  given again. So the first copy stays, as on the branch. A unit deleted during a doubled session can come back (in
+  the reserve when its ship is gone), whichever copy is kept: the deletions reached only some of its copies. Nothing
+  else holds `TAirUnit` pointers (`TdlgCAG.CopyFromAirUnit`, the only RTTI field of that type, is cleared when the
+  dialog shows; `TAirFormation` names a `TAircraftType`), and `TAirUnit` has no destructor of its own. Logs: `air
+  units: <n> from before the load dropped; the campaign's <m> kept` and `air units: <k> repeated units of the save
+  dropped (<a> -> <b>; a save of an earlier version)`; bridge `airunits` -> `ok count=<n>`.
+- **2. A division report desynced a live battle (since 0.3.0).** `TdlgDivisionReport.FillShipList` (0xae1874; called
+  only by the report's `Execute` and the torpedo dialog's `bnCloseClick` and `bnFireClick`) sets each listed ship's
+  `CurrentSpeed` (+0xa48) to `GetMaxWeatherSpeed` when that is lower (0xae1972..0xae1990), on the PC where the report
+  opens only (the branch's leak check: `G8.CurrentSpeed 1c000000->1b000000`, then a DESYNC). Fix (`lockstep.cpp`):
+  FillShipList is a display context (`K_UI`), and in a live battle (on, not ended, not loading) every ship's
+  `CurrentSpeed` is saved at its entry and put back at its exit, outside the simulation (`ReportSpeedsSave` and
+  `ReportSpeedsRestore`); the simulation lowers it in the next minute on both PCs, and the report still shows the
+  lowered value. FillShipList draws no random number and takes no stack argument, so the new context changes nothing
+  else. Log: `lockstep: the division report lowered <ship>'s current speed a -> b on this PC only: put back (the next
+  minute lowers it on both PCs)`. Test probe: `ls testcurspeed <ship> <knots>` (docs/TESTING.md).
+- **3. The two PCs' simulation started every live load with different ship identification (since 0.3.0).** The
+  battle save keeps none (`TFightingShip.Create` writes `IdentifiedAsType` (+0xd70) := 0x16 at 0xe1c6bf and never the
+  class +0xd6c; `TFightingShip.LoadMe` reads neither), but the battle screen's first drawing during the load names
+  enemy ships through `GetTypeAndNameForEnemy` -> `IdentifyType`/`IdentifyClass` (both draw `Random`) with this PC's
+  display draws, and `SetView`'s first swap took those values as the simulation's set. The hash lines' `ident=` (not
+  part of `all`) differed in every minute, and the simulation reads the identification: the sighting reports routine
+  in EOTP (0xdc960c) calls `IdentifyClass`/`IdentifyType` with shared draws that depend on it (and, a guess, some AI
+  decisions may read it). So now and then the battles drifted apart next to "Unknown ship sighted!": 0.3.2's
+  `lockstep_ui` e) (the 0.3.2 testing entry above: pos and ord first, the RNG equal, "a lead: an AI decision that
+  reads the display's identification"), and on the branch with the RNG first. Fix (`lockstep.cpp`): right after every
+  live load (the start and every resync) `SetView` gives the simulation the identification of a freshly loaded ship
+  (Create's immediate, read from its `mov byte ptr [ebx+IdentifiedAsType], imm8`, and no class) on both PCs; the
+  display keeps what it drew. If the pattern isn't found: a WARNING and the old behaviour. Log: `lockstep: the
+  simulation's ship identification as the battle save leaves it (type 22, no class); this PC's display had identified
+  <n> ship(s) during the load and keeps that`.
+- **Mixed sessions.** The host checks only the protocol and the game build (the hello's `mod=` is not read), so a
+  0.3.2 player joins a 0.3.3 host and a 0.3.3 player a 0.3.2 host as before.
+  - 1 acts per process. A 0.3.3 host keeps the campaign clean whatever its players run, and heals a doubled one at
+    its first load. A 0.3.2 host keeps doubling: its saves, month packages and battle files carry the copies, which a
+    0.3.3 player only removes from its own memory at each load. A 0.3.2 player's copies stay on its PC (memory, slots
+    77 and 87, and the battles its PC sets up: its battles against AI nations and the live battles it sets up as A of
+    two joined players): the submission carries only the nation's sections, the host never merges `[AirUnits]`, and a
+    joined player's Turn never runs the game's checks. A live battle doesn't depend on the list on B: B loads A's
+    snapshot, whose air formations A's setup made, and the hash covers no air unit. So the host must update; the
+    players should, for their own battles and screens.
+  - 2 acts per PC: a report opened on a 0.3.3 PC no longer desyncs, one opened on a 0.3.2 PC still does (a resync),
+    whichever side each PC plays.
+  - 3 needs both PCs: with one 0.3.2 PC the simulation identification still differs (the constructor's on the 0.3.3
+    PC, what its display drew on the 0.3.2 PC), so the rare desync stays possible, as between two 0.3.2 PCs. Nothing
+    new can go wrong: the hash ignores the identification, and both PCs run the same game code on it.
+- **Checks.** `build.bat` without warnings. Every pattern above checked offline against the 1.01.44 image (a script
+  kept outside the repository): the list cell from both routines, the only callers of `LoadAircraftData`
+  (`LoadBuildCampaign`) and `ClearAirData` (`TfrmQuickBattle.bnGenerateFleetsClick`), `AirUnitId` and the `IDNo`
+  counter, `TAirUnit`'s destructor slot (`TObject.Destroy`), `AddScenarioAirUnits` and its callers; FillShipList's
+  callers, its single `CurrentSpeed` write, no `Random`, a plain `ret`; Create's single identification write (0x16)
+  within the resolver's 0x400 bytes, `LoadMe` without identification, `Random` in `IdentifyType`/`IdentifyClass`.
+- **Open:** the live tests of 0.3.3 (regression agent): a joined player's months with the 1935 test campaign (slot 9:
+  232 air units; `airunits` on both copies after the session start, every month, a live battle start and `ls
+  resync`), a copy of it with every `[AirUnits]` entry doubled (the repair at the first load), `ls testcurspeed` and a
+  division report in a live battle, `ident=` equal in every minute, the default suite. Mixed-version pairs need two
+  game folders: both copies of one folder load its `RTW3MP.dll`.
