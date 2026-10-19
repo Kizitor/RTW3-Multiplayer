@@ -19,7 +19,8 @@ Uninstall
 Delete version.dll, RTW3MP.dll and the RTW3MP_* files from the game folder. The mod never modifies
 RTW3.exe or the Steam DRM. Its settings and logs are in Documents\My Games\Rule the Waves 3\RTW3MP, and a
 joined player's copies of the campaign are in the save slots Game77 and Game87: delete them too if you
-don't need them any more. The host's campaign is a normal save in its own slot.
+don't need them any more. The host's campaign is a normal save in its own slot; the mod keeps its
+session settings next to it (rtw3mp_session.ini, and rtw3mp_livebattle.ini to resume a live battle).
 
 Files
 - version.dll                loader: forwards to the Windows version.dll and loads RTW3MP.dll

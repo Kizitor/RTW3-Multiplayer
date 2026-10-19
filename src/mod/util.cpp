@@ -215,3 +215,13 @@ std::string KVStr(const KV& kv, const char* key, const std::string& def) {
     auto it = kv.find(key);
     return it == kv.end() ? def : it->second;
 }
+
+int AnnouncedLsLevel() {
+    static volatile LONG level = 0;
+    if (level == 0) {
+        char buf[16] = {};
+        int v = GetEnvironmentVariableA("RTW3MP_TEST_LS_LEVEL", buf, sizeof(buf)) > 0 ? atoi(buf) : 0;
+        InterlockedExchange(&level, v > 0 ? v : MP_LS_LEVEL);
+    }
+    return (int)level;
+}

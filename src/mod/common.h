@@ -14,8 +14,43 @@
 #include <deque>
 #include <functional>
 
-#define MP_MOD_VERSION "0.3.3"
+#define MP_MOD_VERSION "0.4.0"
 #define MP_PROTOCOL 3
+// The live-battle engine level (lockstep.cpp): a live battle is fought only between two PCs with the same level, while
+// the rest of the session stays compatible within MP_PROTOCOL. A client announces it in its hello (`ls=<level>`;
+// 0.3.x announced `ls=1`: level 1). 2 = 0.4.0 step 2 (simulation PlayerSide per routine, Fastest available as clock
+// state); 3 = 0.4.0 phase 1 (deferred actions: change force, change lead, battle turn-away; the order of battle in the
+// state hash; Save as the host's crash checkpoint; side 1's computer control kept over a resync); 4 = 0.4.0 phase 1b
+// (auto-run per player: a deferred action hands a side to the computer and back; both sides on auto-run run to the end);
+// 5 = 0.4.0 phase 2 (manual torpedo salvoes: the torpedo dialog's Fire is a deferred action for that boundary; the
+// torpedo mounts and more torpedo fields in the state hash); 6 = 0.5.0 phase 3a (routine air operations: the force air
+// settings are orders; land-based CAP: one slot per side, the airfield's side checked; NightCAP kept over a resync);
+// 7 = 0.5.0 phase 3b (air strikes: the strike dialog's LaunchSomeAircraft is an immediate action with side-partitioned
+// AFIds, the air formations' strike fields are orders, the computer flies only the airfields' strikes of a human side
+// unless the host's option says otherwise; air formation fields, the AFID and ScoutCount counters in the state hash);
+// 8 = 0.5.0 phase 5a (rejoin: a player dropped from a live battle that goes on against the computer gets side 1 back
+// when they return: A starts the battle again mid-way (`rj=` in the start message, the epochs go on), and B takes a new
+// start of a battle it still has as a restart); 9 = 0.6.0 phase 4 (missiles: each side's own Fire at will, an order
+// honoured through HoldMissileFire inside the automatic fire; the missile dialog's FireMissileMount calls are deferred
+// actions; PendingMissileTarget is an order; both kept over a resync (`faw=`, `pmt=`); submarines in the state hash).
+// 0.6.0 phase 5b (a live battle resumed from the host's save after its game restarted) keeps 9: the host takes it up
+// with level 8's rejoin start; its `hr=1` only changes the returning player's chat line. 10 = 0.6.0 with 0.3.2 merged
+// (the campaign date: after every live load both PCs write the campaign's own Year, Month and Day back, decoded from
+// the campaign's TDateTime, so the battle runs with the campaign's month and day; the three in the state hash). 11 =
+// stage B's fix (after every live load the simulation's ship identification is the battle save's on both PCs, not what
+// each PC's display drew during the load: the sighting reports' IdentifyClass/IdentifyType in EOTP draw shared random
+// numbers depending on it). 12 = the pre-release fixes (Auto-run off gives a side back as single player does: each
+// force's lead division, the forces as they were before auto-run (`pa=` in the start message), the other divisions stay
+// with the computer; a manual torpedo salvo of a side on auto-run is refused at the release, as a missile salvo is). 13 =
+// side 0's computer control kept over a reload (`ai0=` in the start message: the game's resume gives side 0's divisions
+// of computer forces to the computer, also one the host's player had taken back). 14 = TFightingShip.LightState kept
+// out of the display's reach and in the state hash (the map's sighting circles wrote it between minutes; the division
+// routine of StartMinute reads it: the dawn and dusk DESYNCs).
+#define MP_LS_LEVEL 14
+// The level this copy announces (hello `ls=`, the start's, ready's and rejoin's `lv=`): MP_LS_LEVEL. TEST ONLY: env
+// RTW3MP_TEST_LS_LEVEL (read once) announces another level, so one build can play a peer of another mod version; this
+// copy's own checks keep MP_LS_LEVEL.
+int AnnouncedLsLevel();
 #define MP_DEFAULT_PORT 47624
 
 // Window messages used by the main-thread dispatcher.

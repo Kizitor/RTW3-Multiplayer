@@ -49,7 +49,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 ## Install
 Every player:
 1. Close the game.
-2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.3.0-win32.zip`) from the
+2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.4.0-win32.zip`) from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract all its files into the
    game folder, next to `RTW3.exe`. When you update, replace the older files.
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
@@ -69,7 +69,8 @@ two DLLs on their own, for updating an existing install. Updating from an older 
    (the copies of the multiplayer campaign).
 
 The mod never modifies `RTW3.exe` or the Steam DRM. A campaign you host stays a normal save in its own slot; the mod
-keeps its session settings next to it, in `rtw3mp_session.ini`.
+keeps its session settings next to it, in `rtw3mp_session.ini`, and during a live battle `rtw3mp_livebattle.ini`, so
+that the battle can be resumed if the host's game stops.
 
 ## Network setup
 Hamachi example:
@@ -83,8 +84,9 @@ Hamachi example:
 
 **Video walkthrough (1 minute):** [docs/hosting.mp4](docs/hosting.mp4). It shows the host's screen from the title
 screen to the first processed month; a second copy of the game plays the joined player "Captain". The video and the
-pictures below were made with version 0.1: today's Multiplayer window also has the **Fight my battles** checkbox and
-the Diplomacy list. The addresses in them are examples.
+pictures below were made with version 0.1: today's Multiplayer window also has the **Fight my battles** and
+**Computer flies carrier strikes in live battles** checkboxes and the Diplomacy list. The addresses in them are
+examples.
 
 1. Open **Multiplayer**, enter your name, optionally a password and a turn time limit in minutes (0 = none), and
    press **Host game**. Players can join and pick nations right away. Give them the VPN address shown under the
@@ -116,7 +118,10 @@ the Diplomacy list. The addresses in them are examples.
   You can change the limit during the session with **Set**.
 - **Players who leave:** a player who joins again with the same name gets their nation back. Until then the nation
   keeps its last orders; the computer doesn't take it over. To hand a nation to the computer, select it under
-  **Nation** and press **Give to AI**.
+  **Nation** and press **Give to AI**. A player who drops out of a live battle gets their ships back the same way (see
+  [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops)).
+- **Carrier strikes in live battles:** tick **Computer flies carrier strikes in live battles** to let the computer
+  fly both sides' carrier strikes (see [Commands in live battles](#commands-in-live-battles)).
 
 ## Joining a session
 1. Open **Multiplayer**, enter your name, the host's IP (or use **Find LAN games**) and the password. Leave **Fight my
@@ -135,7 +140,9 @@ the Diplomacy list. The addresses in them are examples.
    - You keep your nation, its fleet, designs, possessions, budget, research, relations and wars.
    - The host's officers come with the copy, unassigned; their divisions don't.
    - Tech-sharing deals start over.
-6. If you leave or lose the connection, join again with the same name: you get your nation back.
+6. If you leave or lose the connection, join again with the same name: you get your nation back, and your ships if
+   your live battle is still going on (see
+   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops)).
 
 To test on one PC, run two copies of the game and join `127.0.0.1` (`RTW3MP_SecondCopy.bat` from the release starts
 the second copy). Both copies share one settings file, so the joining copy gets a numbered name (e.g. "Friend 2").
@@ -223,32 +230,125 @@ fight the same battle **at the same time**, each on their own PC and each comman
 players in the battle need **Fight my battles** on (the host's own box makes no difference; it only applies when
 joining a session). If it is off, the host fights its battle against that nation's ships under computer control, and a
 battle between two joined players' nations is resolved by the game.
-- **How it works:** both PCs run the same battle, minute by minute, and exchange their orders. If the two ever
-  disagree, the battle is reloaded on both from the leading PC's state (a short pause; orders given in the last minute
-  are dropped).
-- **The clock is shared.** *Run one minute*, *Run 5 minutes*, *Run until break*, *Pause*, and the game speed box and
-  its arrows work for both players: the battle advances when both are ready, and stops for both when one pauses or
-  the game stops for a sighting. A new game speed, and orders given while a minute is running, take effect at the
-  next minute.
+- **Same mod version:** a live battle needs the same mod version on both players' PCs, and a host on 0.4.0 checks it
+  for every live battle: its own battle against a player on another version is fought against the computer, and a
+  battle between two joined players is resolved by the game unless both have the host's version. The chat and the
+  players' notices say why, naming both versions ("live battles need the same mod version on both PCs: ..."), and the
+  month goes on. A host on 0.3.x checks no versions: when it fights its own battle against a player on 0.4.0, the
+  player's game refuses the battle with a notice, its chat naming both live-battle levels, and the host's computer
+  fights the player's side. Two joined players on 0.4.0 fight their battle against each other live under such a host,
+  which only passes its messages on; a player who drops out of it doesn't get their ships back (see
+  [Known limitations](#known-limitations)).
+- **How it works:** both PCs run the same battle, minute by minute, and exchange their orders. One PC leads: the
+  host's in a battle against the host; in a battle between two joined players, the PC of the player who starts it
+  (the other player's chat names them). That player is the *first player* below, and the other one the *second
+  player*. The first player's battle preferences (for example *Realism* and *Floatplane launch*) apply on both PCs
+  during the battle. If the two PCs ever disagree, the battle is reloaded on both from the leading PC's state (a short
+  pause); orders given in the last minute are dropped, and the chat lists the commands that were not carried out.
+- **The clock is shared.** *Run one minute*, *Run 5 minutes*, *Run until break*, *Pause*, the game speed box and its
+  arrows, and *Fastest available* work for both players: the battle advances when both are ready, and stops for both
+  when one pauses or the game stops for a sighting. A new speed, *Fastest available*, and orders given while a minute
+  is running take effect at the next minute. Choosing a speed turns *Fastest available* off.
 - **Fog of war:** each player sees their own ships and only what they have sighted of the enemy.
 - **Ending:** both players press *End game* (the game's own rule still applies: at least half the battle and 400
-  minutes, and no enemy close). The game's own end conditions (both fleets far apart, one side gone, the time limit)
-  end it for both. The result counts like any battle and the month goes on.
-- **If a player leaves:** if a player disconnects or doesn't respond for 30 seconds, the computer takes over their
-  ships for the rest of the battle.
-- **Not available in live battles yet:** air strikes and routine air operations; missiles (manual fire and the
-  missile panel's settings); manual torpedo salvoes; change force, change lead and battle turn-away; the *Fastest
-  available* button (use the speed box); auto-run and save. Pressing them shows a line in the chat. The missile
-  panel's *Fire at will* and *Fire mode* are locked: the two PCs don't share them yet.
-  Emergency activation and try for home don't exist in campaign battles: the game hides them, also in single player.
+  minutes, and no enemy close). When the game asks whether to end the battle (for example when the fleets are far
+  apart), the chat shows its question, and both players press *End game* to agree. The game's own end (for example
+  when the battle's time limit is reached) ends it for both. The result counts like any battle and the month goes on.
 - Both PCs hold the whole battle, so a determined player could read the enemy's positions from memory: play with
-  people you trust. The battle log on the second player's PC is written from the first side's point of view.
+  people you trust.
+
+### Commands in live battles
+Orders to your own divisions, ships and forces work as in single player and take effect when the next minute starts.
+Detaching ships, torpedo and missile salvoes and air strikes work only while the battle is paused.
+- **Force orders:** *Change force* (the ship tree's popup), and *Change lead* and *Battle turn away* (the Force orders
+  dialog) work as in single player, but take effect when the next minute starts. The game's conditions are checked
+  again then; an order that can no longer be carried out is reported in your chat ("Not carried out: ...").
+- **Torpedo salvoes:** the division report's *Fire torpedoes*, then a target, a mount and *Fire*. The torpedoes enter
+  the water on both PCs when the next minute starts ("Torpedo salvo fired: ..."). The torpedo dialog closes then: its
+  firing solutions hold only for that pause. As in single player, the game offers *Fire torpedoes* only with the
+  battle preference *Realism* set to Captain's mode (its third setting); in a live battle the first player's
+  preference counts for both players. Not while your ships are on auto-run: the computer fires their torpedoes.
+- **Air strikes:** the tool bar's *Order an airstrike* (it pauses a running battle) and the reports list's *Launch
+  strike* open the game's strike dialog with your own squadrons; *Launch*, *Ready* and *Stand down* work as in single
+  player. Strikes fly to the target set at launch: *Confirm target location when spotted* has no effect. The computer
+  flies the airfields' strikes of both sides, as in single player. The host's option **Computer flies carrier strikes
+  in live battles** (in the Multiplayer window, off by default) makes the computer fly both sides' carrier strikes as
+  well; the strike dialog still launches your own strikes besides them. It applies from the next live battle; when a
+  battle with aircraft starts, the chat says which rule it uses.
+- **Routine air operations and land-based CAP:** the tool bar's *Manage CAP and air recon*, the ship tree's *Search
+  pattern* and the division report's land-based CAP button work for your own forces and divisions. CAP and scouts fly
+  from each player's own settings, and your land-based CAP comes only from your own side's airfields.
+- **Missiles:** both sides' missile ships fire on their own by the computer's rules, and SAMs and decoys defend
+  against missiles as in single player. *Fire at will* on the missile panel is each player's own setting, on at the
+  start; with it off, your missile ships fire only the salvoes you order. A change takes effect at the next minute,
+  also when you make it while a minute runs. *Manual fire* opens the game's missile dialog while the battle is paused
+  (pressed while the battle runs, it pauses it: press it again), but not while your ships are on auto-run. Both PCs
+  fire the salvoes you order there when the next minute starts ("Missile salvo fired: ..."); until then the dialog
+  still shows the missiles as before the salvo. *Fire mode* is disabled for both players (it shows *Ripple*): the
+  computer chooses the salvo size of both sides' automatic fire.
+- **Auto-run** hands your own ships to the computer. It asks first (*Yes*, or *Yes, and order all forces to move to
+  the closest friendly base*); from the next minute the computer commands your ships with its full rules, while the
+  other player keeps commanding theirs, and it fires their torpedoes and missiles (salvoes you ordered before still
+  fire). Press *Auto-run* again to take back command as in single player: you get each force's lead division back, and
+  the computer keeps the other divisions until you clear *AI controlled* in their division reports. When both
+  players' ships are on auto-run, the battle runs to its end at the fastest speed, and the game's "Do you want to end
+  the scenario?" is answered Yes; when one player takes back command, the battle pauses after that minute.
+- **Save:** in a battle against the host, *Save* (pressed by either player) saves the battle into the host's campaign
+  slot, at once or when the running minute ends: a checkpoint in case the host's game stops (see below). The battle
+  goes on, and nothing is saved on the joined player's PC. Press it now and then in a long battle. In a battle between
+  two joined players nothing is saved (the host keeps such battles).
+
+### When a player drops out or the host's game stops
+If the second player disconnects, their game stops, or their PC doesn't respond for 30 seconds, the computer takes
+over their ships and the battle goes on on the first player's PC; the same happens when the host's connection drops
+during its battle. If the first player of a battle between two joined players disconnects or their game stops, the
+game resolves the battle.
+
+**Getting your ships back:** join the session again with the same name while the battle goes on (start the game
+again first if it stopped; if you are still connected, press *Leave*, then *Join game*). You get your nation back,
+the battle loads on your PC (also from the title screen), and you command your ships again from its next minute. The
+battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0,
+the same version as yours; otherwise the computer keeps your ships (a host on 0.4.0 tells you why).
+
+**When the host's game stops** (it crashes or is closed) during its live battle against a joined player, the joined
+player's game leaves the battle and the session. To go on:
+1. The host starts the game again and loads the campaign's save slot. If the game asks *Select autostart point*,
+   choose *Start from latest autosave point*. The battle opens where it was last saved (at its start, at the last
+   *Save*, or when it was last reloaded or rejoined; not at the minute the game stopped) and waits for the player.
+   The Multiplayer window opens, and its chat explains what to do.
+2. The host presses **Host game**: the session goes on with the month in progress.
+3. The player joins again with the same name and gets their nation and their ships back, and the battle goes on
+   live. After it, the rest of the month and the new month follow as usual.
+
+Instead, the host can press *Run* in the battle to go on against the computer; the player can still join and take
+their ships back. If the host doesn't host the session before the battle ends, the computer decides for the other
+players' nations for the rest of that month. A battle between two joined players can't be resumed this way.
+
+### Differences from single player
+- **Not player commands:** emergency activation, try for home and enter port aren't player commands in Rule the
+  Waves 3, in single player either: emergency activation's button is never shown and does nothing, and try for home
+  and enter port are developer menu items that the game hides in every battle. To withdraw a force, use *Disengage*
+  in its Force orders.
+- **Missiles:** missile submarines fire on their own but can't fire salvoes from *Manual fire* (the game would fire
+  them for the first player's side; the dialog leaves them out). *Fire mode* is the computer's for both players. On
+  the second player's PC the missile panel doesn't open by itself (open it with its tool bar button), and its counts
+  aren't updated.
+- **Aircraft:** a strike's target can't be adjusted during its flight. Carriers launch their scouts from their
+  force's air settings without asking. With the battle preference *Floatplane launch* on *Ask before launch*, ships
+  launch no search floatplanes (the game's question gets No): use *Automatic*.
+- **Messages and the battle log:** the game's message boxes during a minute are answered automatically on both PCs.
+  Each player reads only the messages about their own side: the first player in the chat ("Battle: ..."), and both
+  players when the battle pauses ("The battle paused (...)", or "an event" when the message was about the other
+  side). The game's questions about ending the battle go to both players. The battle's message log panel lists the
+  messages of both sides on both PCs, from the first player's point of view, so it can name the other side's ships.
+  At the end, each player's result box shows their own side's result; the campaign takes the battle's result from the
+  first player's PC.
 
 ## Known limitations
 - **Battles:** raider interceptions and submarine attacks are still resolved by the game. The battles of a player who
   doesn't fight their battles are resolved by the game too, or fought by the host against the computer when the
-  enemy is the host's nation. For what live battles can't do yet, see
-  [Battles between players](#battles-between-players-live).
+  enemy is the host's nation. What live battles do differently: see
+  [Differences from single player](#differences-from-single-player).
 - **Victory points:** a joined player's *VP* counts what their nation scored in its wars, including battles against
   the host; *Enemy VP* counts the points of the nations at war with them. (The game itself only keeps the host's view,
   so the mod fills in a joined player's.) Points the host's enemies score outside battles (blockades, sinkings,
@@ -261,7 +361,7 @@ battle between two joined players' nations is resolved by the game.
   The game's random committee and Air Force events about design studies only happen for the host's nation.
 - **Doctrine changes of joined players** (new training priorities, missile storage policy) take effect after the same
   number of months as in single player, and the player is told in the Multiplayer chat.
-- **Random events of joined players** ("Event - <month>" dialogs) appear on the joined player's own screen at the
+- **Random events of joined players** ("Event - ..." dialogs) appear on the joined player's own screen at the
   start of a month, about one month in three, and the player answers them as in single player. The answer changes
   their own nation (budget, prestige, unrest, ...) and their relations with the other nations. Events about the host's
   own war (peace offers, army offensives), arms-control treaties, colonial rebellions and sabotage of another navy's
@@ -272,9 +372,17 @@ battle between two joined players' nations is resolved by the game.
 - **Player-centric screens:** the relations bars and intel screens show the campaign from the host nation's point of
   view. The Diplomacy list in the Multiplayer window shows your own relations with the other players.
 - **Resigning** is not possible during a session: leave the session first.
-- **Versions and slots:** the host refuses players with another game version, and players whose mod version can't play
-  with the host's (0.1, 0.2 and 0.3 can't play together). Joined players use save slot 77, and slot 87 for their
+- **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
+  play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same mod version
+  on both players' PCs, and a host on 0.4.0 pairs only players with its own version (see
+  [Battles between players](#battles-between-players-live)). Joined players use save slot 77, and slot 87 for their
   battles.
+- **A host on 0.3.x** passes on the live battles between two joined players on 0.4.0, but can't start such a battle
+  again for a player who dropped out: the computer keeps that player's ships to the end of the battle, although the
+  other player's chat says they get them back by joining again. Update the host.
+- **Joining a session on another campaign:** if your game had another campaign loaded before, restart the game before
+  you join. In tests, a player who joined a session on a different campaign without restarting got "Error in
+  SaveBuildCampaign procedure! Access violation ..." when their game first saved the new campaign.
 - **Memory over long sessions:** the game's memory use grows by about 3 MB per processed month (the game doesn't fully
   free a campaign when it's reloaded, and multiplayer reloads it every month and for every battle a joined player
   fights). The game is limited to 2 GB, so after a few hundred months in one sitting, save, close the game and rejoin.
@@ -291,21 +399,39 @@ battle between two joined players' nations is resolved by the game.
   - "different game version than the host": update both games through Steam.
   - "protocol mismatch (host mod X)": install mod version X, the host's (or ask the host to update).
   - "wrong password": ask the host for the password.
-- **The host sees "<player>'s turn could not be applied":** another program (usually antivirus or OneDrive) held a
+- **The host sees "...'s turn could not be applied":** another program (usually antivirus or OneDrive) held a
   save file for more than 3 seconds, so that nation keeps last month's orders. If it happens repeatedly, exclude
   `Documents\My Games\Rule the Waves 3\Save` from scanning/syncing.
 - **The host's screen stays locked with "Battles in progress":** a player is fighting a battle. Each battle has a
   30-minute limit; after it (or if the player disconnects) the game resolves the battle and the month goes on.
-- **A live battle pauses and reloads:** the two PCs disagreed and were brought back in step. If it happens often, the
-  computer takes over the second player's ships. The log lines start with `lockstep:`.
+- **A live battle pauses and reloads:** the two PCs disagreed and were brought back in step. The chat lists the
+  commands that were not carried out: give them again. If it happens often, the computer takes over the second
+  player's ships; the player can take them back by joining again. Each time, both PCs write a report
+  (`ls_desync_*.txt`, next to the log): add both PCs' reports and logs when you report it. The mod's log lines about
+  live battles start with `lockstep:`.
+- **"... live battles need the same mod version" in the chat:** both players of a live battle need the same mod
+  version, and a host on 0.4.0 needs both on its own; until then, such battles are fought against the computer or
+  resolved by the game. See [Upgrading from an older version](#upgrading-from-an-older-version).
+- **The computer took over your ships in a live battle, or the host's game stopped during one:** see
+  [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops).
+- ***Fire torpedoes* is greyed out, or ships launch no search floatplanes, in a live battle:** the first player's
+  battle preferences count on both PCs. Manual torpedo fire needs *Realism* set to Captain's mode, and search
+  floatplanes need *Floatplane launch* on *Automatic*.
 - **"Out of memory" after a long session:** see *Memory over long sessions* in
   [Known limitations](#known-limitations).
-- **The host's turn stops with "CV <name> aircraft capacity exceeded!":** before 0.3.3, every reload of the campaign
-  (every month and every live battle) added another copy of every squadron. Update the host to 0.3.3 and load the
-  campaign again: it removes the copies. If the message stays, that carrier really carries more aircraft than it has
-  room for: open its air group and move squadrons to the reserve.
+- **"Error in SaveBuildCampaign procedure! Access violation ..." after joining a session:** see *Joining a session on
+  another campaign* in [Known limitations](#known-limitations).
+- **The host's turn stops with "CV ... aircraft capacity exceeded!":** before 0.3.3, every reload of the campaign
+  (every month and every live battle) added another copy of every squadron. Update the host (0.3.3 or newer) and load
+  the campaign again: it removes the copies. If the message stays, that carrier really carries more aircraft than it
+  has room for: open its air group and move squadrons to the reserve.
 
 ### Upgrading from an older version
+- **0.4.0** plays with 0.3.x (protocol 3), but a live battle needs 0.4.0 on both players' PCs: until everyone has
+  updated, a battle with a player on 0.3.x is fought against the computer or resolved by the game, and so is a 0.3.x
+  host's own battle against a player on 0.4.0 (see [Battles between players](#battles-between-players-live)). A host
+  on 0.3.x passes on the live battles between two players on 0.4.0, but can't give a dropped player's ships back.
+  0.4.0 contains the fixes of 0.3.3, the previous release. Everyone should update, the host too.
 - **0.3.3** plays with 0.3.0, 0.3.1 and 0.3.2 (protocol 3). **Update the host first:** older versions added another
   copy of every squadron each time the campaign was loaded again, and 0.3.3 repairs such a campaign the first time it
   loads it. Its two live-battle fixes need the players of a live battle on 0.3.3 (the division report fix works on

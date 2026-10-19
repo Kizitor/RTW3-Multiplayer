@@ -39,15 +39,20 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
 5. **Protect the saves.** Back up `<Documents>\My Games\Rule the Waves 3\Save\Game1` before launching and
    restore it afterwards, also when the run fails; delete `Game77` (the client slot), `Game87` (the client's battle
    slot, client slot + 10, written by the mod for every battle it is sent), `Game76`/`Game86` (the third copy's slot and
-   battle slot in `lockstep_pvp`), `Game49` (`air_units`' copy of the 1935 test campaign) and every slot a test copied
+   battle slot in `lockstep_pvp`) and every slot a test copied
    to (`player_copy`: Game78-80 and the button's slot; never a slot that existed before the run). Find Documents
    with `rtw3ctl.SAVE_DIR` (handles OneDrive redirection). The suite runner does this; keep it that way. A killed host
    (`lockstep_stress` b) leaves its live battle's save in slot 1: the runner puts slot 1 back from its backup
    (`restore_slot1_copy`, the backup is kept for the final restore) before it starts the host again. `lockstep_air`
    also backs up and restores save slot 9, the 1935 test campaign (a second fixture, kept outside the repo: TESTING.md,
-   "The 1935 test campaign"; `air_units` backs it up too and only copies it, into the throwaway slot 49); never delete
-   it and never let anything save into it outside a backed-up run (`pocbattle`
-   autosaves into the open slot). Any other slot that existed before the run (e.g. Game2) may be the user's own: never
+   "The 1935 test campaign"); never delete it and never let anything save into it outside a backed-up run (`pocbattle`
+   autosaves into the open slot). `lockstep_strike` and `air_units` use the same backup of slot 9 (`air_units` also
+   writes a bloated copy of it into slot 49 and deletes it). `lockstep_resume` kills the host in
+   its live battle and starts it again from slot 1 (the resume of phase 5b): it keeps its own copy of slot 1 outside the
+   save folder (`slot1_snapshot`, deleted by the runner) and puts slot 1 back from it before its later parts. The
+   1958 missile test campaign of `lockstep_missiles` comes into slot 48 for the run only (`--missile-fixture
+   <folder>\Game48`: copied in and deleted; `--missile-slot`: backed up and put back); the runner refuses a slot that
+   holds other files. Any other slot that existed before the run (e.g. Game2) may be the user's own: never
    read-modify, overwrite or delete it.
 6. **Never save outside a backed-up run.** Don't send the bridge `save` command, or anything else that saves
    (`start`, a processed month, `submit` on a client, claims while hosting), to a game copy unless it runs
@@ -58,8 +63,42 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
    of distinct non-empty entries (saved by 0.2.0-0.2.1, which doubled the list on every reload). It is
    intentional: every run exercises the 0.2.2 repair on load. Don't "clean" or replace it; the runner's
    backup/restore keeps it exactly as it is.
-8. **Never modify `RTW3.exe`, the Steam DRM stub, or game data files.**
+8. **Never modify `RTW3.exe`, the Steam DRM stub, or game data files.** The user's Preferences
+   (`<Documents>\My Games\Rule the Waves 3\Preferences`) change only inside a run that includes `lockstep_torpedo`
+   (`RealismSetting=2`) or `lockstep_strike` (`FloatplaneLaunch=0`, Automatic: with "Ask before launch" no search
+   floatplane flies in a live battle): the runner backs the file up, changes those lines and puts it back (verified
+   by hash); a leftover backup that differs from the file makes it refuse to start. Never edit the Preferences by hand.
 9. **No personal data in the repo** (no absolute user paths, IPs, names). The repo is public.
+10. **When the game is in use elsewhere, work offline.** If the caller says another agent runs the game, don't launch
+    `RTW3.exe`, don't install DLLs and don't touch the game folder, the saves or the Preferences: validate with
+    `python -m py_compile`, `python tools/regression.py --list` / `--dry-run` (they start, write and delete nothing)
+    and `python tools/regression_selftest.py [--logs <recorded run>]`.
+11. **When the caller says "pause", stop at the next safe point and leave everything as it was.** Killing the game
+    copies alone does not stop a run (later parts start new copies): stop the runner's `python` (its PID), then
+    `taskkill /PID` the `RTW3.exe` processes it started (their parent PID), then put back what the run changed with the
+    runner's own helpers (slot 1 from its backup, `remove_client_slot()`, the battle slot, the snapshot copies, the
+    event files; slot 9, the Preferences, slots 48/49 and the third copy's slots when the run used them), reinstall the
+    DLLs the caller names, check that no `RTW3.exe` of yours is left, commit the suite work and report where you
+    stopped. TESTING.md, Known traps, says how.
+12. **Write files safely.** A Python `open(p, 'w', ...)` truncates the file before it checks its other arguments (an
+    invalid `newline=` once emptied `tools/regression.py`): write to `<file>.new` and `os.replace` it, and commit often.
+
+## Shared task table
+The session's SQL `todos` table can be shared with the main session and other agents. Insert or update only rows
+whose id starts with `rg-` (this agent's prefix), and never run an UPDATE or DELETE on `todos` without such an id
+restriction (`WHERE id = 'rg-...'` or `WHERE id LIKE 'rg-%'`).
+
+## The installed build and mixed versions
+- Test a build from its frozen snapshot (`--dist <snapshot>`: the runner compares the installed DLLs with it). At the
+  end of every run of yours put the released version's DLLs back into the game folder (the caller names it: since
+  2026-10-18 v0.3.3, `dist_033`; compare the hashes), restore the slots and the Preferences, and leave no `RTW3.exe`.
+- Mixed versions (a release candidate against the released version): copy the game folder outside the Steam library,
+  put the released DLLs into the copy and the candidate into the Steam folder, and start each copy from its folder
+  (TESTING.md, "Mixed versions"; the 0.4.0 driver `mixed_040.py` is kept with the developers' session files). Delete
+  the copy afterwards. Battles between the host and a player need real months there (`pocbattle` closes a non-live
+  battle with the rest of a turn: the host's campaign moves a month on its own). A 0.3.x host knows no engine levels:
+  it holds and sends its own battle to a 0.4.0 player, whose PC refuses it naming both levels, and the host's AI then
+  commands that player's side (`--case d`, dist_vp_2); two 0.4.0 players under a 0.3.x host fight live (`--case b`).
 
 ## Environment
 - Windows, PowerShell, Python 3 (ctypes), Visual Studio 2022 Build Tools (x86).
@@ -73,20 +112,20 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
   `RTW3MP_CLIENT_SLOT=77` and `RTW3MP_EVENT_CHANCE=0` (no random events for the joined player unless a test asks
   for one with `eventchance`); cwd = game folder. `lockstep_pvp` starts a third copy (bridge 47703, `RTW3MP_CLIENT_SLOT=76`,
   battle slot 86) that joins as "Bot" (the stand-in player reserved by `session`, so the host gives it nation 2) and
-  closes it (its PID) at the end. `lockstep_stress` kills and restarts copies (taskkill /F of their own PIDs; PROCS,
-  `ctx.hp`/`ctx.cp` and the answerer follow the new PIDs).
+  closes it (its PID) at the end; `lockstep_rejoin` e) does the same. `lockstep_stress`, `lockstep_limits` i),
+  `lockstep_rejoin` and `lockstep_resume` kill and restart copies (taskkill /F of their own PIDs; PROCS,
+  `ctx.hp`/`ctx.cp` and the answerer follow the new PIDs; `ll_kill`/`ll_relaunch` keep each run's log for the scan),
+  some with `RTW3MP_TEST_LS_LEVEL=<level-1>` (another live-battle engine level).
 - Logs: `<Documents>\My Games\Rule the Waves 3\RTW3MP\rtw3mp_<port>.log` (one per instance; a start renames the old
   one to `.prev.log`, one generation, so log marks of a copy are invalid after it was started again; the runner copies
-  the log of a killed copy to `rtw3mp_<port>.kill<N>.log` / `.hostkill<N>.log` first and deletes such copies at the
+  the log of a killed copy to `rtw3mp_<port>.<tag><N>.log` (`kill`, `hostkill`, `restart`, `k2restart`, `level`,
+  `afterend`, `relay`, `vanilla`, `clean`: `KEPT_LOG_RE`) first and deletes such copies at the
   start of the next run). Read them
   for evidence (`AI suppressed`, `merge nation`, `diplomacy:`, `design study`, `intel reports:`,
   `state seq N -> <name> (nation K, B bytes)`, `NOT sent`, `net:`, exceptions; events: client
   `event <idx> for nation K: <caption> | event=..`, `event: no event this month`, `event: this month was already
   rolled`, `event: event needs the host`; host `event of <name> (nation K, #idx '<caption>'): tension K-j a->b ...`,
-  `second event of <name> in <date> ignored (one per month)`, `event from ... ignored (...)`; 0.3.3: `air units: N from
-  before the load dropped; the campaign's M kept` and `air units: K repeated units of the save dropped (...)` at
-  campaign loads, `lockstep: the simulation's ship identification as the battle save leaves it ...` at every live load,
-  `lockstep: the division report lowered <ship>'s current speed a -> b on this PC only: put back ...`).
+  `second event of <name> in <date> ignored (one per month)`, `event from ... ignored (...)`).
 - Event cooldown files: the client keeps `events_<hash>.ini` (its event cooldowns and the calendar month it last
   rolled) in the same RTW3MP folder. The fixture campaign always starts at the same month, so a leftover file would
   mark that month as already rolled: the runner deletes every `events_*.ini` there before and after the run.
@@ -94,13 +133,36 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
   fixture (safety rule 7). Clients use slot 77, and slot 87 (`RTW3MP_BATTLE_SLOT`, default client slot + 10) for
   the battles they fight.
 - Save slot 9 holds the 1935 test campaign (Great Britain = nation 0, January 1935, never played) for live battles
-  with aircraft (`lockstep_air`: `pocbattle 2 0` against France, carriers and air stations on both sides; the scenario
-  is skipped with a SKIP line without it) and, copied into slot 49 with every air unit doubled, for `air_units`' real
-  months (0.3.3: the air units no longer double at every load; also skipped without it). Its pristine copy is outside
-  the repo; TESTING.md says how it was made and how to put it back.
+  with aircraft (`lockstep_air` and `lockstep_strike`: `pocbattle 2 0` against France, air stations on both sides and
+  usually carriers: a battle without a carrier division on a side, which the strike dialog needs, is ended and replaced
+  (`carrier_divs`); skipped with a SKIP line without the campaign). Its pristine copy is outside the repo; TESTING.md
+  says how it was made and how to put it back.
+- The 1958 missile test campaign for `lockstep_missiles` (engine level 9; stage C, 72a3ef7): kept outside the repo
+  (the developers' session folder, `fixture_missile\Game48`, with a README and a SAM variant), Italy hosts (nation 0),
+  the client claims the Soviet Union (nation 3); `settension 0 3 50`, `pocbattle 3 1 1` (the Cruiser battle in The
+  Mediterranean). Given per run with `--missile-fixture <folder>\Game48` (slot 48, copied in and deleted) or
+  `--missile-slot <n>`; the defaults `--missile-nations 0,3`, `--missile-mission 1`, `--missile-area 1` fit it.
+  Without it the scenario is a SKIP with the reason. TESTING.md, "The 1958 missile test campaign".
+- Scenarios and groups (0.4.0, live-battle engine level 14): the default run adds `air_units` (the
+  campaign's air units after every load on both copies, never doubled; a bloated save heals on its first load: 72a3ef7)
+  and `lockstep_limits` (deferred orders,
+  Save, auto-run, the realism requirement, the division report's speed, a killed client's rejoin, both on auto-run,
+  `ident=`/`date=` every minute) and the 0.4.0 parts of `lockstep_ui` (the panel's own Fire at will, Auto-run per
+  player, Fastest shared, land CAP an order, the identification) and `lockstep_air` (routine air ops, night CAP over a
+  resync, land CAP with the own-airfield rule, strikes through the real dialog: the short variant). `--stress` or
+  `--group` run the long ones: `rejoin` (`lockstep_rejoin`, `lockstep_resume`), `air` (`lockstep_air`, `air_units`,
+  `lockstep_strike`), `airunits` (`air_units`), `torpedo` (`lockstep_torpedo`, Realism 2), `missiles`
+  (`lockstep_missiles`), `live-limits` (all). `--list` shows each scenario's estimated game time (measured on the 0.4.0
+  release candidate dist_ll_16: the default run ~25 min, `--stress` ~92 min); `--dry-run` the whole plan. Engine
+  level 12 (ll-polish): Auto-run off gives a side
+  back as single player does (only the lead divisions), torpedo and missile salvoes are refused on auto-run (also while
+  the order is pending), B's result box shows B's side, the drop chat promises the ships back only when a rejoin can
+  work, level notices give both levels, and the battle's chat lines stay on each PC.
 - Battle screen controls are tested with posted messages only (`click_tool`, `click_arrow`, `post_click`, tree views
   and list views read cross-process) and the bridge probes `ls ctl`, `ls airwin`, `pocstate fastest=`; the battle's
   modeless tool windows must be closed (`close_modeless`) before anything answers dialogs with `answer_dialogs`.
+  Popup menus: `popup_pick` keys at a 0.25 s pace with the highlight read before each one; a menu that can't be used
+  is closed (`close_menus`): an open menu keeps the game in its menu loop and a live load waits for it.
 - Evidence the runner logs for you: the text of every game box it answers (`(text: '...')`, read-only from the copy's
   memory by `box_text`) and the saves' [General] dates (`gen_date`) before every turn and around test battles. A live
   battle's load moves the host's campaign date to the battle's own; up to 0.3.2 3cc0628 a resync saved it (a turn `NOT
@@ -111,9 +173,19 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
   into slot 87 within a second of "battle N: fought" (`BattleDriver` compares the file's write time with the line).
   Before calling a fail a mod bug, check the file's write time against the log (`file_time`) and the client's
   `write ...: succeeded after N retries` lines (the mod's writes wait while the runner holds a file).
-- Open since 05b81f6: `lockstep_month`'s VP check can fail after a `drop12` battle in which the host's side scored 0.
-  The client's own load of a correct package gives nation 0 60-100 VP more. `vp_mismatch_probe`'s two log lines (the
-  files and both copies' reloads) are the evidence to report.
+- Fixed in 0.4.0 (MODLOG, Fix 2026-10-18): `lockstep_month`'s VP difference after a `drop12` battle (open since
+  05b81f6) was the game's load crediting blockades again (`CheckBlockadeStatus`). In a multiplayer session (and for
+  the mod's own reloads) the mod now puts the load's credit back (`load: the game's blockade check gave victory points
+  the save doesn't have; put back: ...`; `Load VP guard: ok` at startup); a load without a session keeps it, as in
+  single player (`kept: no multiplayer session`). `vp_reload_check` makes a blockade on purpose and reloads both copies
+  after every host battle. A VP difference now is a regression: report those lines with `vp_mismatch_probe`'s two log
+  lines.
+- A product issue that predates 0.4.0 (report it when it recurs, with the copy's log around it): the client's "Error
+  in SaveBuildCampaign procedure! Access violation at address 00C5B9D4 ..." (`@UStrAddRef` with a bad string pointer)
+  at its first save after it joined a session on another campaign in the same process (0.3.3's `air_units`, dist_vp_2's
+  `lockstep_air` start). The runner fails the scenario and `session` on it (`game_error_boxes`). Not a suite issue.
+- Test-only: `ls testcurspeed` re-baselines the leak check while the display's sighting values are in place, so a
+  sighting-only LEAK right after it is the command's own (`testcur_leak` excuses that one; TESTING.md, Known traps).
 
 ## How to work
 1. Read the change you're asked to test (diff, `MODLOG.md` entry) and decide which scenarios cover it (the scenario
@@ -122,7 +194,8 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
    bridge commands and posted messages; if a bridge command is missing, ask the caller to add it to
    `src/mod/bridge.cpp` (or add it yourself only if the caller allows it) and rebuild.
 3. Build (`build.bat`), install (no `RTW3.exe` running), run the full suite once. Don't loop launches: if
-   something fails, collect logs, close the game, and report.
+   something fails, collect logs, close the game, and report. After changing the runner or a parser, run
+   `python tools/regression_selftest.py` first (offline, a few seconds).
 4. Report: scenario table with PASS/FAIL counts, failing checks with values, relevant log lines, total
    game-open time, and confirmation that saves were restored and no game process is left.
 5. Keep `docs/TESTING.md` current: the scenario catalog when you add or change scenarios, the bridge command

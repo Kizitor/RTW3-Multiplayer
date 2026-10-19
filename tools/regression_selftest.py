@@ -1,0 +1,722 @@
+"""Offline self-test of tools/regression.py: never starts the game, never reads or writes the game's saves, logs or
+Preferences.
+
+  python tools/regression_selftest.py                  the parsers and log patterns against sample replies and log lines
+                                                       (the formats of src/mod, lines of the 0.4.0 live proofs), the
+                                                       runner's plan: --list, --dry-run and the fixture/Preferences helpers
+                                                       in a sandbox folder (made in the current folder, deleted after)
+  python tools/regression_selftest.py --logs <folder>  also the parsers over a recorded run's mod logs
+                                                       (rtw3mp_<bridge port>[.<tag>].log, ls_trace_*.txt): a report
+
+Exit code 0 when every check passed. Run it after every change of the suite's parsers, patterns or runner options.
+"""
+import argparse
+import contextlib
+import io
+import os
+import re
+import shutil
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import regression as R  # noqa: E402
+
+RESULTS = []
+
+
+SESSION_FILES = os.environ.get('RTW3_SESSION_FILES', '')  # (optional: the developers' snapshots)
+
+
+def check(name, ok, detail=''):
+    RESULTS.append((name, bool(ok)))
+    print(f'{"PASS" if ok else "FAIL"} {name}' + ('' if ok else f'  -- {detail}'))
+    return bool(ok)
+
+
+# ---------------------------------------------------------------- samples (the bridge's replies, the mods' log lines)
+
+FORCES = ('ok 0:0:Great Britain Main force:divs=0,1:lead=0:changed=0:turnaway=0:ai=0:withdraw=0:mission=0; '
+          '1:1:Germany Main force:divs=2,3,4:lead=2:changed=1:turnaway=12:ai=0:withdraw=0:mission=1; '
+          '2:0:Great Britain Coastal forces:divs=16,17:lead=-:changed=0:turnaway=0:ai=1:withdraw=0:mission=1;')
+FORCES_DIV = ('ok 0:0:GB Battle Division 2:force=0:admin=0:lead=-:role=0:flead=1:ai=0; '
+              '1:0:GB Destroyer Division 28:force=0:admin=0:lead=0:role=2:flead=0:ai=1; '
+              '3:1:Germany Battle Division 3:force=1:admin=0:lead=2:role=1:flead=0:ai=0;')
+PENDING = 'ok n=2 #1:lead:0:Great Britain Main force>GB Destroyer Division 28; #2:torp:5:A12#0>A33#0;'
+LANDCAP = ('ok landcap0=0:GB Battle Division 11 landcap1=4:France Battle Division 8 swapped=1 mine=1 feature=1 rule=1 '
+           'calls=8 other=1 airfields=27:0:-;28:0:0;29:1:4;30:1:-;31:0:-;')
+AIRFORCE = ('ok force=0 name=Great Britain Main force side=0 cap=1 nightcap=1 left=185 right=285 dist=300 interval=0 '
+            'twophase=0 repeat=0 nightsearch=0 ordered=0000000000111110000 current=0,0,3,0 flagship=Repulse feature=1 | '
+            'landcap0=- landcap1=- swapped=0 mine=0 feature=1 rule=1 calls=0 other=0 airfields=27:0:-;28:0:-; | batch=#4')
+AIRLIST = ('ok n=3 mark=43 afid=43 scout=0 launches=1 replays=2 failed=0 sorts=0 next=0/1 feature=1 auto=0 fresh=1 | '
+           '1:0:m0:s0:o0:5/0:l0:p-:L-:g0:c0:t0.000,0.000:at0.000,0.000:59 Squadron; '
+           '1100000:1:m3:s2:o2:3/3:l4:p42:L-:g0:c0:t-4.123,50.250:at-4.500,48.380:N strike #58; '
+           '7:0:m1:s10:o0:2/0:l0:p-:L-:g0:c1:t0.000,0.000:at-4.100,50.300:Recon: west;')
+STRIKE = ('ok visible=1 division=24:France Carrier Division 3 target=0.000,0.000 fresh=1 ready=0 (Pause the battle first: '
+          'aircraft are launched, readied and stood down between minutes.) hwnd=1ec176a lv=31e13fc launch=14f140a '
+          'ready=a3142c standdown=2631438 autoselect=167145e cancel=fe140c rows=0:34:0;1:36:1;2:-:0;')
+REJOINABLE = ('ok on=1 bid=100000 opp=1 peer=Captain side=1 dropMinute=4 minute=4 age=2 epoch=1 pending=0 why=Captain '
+              'disconnected')
+RESUMABLE = ('ok on=1 held=1 rejoinable=1 bid=100003 epoch=1 opp=1 slot=1 slotMode=1 serial=1 loadedAt=0 minute=0 age=2 '
+             'pending=0 marker=match:bid100003:epoch1:min0:faw11:slotmode1 peer=Captain why=the battle was loaded from the '
+             'host\'s save')
+MISSILESTAT = ('ok faw=10 agreed=10 box=1 boxEnabled=1 feature=11 calls=42 held=0/2 heldCalls=0/5 | side0 ships=4 '
+               'heavySSM=8 mediumSSM=0 lightSSM=12 heavySAM=0 mediumSAM=16 lightSAM=24 pending=1 air=2 msub=0/0 | side1 '
+               'ships=3 heavySSM=4 mediumSSM=2 lightSSM=0 heavySAM=8 mediumSAM=0 lightSAM=12 pending=0 air=0 msub=1/1 | '
+               'otherAir=0 subs=2 | intercepted shotDown=2/1 bySAM=2/0 decoyed=0/1 | nations 0:4:msam1:antimissile1:c8=0:'
+               'gate0 1:3:msam1:antimissile1:c8=0:gate0 | orders=1 pendingOrders=0 replays=1 fired=2 skipped=0 '
+               'ssmRefused=0 subsUnchecked=0 last=Kirov mount 2: 2 of 2 (a location, bearing 270)')
+MOUNTS = ('ok ship=Fame side=0 sunk=0 speed=15 type=9 fired=0 mounts=2 0:type=0:pos=Q:tubes=1:left=1:reload=0:reloads=0:'
+          'destroyed=0:sub=0; 1:type=0:pos=V:tubes=2:left=0:reload=4:reloads=0:destroyed=0:sub=?;')
+MARKER = 'bid=100003\nepoch=2\nminute=7\nslotmode=1\nfaw=11\nautostrike=0\nhost=Admiral\ns0=Great Britain\ns1=Germany\n'
+TORP = ('ok queued=1 target=0 mount=1 | result: ordered for minute 64 | solution: 1 HIGH 3 tubes | ship=Fame button=1 | '
+        'solutions: 0 LOW 2 tubes [mount 0]; 1 HIGH 3 tubes [mount 1]; | targets 2: 0 Brandenburg; 1 Woerth;')
+TORP_NONE = ('ok queued=0 target=1 (no firing solution) | ship=Fame button=1 | solutions: | targets 2: 0 Brandenburg; '
+             '1 Woerth;')
+MISSILES = ('ok queued=2 missiles=6 target=0 | result: 2 launchers | summary: - | shooters: 0:Kirov:1; 1:Grozny:1; '
+            '2:K-45:0; | targets 1: 0 Enterprise;')
+
+HASH_A = ('14:20:23.436 [16412] lockstep hash A t=12:17 min=1 all=211145f3f7c0b80f pos=c52dff4c dmg=0794691d '
+          'ammo=96d69bf4 sight=d0e55762 ident=a01a6238 ord=fe85cd41 air=4cdf56bf torp=67f80c33 force=67662527 '
+          'sub=b7f67793 ships=51(30/21) sunk=0 divs=28 af=0 torps=0 draws sim=2110 ui=18 other=1026 rng=5b3ec0dc speed=3 '
+          'date=1901-07-01\n'
+          '14:20:23.612 [16412] lockstep hash A t=12:18 min=2 all=e2e8d28422c79fa6 pos=7379a5dd ident=a01a6238 rng=62da13ac '
+          'speed=3 date=1901-07-01\n'
+          '14:20:30.001 [16412] lockstep hash A t=12:18 min=2 all=ffff000011112222 pos=7379a5dd ident=a01a6238 rng=62da13ac '
+          'speed=3 date=1901-07-01\n')
+HASH_B = ('14:20:23.440 [ 6828] lockstep hash B t=12:17 min=1 all=211145f3f7c0b80f pos=c52dff4c ident=a01a6238 '
+          'draws sim=2110 ui=3 other=7 rng=5b3ec0dc speed=3 date=1901-07-01\n'
+          '14:20:30.010 [ 6828] lockstep hash B t=12:18 min=2 all=ffff000011112222 pos=7379a5dd ident=0badf00d '
+          'rng=62da13ac speed=3 date=1901-07-01\n')
+
+LINES = {
+    'deferred ok': "10:45:05.241 [ 9972] lockstep: deferred Change of lead division (Great Britain Main force, new lead GB "
+                   "Destroyer Division 28) of side 0 carried out at minute 0 (given for minute 0)",
+    'deferred no': "10:45:40.100 [ 9972] lockstep: deferred Battle turn-away (Great Britain Main force, new lead GB Battle "
+                   "Division 2) of side 0 (given for minute 1) not carried out at minute 1: the divisions' lead chain loops",
+    'deferred torp': "12:01:00.000 [ 9972] lockstep: deferred torpedo salvo of side 1 carried out at minute 64 (given for "
+                     "minute 64): Fame mount 1 at Brandenburg, course 271.5, speed 30, range 4000, manual 1: 3 torpedoes in "
+                     "the water (3 -> 0 left, reload 12)",
+    'deferred late': "12:02:00.000 [ 9972] lockstep: deferred Torpedo salvo of Fame of side 1 (given for minute 65) not "
+                     "carried out at minute 66: it was meant for minute 65 and arrived too late",
+    'deferred msl': "12:03:00.000 [ 9972] lockstep: deferred missile salvo of side 0 carried out at minute 30 (given for "
+                    "minute 30): Kirov mount 2 (type 4) at a location, bearing 270, 2 of 2: 2 fired, 2 missiles in the air "
+                    "(8 -> 6 left, reload 0)",
+    'quiet box': "10:45:05.241 [ 9972] lockstep: deferred action's box 'Force lead division changed!\rYou might want to "
+                 "update the lead division setting for other divisions.' answered 1 (chat)",
+    'load date kept': '14:20:19.001 [16412] lockstep: the load: campaign date 1901-07-01 kept (the battle save said '
+                      '1901-07-29)',
+    'load date same': '14:20:19.001 [16412] lockstep: resume: campaign date 1901-07-01 (as the battle save: 1901-07-01)',
+    'load vp back': "14:20:19.001 [16412] load: the game's blockade check gave victory points the save doesn't have; "
+                    "put back: nation 0 1502 -> 1402, EnemyVP 1100 -> 1000 (blockaded: 1 3)",
+    'load vp kept': "14:20:19.001 [16412] load: the game's blockade check gave victory points: nation 0 1402 -> 1502 "
+                    "(blockaded: 1); kept: no multiplayer session (a load outside a session is the game's own)",
+    'ident': "14:20:19.002 [16412] lockstep: the simulation's ship identification as the battle save leaves it (type 22, "
+             "no class); this PC's display had identified 17 ship(s) during the load and keeps that",
+    'fastest': 'lockstep: France turned Fastest available on (from the next minute).',
+    'autorun q': 'lockstep: auto-run question (hand over) answered 1',
+    'autorun rel': 'lockstep: auto-run home for side 1 at minute 7 (2 forces ordered to the closest friendly base; auto-run '
+                   '01)',
+    'landcap cover': 'lockstep: land CAP of side 1 over France Battle Division 8: Naval air station Brest covers it; the '
+                     'game alone would have tasked Naval air station Plymouth of side 0 (t=06:50)',
+    'landcap cover own': 'lockstep: land CAP of side 0 over GB Battle Division 11: Naval air station Plymouth covers it '
+                         '(t=06:50)',
+    'nightcap': 'lockstep: night CAP as before the load: on for 2 of 4 forces (2 put back)',
+    'launch': "lockstep: launch from the screen: A42#0 -> AF1100001 'N strike #58' (3 aircraft, mission 3, ordered state 2, "
+              "loadout 4, spot 0) at t=09:39",
+    'replay': "lockstep: replayed launch from A41#0 -> AF1100000 'None #57'",
+    'rejoin host': 'rejoin: Captain is back as nation 1: live battle 100000 starts again with them at its next minute '
+                   'boundary (resumed from the host\'s save)',
+    'rejoinable': 'lockstep: rejoin: battle 100000 (epoch 1) can be rejoined by Captain (Germany) while it goes on against '
+                  'the computer (minute 4, t=08:34: Captain disconnected)',
+}
+
+
+def samples():
+    f = R.parse_forces(FORCES)
+    check('parse_forces: three forces, divisions, lead (None for -), the turn-away cooldown, ai, withdraw, mission',
+          [(x['i'], x['side'], x['name'], x['divs'], x['lead'], x['turnaway'], x['ai'], x['mission']) for x in f] ==
+          [(0, 0, 'Great Britain Main force', [0, 1], 0, '0', '0', '0'),
+           (1, 1, 'Germany Main force', [2, 3, 4], 2, '12', '0', '1'),
+           (2, 0, 'Great Britain Coastal forces', [16, 17], None, '0', '1', '1')], f)
+    check('parse_forces: an error reply gives []', R.parse_forces('error no battle') == [])
+    fd = R.parse_forces_div(FORCES_DIV)
+    check('parse_forces_div: the divisions by index (force, lead None for -, role, flead, ai)',
+          sorted(fd) == [0, 1, 3] and fd[1] == dict(side=0, name='GB Destroyer Division 28', force=0, admin='0', lead=0,
+                                                    role='2', flead='0', ai='1') and fd[0]['lead'] is None, fd)
+    p = R.parse_pending(PENDING)
+    check('parse_pending: the pending deferred actions (seq, kind, minute, objects)',
+          [(x['seq'], x['kind'], x['minute'], x['objs']) for x in p] ==
+          [(1, 'lead', 0, ['Great Britain Main force', 'GB Destroyer Division 28']), (2, 'torp', 5, ['A12#0', 'A33#0'])], p)
+    lc = R.parse_landcap(LANDCAP)
+    check('parse_landcap: the requests with spaces in the names, the swap, the airfields and their capped divisions',
+          lc.get('landcap0') == '0:GB Battle Division 11' and lc.get('landcap1') == '4:France Battle Division 8'
+          and lc.get('swapped') == '1' and lc.get('mine') == '1' and lc.get('calls') == 8 and lc.get('other') == 1
+          and lc.get('airfields') == [(27, 0, None), (28, 0, 0), (29, 1, 4), (30, 1, None), (31, 0, None)], lc)
+    check('landcap_shared: the display swap and the copy\'s side left out',
+          set(R.landcap_shared(lc)) == {'landcap0', 'landcap1', 'calls', 'other', 'airfields'})
+    af = R.parse_airforce(AIRFORCE)
+    check('parse_airforce: the settings as ints, settings without the count-downs, the land-CAP tail, the batch',
+          af.get('force') == 0 and af.get('name') == 'Great Britain Main force' and af.get('left') == 185
+          and af.get('nightcap') == 1 and af.get('ordered') == '0000000000111110000' and 'current=' not in af['settings']
+          and af['landcap'].get('rule') == '1' and af.get('batch') == '#4' and af.get('flagship') == 'Repulse', af)
+    head, items, rest = R.parse_airlist(AIRLIST)
+    check('parse_airlist: the head\'s counters, every formation (ids, missions, states, numbers, places, names with '
+          'colons), the items text', head.get('n') == '3' and head.get('auto') == '0' and len(items) == 3
+          and items[1] == dict(id=1100000, side=1, m=3, s=2, o=2, num=3, loaded=3, l='4', p='42', L='-', g='0', c='0',
+                               t='-4.123,50.250', at='-4.500,48.380', name='N strike #58')
+          and items[2]['name'] == 'Recon: west' and rest.startswith('1:0:m0'), items)
+    st = R.parse_strike(STRIKE)
+    check('parse_strike: visible, fresh, the Ready state with its reason, the button handles (ready= twice), the rows',
+          st.get('visible') == '1' and st.get('fresh') == '1' and st.get('readyok', '').startswith('0 (Pause')
+          and st.get('readybtn') == 0xa3142c and st.get('launch') == 0x14f140a and st.get('lv') == 0x31e13fc
+          and st.get('rows') == [(0, 34, False), (1, 36, True), (2, None, False)], st)
+    st1 = R.parse_strike(STRIKE.replace('ready=0 (Pause the battle first: aircraft are launched, readied and stood down '
+                                        'between minutes.)', 'ready=1'))
+    check('parse_strike: ready=1 and the Ready button\'s handle told apart', st1.get('readyok') == '1'
+          and st1.get('readybtn') == 0xa3142c, st1)
+    rj, rs = R.parse_tail_why(REJOINABLE), R.parse_tail_why(RESUMABLE)
+    check('parse_tail_why: `ls rejoinable` and `ls resumable` with the reason\'s spaces',
+          rj.get('on') == '1' and rj.get('peer') == 'Captain' and rj.get('why') == 'Captain disconnected'
+          and rs.get('held') == '1' and rs.get('marker', '').startswith('match:bid100003:epoch1:min0:')
+          and rs.get('why') == 'the battle was loaded from the host\'s save', (rj, rs))
+    ms = R.parse_missilestat(MISSILESTAT)
+    check('parse_missilestat: Fire at will (faw, agreed, box), both sides\' stocks and counts, the interceptions, the '
+          'nations, the salvo counters, the last salvo with spaces', ms.get('faw') == '10' and ms.get('box') == '1'
+          and ms.get('held') == '0/2' and ms['side0'].get('heavySSM') == '8' and ms['side1'].get('msub') == '1/1'
+          and ms.get('orders') == '1' and ms.get('fired') == '2' and ms.get('last', '').startswith('Kirov mount 2')
+          and ms.get('intercepted') == {'shotDown': '2/1', 'bySAM': '2/0', 'decoyed': '0/1'}
+          and ms.get('nations', '').startswith('0:4:msam1') and 'gate0 1:3' not in ms, ms)
+    st2 = R.missile_stocks(ms)
+    check('missile_stocks: per side the stocks both copies must agree on, and the interceptions',
+          st2[0].get('pending') == '1' and st2[1].get('heavySAM') == '8' and 'faw' not in st2[0]
+          and st2['x'].get('bySAM') == '2/0', st2)
+    mo = R.parse_mounts(MOUNTS)
+    check('parse_mounts: the ship and its mounts (left, reload, sub ?)', mo.get('ship') == 'Fame' and mo.get('n') == 2
+          and mo['mounts'][1] == dict(type='0', pos='V', tubes='2', left='0', reload='4', reloads='0', destroyed='0',
+                                      sub='?'), mo)
+    mk = R.parse_marker(MARKER)
+    check('parse_marker: the marker\'s key=value lines', mk.get('bid') == '100003' and mk.get('s0') == 'Great Britain'
+          and mk.get('faw') == '11', mk)
+    t1, t0 = R.parse_torp(TORP), R.parse_torp(TORP_NONE)
+    check('parse_torp: queued, the ship, the button\'s enabled state, the mount, the result; no solution: queued=0, no '
+          'mount', t1['queued'] and t1['ship'] == 'Fame' and t1['button'] == '1' and t1['mount'] == 1
+          and t1['result'] == 'ordered for minute 64' and not t0['queued'] and t0['mount'] is None, (t1, t0))
+    m1 = R.parse_missiles(MISSILES)
+    check('parse_missiles: launchers queued, missiles, the result', m1['queued'] == 2 and m1['missiles'] == 6
+          and m1['result'] == '2 launchers', m1)
+    ga, gb = R.hash_groups(HASH_A), R.hash_groups(HASH_B)
+    cmp_ = R.groups_compare(ga, gb)
+    check('hash_groups/groups_compare: per minute the last line counts (a resync loads a minute again); `ident=` that '
+          'differs at minute 2 is found, `all=` and `date=` equal', cmp_['minutes'] == 2 and cmp_['differ'] ==
+          {'all': [], 'ident': [2], 'date': []} and cmp_['values']['date'] == ['1901-07-01'], cmp_)
+    d = R.deferred_lines('\n'.join(LINES[k] for k in ('deferred ok', 'deferred no', 'deferred torp', 'deferred late',
+                                                      'deferred msl')))
+    check('deferred_lines: carried out (what, side, minute, given for), not carried out (why), torpedo and missile '
+          'salvoes with their rest', [(x['what'], x['side'], x['ok'], x['m'], x['g']) for x in d] == [
+              ('Change of lead division (Great Britain Main force, new lead GB Destroyer Division 28)', 0, True, 0, 0),
+              ('Battle turn-away (Great Britain Main force, new lead GB Battle Division 2)', 0, False, 1, 1),
+              ('torpedo salvo', 1, True, 64, 64), ('Torpedo salvo of Fame', 1, False, 66, 65),
+              ('missile salvo', 0, True, 30, 30)]
+          and d[1]['why'] == "the divisions' lead chain loops" and 'torpedoes in the water' in d[2]['rest']
+          and 'arrived too late' in d[3]['why'] and 'missiles in the air' in d[4]['rest'], d)
+    qb = R.quiet_boxes(LINES['quiet box'])
+    check('quiet_boxes: the box\'s first line (its text has \\r), the answer, chat or quiet',
+          qb == [('Force lead division changed!', 1, 'chat')], qb)
+    ld = R.load_dates(LINES['load date kept'] + '\n' + LINES['load date same'])
+    check('load_dates: "kept (the battle save said ...)" and "(as the battle save: ...)"',
+          ld == [('the load', '1901-07-01', '1901-07-29'), ('resume', '1901-07-01', '1901-07-01')], ld)
+    check('IDENT_LOAD_RE: the identification line of a live load', re.search(R.IDENT_LOAD_RE, LINES['ident']))
+    m, mk = re.search(R.LOAD_VP_RE, LINES['load vp back']), re.search(R.LOAD_VP_RE, LINES['load vp kept'])
+    check('LOAD_VP_RE (0.4.0): the load\'s blockade credit put back (what, the blockaded nations); the "kept" line of a '
+          'load outside a session is not a put-back', m and m[1] == 'nation 0 1502 -> 1402, EnemyVP 1100 -> 1000'
+          and m[2].split() == ['1', '3'] and mk is None, m and m.groups())
+    lk = ['14:29:08.153 [ 1444] lockstep: LEAK the simulation state changed outside the simulation (sight) between '
+          'EndOfTurnProcedures and a shared section at t=05:12; display routines in between: tvShipsChange,GlobeRender,'
+          'FillShipList,GetTypeAndNameForEnemy,GetTypeAndNameForEnemy; Mecklenburg.SightingLevel 01000000->02000000',
+          '14:29:08.181 [50616] lockstep: LEAK the simulation state changed outside the simulation (sight) between '
+          'EndOfTurnProcedures and a shared section at t=05:12; display routines in between: none; Le Redoutable.'
+          'RadarSightingLevel 01000000->02000000',
+          '14:29:08.181 [50616] lockstep: LEAK the simulation state changed outside the simulation (pos,sight) between '
+          'EndOfTurnProcedures and a shared section at t=05:12; display routines in between: none; Revenge.'
+          'CurrentSpeed 2d000000->12000000 Revenge.SightingLevel 01000000->02000000']
+    check('testcur_leak: a LEAK naming only the sighting guard\'s fields (group sight) is the `ls testcurspeed` baseline\'s; '
+          'one with another group or field is not', [R.testcur_leak(x) for x in lk] == [True, True, False],
+          [R.testcur_leak(x) for x in lk])
+    saved_divs = R.ls_divs
+    try:  # (the 1935 battle of dist_vp_2's default run: air stations only; and one with a carrier division per side)
+        R.ls_divs = lambda port: R.__dict__['_divs_fixture']
+        R._divs_fixture = [dict(i=0, side=0, name='GB Battle Division 2', ships=3), dict(i=4, side=1,
+                           name='France Battle Division 3', ships=2), dict(i=9, side=0, name='GB Battery 3', ships=1)]
+        none = R.carrier_divs(8001)
+        R._divs_fixture += [dict(i=5, side=0, name='GB Carrier Division 4', ships=2),
+                            dict(i=6, side=1, name='France Carrier Division 3', ships=0)]
+        sunk = R.carrier_divs(8001)
+        R._divs_fixture[-1]['ships'] = 1
+        both = R.carrier_divs(8001)
+    finally:
+        R.ls_divs = saved_divs
+        R.__dict__.pop('_divs_fixture', None)
+    check('carrier_divs: a side\'s carrier divisions with ships (the strike dialog\'s precondition), none for air stations '
+          'and batteries', none == {0: [], 1: []} and sunk == {0: ['GB Carrier Division 4'], 1: []}
+          and both == {0: ['GB Carrier Division 4'], 1: ['France Carrier Division 3']}, (none, sunk, both))
+    m = re.search(R.FASTEST_REQ_RE, LINES['fastest'])
+    check('FASTEST_REQ_RE: the nation and on/off', m and m.groups() == ('France', 'on'), m and m.groups())
+    m = re.search(R.AUTORUN_Q_RE, LINES['autorun q'])
+    check('AUTORUN_Q_RE: the question and the answer', m and m.groups() == ('hand over', '1'), m and m.groups())
+    m = re.search(R.AUTORUN_REL_RE, LINES['autorun rel'])
+    check('AUTORUN_REL_RE: on/home/off, the side, the minute, the forces sent home, the agreed pair',
+          m and m.groups() == ('home', '1', '7', '2', '01'), m and m.groups())
+    m1, m2 = R.LANDCAP_COVER_RE.search(LINES['landcap cover']), R.LANDCAP_COVER_RE.search(LINES['landcap cover own'])
+    check('LANDCAP_COVER_RE: the side, the division, the airfield, and what the game alone would have tasked',
+          m1 and m1.groups() == ('1', 'France Battle Division 8', 'Naval air station Brest', 'Naval air station Plymouth',
+                                 '0') and m2 and m2.groups()[3] is None, (m1 and m1.groups(), m2 and m2.groups()))
+    m = re.search(R.NIGHTCAP_RE, LINES['nightcap'])
+    check('NIGHTCAP_RE: forces on, of all, put back', m and m.groups() == ('2', '4', '2'), m and m.groups())
+    m = R.LAUNCH_RE.search(LINES['launch'])
+    check('LAUNCH_RE: the source, the new AFId (side 1\'s range), name, aircraft, mission, ordered state',
+          m and m.groups() == ('42', '1100001', 'N strike #58', '3', '3', '2')
+          and R.UI_AFID[1][0] <= int(m[2]) < R.UI_AFID[1][1], m and m.groups())
+    m = R.REPLAY_RE.search(LINES['replay'])
+    check('REPLAY_RE: the replayed launch', m and m.groups() == ('41', '1100000', 'None #57'), m and m.groups())
+    m = re.search(R.REJOIN_HOST_RE, LINES['rejoin host'])
+    check('REJOIN_HOST_RE: the player, the nation, the battle', m and m.groups() == ('Captain', '1', '100000'),
+          m and m.groups())
+    m = re.search(R.REJOINABLE_RE, LINES['rejoinable'])
+    check('REJOINABLE_RE: battle, epoch, player, nation', m and m.groups() == ('100000', '1', 'Captain', 'Germany'),
+          m and m.groups())
+    check('STRIKE_PAUSE_LINE: the refusal of the strike buttons while a minute runs',
+          R.STRIKE_PAUSE_LINE.endswith('aircraft are launched, readied and stood down between minutes.'))
+    lines = ['e0080000', 'bf529a47', 'f0090000', '565c1c', '58d80d', 'ff529a47', 'f0090000', '80529a47', 'f009000a',
+             '62a1df', 'bf000001', '6aa000', 'e0120001', '6aa001', 'ff000001', 'c0529a47']
+    e, b = R.trace_entries(lines)
+    check('trace_entries: display markers (e...) left out; the shared sections (bf.../ff...: idx 0x3f) hold the call '
+          'sites between their ENTER and EXIT', len(e) == 14 and b == [['565c1c', '58d80d'], ['6aa000', '6aa001']], (e, b))
+    check('expected_ls_level: this source tree\'s MP_LS_LEVEL (11 or later: the live-battle limits)',
+          (R.expected_ls_level() or 0) >= 11, R.expected_ls_level())
+    m = re.search(R.AUTO_OFF_RE, 'lockstep: side 1 back to its player as in single player: the lead divisions of 2 forces; 1 '
+                                 'forces stay with the computer as before auto-run; 9 divisions stay with the computer (31 '
+                                 'ships) at t=05:40')
+    check('AUTO_OFF_RE (engine level 12): the side, the lead divisions given back, the forces and divisions kept by the '
+          'computer', m and m.groups() == ('1', '2', '1', '9', '31'), m and m.groups())
+    box = ("12:00:00.000 [1] lockstep: the result box shows this player's side: 'German minor victory\r\rOwn VP: 120\r"
+           "Enemy VP: 340' (the game's: 'Enemy minor victory\r\rBritish prestige +2\rOwn VP: 340\rEnemy VP: 120')\r\n"
+           "12:00:00.001 [1] lockstep: next line\r\n")
+    saved = R.log_since
+    try:
+        R.log_since = lambda port, mark=0: box
+        r1 = R.result_box_side(0, 0)
+        R.log_since = lambda port, mark=0: box.replace('German minor', 'Enemy minor', 1)
+        r2 = R.result_box_side(0, 0)
+        R.log_since = lambda port, mark=0: 'nothing\r\n'
+        r3 = R.result_box_side(0, 0)
+    finally:
+        R.log_since = saved
+    import tempfile
+    with tempfile.TemporaryDirectory(dir='.') as td:
+        dll = os.path.join(td, 'RTW3MP.dll')
+        with open(dll, 'wb') as f:
+            f.write(b'\x00MZ\x00mod 0.4.0\x00both mod 0.4.0, but different builds\x001.2\x0010.0.19041\x00x')
+        v1 = R.build_version(dll)
+        with open(dll, 'wb') as f:
+            f.write(b'\x00mod 0.4.0\x00mod 0.3.3\x00')
+        v2 = R.build_version(dll)
+        with open(dll, 'wb') as f:
+            f.write(b'\x00version 0.3.2\x00')
+        v3 = R.build_version(dll)
+    check('build_version: the one x.y.z after "mod " (another x.y.z such as an SDK version ignored), two: None; without '
+          '"mod ": the one token', (v1, v2, v3) == ('0.4.0', None, '0.3.2'), (v1, v2, v3))
+    real = {n: R.build_version(os.path.join(SESSION_FILES, n, 'RTW3MP.dll')) for n in ('dist_ll_15', 'dist_ll_16', 'dist_033')
+            if os.path.exists(os.path.join(SESSION_FILES, n, 'RTW3MP.dll'))}
+    if real:
+        check('build_version on the snapshots at hand: dist_ll_15 0.6.0 (the branch), dist_ll_16 0.4.0, dist_033 0.3.3',
+              all(v == {'dist_ll_15': '0.6.0', 'dist_ll_16': '0.4.0', 'dist_033': '0.3.3'}[n] for n, v in real.items()),
+              real)
+    check('expected_ctx_hooks: the context hooks of this source tree, hex stack sizes counted too (LaunchSomeAircraft '
+          '0x14): 22', R.expected_ctx_hooks() == 22, R.expected_ctx_hooks())
+    lg = ("10:00:00.000 [1] lockstep: DESYNC report ls_desync_A_100000_2_4.txt written (1051 kB; compare it with the "
+          "other PC's: tools/desync_diff.py)\n10:00:01.000 [1] lockstep: DESYNC report ls_desync_B_100000_2_4.txt NOT "
+          "written (3 kB; ...)\n")
+    saved = R.log_since
+    try:
+        R.log_since = lambda port, mark=0: lg
+        dr = R.desync_reports(0, 0)
+        R.log_since = lambda port, mark=0: (
+            "1 lockstep: the simulation's ship identification as the battle save leaves it (type 22, no class); this PC's "
+            "display had identified 27 ship(s) during the load and keeps that\n2 lockstep: battle loaded from slot 1 "
+            "(seed 1, minute 0, t=07:18) in 2968 ms\n3 lockstep: battle loaded from slot 1 (seed 2, minute 9, t=07:27) in "
+            "2000 ms\n")
+        il = R.ident_loads(0, 0)
+        R.log_since = lambda port, mark=0: ("air units: 232 from before the load dropped; the campaign's 232 kept\n"
+                                            "air units: 116 repeated units of the save dropped (232 -> 116; a save of an "
+                                            "earlier version)\n")
+        al = R.air_lines(0, 0)
+    finally:
+        R.log_since = saved
+    check('desync_reports: the DESYNC report lines (file, A|B, battle, epoch, minute, written)', dr == [
+        ('ls_desync_A_100000_2_4.txt', 'A', '100000', '2', '4', True),
+        ('ls_desync_B_100000_2_4.txt', 'B', '100000', '2', '4', False)], dr)
+    check('ident_loads: two live loads, the first with the identification line before it (type 22, 27 shown)',
+          il == dict(loads=2, with_line=1, types=['22'], shown=[27]), il)
+    check('air_lines: the load lines (N, M) only, not the repair line; AIR_REPAIR_RE its numbers',
+          al == [(232, 232)] and re.search(R.AIR_REPAIR_RE, 'air units: 116 repeated units of the save dropped (232 -> '
+                                                         '116; a save of an earlier version)').groups()
+          == ('116', '232', '116'), al)
+    check('GAME_ERROR_RE: the game\'s own error boxes, not its ordinary ones', R.GAME_ERROR_RE.search(
+        'Error in SaveBuildCampaign procedure! Access violation at address 00B3F2A1') and R.GAME_ERROR_RE.search(
+        'Out of memory') and not R.GAME_ERROR_RE.search('CV Furious aircraft capacity exceeded!'))
+    check('result_box_side: the second player\'s result box (engine level 12): heads and points of both texts across the '
+          'box\'s line breaks; ok for the victory from its side with the points swapped, not for a head left as the game '
+          'wrote it; None without the line', r1 and r1['ok'] and (r1['head'], r1['own'], r1['enemy'], r1['g_head'],
+                                                                 r1['g_own'], r1['g_enemy']) == (
+              'German minor victory', '120', '340', 'Enemy minor victory', '340', '120') and r2 and not r2['ok']
+          and r3 is None, (r1, r2, r3))
+
+
+def tracefiles(sandbox):
+    d = os.path.join(sandbox, 'traces')
+    os.makedirs(d)
+    a = ['e0080000', 'bf529a47', 'f0090000', '565c1c', 'ff529a47', '80aaaaaa', '62a1df', 'c0aaaaaa']
+    b = ['e0080001', 'bf529a47', 'f0090000', '565c1c', 'ff529a47', '80bbbbbb', '62a1df', 'c0bbbbbb', 'e0120000']
+    for side, lines in (('A', a), ('B', b)):
+        with open(os.path.join(d, f'ls_trace_{side}_100000_1_5.txt'), 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+    with open(os.path.join(d, 'ls_trace_A_100000_1_6.txt'), 'w') as f:
+        f.write('\n'.join(a) + '\n')
+    with open(os.path.join(d, 'ls_trace_B_100000_1_6.txt'), 'w') as f:
+        f.write('\n'.join(a[:3] + ['565c1d'] + a[4:]) + '\n')
+    with open(os.path.join(d, 'ls_dump_A_100000_1_6.txt'), 'w') as f:
+        f.write('x')
+    with open(os.path.join(d, 'ls_trace_A_200000_1_6.txt'), 'w') as f:
+        f.write('x')
+    t5 = R.trace_compare(100000, 1, 5, folder=d)
+    check('trace_compare: equal call sites and marker kinds (the frame markers\' hash bits counted apart: hash_diff 2)',
+          t5['found'] and t5['first_diff'] is None and t5['hash_diff'] == 2 and t5['blocks_equal'], t5)
+    t6 = R.trace_compare(100000, 1, 6, folder=d)
+    check('trace_compare: a different call site is found (its index)', t6['first_diff'] == 2 and not t6['blocks_equal'],
+          t6)
+    check('trace_compare: a missing minute', not R.trace_compare(100000, 1, 7, folder=d)['found'])
+    n = R.trace_cleanup({100000}, folder=d)
+    check('trace_cleanup: this run\'s battles\' trace and dump files deleted, another battle\'s kept',
+          n == 5 and os.listdir(d) == ['ls_trace_A_200000_1_6.txt'], (n, os.listdir(d)))
+
+
+# ---------------------------------------------------------------- the runner's plan in a sandbox
+
+def write(p, text):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def digest(d):
+    return R.tree_digest(d)
+
+
+@contextlib.contextmanager
+def sandboxed(sandbox):
+    """The runner's paths pointed into the sandbox (saves, logs, Preferences, its backups, the game folder)."""
+    names = ('SAVE', 'LOG_DIR', 'PREFS_FILE', 'PREFS_BACKUP', 'BACKUP', 'F1935_BACKUP', 'SNAP_DIR', 'SNAPSHOT_DIRS')
+    saved = {k: getattr(R, k) for k in names}
+    saved_game = R.ctl.GAME
+    root = os.path.join(sandbox, 'Rule the Waves 3')
+    R.SAVE = os.path.join(root, 'Save')
+    R.LOG_DIR = os.path.join(root, 'RTW3MP')
+    R.PREFS_FILE = os.path.join(root, 'Preferences')
+    R.PREFS_BACKUP = os.path.join(sandbox, 'tmp', 'rtw3mp_regression_backup_Preferences')
+    R.BACKUP = os.path.join(sandbox, 'tmp', 'rtw3mp_regression_backup_Game1')
+    R.F1935_BACKUP = os.path.join(sandbox, 'tmp', 'rtw3mp_regression_backup_Game9')
+    R.SNAP_DIR = os.path.join(sandbox, 'tmp', 'rtw3mp_regression_snapshot_Game1')
+    R.SNAPSHOT_DIRS = (R.SNAP_DIR,)
+    R.ctl.GAME = os.path.join(sandbox, 'game')
+    tmp_saved = R.tempfile.tempdir
+    R.tempfile.tempdir = os.path.join(sandbox, 'tmp')
+    try:
+        yield root
+    finally:
+        for k, v in saved.items():
+            setattr(R, k, v)
+        R.ctl.GAME = saved_game
+        R.tempfile.tempdir = tmp_saved
+        R.MISSILE.update(path=None, slot=None, nations=None, mission=0, why=None)
+
+
+def run_main(args):
+    out = io.StringIO()
+    code = None
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        try:
+            code = R.main(args)
+        except SystemExit as e:
+            code = ('exit', e.code)
+    return code, out.getvalue()
+
+
+def runner(sandbox):
+    with sandboxed(sandbox) as root:
+        os.makedirs(os.path.join(sandbox, 'tmp'))
+        os.makedirs(os.path.join(sandbox, 'game'))
+        write(os.path.join(R.SAVE, 'Game1', 'RTWGame1.bcs'), '[General]\nYear=1900\nMonth=8\nDay=1\nScenarioInProgress=-1\n'
+                                                            '[Nation0]\nName=Great Britain\n[Nation1]\nName=Germany\n')
+        write(os.path.join(R.SAVE, 'Game9', 'RTWGame9.bcs'), '[General]\nCampaignStartYear=1935\nYear=1935\nMonth=1\nDay=1\n'
+                                                            'ScenarioInProgress=-1\n[Nation0]\nName=Great Britain\n'
+                                                            '[Nation2]\nName=France\n')
+        write(R.PREFS_FILE, 'MapZoom=3\nRealismSetting=1\nSound=1\n')
+        fix = os.path.join(sandbox, 'fixture_late', 'Game5')
+        write(os.path.join(fix, 'RTWGame5.bcs'), '[General]\nCampaignStartYear=1935\nYear=1958\nMonth=4\nDay=1\n'
+                                                 'ScenarioInProgress=-1\n[Nation0]\nName=Italy\n[Nation3]\n'
+                                                 'Name=Soviet Union\n[AirUnits]\nAirUnitNo=2\nAU0Id=5\nAU0Name=A\n'
+                                                 'AU1Id=7\nAU1Name=B\n')
+        write(os.path.join(fix, 'MapData5.dat'), '[MapAreas]\n')
+        # --list and the groups
+        code, out = run_main(['--list'])
+        check('--list: exit 0, every scenario with its game time and where it runs, the groups', code == 0
+              and all(re.search(rf'^{s[0]} ', out, re.M) for s in R.SCENARIOS) and 'groups: limits:' in out
+              and re.search(r'^lockstep_limits +0 +\d+ +default, limits', out, re.M), out[-400:])
+        check('GROUPS, STRESS_ONLY and EST name only scenarios of the suite; every scenario has a time estimate',
+              all(n in [s[0] for s in R.SCENARIOS] for v in R.GROUPS.values() for n in v)
+              and all(n in [s[0] for s in R.SCENARIOS] for n in R.STRESS_ONLY)
+              and all(s[0] in R.EST for s in R.SCENARIOS), (R.GROUPS, R.STRESS_ONLY))
+        dflt = [s[0] for s in R.SCENARIOS if s[0] not in R.STRESS_ONLY]
+        check('the default run: lockstep_ui, lockstep_limits and lockstep_air in it; rejoin, resume, torpedo, strike and '
+              'missiles not', {'lockstep_ui', 'lockstep_limits', 'lockstep_air'} <= set(dflt) and not (
+                  {'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_strike', 'lockstep_missiles'}
+                  & set(dflt)), dflt)
+        order = [s[0] for s in R.SCENARIOS]
+        check('the order: the slot-1 scenarios before lockstep_air, lockstep_strike and lockstep_missiles (they move the '
+              'session to other campaigns)', all(order.index(x) < order.index('lockstep_air') for x in (
+                  'lockstep_limits', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_stress'))
+              and order.index('lockstep_air') < order.index('lockstep_strike') < order.index('lockstep_missiles'), order)
+        code, out = run_main(['--group', 'nosuch'])
+        check('--group with an unknown group: an argument error', code == ('exit', 2) and 'unknown group' in out, out[-300:])
+        # --dry-run: nothing written, nothing deleted
+        before = digest(sandbox)
+        code, out = run_main(['--dry-run'])
+        check('--dry-run (default): the plan (the scenarios with their game time, slot 1, the 1935 campaign), the game '
+              'files missing in the sandbox reported, exit 2; the sandbox unchanged', code == 2 and 'lockstep_limits' in out
+              and 'lockstep_rejoin' not in out and 'RTW3.exe not found in the game folder' in out
+              and 'the 1935 test campaign (slot 9): ok' in out and digest(sandbox) == before, out[-1500:])
+        code, out = run_main(['--dry-run', '--stress'])
+        check('--dry-run --stress: the stress-only scenarios and the long variants\' times', code == 2
+              and 'lockstep_resume' in out and 'lockstep_stress' in out and '(long variants: --stress)' in out
+              and 'SKIP lockstep_missiles' in out and digest(sandbox) == before, out[-1500:])
+        code, out = run_main(['--dry-run', '--group', 'torpedo'])
+        check('--dry-run --group torpedo: session and lockstep_torpedo; RealismSetting 1 would be set to 2 for the run, '
+              'the Preferences unchanged now', code == 2 and 'lockstep_torpedo' in out and 'lockstep_ui' not in out
+              and 'would set RealismSetting=2' in out and R.realism_pref() == 1 and digest(sandbox) == before,
+              out[-1200:])
+        code, out = run_main(['--dry-run', '--group', 'missiles', '--missile-fixture', fix, '--missile-nations', '0,3'])
+        check('--dry-run --group missiles with a fixture folder: copied into the free slot 5 for the run (not now), the '
+              'fixture read', code == 2 and 'copied into the free save slot 5' in out and 'ok {' in out
+              and not os.path.exists(R.slot_dir(5)) and digest(sandbox) == before, out[-1200:])
+        code, out = run_main(['--dry-run', '--only', 'lockstep_rejoin,lockstep_air'])
+        check('--dry-run --only: session first, the suite\'s order, the third copy\'s slots for lockstep_rejoin',
+              code == 2 and out.index('session') < out.index('lockstep_rejoin') < out.index('lockstep_air')
+              and '76, 86' in out, out[-1200:])
+        # a leftover backup of an interrupted run
+        os.makedirs(os.path.dirname(R.PREFS_BACKUP), exist_ok=True)
+        write(R.PREFS_BACKUP, 'RealismSetting=3\n')
+        p = R.preflight(os.path.join(R.SAVE, 'Game1'), dry=True)
+        check('preflight: a Preferences backup that differs from the file is a problem (the user\'s settings)',
+              any('Preferences from an interrupted run' in x for x in p) and os.path.exists(R.PREFS_BACKUP), p)
+        shutil.copyfile(R.PREFS_FILE, R.PREFS_BACKUP)
+        p = R.preflight(os.path.join(R.SAVE, 'Game1'), dry=True)
+        check('preflight (dry): an identical leftover backup is kept, only reported', os.path.exists(R.PREFS_BACKUP)
+              and not any('Preferences' in x for x in p), p)
+        with contextlib.redirect_stdout(io.StringIO()):
+            R.preflight(os.path.join(R.SAVE, 'Game1'))
+        check('preflight (a run): an identical leftover backup is removed', not os.path.exists(R.PREFS_BACKUP))
+        # Preferences for lockstep_torpedo
+        raw0 = open(R.PREFS_FILE, 'rb').read()
+        h, note = R.prefs_realism_for_run(2)
+        check('prefs_realism_for_run: RealismSetting 1 -> 2, the rest of the file as it was, a backup',
+              h and R.realism_pref() == 2 and open(R.PREFS_FILE, 'rb').read() == raw0.replace(b'RealismSetting=1',
+                                                                                             b'RealismSetting=2')
+              and os.path.exists(R.PREFS_BACKUP), note)
+        check('prefs_restore: the original back (verified by its hash), the backup deleted', R.prefs_restore(h)
+              and open(R.PREFS_FILE, 'rb').read() == raw0 and not os.path.exists(R.PREFS_BACKUP))
+        write(R.PREFS_FILE, 'RealismSetting=3\n')
+        h, note = R.prefs_realism_for_run(2)
+        check('prefs_realism_for_run: RealismSetting 3 is left as it is (no backup)', h is None and R.realism_pref() == 3
+              and not os.path.exists(R.PREFS_BACKUP), note)
+        write(R.PREFS_FILE, 'MapZoom=3\n')
+        h, note = R.prefs_realism_for_run(2)
+        check('prefs_realism_for_run: no RealismSetting line: nothing changed', h is None and R.realism_pref() is None,
+              note)
+        p = R.preflight(os.path.join(R.SAVE, 'Game1'), dry=True, prefs=True)
+        check('preflight: lockstep_torpedo without a RealismSetting line is a problem', any('RealismSetting' in x
+                                                                                            for x in p), p)
+        # Preferences for lockstep_strike (search floatplanes: FloatplaneLaunch=0, Automatic)
+        write(R.PREFS_FILE, 'MapZoom=3\nFloatplaneLaunch=1\nRealismSetting=1\n')
+        raw0 = open(R.PREFS_FILE, 'rb').read()
+        h, note = R.prefs_for_run(2, float_auto=True)
+        check('prefs_for_run: RealismSetting 1 -> 2 and FloatplaneLaunch 1 -> 0 (lockstep_torpedo and lockstep_strike), '
+              'the rest of the file as it was, a backup', h and open(R.PREFS_FILE, 'rb').read() == raw0.replace(
+                  b'FloatplaneLaunch=1', b'FloatplaneLaunch=0').replace(b'RealismSetting=1', b'RealismSetting=2')
+              and os.path.exists(R.PREFS_BACKUP), note)
+        check('prefs_restore after prefs_for_run: the original back, the backup deleted', R.prefs_restore(h)
+              and open(R.PREFS_FILE, 'rb').read() == raw0 and not os.path.exists(R.PREFS_BACKUP))
+        write(R.PREFS_FILE, 'FloatplaneLaunch=0\nRealismSetting=1\n')
+        h, note = R.prefs_for_run(None, float_auto=True)
+        check('prefs_for_run: FloatplaneLaunch 0 (Automatic) is left as it is (no backup)', h is None
+              and not os.path.exists(R.PREFS_BACKUP), note)
+        write(R.PREFS_FILE, 'MapZoom=3\nRealismSetting=1\nSound=1\n')
+        # the missile-era fixture
+        names = ['session', 'lockstep_missiles']
+        R.MISSILE.update(path=None, slot=None, nations=None, mission=0, why=None)
+        pl = R.missile_plan(None, None, None, None, names)
+        ok, why, _ = R.missile_fixture()
+        check('missile_plan: nothing given: no problem, lockstep_missiles SKIPs with the reason (the options named)',
+              not pl['problems'] and not ok and '--missile-fixture' in why, (pl, why))
+        pl = R.missile_plan(fix, None, '0,3', '2', names)
+        ok, why, info = R.missile_fixture(os.path.join(fix, 'RTWGame5.bcs'))
+        check('missile_plan: a fixture folder Game5 with slot 5 free: copied in for the run; MISSILE slot 5, nations '
+              '(0, 3), mission 2, the 1958 campaign\'s area 1; the fixture the 1958 missile test campaign', not pl['problems']
+              and pl['copy'] == (fix, 5) and R.MISSILE['slot'] == 5 and R.MISSILE['nations'] == (0, 3)
+              and R.MISSILE['mission'] == 2 and R.MISSILE['area'] == 1 and ok
+              and info['names'] == ['Italy', 'Soviet Union'], (pl, why, info))
+        R.MISSILE.update(path=None, slot=None, nations=None, mission=0, area=None, why=None)
+        pl = R.missile_plan(fix, None, None, None, names)
+        check('missile_plan: without --missile-nations/--missile-mission the 1958 campaign\'s 0,3, mission 1, area 1',
+              not pl['problems'] and R.MISSILE['nations'] == (0, 3) and R.MISSILE['mission'] == 1
+              and R.MISSILE['area'] == 1, R.MISSILE)
+        R.MISSILE.update(path=None, slot=None, nations=None, mission=0, area=None, why=None)
+        pl = R.missile_plan(fix, None, '0,2', None, names)
+        ok2, why2, _ = R.missile_fixture(os.path.join(fix, 'RTWGame5.bcs'))
+        check('missile_plan: other nations: no default area; a fixture without that nation SKIPs', R.MISSILE['area'] is None
+              and not ok2 and 'missile-era' in why2, (R.MISSILE, why2))
+        R.MISSILE.update(path=None, slot=None, nations=None, mission=0, area=None, why=None)
+        pl = R.missile_plan(fix, None, '0,3', '2', names)
+        shutil.copytree(fix, R.slot_dir(5))
+        pl = R.missile_plan(fix, None, '0,3', None, names)
+        check('missile_plan: slot 5 holds the same files: used as it is, backed up and put back', not pl['problems']
+              and pl['copy'] is None and pl['backup'][0] == 5, pl)
+        write(os.path.join(R.slot_dir(5), 'RTWGame5.bcs'), '[General]\nYear=1901\n')
+        pl = R.missile_plan(fix, None, '0,3', None, names)
+        check('missile_plan: slot 5 holds another campaign: a problem (never overwritten)', any(
+            'differs from the missile fixture' in x for x in pl['problems']), pl)
+        R.MISSILE.update(why=None)
+        pl = R.missile_plan(None, '5', '0,3', None, names)
+        ok, why, _ = R.missile_fixture()
+        check('missile_plan: --missile-slot 5 alone: backed up and put back; a 1901 campaign there SKIPs (not a '
+              'missile-era campaign)', not pl['problems'] and pl['backup'][0] == 5 and not ok and 'missile-era' in why,
+              (pl, why))
+        shutil.rmtree(R.slot_dir(5))
+        for args, want in (((fix, None, '0', None), '--missile-nations'), ((fix, None, '3,3', None), '--missile-nations'),
+                           ((fix, '6', '0,3', None), 'belongs in save slot 5'),
+                           ((None, '77', '0,3', None), 'one the suite writes itself'),
+                           ((None, '9', '0,3', None), '1935 test campaign')):
+            R.MISSILE.update(path=None, slot=None, nations=None, mission=0, why=None)
+            pl = R.missile_plan(*args, names + ['lockstep_air'])
+            ok, why, _ = R.missile_fixture()
+            shown = tuple('<the fixture Game5>' if x == fix else x for x in args[:3])
+            check(f'missile_plan {shown}: refused ({want}); lockstep_missiles SKIPs with that reason',
+                  any(want in x for x in pl['problems']) and not ok and want in why, (pl, why))
+        R.MISSILE.update(path=None, slot=None, nations=None, mission=0, why=None)
+        check('the 1935 fixture check reads the sandbox slot 9', R.fixture1935() == (True, ''), R.fixture1935())
+        bk9 = os.path.join(sandbox, 'tmp', 'fx', 'Game9')
+        shutil.copytree(R.slot_dir(R.F1935_SLOT), bk9)
+        sv = os.path.join(bk9, 'RTWGame9.bcs')
+        ok_bk = R.fixture1935(bk9)
+        with open(sv, 'rb') as f:
+            raw9 = f.read()
+        with open(sv, 'wb') as f:  # (lockstep_air's battle snapshot: a battle in progress)
+            f.write(raw9.replace(b'ScenarioInProgress=-1', b'ScenarioInProgress=2'))
+        bad_bk = R.fixture1935(bk9)
+        check('fixture1935(folder): the run\'s backup checked like slot 9 (lockstep_strike runs after lockstep_air on the '
+              'backup); a battle in progress refused', ok_bk == (True, '') and not bad_bk[0]
+              and "'2'" in bad_bk[1] and b'ScenarioInProgress=-1' in raw9, (ok_bk, bad_bk))
+        shutil.rmtree(os.path.dirname(bk9))
+        src = os.path.join(sandbox, 'tmp', 'bk', 'Game9')
+        os.makedirs(src)
+        with open(os.path.join(src, 'RTWGame9.bcs'), 'wb') as f:
+            f.write(b'\xef\xbb\xbf' + '[General]\r\nYear=1935\r\n[AirUnits]\r\nAirUnitNo=2\r\nAU0Id=59\r\nAU0Name=59 '
+                    'Squadron\r\nAU1Id=60\r\nAU1Name=60 Squadron\r\n[EUT]\r\nX=1\r\n'.encode('utf-8'))
+        write(os.path.join(src, 'MapData9.dat'), '[MapAreas]\n')
+        write(os.path.join(src, 'DesignFiles0.des'), 'x')
+        n = R.air_copy(R.F1935_SLOT, R.AIR_SLOT, src)
+        raw = open(R.save_path(R.AIR_SLOT), 'rb').read()
+        check('air_copy (from the run\'s backup of slot 9): the slot\'s files renamed (RTWGame49.bcs, MapData49.dat), every '
+              '[AirUnits] entry twice with the same ids (AirUnitNo 4, 4 units, 2 ids), the BOM, the line ends and the '
+              'other sections kept', n == 2
+              and sorted(os.listdir(R.slot_dir(R.AIR_SLOT))) == ['DesignFiles0.des', 'MapData49.dat', 'RTWGame49.bcs']
+              and R.saved_airunits(R.AIR_SLOT) == dict(no=4, units=4, ids=2) and raw.startswith(b'\xef\xbb\xbf')
+              and b'AU3Id=60\r\n' in raw and b'[EUT]\r\nX=1' in raw, raw[:200])
+        check('saved_airunits: a save without [AirUnits] counts 0 (the 1900 campaign)',
+              R.saved_airunits(1) in (dict(no=0, units=0, ids=0), None), R.saved_airunits(1))
+        p = R.preflight(os.path.join(R.SAVE, 'Game1'), dry=True, air_slots=(R.AIR_SLOT,))
+        check('preflight: air_units refuses an existing slot 49', any('save slot 49 exists' in x for x in p), p)
+        shutil.rmtree(R.slot_dir(R.AIR_SLOT))
+        check('no_doubling: the kept count within 25 % of the dropped one (0.3.2: x2)', R.no_doubling(232, 232)
+              and R.no_doubling(232, 240) and not R.no_doubling(232, 464) and not R.no_doubling(0, 5))
+        check('KEPT_LOG_RE: the kept logs of every restart tag, not the .prev log or the current one',
+              all(re.match(R.KEPT_LOG_RE, f'rtw3mp_47702.{t}3.log') for t in (
+                  'kill', 'hostkill', 'restart', 'k2restart', 'level', 'afterend', 'relay', 'vanilla', 'clean'))
+              and not re.match(R.KEPT_LOG_RE, 'rtw3mp_47702.prev.log')
+              and not re.match(R.KEPT_LOG_RE, 'rtw3mp_47702.log'))
+        _ = root
+
+
+# ---------------------------------------------------------------- recorded logs (a report)
+
+def recorded(folder):
+    print(f'--- recorded logs in {folder}')
+    logs = sorted(f for f in os.listdir(folder) if re.match(r'^rtw3mp_\d+(\..+)?\.log$', f))
+    texts = {}
+    for fn in logs:
+        with open(os.path.join(folder, fn), encoding='utf-8', errors='replace') as f:
+            texts[fn] = f.read()
+    for fn, t in texts.items():
+        hg = R.hash_groups(t)
+        n = {k: len(re.findall(p, t)) for k, p in (
+            ('rejoinable', R.REJOINABLE_RE), ('rejoin host', R.REJOIN_HOST_RE), ('ident', R.IDENT_LOAD_RE),
+            ('fastest', R.FASTEST_REQ_RE), ('autorun q', R.AUTORUN_Q_RE), ('autorun rel', R.AUTORUN_REL_RE),
+            ('nightcap', R.NIGHTCAP_RE))}
+        n.update(cover=len(R.LANDCAP_COVER_RE.findall(t)), launch=len(R.LAUNCH_RE.findall(t)),
+                 replay=len(R.REPLAY_RE.findall(t)))
+        print(f'  {fn}: {len(hg)} hash minutes, deferred {len(R.deferred_lines(t))}, quiet boxes {len(R.quiet_boxes(t))}, '
+              f'load dates {len(R.load_dates(t))}, ' + ', '.join(f'{k} {v}' for k, v in n.items() if v))
+        bad = [ln for ln in t.splitlines() if 'lockstep: deferred ' in ln and ' of side ' in ln
+               and ('carried out at minute' in ln) and not R.DEFERRED_RE.search(ln) and 'FAILED' not in ln]
+        check(f'{fn}: every deferred release line parsed', not bad, bad[:2])
+        lines = [ln for ln in t.splitlines() if 'campaign date' in ln and ('kept (the battle save' in ln or
+                                                                          '(as the battle save:' in ln)]
+        check(f'{fn}: every load-date line parsed', len(R.load_dates(t)) == len(lines), lines[:2])
+    host = next((f for f in logs if re.match(r'^rtw3mp_47701\.log$', f)), None)
+    client = next((f for f in logs if re.match(r'^rtw3mp_47702\.log$', f)), None)
+    if host and client:
+        cmp_ = R.groups_compare(R.hash_groups(texts[host]), R.hash_groups(texts[client]))
+        print(f'  host/client hash groups: {cmp_["minutes"]} minutes, differ '
+              f'{ {g: v[:6] for g, v in cmp_["differ"].items()} }, dates {cmp_["values"]["date"][:4]}')
+    traces = sorted(f for f in os.listdir(folder) if re.match(r'^ls_trace_A_\d+_\d+_\d+\.txt$', f))
+    eq = 0
+    for fn in traces:
+        _, _, _, bid, ep, mn = fn[:-4].split('_')
+        tc = R.trace_compare(bid, ep, mn, folder=folder)
+        eq += tc.get('found') and tc.get('first_diff') is None and tc.get('blocks_equal')
+    if traces:
+        check(f'the trace files: {eq} of {len(traces)} minutes with the same draws on both copies', eq == len(traces))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--logs', action='append', default=[], help='a folder of a recorded run\'s mod logs (repeatable)')
+    a = ap.parse_args()
+    samples()
+    sandbox = os.path.abspath('regression_selftest_sandbox')
+    if os.path.exists(sandbox):
+        shutil.rmtree(sandbox)
+    os.makedirs(sandbox)
+    try:
+        tracefiles(sandbox)
+        runner(sandbox)
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+    for folder in a.logs:
+        recorded(folder)
+    bad = [n for n, ok in RESULTS if not ok]
+    print(f'{len(RESULTS) - len(bad)}/{len(RESULTS)} self-test checks passed')
+    return 0 if not bad else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

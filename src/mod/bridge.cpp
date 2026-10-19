@@ -87,6 +87,14 @@ static std::string Execute(const std::string& line) {
         return "ok";
     }
     if (cmd == "researchopen") return RunOnMainThread([] { game::OpenResearch(); }), "ok";  // the Research button (modal)
+    if (cmd == "loadasync") {  // loadasync <slot> [player]: `load` without waiting (a battle in progress may ask first)
+        int slot = atoi(arg(1, "0").c_str()), player = atoi(arg(2, "0").c_str());
+        if (slot <= 0) return "error slot";
+        RunOnMainThread([slot, player] {
+            Log("loadasync %d %d -> %s", slot, player, game::LoadCampaign(slot, player, false) ? "ok" : "error load");
+        });
+        return "ok";
+    }
     if (cmd == "researchrun") {  // researchrun <nation> <count>: the game's monthly research, logged (may show messages)
         int n = atoi(arg(1, "0").c_str()), c = atoi(arg(2, "1").c_str());
         RunOnMainThread([n, c] { game::DebugDoResearch(n, c); });
@@ -177,7 +185,9 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "chat") return mp::SendChat(line.size() > 5 ? line.substr(5) : ""), "ok";
         if (cmd == "turn") return game::ClickTurnButton(), "ok";
         if (cmd == "save") return game::SaveGame() ? "ok" : "error save";
-        if (cmd == "load") return game::LoadCampaign(atoi(arg(1).c_str()), atoi(arg(2, "0").c_str())) ? "ok" : "error load";
+        if (cmd == "load")  // load <slot> [player] [mod]: as the player's own load; `mod`: as the mod's own reload
+            return game::LoadCampaign(atoi(arg(1).c_str()), atoi(arg(2, "0").c_str()), arg(3, "") == "mod") ? "ok"
+                                                                                                            : "error load";
         if (cmd == "setplayer") return game::SetPlayerNation(atoi(arg(1).c_str())), "ok";
         if (cmd == "mpwindow") return ui::ShowMpWindow(), "ok";
         if (cmd == "claimui") return ui::DebugClaimWindow(arg(1, "state"), atoi(arg(2, "-1").c_str()));  // state | toggle <row>

@@ -14,7 +14,7 @@ enum {
     IDC_ADDRS = 1020, IDC_STATUS,
     IDC_PLAYERS = 1030,
     IDC_NATION = 1040, IDC_CLAIM,
-    IDC_LIMIT = 1050, IDC_SETLIMIT, IDC_LIMITLBL,
+    IDC_LIMIT = 1050, IDC_SETLIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE,
     IDC_START = 1060, IDC_ADVANCE, IDC_RELEASE,
     IDC_CHATLOG = 1070, IDC_CHATIN, IDC_SEND,
     IDC_DIPLOLBL = 1080, IDC_DIPLO, IDC_DWAR, IDC_DALLY, IDC_DPEACE, IDC_DLEAVE, IDC_DCANCEL,
@@ -422,6 +422,11 @@ static void OnCommand(int id) {
             SaveCfg();
             mp::SetTurnLimit(atoi(g_cfg["limit"].c_str()));
             break;
+        case IDC_AUTOSTRIKE:  // the host's live-battle option (takes effect from the next live battle)
+            g_cfg["autostrike"] = SendDlgItemMessageW(g_wnd, IDC_AUTOSTRIKE, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0";
+            SaveCfg();
+            mp::SetAutoStrike(g_cfg["autostrike"] == "1");
+            break;
         case IDC_START: {
             int r = mp::StartSession();
             if (r == 1)
@@ -507,11 +512,11 @@ static void CreateMpWindow() {
     // Fit small screens: the chat box gives up height first.
     RECT work = {0, 0, 1024, 768};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    RECT probe = {0, 0, 500, 770};
+    RECT probe = {0, 0, 500, 796};
     AdjustWindowRectEx(&probe, style, FALSE, WS_EX_TOOLWINDOW);
     int overflow = (probe.bottom - probe.top) - (work.bottom - work.top);
     int chatH = overflow > 0 ? std::max(40, 110 - overflow) : 110;
-    RECT r = {0, 0, 500, 770 - (110 - chatH)};
+    RECT r = {0, 0, 500, 796 - (110 - chatH)};
     AdjustWindowRectEx(&r, style, FALSE, WS_EX_TOOLWINDOW);
     int winY = std::max((int)work.top, std::min(80, (int)work.bottom - (int)(r.bottom - r.top)));
     g_wnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Rule the Waves 3 - Multiplayer", style, 80, winY,
@@ -561,7 +566,11 @@ static void CreateMpWindow() {
     Ctl(L"EDIT", U2W(g_cfg.count("limit") ? g_cfg["limit"] : "0").c_str(), WS_BORDER | WS_TABSTOP | ES_NUMBER,
         225, y, 45, 22, IDC_LIMIT);
     Ctl(L"BUTTON", L"Set", WS_TABSTOP, 275, y - 1, 50, 26, IDC_SETLIMIT);
-    y += 32;
+    y += 30;
+    HWND autoStrike = Ctl(L"BUTTON", L"Computer flies carrier strikes in live battles", WS_TABSTOP | BS_AUTOCHECKBOX, 10,
+                          y, 330, 20, IDC_AUTOSTRIKE);
+    SendMessageW(autoStrike, BM_SETCHECK, g_cfg.count("autostrike") && g_cfg["autostrike"] == "1" ? BST_CHECKED : BST_UNCHECKED, 0);
+    y += 28;
     Ctl(L"BUTTON", L"Start session", WS_TABSTOP, 10, y, 150, 30, IDC_START);
     Ctl(L"BUTTON", L"Advance turn now", WS_TABSTOP, 170, y, 150, 30, IDC_ADVANCE);
     y += 40;
@@ -680,9 +689,10 @@ static void RefreshInner() {
     EnableWindow(GetDlgItem(g_wnd, IDC_RELEASE), host);
     EnableWindow(GetDlgItem(g_wnd, IDC_SETLIMIT), host);
     EnableWindow(GetDlgItem(g_wnd, IDC_LIMIT), host || none);
+    EnableWindow(GetDlgItem(g_wnd, IDC_AUTOSTRIKE), host || none);
     EnableWindow(GetDlgItem(g_wnd, IDC_START), host && v.phase == mp::Phase::Lobby);
     EnableWindow(GetDlgItem(g_wnd, IDC_ADVANCE), host && v.phase == mp::Phase::Planning);
-    for (int id : {IDC_START, IDC_ADVANCE, IDC_RELEASE, IDC_SETLIMIT, IDC_LIMIT, IDC_LIMITLBL})  // host-only controls
+    for (int id : {IDC_START, IDC_ADVANCE, IDC_RELEASE, IDC_SETLIMIT, IDC_LIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE})  // host-only controls
         ShowWindow(GetDlgItem(g_wnd, id), client ? SW_HIDE : SW_SHOWNA);
     EnableWindow(GetDlgItem(g_wnd, IDC_SEND), !none);
 
@@ -786,6 +796,23 @@ void Notice(const std::string& text) {
     FLASHWINFO fi = {sizeof(fi), g_wnd, FLASHW_CAPTION, 3, 0};
     FlashWindowEx(&fi);
     Refresh();
+}
+
+// An important message that must be seen also without a session (a live battle resumed from the save): the window is
+// created if needed, shown on top without taking the focus from the game, and flashed. (Never owned by the battle
+// screen: the live battles free battle forms, and a window dies with its owner.)
+void RevealMpWindow() {
+    if (!g_wnd) CreateMpWindow();
+    if (!g_wnd) return;
+    HWND owner = DesiredOwner();
+    if (owner && (HWND)GetWindowLongPtrW(g_wnd, GWLP_HWNDPARENT) != owner)
+        SetWindowLongPtrW(g_wnd, GWLP_HWNDPARENT, (LONG_PTR)owner);
+    SetText(IDC_ADDRS, AddressesText());
+    Refresh();
+    if (!IsWindowVisible(g_wnd)) ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_wnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    FLASHWINFO fi = {sizeof(fi), g_wnd, FLASHW_CAPTION, 3, 0};
+    FlashWindowEx(&fi);
 }
 
 bool PreTranslate(MSG* msg) {
@@ -908,8 +935,10 @@ void Init(HINSTANCE inst) {
     g_menuFont = CreateFontW(-30, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0,
                              L"Times New Roman");
     LoadCfg();
+    mp::SetAutoStrike(g_cfg.count("autostrike") && g_cfg["autostrike"] == "1");  // the host's live-battle option
     mp::g_onChanged = [] { Refresh(); };
     mp::g_onNotice = [](const std::string& s) { Notice(s); };
+    mp::g_onReveal = [] { RevealMpWindow(); };
 }
 
 void Tick() {

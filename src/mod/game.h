@@ -29,7 +29,9 @@ void SetCurrentSlot(int slot);
 std::wstring SaveDir(int slot);  // "...\Save\Game<slot>\"
 
 bool SaveGame();                             // same as the Save button (normal save into the current slot)
-bool LoadCampaign(int slot, int playerIdx);  // full load like the title screen, then optionally switch nation
+// Full load like the title screen, then optionally switch nation. modReload: the mod's own reload (its load keeps the
+// saved victory points even outside a multiplayer session); false = as the player's own load (the test bridge).
+bool LoadCampaign(int slot, int playerIdx, bool modReload = true);
 void SetPlayerNation(int idx);               // switch the human-controlled nation and refresh the UI
 void RefreshUI();
 bool IsBusy();          // modal dialog open, turn running, or form disabled by the game
@@ -193,7 +195,10 @@ void OnAfterCopyGame(int fromSlot, int toSlot);  // the game's "Copy game" finis
 bool OnAIBattle(int a, int b, int countA, int countB, const std::wstring& area);
 // The game's DoBattle returned (opp = the opponent's nation index); the battle screen is open if it was fought.
 void OnDoBattleDone(int opp, bool result);
+// The game's LoadBuildCampaign returned (a battle in progress in that save is resumed inside it: the screen is open).
+void OnAfterCampaignLoad();
 void OnBattleSlotSkippedTurn();  // a battle slot's close skipped DoStrategicTurn
 void OnStrategicTurnRuns();      // DoStrategicTurn runs (outside a battle slot)
 void OnCampaignLoading();        // LoadBuildCampaign is about to load a campaign
+bool InSession();                // a multiplayer session is up on this PC (hosting or joined)
 }  // namespace hookcb

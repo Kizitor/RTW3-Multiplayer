@@ -109,8 +109,13 @@ std::string DebugVPInfo();  // tests: EnemyVP, what the host already gave the en
 // Joined players fight their battles against AI nations (sent with the hello; set before joining).
 void SetFightBattles(bool on);
 bool FightBattles();
+// The host's option "Computer flies carrier strikes in live battles" (default off: each player launches their own from
+// the strike dialog); the host's live battles and the battles it relays between two players carry it.
+void SetAutoStrike(bool on);
+bool AutoStrike();
 std::string DebugBattles(const std::vector<std::string>& args);  // bridge `battles ...`
-// Live player-vs-player battles: bridge `ls ...` (session-level `ls enable 0|1`, `ls session`; the rest: lockstep.h).
+// Live player-vs-player battles: bridge `ls ...` (session-level `ls enable 0|1`, `ls session`, `ls autostrike`,
+// `ls rejoin`; the rest: lockstep.h).
 std::string DebugLockstep(const std::vector<std::string>& args);
 
 View GetView();
@@ -119,5 +124,6 @@ bool CampaignReady();
 
 extern std::function<void()> g_onChanged;   // UI refresh
 extern std::function<void(const std::string&)> g_onNotice;  // important notices (flash UI)
+extern std::function<void()> g_onReveal;    // show the Multiplayer window, not focused (also outside a session)
 
 }  // namespace mp

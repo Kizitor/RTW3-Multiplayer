@@ -38,6 +38,11 @@ struct Api {
     // air units (TList of TAirUnit the game appends to on every load and never clears): the cell of its unit variable
     uint32_t airUnitsCell = 0;
     void* mObjFree = nullptr;
+    // the load's blockade check (credits victory points on every load): the routine, the return address of
+    // LoadBuildCampaign's call of it, the nations' Blockaded flag
+    void* mCheckBlockade = nullptr;
+    uintptr_t loadBlockadeRet = 0;
+    int fBlockaded = -1;
     // pending doctrine changes (counted down by ReduceTimeLimits for the host's nation only)
     int fTraining = -1, fPendingTraining = -1, fPendingTrainingTime = -1;
     int fMissileStorage = -1, fPendingMissileStorage = -1, fMissileStorageTime = -1;
@@ -211,6 +216,29 @@ static void ResolveDiplomacy() {
         layout, A.warVar, A.recYearCell, A.mDoPeace, A.mHandleAIPeace);
 }
 
+// The load's blockade check (see CB_BeforeBlockade): LoadBuildCampaign's own call of CheckBlockadeStatus (one E8 call
+// in 1.01.44, 0x1327 bytes in), told apart from the month's calls (DoTurn, DoStrategicTurn) by its return address.
+static void ResolveLoadBlockade() {
+    A.mCheckBlockade = dl::Method("TfrmBuildCamp", "CheckBlockadeStatus");
+    A.fBlockaded = dl::Field("TBuilderNation", "Blockaded");
+    int calls = 0;
+    uint8_t* load = (uint8_t*)A.mLoad;
+    for (int i = 0; load && A.mCheckBlockade && i < 0x2000 && InImage((uintptr_t)(load + i + 5)); i++)
+        if (load[i] == 0xE8 && CallTarget(load + i) == A.mCheckBlockade) {
+            calls++;
+            A.loadBlockadeRet = (uintptr_t)(load + i + 5);
+        }
+    if (calls != 1) A.loadBlockadeRet = 0;
+    bool ok = A.loadBlockadeRet && A.fVP >= 0 && A.fEnemyVP >= 0 && A.fBuilderNations >= 0;
+    Log("Load VP guard: %s (CheckBlockadeStatus=%p, %d call(s) in LoadBuildCampaign%s)", ok ? "ok" : "UNAVAILABLE",
+        A.mCheckBlockade, calls,
+        ok ? "; loads in a multiplayer session and the mod's own reloads keep the saved victory points, a load without a "
+             "session is the game's own"
+           : "; every load in a multiplayer session of a campaign with a blockade will add victory points the save "
+             "doesn't have");
+    if (!ok) A.loadBlockadeRet = 0;
+}
+
 bool Resolve() {
     bool ok = true;
     REQ_FIELD(A.fBuilderNations, "TfrmBuildCamp", "BuilderNations");
@@ -327,6 +355,7 @@ bool Resolve() {
     A.events = A.diplomacy && A.fEvents >= 0 && A.fTechSharing >= 0 && A.mHandleEvent && A.mLikelihood;
     if (!A.events) Log("WARNING: event data not found; joined players won't get random events");
     ResolveTreaties();
+    ResolveLoadBlockade();
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -498,10 +527,10 @@ static void DedupIntelReports(void* form) {
 // Air units. LoadAircraftData (called by LoadBuildCampaign) appends the save's [AirUnits] to the global TAirUnit list
 // without clearing it (the game's own ClearAirData is called only by the quick battle). The mod reloads the campaign in
 // the same process every month (host: after merging the players' turns; client: the new month) and at every live
-// battle start and resync, so the list doubled with each save and load: the host's carriers soon failed the Turn's
-// check ("CV ... aircraft capacity exceeded!") and the air maintenance costs ran away. The units the list held before a
-// load are dropped and freed after the load succeeded (nothing else keeps TAirUnit pointers: the battle's formations
-// name aircraft types, the air group dialog clears its copy pointer when it opens).
+// battle start, resync and rejoin, so the list doubled with each save and load: the host's carriers soon failed the
+// Turn's check ("CV ... aircraft capacity exceeded!") and the air maintenance costs ran away. The units the list held
+// before a load are dropped and freed after the load succeeded (nothing else keeps TAirUnit pointers: the battle's
+// formations name aircraft types, the air group dialog clears its copy pointer when it opens).
 static std::vector<void*> g_airBefore;
 
 static void* AirUnitList() {
@@ -584,6 +613,144 @@ int IntelReportCount(int* unique) {
         *unique = (int)u.size();
     }
     return count;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Victory points on every load. LoadBuildCampaign sets PlayerNation := BuilderNations[0] (1.01.44: 0xc9a69d) and ends
+// its "Setting data" step with CheckBlockadeStatus (0xccc1c4, called at 0xc9abeb) to set the nations' Blockaded flags,
+// which the save doesn't keep. The routine also credits blockades, as in the month (its other two callers are DoTurn
+// and DoStrategicTurn): while the war counter is above 0, for each nation 1..8 at war with PlayerNation (Tension > 40),
+// PlayerNation.VP += (Random(3) + FleetSize) * 20 when that nation is blockaded, and EnemyVP += the same when
+// PlayerNation is. So every load of a campaign with a blockade gave nation 0 (or the host's enemies) points the save
+// never had, 60-100 per blockade with FleetSize 3. The game loads once per process; the mod reloads the campaign in the
+// same process every month (host: after merging the turns; client: the new month) and at every live battle load, so the
+// host's VP grew with each reload and a joined player saw nation 0 above the host's own numbers. The load's call still
+// runs (its flags, and its Random draws: the same dice as before); the VP and EnemyVP it changed are put back. The
+// month's own calls are not touched. Only in multiplayer: while a session is up (hosting or joined) and for the mod's
+// own reloads (game::LoadCampaign; also outside a session, e.g. a joined player back to its slot after a live battle
+// that outlived the session). A load without a session (the title screen, the host's first load before hosting, the
+// resume after a restart) stays the game's own: one credit per start, as in single player.
+static const int kBlockadeSlots = 4;
+static int g_blockadeDepth = 0;
+static int g_modReload = 0;  // inside game::LoadCampaign for one of the mod's own reloads
+static struct BlockadeCtx {
+    bool load;
+    bool guard;  // put back (a session is up, or the mod's own reload); else only logged
+    int n;
+    void* nation[16];
+    int vp[16];
+    int enemyVP;
+} g_blockade[kBlockadeSlots];
+
+extern "C" int __stdcall CB_BeforeBlockade(void* self, uintptr_t ret) {
+    int d = g_blockadeDepth++;
+    if (d < 0 || d >= kBlockadeSlots) return d;
+    BlockadeCtx& c = g_blockade[d];
+    c.load = false;
+    if (!self || !ret || ret != A.loadBlockadeRet) return d;
+    c.guard = g_modReload > 0 || hookcb::InSession();
+    __try {
+        void* l = dl::At<void*>(self, A.fBuilderNations);
+        int n = dl::ListCount(l);
+        c.n = n < 0 ? 0 : n > 16 ? 16 : n;
+        for (int i = 0; i < c.n; i++) {
+            c.nation[i] = dl::ListItem(l, i);
+            c.vp[i] = c.nation[i] ? dl::At<int>(c.nation[i], A.fVP) : 0;
+        }
+        c.enemyVP = dl::At<int>(self, A.fEnemyVP);
+        c.load = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        c.load = false;
+    }
+    return d;
+}
+
+// What the load's blockade check changed (put back by RestoreLoadVP when `restore`), for the log.
+struct LoadVPChange {
+    int n = 0, nb = 0;
+    int nation[16], before[16], after[16], blockaded[16];
+    bool enemy = false;
+    int enemyBefore = 0, enemyAfter = 0;
+};
+
+static bool RestoreLoadVP(const BlockadeCtx& c, void* self, bool restore, LoadVPChange& r) {
+    __try {
+        for (int i = 0; i < c.n; i++) {
+            if (!c.nation[i]) continue;
+            int& v = dl::At<int>(c.nation[i], A.fVP);
+            if (v != c.vp[i]) {
+                r.nation[r.n] = i;
+                r.before[r.n] = c.vp[i];
+                r.after[r.n++] = v;
+                if (restore) v = c.vp[i];
+            }
+            if (A.fBlockaded >= 0 && dl::At<uint8_t>(c.nation[i], A.fBlockaded)) r.blockaded[r.nb++] = i;
+        }
+        int& e = dl::At<int>(self, A.fEnemyVP);
+        if (e != c.enemyVP) {
+            r.enemy = true;
+            r.enemyBefore = c.enemyVP;
+            r.enemyAfter = e;
+            if (restore) e = c.enemyVP;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+extern "C" void __stdcall CB_AfterBlockade(int slot, void* self) {
+    if (slot < 0) return;
+    g_blockadeDepth = slot;  // also drops frames left behind by an exception
+    if (slot >= kBlockadeSlots || !g_blockade[slot].load) return;
+    g_blockade[slot].load = false;
+    bool guard = g_blockade[slot].guard;
+    LoadVPChange r;
+    if (!RestoreLoadVP(g_blockade[slot], self, guard, r)) {
+        Log("WARNING: load: the victory points after the game's blockade check could not be read");
+        return;
+    }
+    if (!r.n && !r.enemy) return;
+    try {
+        // put back: "<after the check> -> <the save's>"; kept: "<the save's> -> <after the check>"
+        auto pair = [guard](int saved, int now) {
+            return guard ? std::to_string(now) + " -> " + std::to_string(saved)
+                         : std::to_string(saved) + " -> " + std::to_string(now);
+        };
+        std::string s;
+        for (int i = 0; i < r.n; i++)
+            s += (s.empty() ? "" : ", ") + std::string("nation ") + std::to_string(r.nation[i]) + " " +
+                 pair(r.before[i], r.after[i]);
+        if (r.enemy) s += (s.empty() ? "" : ", ") + std::string("EnemyVP ") + pair(r.enemyBefore, r.enemyAfter);
+        std::string b;
+        for (int i = 0; i < r.nb; i++) b += " " + std::to_string(r.blockaded[i]);
+        if (guard)
+            Log("load: the game's blockade check gave victory points the save doesn't have; put back: %s (blockaded:%s)",
+                s.c_str(), b.empty() ? " none" : b.c_str());
+        else
+            Log("load: the game's blockade check gave victory points: %s (blockaded:%s); kept: no multiplayer session (a "
+                "load outside a session is the game's own)",
+                s.c_str(), b.empty() ? " none" : b.c_str());
+    } catch (...) {
+    }
+}
+
+extern "C" void* o_CheckBlockade = nullptr;
+
+// CheckBlockadeStatus(Self=EAX): a register procedure without stack arguments. The caller's return address tells the
+// load's call apart from the month's.
+extern "C" __declspec(naked) void d_CheckBlockade() {
+    __asm {
+        push eax
+        push dword ptr [esp + 4]
+        push eax
+        call CB_BeforeBlockade
+        push eax
+        mov eax, [esp + 4]
+        call dword ptr [o_CheckBlockade]
+        call CB_AfterBlockade
+        ret
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1446,7 +1613,7 @@ void SetPlayerNation(int idx) {
     RefreshUI();
 }
 
-bool LoadCampaign(int slot, int playerIdx) {
+bool LoadCampaign(int slot, int playerIdx, bool modReload) {
     void* f = BuildCamp();
     if (!f) {
         Log("LoadCampaign: no frmBuildCamp");
@@ -1466,6 +1633,11 @@ bool LoadCampaign(int slot, int playerIdx) {
     if (start && FormVisible(start)) dl::Call(A.mHide, (uint32_t)(uintptr_t)start);
     SetCurrentSlot(slot);
     dl::ConstUStr s(path);
+    struct ModReload {  // the load's blockade check (CB_BeforeBlockade) keeps the saved VP of the mod's own reloads
+        bool on;
+        explicit ModReload(bool b) : on(b) { g_modReload += on; }
+        ~ModReload() { g_modReload -= on; }
+    } mr(modReload);
     bool ok = (dl::Call(A.mLoad, self, s.ptr()) & 0xFF) != 0;
     if (dl::At<int>(f, A.fBattleOpponentIdx) == -1) dl::Call(A.mShow, self);
     if (ok) {
@@ -1729,6 +1901,11 @@ extern "C" void __stdcall CB_AfterLoad(void* self, uint32_t result) {
         if (loaded) DedupAirUnits();
     } catch (...) {
         Log("exception dropping the air units from before the load");
+    }
+    try {
+        hookcb::OnAfterCampaignLoad();
+    } catch (...) {
+        Log("exception after a campaign load");
     }
 }
 
@@ -2334,6 +2511,7 @@ bool InstallHooks() {
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
         Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
+    if (A.loadBlockadeRet) Hook(A.mCheckBlockade, (void*)&d_CheckBlockade, &o_CheckBlockade, "CheckBlockadeStatus");
     if (A.doctrine) Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");
     if (A.events) Hook(A.mLikelihood, (void*)&d_Likelihood, &o_Likelihood, "EventLikelihoodCheck");
     bool aftermathHook = false, aiBattleHook = false;

@@ -1,4 +1,5 @@
 #include "delphi.h"
+#include <algorithm>
 #include "../../third_party/minhook/src/hde/hde32.h"
 
 namespace dl {
@@ -232,6 +233,54 @@ int Field(const char* cls, const char* name) {
         vmt = ParentVmt(vmt);
     }
     return -1;
+}
+
+static void FieldsInVmt(uintptr_t vmt, std::vector<std::pair<int, std::string>>& out) {
+    uint32_t ft = RD32(vmt + VMT_FIELDS);
+    if (!ft || !InImage(ft)) return;
+    uint16_t cnt = RD16(ft);
+    uintptr_t p = ft + 6;
+    std::string nm;
+    for (int i = 0; i < cnt; i++) {  // published fields: always class references (TTypeKind tkClass = 7)
+        uint32_t off = RD32(p);
+        if (!ReadShortString(p + 6, nm)) return;
+        out.push_back({(int)off, nm + ":7"});
+        p += 7 + nm.size();
+    }
+    uint16_t ex = RD16(p);
+    p += 2;
+    for (int i = 0; i < ex; i++) {  // extended RTTI: flags, PPTypeInfo, offset, name, attributes
+        uint32_t off = RD32(p + 5);
+        if (!ReadShortString(p + 9, nm)) return;
+        int kind = -1;
+        uint32_t ppti = RD32(p + 1);
+        if (ppti && InImage(ppti)) {
+            uint32_t pti = RD32(ppti);
+            if (pti && InImage(pti, 1)) kind = *(uint8_t*)(uintptr_t)pti;
+        }
+        out.push_back({(int)off, nm + ":" + std::to_string(kind)});
+        p += 10 + nm.size();
+        p += RD16(p);
+    }
+}
+
+std::vector<std::pair<int, std::string>> FieldList(const char* cls) {
+    std::vector<std::pair<int, std::string>> out;
+    uintptr_t vmt = (uintptr_t)ClassVmt(cls);
+    for (int depth = 0; vmt && depth < 64; depth++) {
+        FieldsInVmt(vmt, out);
+        vmt = ParentVmt(vmt);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+int InstanceSize(void* obj) {
+    uint32_t vmt = obj ? SafeVmtOf(obj) : 0;
+    if (!vmt) return -1;
+    int32_t n = (int32_t)RD32(vmt + VMT_SIZE);
+    return n > 0 && n <= 0x10000 ? n : -1;
 }
 
 extern "C" __declspec(naked) uint32_t __cdecl DelphiCallAsm(void* fn, uint32_t a, uint32_t d, uint32_t c, int n,

@@ -21,6 +21,11 @@ void* Method(const char* cls, const char* name);
 void* MethodFewestParams(const char* cls, const char* name);
 // Instance field offset by name (published + extended RTTI), searching parent classes. -1 if missing.
 int Field(const char* cls, const char* name);
+// Every RTTI field of the class and its parents as (offset, "name:kind"; kind = the field type's TTypeKind, -1 if
+// unknown), by offset (diagnostics).
+std::vector<std::pair<int, std::string>> FieldList(const char* cls);
+// The object's instance size from its VMT, or -1.
+int InstanceSize(void* obj);
 
 // Calls a Delphi `register` routine: EAX, EDX, ECX, then remaining params pushed left to right (callee pops).
 uint32_t Call(void* fn, uint32_t eax, uint32_t edx = 0, uint32_t ecx = 0, int nstack = 0, const uint32_t* stack = nullptr);

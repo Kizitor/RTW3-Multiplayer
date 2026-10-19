@@ -79,8 +79,10 @@ static std::string Missions(int opp) {
 
 // The debug menu's "Test battle" (numbered path) without its input dialogs: DoBattle against nation `opp` with its
 // war mission `m`. The battle preview dialog and the battle screen follow (and a live battle, if `opp` is a joined
-// player who fights live battles: the host's DoBattle is the start of host-vs-player battles).
-static void StartBattle(int opp, int m) {
+// player who fights live battles: the host's DoBattle is the start of host-vs-player battles). `areaIdx` >= 0 (test
+// only): the battle is fought in that map area (TfrmBuildCamp.MapAreas index, see the bridge's `areas`), as the debug
+// menu's "Test area battle" chooses one, for nations that share no home area.
+static void StartBattle(int opp, int m, int areaIdx) {
     void* f = game::BuildCamp();
     void* pn = game::PlayerNation();
     if (!f || !pn || opp < 1 || opp > 8 || m < 0 || m > 9 || !LoadWar()) {
@@ -98,7 +100,14 @@ static void StartBattle(int opp, int m) {
     void* area = nullptr;
     void* oppArea = dl::At<void*>(oppN, R.fBuildArea);
     void* myArea = dl::At<void*>(pn, R.fBuildArea);
-    if (oppArea && (dl::Call(R.mIsHomeArea, U(oppArea), U(pn), 0) & 0xFF))
+    if (areaIdx >= 0) {
+        static int fAreas = dl::Field("TfrmBuildCamp", "MapAreas");
+        area = fAreas >= 0 ? dl::ListItem(dl::At<void*>(f, fAreas), areaIdx) : nullptr;
+        if (!area) {
+            Log("pocbattle: no map area %d", areaIdx);
+            return;
+        }
+    } else if (oppArea && (dl::Call(R.mIsHomeArea, U(oppArea), U(pn), 0) & 0xFF))
         area = oppArea;
     else if (myArea && (dl::Call(R.mIsHomeArea, U(myArea), U(oppN), 0) & 0xFF))
         area = myArea;
@@ -164,7 +173,11 @@ std::string Command(const std::vector<std::string>& a) {
     if (c == "pocstate") return lockstep::StateText();
     if (c == "pocdump") return lockstep::DumpState(U2W(arg(1))) ? "ok" : "error dump";  // pocdump <file>
     if (c == "pocmissions") return Resolve() ? Missions(atoi(arg(1, "1").c_str())) : "error";
-    if (c == "pocbattle") return Resolve() ? (StartBattle(atoi(arg(1, "1").c_str()), atoi(arg(2, "0").c_str())), "ok") : "error";
+    if (c == "pocbattle")  // pocbattle <opp> <mission> [map area index]
+        return Resolve() ? (StartBattle(atoi(arg(1, "1").c_str()), atoi(arg(2, "0").c_str()),
+                                        a.size() > 3 ? atoi(arg(3).c_str()) : -1),
+                            "ok")
+                         : "error";
     void* m = lockstep::BattleForm();
     if (!m) return "error no battle";
     if (c == "pocrun") return lockstep::RunMinutes(atoi(arg(1, "1").c_str())) ? "ok" : "error";  // as the Run buttons

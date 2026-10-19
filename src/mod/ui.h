@@ -7,6 +7,7 @@ void Init(HINSTANCE inst);
 void Tick();  // ~4x per second on the main thread
 void ShowMpWindow();
 void ToggleMpWindow();
+void RevealMpWindow();  // shown on top without taking the focus, and flashed (also outside a session)
 void Refresh();
 void Notice(const std::string& text);
 // Lets the dialog manager handle Tab/Enter for our window; returns true if consumed.
