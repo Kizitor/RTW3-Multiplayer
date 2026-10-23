@@ -310,12 +310,14 @@ static int MergePossessions(IniDoc& host, const IniDoc& client, const std::strin
 // Diplomacy is decided on the host: these [NationK] keys keep the host's values when a player's turn is merged
 // (the other side of each relation lives in the other nations' sections).
 // Keys of [NationK] the host keeps when it merges a player's turn: the diplomacy values, and the victory points (the
-// host credits them during the month; the player's copy is the older value).
+// host credits them during the month; the player's copy is the older value). IntelligenceSpending/IntelEffort of
+// [NationK] are the host's own spending and effort against K (the game keeps them on the target nation); the player's
+// own come with its turn's [MPIntel] (nationplay.cpp).
 static bool IsHostOwnedKey(const std::string& line) {
     size_t eq = line.find('=');
     if (eq == std::string::npos) return false;
     std::string k = line.substr(0, eq);
-    if (k == "Tension" || k == "Allied" || k == "VP") return true;
+    if (k == "Tension" || k == "Allied" || k == "VP" || k == "IntelligenceSpending" || k == "IntelEffort") return true;
     for (const char* p : {"AITension", "AIAlliance"}) {
         size_t n = strlen(p);
         if (k.size() == n + 1 && k.compare(0, n, p) == 0 && isdigit((unsigned char)k[n])) return true;

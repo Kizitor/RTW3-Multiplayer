@@ -74,6 +74,53 @@ TORP_NONE = ('ok queued=0 target=1 (no firing solution) | ship=Fame button=1 | s
              '1 Woerth;')
 MISSILES = ('ok queued=2 missiles=6 target=0 | result: 2 launchers | summary: - | shooters: 0:Kirov:1; 1:Grozny:1; '
             '2:K-45:0; | targets 1: 0 Enterprise;')
+# twopc (0.4.1, engine level 15): `ls prefs` and `ls mapview` replies and the log lines of the live proofs nb4-nb8
+PREFS_A = ('ok AIControl=2 FloatWarning=2 ReadyPopup=0 BreakOnNewSighting=1 AirApproachMessage=1 AirSurfaceMessageLvl=0 '
+           'LetAIControlForce=0 LOScalc=1 SoundOption=1 Autosave=60 FloatplaneLaunch=1 RealismSetting=1 '
+           'NoFriendlyTorpHits=0 BSSMHC=40 | DarkMode=0 Scale=0 SoundVolume=25 MainFormState=0')
+PREFS_B = ('ok AIControl=2 FloatWarning=2 ReadyPopup=0 BreakOnNewSighting=1 AirApproachMessage=1 AirSurfaceMessageLvl=0 '
+           'LetAIControlForce=0 LOScalc=1 SoundOption=1 Autosave=60 FloatplaneLaunch=1 RealismSetting=1 '
+           'NoFriendlyTorpHits=0 BSSMHC=40 | DarkMode=1 Scale=1 SoundVolume=5 MainFormState=0 | after the battle: '
+           'AIControl 2 -> 0, RealismSetting 1 -> -1, BSSMHC 40 -> 35')
+MAPVIEW_B = 'ok view=1 on=1 passes=25 side0=7/15 wake0=1 flags0=0/8 side1=31/31 wake1=31 flags1=14/14 playerSide=1'
+MAPVIEW_A = 'ok view=0 on=1 passes=25 side0=15/15 wake0=15 flags0=8/8 side1=1/31 wake1=0 flags1=0/14 playerSide=0'
+MAPVIEW_040 = 'ok view=1 on=1 passes=3 side0=15/15 wake0=15 flags0=8/8 side1=4/31 wake1=4 flags1=14/14 playerSide=1'
+STATE_DUMP = ('RTW3MP 0.4.1 DESYNC report: B side 1 battle 100000 epoch 1 minute 6 (boundary here 6, engine level 15)\r\n'
+              'raw boundary 6\r\nD0 deadbeef Side=01000000\r\n  S0.0 Fake Sunk=00 SightingLevel=05000000\r\n'
+              'state\r\nt=12:36\r\n'
+              'D0 GB Battle Division 2 DivisionCourse=58000000 DivisionSpeed=0c000000 Side=00000000 Formation=00\r\n'
+              '  S0.0 Revenge ShipLocation=0102030405060708 Sunk=00 Sinking=00000000 SightingLevel=02000000 '
+              'RadarSightingLevel=00000000 LastSighted=0c000000 SeenByHumanControlledShips=01 IdentifiedAsClass= '
+              'TargetMain=CL Hela ManuallySelectedTarget=00\r\n'
+              '  S0.1 Royal Sovereign Sunk=00 SightingLevel=00000000 RadarSightingLevel=01000000 '
+              'SeenByHumanControlledShips=00\r\n'
+              '    M0 TorpsLeft=01000000\r\n'
+              'D1 GB Destroyer Division 28 Side=00000000\r\n'
+              '  S1.0 Hood Sunk=01 SightingLevel=03000000 RadarSightingLevel=00000000 SeenByHumanControlledShips=01\r\n'
+              'D2 Germany Battle Division 3 Side=01000000\r\n'
+              '  S2.0 Wörth Sunk=00 SightingLevel=00000000 RadarSightingLevel=00000000 SeenByHumanControlledShips=00\r\n'
+              '  S2.1 S 22 Sunk=00 SightingLevel=01000000 RadarSightingLevel=00000000 SeenByHumanControlledShips=01\r\n'
+              'D3 Neutral Side=03000000\r\n  S3.0 Liner Sunk=00 SightingLevel=01000000 SeenByHumanControlledShips=01\r\n'
+              'F0 Great Britain Main force divs=GB Battle Division 2 Side=00000000 AIControlled=00\r\n')
+LINES2 = {
+    'prefs': "01:12:21.003 [26604] lockstep: battle preferences: Admiral's for the load and the simulation (AIControl 0 "
+             "-> 2, RealismSetting 2 -> 1, BSSMHC 35 -> 40); this PC's own come back after the battle",
+    'prefs back': "01:13:48.100 [26604] lockstep: this PC's own battle preferences again (AIControl 2 -> 0, BSSMHC 40 -> "
+                  "35)",
+    'prefs dialog': "01:25:38.200 [34584] lockstep: the Preferences dialog changed battle preferences the simulation uses "
+                    "(RealismSetting 1 -> -1): this battle's values put back",
+    'ensign': "01:25:36.010 [34584] lockstep: the battle screen shows side 1's ensign",
+    'locale': "01:11:20.500 [26604] TEST: RTW3MP_TEST_LOCALE=comma: decimal separator '.' -> ',', thousands '.', date "
+              "'.', list ';'",
+    'queued': '01:12:19.800 [26604] lockstep: battle 100000 epoch 1 queued for loading',
+    'loaded': '01:12:22.500 [26604] lockstep: battle loaded from slot 87 (seed 2841265903, minute 0, t=12:26) in 2484 ms',
+}
+PROXY_LOG = ('01:11:52 proxy 127.0.0.1:47634 -> 127.0.0.1:47624: delay 120 ms, jitter +-60 ms, bandwidth 4000 kbit/s per '
+             'direction\n01:11:57 connection 1 from 127.0.0.1:61001\n01:12:17 connection 1: up 10 chunks 1234 bytes '
+             '(bandwidth wait max 0.00 s), down 20 chunks 2000000 bytes (max 3.10 s)\n01:20:00 connection 1 closed: up 12 '
+             'chunks 2234 bytes (bandwidth wait max 0.01 s), down 40 chunks 6000000 bytes (max 3.90 s)\n01:21:00 '
+             'connection 2 from 127.0.0.1:61005\n01:21:20 connection 2: up 1 chunks 10 bytes (bandwidth wait max 0.00 s), '
+             'down 9 chunks 900000 bytes (max 1.75 s)\n')
 
 HASH_A = ('14:20:23.436 [16412] lockstep hash A t=12:17 min=1 all=211145f3f7c0b80f pos=c52dff4c dmg=0794691d '
           'ammo=96d69bf4 sight=d0e55762 ident=a01a6238 ord=fe85cd41 air=4cdf56bf torp=67f80c33 force=67662527 '
@@ -372,6 +419,140 @@ def samples():
           and r3 is None, (r1, r2, r3))
 
 
+def twopc_samples():
+    """twopc (0.4.1): the probes' replies, the mod's log lines of engine level 15 (the lines of the live proofs nb4-nb8),
+    the map check's rules, the load cover's report, the proxy's log."""
+    keys = R.battle_prefs_keys()
+    check('battle_prefs_keys: the 14 battle preferences a live battle takes from A (kPrefs of this source tree), in order',
+          keys and len(keys) == 14 and keys[0] == 'AIControl' and keys[-1] == 'BSSMHC' and 'RealismSetting' in keys
+          and all(k in R.TWOPC_ALT for k in keys), keys)
+    pa = R.parse_prefs(PREFS_A)
+    pb = R.parse_prefs(PREFS_B)
+    check('parse_prefs: the battle preferences, the display ones and B\'s own kept for after the battle (A -> B)',
+          pa['sim'].get('AIControl') == 2 and pa['sim'].get('BSSMHC') == 40 and pa['disp'] == dict(
+              DarkMode=0, Scale=0, SoundVolume=25, MainFormState=0) and pa['after'] == {} and pb['disp']['DarkMode'] == 1
+          and pb['after'] == {'AIControl': (2, 0), 'RealismSetting': (1, -1), 'BSSMHC': (40, 35)}
+          and R.parse_prefs('error no record') == {}, (pa, pb))
+    m = re.search(R.PREFS_LINE_RE, LINES2['prefs'])
+    b = re.search(R.PREFS_BACK_RE, LINES2['prefs back'])
+    d = re.search(R.PREFS_DLG_RE, LINES2['prefs dialog'])
+    check('PREFS_LINE_RE, PREFS_BACK_RE, PREFS_DLG_RE: A\'s name and each preference\'s values (B\'s -> A\'s, A\'s -> '
+          'B\'s, the dialog\'s change)', m and m[1] == 'Admiral' and R.parse_pref_changes(m[2]) == {
+              'AIControl': (0, 2), 'RealismSetting': (2, 1), 'BSSMHC': (35, 40)} and b
+          and R.parse_pref_changes(b[1]) == {'AIControl': (2, 0), 'BSSMHC': (40, 35)} and d
+          and R.parse_pref_changes(d[1]) == {'RealismSetting': (1, -1)}, (m and m.groups(), b and b.groups()))
+    check('ENSIGN_LINE, LOCALE_RE, QUEUED_RE, LOADED_RE: the lines of nb6/nb8', R.ENSIGN_LINE in LINES2['ensign']
+          and re.search(R.LOCALE_RE, LINES2['locale']) and re.search(R.QUEUED_RE, LINES2['queued'])
+          and R.LOADED_RE in LINES2['loaded'])
+    mb, ma = R.parse_mapview(MAPVIEW_B), R.parse_mapview(MAPVIEW_A)
+    check('parse_mapview: view, the pass, PlayerSide and per side the ships shown/afloat, wakes, flags shown/divisions',
+          mb == dict(view=1, on=1, passes=25, playerSide=1, shown=[7, 31], ships=[15, 31], wake=[1, 31], flags=[0, 14],
+                     divs=[8, 14]) and ma['flags'] == [8, 0] and R.parse_mapview('error no battle') == {}, mb)
+    check('map_problems: B\'s map of nb6 minute 12 and A\'s mirror are right; with the simulation\'s state the other side\'s '
+          'ships shown must be exactly those this side sights, and the ships afloat the same',
+          R.map_problems(mb, 1) == [] and R.map_problems(ma, 0) == []
+          and R.map_problems(mb, 1, dict(afloat=[15, 31], sighted=7), load=True) == []
+          and len(R.map_problems(mb, 1, dict(afloat=[15, 31], sighted=6), load=True)) == 1
+          and len(R.map_problems(mb, 1, dict(afloat=[16, 31], sighted=7), load=True)) == 1,
+          R.map_problems(mb, 1, dict(afloat=[15, 31], sighted=6), True))
+    p040 = R.map_problems(R.parse_mapview(MAPVIEW_040), 1)
+    check('map_problems: 0.4.0\'s picture on B (the first side\'s: B\'s own ships hidden under their flags, A\'s ships and '
+          'flags shown, as nb1 captured it) is found: own ships hidden, A\'s flags shown, A\'s ships beyond those '
+          'sighted', any('own ships shown 4 of 31' in x for x in p040) and any('8 of the other side' in x for x in p040)
+          and R.map_problems(R.parse_mapview(MAPVIEW_040), 1, dict(afloat=[15, 31], sighted=2), load=True)[-1].startswith(
+              'the other side\'s ships shown 15'), p040)
+    ships = R.parse_state_ships(STATE_DUMP)
+    check('parse_state_ships: a DESYNC report\'s state section by division side (names with spaces, the division index, '
+          'the sighting fields little-endian, sunk ships kept, other sides and the raw boundary\'s lines left out)',
+          [s['name'] for s in ships[0]] == ['Revenge', 'Royal Sovereign', 'Hood'] and [s['name'] for s in ships[1]] == [
+              'Wörth', 'S 22'] and [(s['div'], s['sunk'], s['sight'], s['radar'], s['seen']) for s in ships[0]] == [
+              (0, 0, 2, 0, 1), (0, 0, 0, 1, 0), (1, 1, 3, 0, 1)] and ships[1][0]['sight'] == 0
+          and [s['div'] for s in ships[1]] == [2, 2], ships)
+    check('map_ref: the ships afloat per side, the own ships of human forces, the other side\'s ships this side sights: '
+          'the levels and SeenByHumanControlledShips between minutes, the levels alone right after a load',
+          R.map_ref(ships, 1, False) == dict(afloat=[2, 2], own=2, sighted=1) and R.map_ref(ships, 1, True) == dict(
+              afloat=[2, 2], own=2, sighted=2) and R.map_ref(ships, 0, False) == dict(afloat=[2, 2], own=2, sighted=1)
+          and R.map_ref(ships, 0, False, {0: True}) == dict(afloat=[2, 2], own=0, sighted=1),
+          (R.map_ref(ships, 1, False), R.map_ref(ships, 1, True), R.map_ref(ships, 0, False)))
+    a_cmp = R.parse_mapview(MAPVIEW_A.replace('side0=15/15', 'side0=12/15'))
+    check('map_problems: own ships of a computer force hidden until spotted (the game\'s rule) are no problem when ref '
+          'says so; without ref every own ship must show', R.map_problems(a_cmp, 0, dict(afloat=[15, 31], own=11,
+                                                                                         sighted=1)) == []
+          and R.map_problems(a_cmp, 0, dict(afloat=[15, 31], own=13, sighted=1)) and R.map_problems(a_cmp, 0),
+          R.map_problems(a_cmp, 0, dict(afloat=[15, 31], own=11, sighted=1)))
+    check('hexint: memory-order hex as a little-endian signed integer', R.hexint('02000000') == 2
+          and R.hexint('ffffffff') == -1 and R.hexint('01') == 1 and R.hexint('') is None and R.hexint('zz') is None)
+    m = re.search(R.TWOPC_DESYNC_RE, 'lockstep: DESYNC report ls_desync_B_100000_1_4.txt written (1051 kB; ...)')
+    check('TWOPC_DESYNC_RE: a DESYNC and the loaded battles differ, not the report line of `ls desyncreport`', m is None
+          and re.search(R.TWOPC_DESYNC_RE, 'lockstep: DESYNC at minute 7: here a, Captain b')
+          and re.search(R.TWOPC_DESYNC_RE, 'lockstep: the loaded battles differ: here x, Captain y'))
+    check('map_problems: flags of the other side, more wakes than ships, another PlayerSide, an unreadable reply',
+          R.map_problems(R.parse_mapview(MAPVIEW_B.replace('flags0=0/8', 'flags0=1/8')), 1)
+          and R.map_problems(R.parse_mapview(MAPVIEW_B.replace('wake0=1', 'wake0=9')), 1)
+          and R.map_problems(R.parse_mapview(MAPVIEW_B.replace('playerSide=1', 'playerSide=0')), 1)
+          and R.map_problems({}, 1))
+    q, e = 100.0, 103.0
+    good = [(99.0, None), (100.1, 'hidden'), (102.885, 'clear'), (103.002, 'shown')]  # run 2's first load
+    resync = [(90.0, 'shown'), (100.2, 'hidden'), (102.958, 'clear'), (103.003, 'shown')]  # the old picture until reset
+    bad1 = [(99.0, None), (100.1, 'hidden'), (101.5, 'shown')]  # the load's picture shown (0.4.0: no cover)
+    bad2 = [(90.0, 'shown')]  # a resync drawn into the old window, never hidden or clear
+    bad3 = [(99.0, None), (100.1, 'hidden'), (102.9, 'shown')]  # no cover, shown 0.1 s before the load's end
+    r = [R.cover_report(t, [(q, e)])[0] for t in (good, resync, bad1, bad2, bad3)]
+    check('cover_report: a load whose window is hidden or clear until its end is not exposed (the old picture before the '
+          'reset is not the load\'s); a window shown opaque in the load (also 0.1 s before its end), or never hidden '
+          'nor clear, is exposed; cover seen and shown after reported', [(x['exposed'], x['cover'], x['after'])
+                                                                         for x in r] == [
+              (False, True, True), (False, True, True), (True, False, True), (True, False, True), (True, False, True)]
+          and r[0]['states'][0] == (-3.1, None), [(x['exposed'], x['cover'], x['after'], x['states']) for x in r])
+    nothing = R.cover_report([(99.0, None)], [(q, e)])[0]
+    check('cover_report: a watch that never saw the window: not exposed, not shown after (the check fails on that)',
+          not nothing['exposed'] and not nothing['after'], nothing)
+    lw = R.load_windows('\n'.join((LINES2['queued'], LINES2['ensign'], LINES2['loaded'], LINES2['loaded'])))
+    check('load_windows: "queued for loading" -> the next "battle loaded from slot" (seconds of the day), one per queue',
+          lw == [(R.log_secs(LINES2['queued']), R.log_secs(LINES2['loaded']))], lw)
+    px = R.parse_proxy_log(PROXY_LOG)
+    check('parse_proxy_log: the head line, each connection\'s latest statistics (bytes and the bandwidth cap\'s wait per '
+          'direction; closed)', px['head'].endswith('bandwidth 4000 kbit/s per direction') and px['conns'] == {
+              1: dict(up=2234, down=6000000, up_wait=0.01, down_wait=3.9, closed=True),
+              2: dict(up=10, down=900000, up_wait=0.0, down_wait=1.75, closed=False)}, px)
+    check('as_int / parse_pref_changes: numbers and negatives; text and None give None', R.as_int('-1') == -1
+          and R.as_int('x') is None and R.as_int(None) is None and R.parse_pref_changes('') == {})
+
+
+def intel_samples():
+    """The politics panel on a joined player's PC (0.4.1): `intelinfo`'s reply, IntelToString's labels and the slot ->
+    nation rule of the relations view and the player's own intelligence together (intel_panel_bad)."""
+    r = ('ok fields=0:2/1,1:0/0,2:0/0,3:1/1,4:0/0,5:3/3,6:0/0,7:0/0,8:0/0 cost=360 budget=360 balance=-1,234 '
+         'labels=Med *|None|Low|None|High|None|None|None reports=4 client=1 month1=intel:-360/balance:100')
+    ii = R.parse_intelinfo(r)
+    check('parse_intelinfo: the nations\' spending/effort, the cost, the 8 labels (with " *"), reports, client; an error '
+          'reply -> None', ii and ii['fields'][0] == (2, 1) and ii['fields'][5] == (3, 3) and len(ii['fields']) == 9
+          and ii['cost'] == 360 and ii['labels'][0] == 'Med *' and len(ii['labels']) == 8 and ii['reports'] == 4
+          and ii['client'] and R.parse_intelinfo('error unavailable') is None, ii)
+    check('intel_label_ok: None/Low/Med/High by the spending, " *" only while the effort is below it',
+          R.intel_label_ok('Med *', 2, 1) and R.intel_label_ok('High', 3, 3) and R.intel_label_ok('None', 0, 0)
+          and not R.intel_label_ok('Med', 2, 1) and not R.intel_label_ok('Low', 2, 2)
+          and not R.intel_label_ok('None *', 0, 0) and not R.intel_label_ok('High', 4, 4))
+    names = {0: 'Great Britain', 1: 'Germany', 2: 'France', 3: 'Russia', 4: 'Spain', 5: 'Japan', 6: 'United States',
+             7: 'Italy', 8: 'Austria-Hungary'}
+
+    def view(me):
+        return dict(slots={i: dict(flag=names[0 if i == me else i], hint='', war=False, ally=False, block=False)
+                           for i in range(1, 9)})
+    rv = view(1)
+    own_label = dict(ii, labels=['None'] + ii['labels'][1:])  # slot 1 showing nation 1's own pair, not the host's
+    own_flag = dict(slots={**rv['slots'], 1: dict(rv['slots'][1], flag='Germany')})
+    host_ii = R.parse_intelinfo(r.replace('labels=Med *|None|', 'labels=None|None|').replace('client=1', 'client=0'))
+    check('intel_panel_bad: a joined player\'s panel (slot 1 = the host\'s flag with the player\'s own spending on the '
+          'host) passes; its own nation\'s label under the host\'s flag, its own flag in slot 1, client=0, a missing '
+          'reply fail; the host\'s panel (slot i = nation i, client=0) passes and fails as a player\'s',
+          R.intel_panel_bad(1, names, rv, ii) == [] and R.intel_panel_bad(1, names, rv, own_label)
+          and R.intel_panel_bad(1, names, own_flag, ii) and R.intel_panel_bad(1, names, rv, dict(ii, client=False))
+          and R.intel_panel_bad(1, names, None, ii) and R.intel_panel_bad(0, names, view(0), host_ii) == []
+          and R.intel_panel_bad(1, names, view(0), host_ii),
+          (R.intel_panel_bad(1, names, rv, ii), R.intel_panel_bad(0, names, view(0), host_ii)))
+
+
 def tracefiles(sandbox):
     d = os.path.join(sandbox, 'traces')
     os.makedirs(d)
@@ -477,15 +658,17 @@ def runner(sandbox):
               and all(n in [s[0] for s in R.SCENARIOS] for n in R.STRESS_ONLY)
               and all(s[0] in R.EST for s in R.SCENARIOS), (R.GROUPS, R.STRESS_ONLY))
         dflt = [s[0] for s in R.SCENARIOS if s[0] not in R.STRESS_ONLY]
-        check('the default run: lockstep_ui, lockstep_limits and lockstep_air in it; rejoin, resume, torpedo, strike and '
-              'missiles not', {'lockstep_ui', 'lockstep_limits', 'lockstep_air'} <= set(dflt) and not (
-                  {'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_strike', 'lockstep_missiles'}
-                  & set(dflt)), dflt)
+        check('the default run: lockstep_ui, lockstep_limits, lockstep_air and twopc in it; rejoin, resume, torpedo, '
+              'strike and missiles not', {'lockstep_ui', 'lockstep_limits', 'lockstep_air', 'twopc'} <= set(dflt)
+              and not ({'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_strike', 'lockstep_missiles'}
+                       & set(dflt)) and R.GROUPS.get('twopc') == ('twopc',) and 'twopc' in R.EST_STRESS, dflt)
         order = [s[0] for s in R.SCENARIOS]
         check('the order: the slot-1 scenarios before lockstep_air, lockstep_strike and lockstep_missiles (they move the '
-              'session to other campaigns)', all(order.index(x) < order.index('lockstep_air') for x in (
-                  'lockstep_limits', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_stress'))
-              and order.index('lockstep_air') < order.index('lockstep_strike') < order.index('lockstep_missiles'), order)
+              'session to other campaigns); twopc right after lockstep_month', all(order.index(x) < order.index(
+                  'lockstep_air') for x in ('lockstep_limits', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo',
+                                            'lockstep_stress', 'twopc'))
+              and order.index('lockstep_air') < order.index('lockstep_strike') < order.index('lockstep_missiles')
+              and order.index('twopc') == order.index('lockstep_month') + 1, order)
         code, out = run_main(['--group', 'nosuch'])
         check('--group with an unknown group: an argument error', code == ('exit', 2) and 'unknown group' in out, out[-300:])
         # --dry-run: nothing written, nothing deleted
@@ -650,10 +833,75 @@ def runner(sandbox):
               and R.no_doubling(232, 240) and not R.no_doubling(232, 464) and not R.no_doubling(0, 5))
         check('KEPT_LOG_RE: the kept logs of every restart tag, not the .prev log or the current one',
               all(re.match(R.KEPT_LOG_RE, f'rtw3mp_47702.{t}3.log') for t in (
-                  'kill', 'hostkill', 'restart', 'k2restart', 'level', 'afterend', 'relay', 'vanilla', 'clean'))
+                  'kill', 'hostkill', 'restart', 'k2restart', 'level', 'afterend', 'relay', 'vanilla', 'clean', 'twopc'))
               and not re.match(R.KEPT_LOG_RE, 'rtw3mp_47702.prev.log')
               and not re.match(R.KEPT_LOG_RE, 'rtw3mp_47702.log'))
+        twopc_sandbox(sandbox)
         _ = root
+
+
+def twopc_sandbox(sandbox):
+    """twopc's file helpers in the sandbox (inside runner's sandboxed()): the Preferences backup for the run, B's
+    variant, the battle file's sighting counts, the PNG writer, the dry run."""
+    prefs = ('[Break]\r\nBreakOnHit=1\r\nBreakOnNewSighting=1\r\nAirApproachMessage=1\r\nLetAIControlForce=0\r\n'
+             '[Settings]\r\nFloatWarning=2\r\nReadyPopup=0\r\nFOW=1\r\nAIControl=2\r\nDarkMode=0\r\nLOScalc=1\r\n'
+             'FloatplaneLaunch=1\r\nSoundVolume=25\r\nScale=0\r\nRealismSetting=1\r\nAutosave=60\r\n'
+             'NoFriendlyTorpHits=0\r\nSoundOption=1\r\nBSSMHC=40\r\nAirSurfaceMessageLvl=0\r\n[MainForm]\r\n'
+             'MainFormWidth=1000\r\nMainFormHeight=719\r\nMainFormState=0\r\n[BCMainForm]\r\nBCMainFormWidth=1288\r\n')
+    with open(R.PREFS_FILE, 'wb') as f:
+        f.write(prefs.encode())
+    raw0 = open(R.PREFS_FILE, 'rb').read()
+    h, note = R.prefs_for_run(None, keep=True)
+    check('prefs_for_run(keep=True) (twopc): the Preferences backed up although nothing changes now, the file as it was',
+          h == R.file_hash(R.PREFS_FILE) and os.path.exists(R.PREFS_BACKUP) and open(R.PREFS_FILE, 'rb').read() == raw0
+          and 'twopc' in note, note)
+    keys = R.battle_prefs_keys()
+    a_sim = R.parse_prefs(PREFS_A)['sim']
+    var, diff = R.twopc_variant(raw0, a_sim, keys)
+    vals, before = R.prefs_values(var), R.prefs_values(raw0)
+    check('twopc_variant: every key of TWOPC_ALT differs from A\'s (the battle preferences from A\'s `ls prefs`, the '
+          'others from the file); the keys the file lacks added to their sections (BreakOnSunk to [Break], ShipFlags to '
+          '[Settings]); MainFormWidth set, BCMainFormWidth kept; CRLF kept', all(a != b for a, b in diff.values())
+          and set(diff) == set(R.TWOPC_ALT) and all(str(diff[k][1]) == vals.get(k) for k in diff)
+          and vals.get('BCMainFormWidth') == '1288' and vals.get('MainFormWidth') == '1400'
+          and b'[Break]\r\nBreakOnSunk=0\r\n' in var and b'\n' not in var.replace(b'\r\n', b'')
+          and before['RealismSetting'] == '1' and vals['RealismSetting'] == '2', (diff, var[:200]))
+    os.remove(R.PREFS_FILE)
+    check('prefs_restore after prefs_for_run(keep=True): the file as it was again (here: it was deleted meanwhile), '
+          'verified, the backup deleted', R.prefs_restore(h) and open(R.PREFS_FILE, 'rb').read() == raw0
+          and not os.path.exists(R.PREFS_BACKUP))
+    sac = os.path.join(sandbox, 'tmp', 'RTWGame87.sac')
+    write(sac, '\ufeff[Environment]\nYear=1900\n[Division1]\nSide=0\nShipCount=3\nShip0SightingLevel=2\n'
+               'Ship0RadarSightingLevel=0\nShip0Sunk=0\nShip1SightingLevel=0\nShip1RadarSightingLevel=1\nShip1Sunk=0\n'
+               'Ship2SightingLevel=3\nShip2Sunk=1\n[Division2]\nSide=1\nShipCount=2\nShip0SightingLevel=0\nShip0Sunk=0\n'
+               'Ship1SightingLevel=0\nShip1RadarSightingLevel=0\nShip1Sunk=0\n[Division3]\nSide=3\nShipCount=4\n')
+    check('sac_sighting: per side the ships afloat and those the other side sights (sighting or radar level > 0); sunk '
+          'ships and side 3 left out', R.sac_sighting(sac) == {0: (2, 2), 1: (2, 0)}
+          and R.sac_sighting(sac + '.none') is None, R.sac_sighting(sac))
+    png = os.path.join(sandbox, 'tmp', 'x.png')
+    R.write_png(png, 2, 2, bytes([0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 9, 9, 9, 255]))
+    data = open(png, 'rb').read()
+    i = data.index(b'IDAT')
+    pix = R.zlib.decompress(data[i + 4:i + 4 + R.struct.unpack('>I', data[i - 4:i])[0]])
+    check('write_png: a PNG (signature, IHDR 2x2 RGB), the BGRA pixels as RGB rows with filter 0',
+          data[:8] == b'\x89PNG\r\n\x1a\n' and data[12:16] == b'IHDR' and pix == bytes(
+              [0, 255, 0, 0, 0, 255, 0, 0, 0, 0, 255, 9, 9, 9]), pix)
+    with open(R.PREFS_FILE, 'wb') as f:
+        f.write(b'MapZoom=3\r\nRealismSetting=1\r\nSound=1\r\n')
+    before = digest(sandbox)
+    code, out = run_main(['--dry-run', '--group', 'twopc'])
+    check('--dry-run --group twopc: session and twopc (short), the client\'s comma locale and Preferences variant, the '
+          'delay proxy\'s port and network; nothing written', code == 2 and 'twopc (short)' in out
+          and 'RTW3MP_TEST_LOCALE=comma' in out and f'127.0.0.1:{R.TWOPC_PROXY_PORT}' in out and 'lockstep_ui' not in out
+          and digest(sandbox) == before, out[-1200:])
+    code, out = run_main(['--dry-run', '--group', 'twopc', '--stress'])
+    check('--dry-run --group twopc --stress: the full variant (its network, its game time)', code == 2
+          and 'twopc (full)' in out and f'{R.TWOPC_NET["full"]["kbps"]} kbit/s' in out
+          and f'~{R.EST_STRESS["twopc"]:>5} s' in out, out[-1200:])
+    os.remove(R.PREFS_FILE)
+    code, out = run_main(['--dry-run', '--group', 'twopc'])
+    check('--dry-run --group twopc without a Preferences file: twopc would SKIP', 'MISSING: SKIP twopc' in out, out[-600:])
+    write(R.PREFS_FILE, 'MapZoom=3\nRealismSetting=1\nSound=1\n')
 
 
 # ---------------------------------------------------------------- recorded logs (a report)
@@ -702,6 +950,8 @@ def main():
     ap.add_argument('--logs', action='append', default=[], help='a folder of a recorded run\'s mod logs (repeatable)')
     a = ap.parse_args()
     samples()
+    twopc_samples()
+    intel_samples()
     sandbox = os.path.abspath('regression_selftest_sandbox')
     if os.path.exists(sandbox):
         shutil.rmtree(sandbox)

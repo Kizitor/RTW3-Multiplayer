@@ -1,4 +1,6 @@
 #include "game.h"
+#include "nationplay.h"
+#include "lockstep.h"
 #include "../../third_party/minhook/include/MinHook.h"
 #include <algorithm>
 #include <climits>
@@ -66,6 +68,13 @@ struct Api {
     bool battles = false;
     int* scaleVar = nullptr;  // the game's scale value used in its war-progress thresholds (100*G + 300/500)
     bool treaties = false;
+    // A joined player's screen shows its own nation's relations (the relations view, see KViewBegin). VCL and RTL
+    // routines without RTTI names (TControl.SetVisible/SetText, System._UStrAsg) come from call sites.
+    void *mShowTension = nullptr, *mStrengthBars = nullptr, *mNationData = nullptr, *mFlagFile = nullptr,
+         *mPictureLoad = nullptr, *mSetVisible = nullptr, *mSetText = nullptr, *mUStrAsg = nullptr;
+    int fHint = -1, fText = -1, fPicture = -1, fGbWar = -1, fLbWar = -1, fLbPlayer = -1;
+    int fFlag[9] = {}, fShape[9] = {}, fSlotWar[9] = {}, fSlotAlly[9] = {}, fSlotBlock[9] = {};
+    bool relView = false;
 } A;
 
 static void* g_buildCamp = nullptr;
@@ -239,6 +248,78 @@ static void ResolveLoadBlockade() {
     if (!ok) A.loadBlockadeRet = 0;
 }
 
+// The first call site in [start, start+len) that matches `pat` (bytes < 0 are wildcards) and `ok`.
+template <class Pred>
+static uint8_t* FindSite(uint8_t* start, size_t len, const std::vector<int>& pat, Pred ok) {
+    for (uint8_t* p = start; p && len > pat.size();) {
+        uint8_t* hit = dl::FindPattern(p, len, pat);
+        if (!hit) return nullptr;
+        if (ok(hit)) return hit;
+        len -= (size_t)(hit + 1 - p);
+        p = hit + 1;
+    }
+    return nullptr;
+}
+
+// The relations view (see KViewBegin): the strategic screen's tension panel (TfrmBuildCamp.ShowTensionLevels, slots 1-8:
+// imgFlag<i>, Tension<i>, lbWar<i>, imgAlly<i>, lbBlock<i>), the flags (SetValues), the nation data dialog of a flag
+// click (TdlgNationData.Execute), the map's strength bars (DrawAreaStrengthBars) and the war state (gbWar, lbWar,
+// lbPlayerNation's hint, set by UpdateUIValues from the host's war counter).
+static void ResolveRelationsView() {
+    A.mShowTension = dl::Method("TfrmBuildCamp", "ShowTensionLevels");
+    A.mStrengthBars = dl::Method("TfrmBuildCamp", "DrawAreaStrengthBars");
+    A.mNationData = dl::Method("TdlgNationData", "Execute");
+    A.mFlagFile = dl::Method("TBuilderNation", "GetFlagFileName");
+    A.mPictureLoad = dl::Method("TPicture", "LoadFromFile");
+    A.fHint = dl::Field("TControl", "FHint");
+    A.fText = dl::Field("TControl", "FText");
+    A.fPicture = dl::Field("TImage", "FPicture");
+    A.fGbWar = dl::Field("TfrmBuildCamp", "gbWar");
+    A.fLbWar = dl::Field("TfrmBuildCamp", "lbWar");
+    A.fLbPlayer = dl::Field("TfrmBuildCamp", "lbPlayerNation");
+    bool slots = true;
+    for (int i = 1; i <= 8; i++) {
+        char n[24];
+        auto f = [&](const char* pre) {
+            snprintf(n, sizeof(n), "%s%d", pre, i);
+            int o = dl::Field("TfrmBuildCamp", n);
+            slots &= o > 0;
+            return o;
+        };
+        A.fFlag[i] = f("imgFlag");
+        A.fShape[i] = f("Tension");
+        A.fSlotWar[i] = f("lbWar");
+        A.fSlotAlly[i] = f("imgAlly");
+        A.fSlotBlock[i] = f("lbBlock");
+    }
+    int fIntel1 = dl::Field("TfrmBuildCamp", "stIntel1");
+    // TControl.SetVisible: ShowTensionLevels `setg dl; mov eax, [ebx+lbWar1]; call X` (lbWar1.Visible := Tension > 40)
+    if (A.mShowTension && slots) {
+        uint8_t* hit = FindSite((uint8_t*)A.mShowTension, 0x800, {0x0F, 0x9F, 0xC2, 0x8B, 0x83, -1, -1, -1, -1, 0xE8},
+                                [](uint8_t* h) { return *(int32_t*)(h + 5) == A.fSlotWar[1]; });
+        if (hit && InImage((uintptr_t)CallTarget(hit + 9))) A.mSetVisible = CallTarget(hit + 9);
+    }
+    // TControl.SetText: ShowTensionLevels `mov edx, [ebp-4]; mov eax, [ebx+stIntel1]; call X` (the intel label's text)
+    if (A.mShowTension && fIntel1 > 0) {
+        uint8_t* hit = FindSite((uint8_t*)A.mShowTension, 0x800, {0x8B, 0x55, 0xFC, 0x8B, 0x83, -1, -1, -1, -1, 0xE8},
+                                [fIntel1](uint8_t* h) { return *(int32_t*)(h + 5) == fIntel1; });
+        if (hit && InImage((uintptr_t)CallTarget(hit + 9))) A.mSetText = CallTarget(hit + 9);
+    }
+    // System._UStrAsg: UpdateUIValues `mov eax, [ebx+imgFlag1]; add eax, FHint; call X` (imgFlag1.Hint := the name)
+    if (A.mUpdateUIValues && slots && A.fHint > 0) {
+        uint8_t* hit = FindSite((uint8_t*)A.mUpdateUIValues, 0x600, {0x8B, 0x83, -1, -1, -1, -1, 0x05, -1, -1, -1, -1, 0xE8},
+                                [](uint8_t* h) { return *(int32_t*)(h + 2) == A.fFlag[1] && *(int32_t*)(h + 7) == A.fHint; });
+        if (hit && InImage((uintptr_t)CallTarget(hit + 11))) A.mUStrAsg = CallTarget(hit + 11);
+    }
+    bool distinct = A.mSetVisible != A.mSetText && A.mSetText != A.mUStrAsg && A.mSetVisible != A.mUStrAsg;
+    A.relView = A.diplomacy && slots && distinct && A.mShowTension && A.mSetVisible && A.mSetText && A.mUStrAsg &&
+                A.fHint > 0 && A.fText > 0 && A.fPicture > 0 && A.fGbWar > 0 && A.fLbWar > 0 && A.fLbPlayer > 0 &&
+                A.mFlagFile && A.mPictureLoad && A.fVisible >= 0;
+    Log("Relations view: %s (showTension=%p setVisible=%p setText=%p ustrAsg=%p strengthBars=%p nationData=%p)",
+        A.relView ? "ok" : "UNAVAILABLE; a joined player's screen shows the host's relations", A.mShowTension,
+        A.mSetVisible, A.mSetText, A.mUStrAsg, A.mStrengthBars, A.mNationData);
+}
+
 bool Resolve() {
     bool ok = true;
     REQ_FIELD(A.fBuilderNations, "TfrmBuildCamp", "BuilderNations");
@@ -356,6 +437,8 @@ bool Resolve() {
     if (!A.events) Log("WARNING: event data not found; joined players won't get random events");
     ResolveTreaties();
     ResolveLoadBlockade();
+    ResolveRelationsView();
+    nplay::Resolve();
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -871,7 +954,7 @@ struct EvState {
 };
 static EvState g_ev;
 
-bool EventActive() { return g_ev.swapped; }
+bool EventActive() { return g_ev.swapped || nplay::ViewActive(); }
 
 static void EvRestore() {
     if (!g_ev.swapped) return;
@@ -1553,6 +1636,188 @@ void SetAlliance(int a, int b, int months) {
     Log("diplomacy: alliance %d-%d = %d", a, b, AllianceMonths(a, b));
 }
 
+// ---------------------------------------------------------------------------------------------
+// Each player's own relations on the screen (the relations view)
+//
+// The game keeps relations from nation 0's point of view (every nation's `Tension`/`Allied` is its relation with
+// nation 0; AITension/AIAlliance hold the rest) and its strategic screen shows BuilderNations[1..8] with those fields.
+// On a joined player's PC PlayerNation is nation K, so the tension panel, its war and alliance marks, the flags and the
+// war state showed the host's relations, and slot K showed K's own relation with the host under K's name. While one of
+// these display routines runs, the view puts nation K at index 0 and the host's nation at index K, and every nation's
+// Tension/Allied hold its relation with K (what RunClientEvent does for an event); everything is put back right after
+// the routine, also when a game exception unwinds through it. Only display routines run in the view: the month and the
+// player's orders never see it.
+
+int ShownNationIndex() {
+    void* l = NationList();
+    void* pn = PlayerNation();
+    if (!l || !pn || dl::ListCount(l) < 9 || dl::ListItem(l, 0) == pn) return 0;
+    for (int i = 1; i <= 8; i++)
+        if (dl::ListItem(l, i) == pn) return i;
+    return 0;
+}
+
+static struct {
+    void** arr;
+    void* obj[9];
+    int K;
+    int T[9], Al[9];
+    bool on;
+} g_kv;
+static int g_kvDepth = 0;
+
+// Puts the view in place unless it is already there (nested display routines) or not wanted: the PC shows nation 0 as
+// the player (the host, single player, a battle slot), or an event dialog has its own view. Pair with KViewEnd.
+static bool KViewBegin() {
+    if (g_kvDepth++ > 0 || !A.relView || g_ev.swapped) return false;
+    int K = ShownNationIndex();
+    void* l = NationList();
+    if (K < 1 || !l) return false;
+    int rel[9], ally[9];
+    for (int i = 0; i < 9; i++) {
+        rel[i] = i == K ? 0 : Tension(K, i);
+        ally[i] = i == K ? 0 : AllianceMonths(K, i);
+    }
+    g_kv.arr = dl::At<void**>(l, 4);
+    g_kv.K = K;
+    for (int i = 0; i < 9; i++) {
+        g_kv.obj[i] = g_kv.arr[i];
+        g_kv.T[i] = dl::At<int>(g_kv.obj[i], A.fTension);
+        g_kv.Al[i] = dl::At<int>(g_kv.obj[i], A.fAllied);
+    }
+    for (int i = 0; i < 9; i++) {
+        dl::At<int>(g_kv.obj[i], A.fTension) = rel[i];
+        dl::At<int>(g_kv.obj[i], A.fAllied) = ally[i];
+    }
+    g_kv.arr[0] = g_kv.obj[K];
+    g_kv.arr[K] = g_kv.obj[0];
+    g_kv.on = true;
+    return true;
+}
+
+static void KViewEnd() {
+    if (g_kvDepth > 0) g_kvDepth--;
+    if (g_kvDepth > 0 || !g_kv.on) return;
+    g_kv.arr[0] = g_kv.obj[0];
+    g_kv.arr[g_kv.K] = g_kv.obj[g_kv.K];
+    for (int i = 0; i < 9; i++) {
+        dl::At<int>(g_kv.obj[i], A.fTension) = g_kv.T[i];
+        dl::At<int>(g_kv.obj[i], A.fAllied) = g_kv.Al[i];
+    }
+    g_kv.on = false;
+}
+
+static void* FormCtl(void* f, int off) { return f && off > 0 ? dl::At<void*>(f, off) : nullptr; }
+
+static void SetCtlHint(void* ctl, const std::wstring& s) {  // System._UStrAsg copies the literal
+    if (!ctl) return;
+    dl::ConstUStr u(s);
+    dl::Call(A.mUStrAsg, (uint32_t)(uintptr_t)((uint8_t*)ctl + A.fHint), u.ptr());
+}
+
+static void SetCtlVisible(void* ctl, bool v) {
+    if (ctl) dl::Call(A.mSetVisible, (uint32_t)(uintptr_t)ctl, v ? 1 : 0);
+}
+
+static void SetCtlText(void* ctl, const std::wstring& s) {  // SetText -> SetTextBuf copies it
+    if (!ctl) return;
+    dl::ConstUStr u(s);
+    dl::Call(A.mSetText, (uint32_t)(uintptr_t)ctl, u.ptr());
+}
+
+// In the view: the flags' hints, which name the panel's slots (UpdateUIValues sets them from nations 1-8 right before
+// it shows the panel): the view's nation of each slot, " (Treaty)" while it is allied with the player, as the game does.
+static void KViewFlagHints(void* f) {
+    for (int i = 1; i <= 8; i++) {
+        void* n = Nation(i);
+        if (!n) continue;
+        std::wstring h = dl::ReadUStr(dl::At<void*>(n, A.fNationName));
+        if (dl::At<int>(n, A.fAllied) > 0) h += L" (Treaty)";
+        SetCtlHint(FormCtl(f, A.fFlag[i]), h);
+    }
+}
+
+static void ShowTensionInView(void* f, void* orig) {
+    __try {
+        if (KViewBegin()) KViewFlagHints(f);
+        dl::Call(orig, (uint32_t)(uintptr_t)f);
+    } __finally {
+        KViewEnd();
+    }
+}
+
+static void StrengthBarsInView(void* f, void* area, void* orig) {
+    __try {
+        KViewBegin();
+        dl::Call(orig, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)area);
+    } __finally {
+        KViewEnd();
+    }
+}
+
+// After SetValues (the flags): slot K shows the host's flag (the player's own flag already shows PlayerNation).
+static void KViewFlagPicture(void* f) {
+    int K = A.relView && !g_ev.swapped ? ShownNationIndex() : 0;
+    void* img = K > 0 ? FormCtl(f, A.fFlag[K]) : nullptr;
+    void* host = Nation(0);
+    if (!img || !host) return;
+    void* file = nullptr;  // Delphi string result (small leak per call, acceptable)
+    dl::Call(A.mFlagFile, (uint32_t)(uintptr_t)host, (uint32_t)(uintptr_t)&file);
+    std::wstring path = dl::ReadUStr(file);
+    void* pic = dl::At<void*>(img, A.fPicture);
+    if (!path.empty() && pic && FileExists(path)) dl::Call(A.mPictureLoad, (uint32_t)(uintptr_t)pic, (uint32_t)(uintptr_t)file);
+}
+
+// After UpdateUIValues: the war state the game shows from the host's war counter (the "War results" box, the "At war
+// for N months." line under the player's name, the name's "At peace for ..." hint) follows the player's own wars. The
+// months are not known for a joined player's nation (the war counter is the host's), so the line names the enemy.
+static std::string g_kvLogged;
+
+static void KViewWarState(void* f) {
+    int K = A.relView && !g_ev.swapped ? ShownNationIndex() : 0;
+    if (K < 1) return;
+    std::vector<int> enemies;
+    std::string sig = "nation " + std::to_string(K) + " sees its own relations:";
+    for (int j = 0; j <= 8; j++) {
+        if (j == K) continue;
+        int t = Tension(K, j);
+        if (t > 40) enemies.push_back(j);
+        sig += " " + W2U(NationName(j)) + " " + std::to_string(t) + (AllianceMonths(K, j) > 0 ? " (ally)" : "");
+    }
+    bool war = !enemies.empty();
+    std::wstring line;
+    if (war)
+        line = enemies.size() == 1 ? L"At war with " + NationName(enemies[0]) + L"."
+                                   : L"At war with " + std::to_wstring(enemies.size()) + L" nations.";
+    SetCtlVisible(FormCtl(f, A.fGbWar), war);
+    SetCtlVisible(FormCtl(f, A.fLbWar), war);
+    if (war) SetCtlText(FormCtl(f, A.fLbWar), line);
+    SetCtlHint(FormCtl(f, A.fLbPlayer), war ? L"" : L"At peace.");
+    sig += war ? "; " + W2U(line) : "; at peace";
+    if (sig != g_kvLogged) {
+        g_kvLogged = sig;
+        Log("relations view: %s", sig.c_str());
+    }
+}
+
+std::string DebugRelView() {
+    void* f = BuildCamp();
+    if (!f || !A.relView) return "error relations view unavailable";
+    auto hint = [](void* c) { return c ? W2U(dl::ReadUStr(dl::At<void*>(c, A.fHint))) : std::string("-"); };
+    auto vis = [](void* c) { return c && dl::At<uint8_t>(c, A.fVisible) ? "1" : "0"; };
+    auto text = [](void* c) {
+        const wchar_t* p = c ? dl::At<const wchar_t*>(c, A.fText) : nullptr;
+        return p ? W2U(std::wstring(p, wcsnlen(p, 200))) : std::string();
+    };
+    std::string s = "ok shown=" + std::to_string(ShownNationIndex()) + " slots=";
+    for (int i = 1; i <= 8; i++)
+        s += std::to_string(i) + ":" + hint(FormCtl(f, A.fFlag[i])) + "~" + hint(FormCtl(f, A.fShape[i])) + "~" +
+             vis(FormCtl(f, A.fSlotWar[i])) + vis(FormCtl(f, A.fSlotAlly[i])) + vis(FormCtl(f, A.fSlotBlock[i])) + "; ";
+    s += "war=" + std::string(vis(FormCtl(f, A.fGbWar))) + vis(FormCtl(f, A.fLbWar)) + "~" + text(FormCtl(f, A.fLbWar)) +
+         "~" + hint(FormCtl(f, A.fLbPlayer));
+    return s;
+}
+
 int StartBuildPhase() {
     void* f = BuildCamp();
     return f ? dl::At<uint8_t>(f, A.fStartBuild) : -1;
@@ -2102,6 +2367,94 @@ extern "C" __declspec(naked) void d_ResearchExecute() {
     }
 }
 
+// The relations view's display routines (see KViewBegin).
+extern "C" void* o_ShowTension = nullptr;
+extern "C" void* o_StrengthBars = nullptr;
+extern "C" void* o_NationData = nullptr;
+extern "C" void* o_SetValues = nullptr;
+extern "C" void* o_UpdateUI = nullptr;
+
+extern "C" void __stdcall CB_ShowTension(void* self) { ShowTensionInView(self, o_ShowTension); }
+extern "C" void __stdcall CB_StrengthBars(void* self, void* area) { StrengthBarsInView(self, area, o_StrengthBars); }
+
+// A flag's click opens the nation data dialog for its slot's nation index (the player's own flag: 0). In the view slot
+// K shows the host's nation and the player's flag nation K.
+extern "C" int __stdcall CB_NationDataIdx(int idx) {
+    __try {
+        int K = A.relView && !g_ev.swapped ? ShownNationIndex() : 0;
+        int to = K > 0 && idx == 0 ? K : K > 0 && idx == K ? 0 : idx;
+        if (K > 0) Log("relations view: nation data of slot %d opens nation %d", idx, to);
+        return to;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return idx;
+}
+
+static void SafeFlagPicture(void* self) {
+    __try {
+        KViewFlagPicture(self);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+static void SafeWarState(void* self) {
+    __try {
+        KViewWarState(self);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+extern "C" void __stdcall CB_AfterSetValues(void* self) { SafeFlagPicture(self); }
+extern "C" void __stdcall CB_AfterUpdateUI(void* self) { SafeWarState(self); }
+
+extern "C" __declspec(naked) void d_ShowTension() {  // ShowTensionLevels(Self)
+    __asm {
+        push eax
+        call CB_ShowTension
+        ret
+    }
+}
+
+extern "C" __declspec(naked) void d_StrengthBars() {  // DrawAreaStrengthBars(Self, anArea)
+    __asm {
+        push edx
+        push eax
+        call CB_StrengthBars
+        ret
+    }
+}
+
+extern "C" __declspec(naked) void d_NationData() {  // TdlgNationData.Execute(Self, aNationIdx)
+    __asm {
+        push eax
+        push ecx
+        push edx
+        call CB_NationDataIdx
+        mov edx, eax
+        pop ecx
+        pop eax
+        jmp dword ptr [o_NationData]
+    }
+}
+
+extern "C" __declspec(naked) void d_SetValues() {  // SetValues(Self); no stack arguments
+    __asm {
+        push eax
+        call dword ptr [o_SetValues]
+        call CB_AfterSetValues
+        ret
+    }
+}
+
+extern "C" __declspec(naked) void d_UpdateUI() {  // UpdateUIValues(Self, ReFillShipList, UpdateShipListOK); no stack arguments
+    __asm {
+        push eax
+        call dword ptr [o_UpdateUI]
+        call CB_AfterUpdateUI
+        ret
+    }
+}
+
 // DoResearch(Self, aNationIdx, NoNonGunmessages), register arguments only: the monthly research of one nation. For
 // every nation above 0 it also runs the game's AI research choices: some priorities are set to High by chance, and with a
 // 5 % chance a month every priority is re-rolled (mostly Medium). A joined player's own priorities are put back.
@@ -2424,6 +2777,9 @@ static SkipSpec g_skips[] = {
     {"TfrmBuildCamp", "AISendShipsToForeignStations", 1, false, 0, nullptr},
     {"TfrmBuildCamp", "AISendShipToColonies", 1, false, 4, nullptr},
     {"TBuilderNation", "SetAITraining", 0, false, 0, nullptr},
+    // The AI's spying (SpySuccess for an AI spy: gun qualities copied silently); a joined player's nation spies as the
+    // player does, on the player's PC (nationplay.cpp).
+    {"TfrmBuildCamp", "CheckAISpying", 1, true, 0, nullptr},
 };
 
 extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
@@ -2492,8 +2848,41 @@ static bool Hook(void* target, void* detour, void** orig, const char* name) {
     return true;
 }
 
+// TEST ONLY (env RTW3MP_TEST_PREFS, docs/TESTING.md "Two-PC conditions"): this copy's own preferences without touching
+// the shared Preferences file. The game's reader (TdlgPrefs.LoadPrefs(Self, DoSetStyle), register arguments only) is
+// followed by the overrides; its writer (TdlgPrefs.SavePrefs(Self)) does nothing.
+extern "C" void* o_LoadPrefs = nullptr;
+extern "C" void* o_SavePrefs = nullptr;
+extern "C" void __stdcall CB_AfterLoadPrefs() {
+    try {
+        lockstep::ApplyTestSwitches("the game read its Preferences");
+    } catch (...) {
+    }
+}
+extern "C" void __stdcall CB_SavePrefsSkipped() {
+    Log("TEST: the game's Preferences writer skipped (RTW3MP_TEST_PREFS: this copy never writes the shared file)");
+}
+extern "C" __declspec(naked) void d_LoadPrefs() {
+    __asm {
+        call dword ptr [o_LoadPrefs]
+        push eax
+        call CB_AfterLoadPrefs
+        pop eax
+        ret
+    }
+}
+extern "C" __declspec(naked) void d_SavePrefs() {
+    __asm {
+        push eax
+        call CB_SavePrefsSkipped
+        pop eax
+        ret
+    }
+}
+
 bool InstallHooks() {
-    if (MH_Initialize() != MH_OK) {
+    MH_STATUS mh = MH_Initialize();  // (already initialized: the TEST file-open probe, datafiles::PocFileLog)
+    if (mh != MH_OK && mh != MH_ERROR_ALREADY_INITIALIZED) {
         Log("MH_Initialize failed");
         return false;
     }
@@ -2526,6 +2915,17 @@ bool InstallHooks() {
                 Hook(A.mStrategicTurn, (void*)&d_StrategicTurn, &o_StrategicTurn, "DoStrategicTurn");
     if (A.battles && A.mDoBattle) Hook(A.mDoBattle, (void*)&d_DoBattle, &o_DoBattle, "DoBattle");
     if (!A.battles) Log("Joined players' battles: UNAVAILABLE (hooks)");
+    if (A.relView) {  // a joined player's screen shows its own nation's relations
+        bool core = Hook(A.mShowTension, (void*)&d_ShowTension, &o_ShowTension, "ShowTensionLevels") &&
+                    Hook(A.mUpdateUIValues, (void*)&d_UpdateUI, &o_UpdateUI, "UpdateUIValues");
+        if (A.mSetValues) Hook(A.mSetValues, (void*)&d_SetValues, &o_SetValues, "SetValues");
+        if (A.mStrengthBars) Hook(A.mStrengthBars, (void*)&d_StrengthBars, &o_StrengthBars, "DrawAreaStrengthBars");
+        if (A.mNationData) Hook(A.mNationData, (void*)&d_NationData, &o_NationData, "TdlgNationData.Execute");
+        if (!core) {
+            A.relView = false;
+            Log("Relations view: UNAVAILABLE (hooks)");
+        }
+    }
     for (int i = 0; i < (int)(sizeof(g_skips) / sizeof(g_skips[0])); i++) {
         void* target = dl::Method(g_skips[i].cls, g_skips[i].method);
         void* thunk = target ? EmitSkipThunk(i) : nullptr;
@@ -2534,6 +2934,11 @@ bool InstallHooks() {
             continue;
         }
         Hook(target, thunk, &g_skips[i].orig, g_skips[i].method);
+    }
+    nplay::InstallHooks();
+    if (lockstep::TestPrefsWanted()) {  // TEST ONLY
+        Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");
+        Hook(dl::Method("TdlgPrefs", "SavePrefs"), (void*)&d_SavePrefs, &o_SavePrefs, "TdlgPrefs.SavePrefs (TEST)");
     }
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
         Log("MH_EnableHook failed");

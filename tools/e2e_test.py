@@ -155,7 +155,7 @@ def main():
     log('host sees Germany ResearchPct before turn:', hrp)
 
     cmd(C, 'submit')
-    wait(C, lambda s: s.get('submitted') == '1', 30, 'client submitted')
+    wait(C, lambda s: s.get('submitted') == '1' and s.get('submitting', '0') == '0', 30, 'client submitted')
     log('client submitted; host presses Turn')
     cmd(H, 'turn')
     t0 = time.time()

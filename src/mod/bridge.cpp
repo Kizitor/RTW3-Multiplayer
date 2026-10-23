@@ -5,14 +5,18 @@
 #include "delphi.h"
 #include "game.h"
 #include "lockstep.h"
+#include "nationplay.h"
 #include "net.h"
 #include "poc_battle.h"
 #include "session.h"
 #include "ui.h"
 #include <thread>
+#include <atomic>
 #include <condition_variable>
 
 static std::string ExecuteOnMain(const std::string& line);
+// `submit` runs asynchronously (the Turn's questions may show): status reports submitting=1 until it has returned.
+static std::atomic<int> g_submitting{0};
 
 // Runs a command on the game's main thread and waits for the reply. The job owns a copy of the line and shares
 // its state with the waiter, so a job that only starts after the waiter gave up is skipped safely.
@@ -106,6 +110,21 @@ static std::string Execute(const std::string& line) {
         RunOnMainThread([idx] { mp::DebugEvent(idx); });
         return "ok";
     }
+    // submit: the client's Submit, which may ask the game's Turn questions (trade protection, foreign stations) first.
+    if (cmd == "submit") {
+        g_submitting++;
+        RunOnMainThread([] {
+            struct Done {
+                ~Done() { g_submitting--; }
+            } done;
+            mp::SubmitTurn();
+        });
+        return "ok";
+    }
+    if (cmd == "intelcheck") {  // client: the monthly intelligence check now (the game's spy dialogs may show)
+        if (game::EventActive()) return "error an event dialog is open";
+        return RunOnMainThread([] { mp::DebugIntelCheck(); }), "ok";
+    }
     if (cmd == "windows") {
         std::string out;
         EnumWindows(ListWin, (LPARAM)&out);
@@ -127,7 +146,7 @@ static std::string ExecuteOnMain(const std::string& line) {
     const std::string& cmd = args[0];
     auto arg = [&](size_t i, const std::string& def = "") { return i < args.size() ? args[i] : def; };
     // While a joined player's event dialog is open the nation list is reordered: only read-only commands.
-    static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview"};
+    static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview", "relview"};
     if (game::EventActive() && !kReadOnly.count(cmd)) return "error an event dialog is open";
     if (cmd.compare(0, 3, "poc") == 0) return poc::Command(args);  // research POC (battles), see poc_battle.cpp
     {
@@ -143,6 +162,7 @@ static std::string ExecuteOnMain(const std::string& line) {
             kv["status"] = v.status;
             kv["players"] = std::to_string(v.players.size());
             kv["submitted"] = v.submitted ? "1" : "0";
+            kv["submitting"] = g_submitting > 0 ? "1" : "0";
             kv["remaining"] = std::to_string(v.remainingSec);
             kv["campaignReady"] = v.campaignReady ? "1" : "0";
             kv["slot"] = std::to_string(game::CurrentSlot());
@@ -180,7 +200,6 @@ static std::string ExecuteOnMain(const std::string& line) {
             return mp::ClaimNation(a), "ok";
         }
         if (cmd == "release") return mp::ReleaseNation(atoi(arg(1).c_str())), "ok";
-        if (cmd == "submit") return mp::SubmitTurn(), "ok";
         if (cmd == "limit") return mp::SetTurnLimit(atoi(arg(1).c_str())), "ok";
         if (cmd == "chat") return mp::SendChat(line.size() > 5 ? line.substr(5) : ""), "ok";
         if (cmd == "turn") return game::ClickTurnButton(), "ok";
@@ -269,6 +288,14 @@ static std::string ExecuteOnMain(const std::string& line) {
             int unique = 0, count = game::IntelReportCount(&unique);
             return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count) + " unique=" + std::to_string(unique);
         }
+        // Per-player intelligence and trade protection (nationplay.cpp).
+        if (cmd == "intelinfo") return nplay::IntelInfo();  // fields, cost, labels, reports (+ the host's records)
+        if (cmd == "tradecheck") return nplay::TradeCheck(atoi(arg(1, "0").c_str()));  // [nation]: patrols, stations
+        if (cmd == "shipstatus")  // shipstatus <nation> <ship> [status]: a ship's TShipStatus (6 = foreign stations)
+            return nplay::ShipStatus(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3, "-1").c_str()));
+        if (cmd == "intelbtn") return nplay::IntelButton(atoi(arg(1).c_str()));  // <tag>: the panel's +/- button
+        if (cmd == "fsmonth")  // fsmonth <nation> [count]: host, the month's foreign stations/patrols check for it now
+            return nplay::MonthCheckRun(atoi(arg(1).c_str()), std::max(1, std::min(50, atoi(arg(2, "1").c_str()))));
         if (cmd == "airunits") {  // airunits: the air units in the game's global list (all nations)
             int count = game::AirUnitCount();
             return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count);
@@ -315,6 +342,7 @@ static std::string ExecuteOnMain(const std::string& line) {
                    " ally=" + std::to_string(game::AllianceMonths(a, b)) + " warCounter=" +
                    std::to_string(game::WarCounter()) + " hostWars=" + std::to_string(game::CountAtWarWithHost());
         }
+        if (cmd == "relview") return game::DebugRelView();  // what the tension panel and the war state show
         if (cmd == "diploview") {
             mp::View v = mp::GetView();
             std::string s = std::string("open=") + (v.diploOpen ? "1" : "0") + " note=" + v.diploNote + " rows=";

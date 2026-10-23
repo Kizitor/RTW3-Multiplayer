@@ -16,7 +16,7 @@ The game is driven only through the test bridge and posted window messages: the 
 never used and the screen is never captured. Exit code: 0 = every check passed, 1 = a check failed or the saves
 could not be restored, 2 = not started (precondition).
 """
-import argparse, calendar, contextlib, ctypes, ctypes.wintypes as wt, hashlib, math, os, random, re, shutil, struct, subprocess, sys, tempfile, threading, time
+import argparse, calendar, contextlib, ctypes, ctypes.wintypes as wt, hashlib, math, os, random, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_test  # noqa: E402
@@ -129,6 +129,199 @@ def row(port, nation):
                     d['outlook'] = x
             return d
     return None
+
+
+def relview(port):
+    """`relview` (0.4.1): what the strategic screen's tension panel and war state show now -> dict(shown = the nation the
+    PC plays when it is not nation 0, slots={i: dict(flag, hint, war, ally, block)}, box = the "War results" box visible,
+    line_visible, line = the war line under the player's name, hint = the name's hint), or None."""
+    r = cmd(port, 'relview')
+    m = re.match(r'^ok shown=(-?\d+) slots=(.*?) war=([01])([01])~(.*)~(.*)$', r)
+    if not m:
+        return None
+    slots = {}
+    for part in m[2].split('; '):
+        f = part.strip().rstrip(';').split('~')
+        if len(f) == 3 and ':' in f[0] and f[0].split(':', 1)[0].isdigit():
+            i, flag = f[0].split(':', 1)
+            slots[int(i)] = dict(flag=flag, hint=f[1], war=f[2][0:1] == '1', ally=f[2][1:2] == '1',
+                                 block=f[2][2:3] == '1')
+    return dict(shown=int(m[1]), slots=slots, box=m[3] == '1', line_visible=m[4] == '1', line=m[5], hint=m[6], raw=r)
+
+
+def relview_check(name, port, me):
+    """0.4.1: the tension panel of the PC playing nation `me` (0 = the host) shows `me`'s relations: slot i = nation i,
+    slot `me` = nation 0 (the host's nation), each with its flag's name, "Tension with <name> is <t>" or "You are at war
+    with <name>", and its war and alliance marks, from `rel me j` on that PC; on a joined player's PC the war state follows
+    its own wars ("War results" box, "At war with <name>." or "At war with N nations.", else the hint "At peace.")."""
+    names = {}
+    for p in items(cmd(port, 'nations')):
+        f = p.split(':')
+        if len(f) > 1 and f[0].isdigit():
+            names[int(f[0])] = f[1]
+    rv = relview(port)
+    bad, enemies = [], []
+    for slot in range(1, 9):
+        n = 0 if slot == me else slot
+        r = cmd(port, f'rel {me} {n}')
+        rd = dict(kv.split('=') for kv in r[3:].split()) if r.startswith('ok') else {}
+        nm, t, war, ally = names.get(n, '?'), rd.get('tension'), rd.get('war') == '1', rd.get('ally', '0') != '0'
+        if war:
+            enemies.append(nm)
+        s = (rv or {}).get('slots', {}).get(slot)
+        want = f'You are at war with {nm}' if war else f'Tension with {nm}'
+        ok = s and s['flag'].startswith(nm) and s['hint'].startswith(want) and s['war'] == war and s['ally'] == ally and \
+            (war or re.search(rf' is {t}(\D|$)', s['hint']))
+        if not ok:
+            bad.append((slot, n, nm, t, war, ally, s))
+    if me > 0 and rv:
+        line = f'At war with {enemies[0]}.' if len(enemies) == 1 else f'At war with {len(enemies)} nations.'
+        if rv['box'] != bool(enemies) or rv['line_visible'] != bool(enemies) or (enemies and rv['line'] != line) or \
+                (not enemies and rv['hint'] != 'At peace.'):
+            bad.append(('war state', enemies, rv['box'], rv['line_visible'], rv['line'], rv['hint']))
+    return check(name, rv is not None and rv['shown'] == me and not bad, dict(bad=bad, relview=rv and rv['raw'][:300]))
+
+
+INTEL_LEVELS = ('None', 'Low', 'Med', 'High')  # IntelToString: IntelligenceSpending 0..3, " *" while IntelEffort < it
+
+
+def parse_intelinfo(r):
+    """`intelinfo` (0.4.1) -> dict(fields={nation index: (IntelligenceSpending, IntelEffort)} as this PC holds them (on
+    a joined player's PC its own spending on each nation, its own nation's pair 0), cost = the budget's Intelligence line
+    (GetIntelCostForPlayerNation through the hook), labels = [IntelToString(slot) for the politics panel's slots 1..8,
+    through the hook: the text ShowTensionLevels puts under each flag], reports, client = the player's own intelligence
+    is on), or None."""
+    m = re.match(r'^ok fields=(\S+) cost=(-?\d+) .*? labels=(.*?) reports=(\d+) client=([01])', r or '')
+    if not m:
+        return None
+    fields = {}
+    for part in m[1].split(','):
+        f = re.match(r'^(\d+):(-?\d+)/(-?\d+)$', part)
+        if not f:
+            return None
+        fields[int(f[1])] = (int(f[2]), int(f[3]))
+    return dict(fields=fields, cost=int(m[2]), labels=m[3].split('|'), reports=int(m[4]), client=m[5] == '1', raw=r)
+
+
+def intel_label_ok(label, spend, effort):
+    """IntelToString's text for a spending level: None/Low/Med/High, with " *" while the effort is below it."""
+    return 0 <= spend < len(INTEL_LEVELS) and label.replace('*', '').strip() == INTEL_LEVELS[spend] and \
+        ('*' in label) == (effort < spend)
+
+
+def intel_panel_bad(me, names, rv, ii):
+    """The politics panel of the PC playing nation `me` (0 = the host): slot i shows nation n = i, slot `me` the host's
+    nation 0 (the player's own nation in no slot). The flag (`relview`) names n and the intelligence label (`intelinfo`)
+    is this PC's own spending on n; a joined player's own intelligence is on (client=1), its own nation's pair is 0.
+    -> the list of problems (empty: right)."""
+    if rv is None or ii is None:
+        return [('no reply', rv is not None, ii is not None)]
+    bad = []
+    for slot in range(1, 9):
+        n = 0 if slot == me else slot
+        s = rv['slots'].get(slot)
+        if not s or not s['flag'].startswith(names.get(n, '?')) or (me and s['flag'].startswith(names.get(me, '?'))):
+            bad.append(('flag', slot, n, s and s['flag']))
+        sp, ef = ii['fields'].get(n, (-1, -1))
+        lab = ii['labels'][slot - 1] if len(ii['labels']) >= slot else None
+        if lab is None or not intel_label_ok(lab, sp, ef):
+            bad.append(('label', slot, n, lab, sp, ef))
+    if len(ii['labels']) != 8:
+        bad.append(('labels', len(ii['labels'])))
+    if ii['client'] != bool(me):
+        bad.append(('client', ii['client']))
+    if me and ii['fields'].get(me) != (0, 0):
+        bad.append(('own nation\'s pair', ii['fields'].get(me)))
+    return bad
+
+
+def nation_names(port):
+    names = {}
+    for p in items(cmd(port, 'nations')):
+        f = p.split(':')
+        if len(f) > 1 and f[0].isdigit():
+            names[int(f[0])] = f[1]
+    return names
+
+
+def intel_panel_check(name, port, me):
+    """0.4.1: the relations view (fix-strat) and the player's own intelligence (fix-intel) together (intel_panel_bad)."""
+    names, rv, ii = nation_names(port), relview(port), parse_intelinfo(cmd(port, 'intelinfo'))
+    bad = intel_panel_bad(me, names, rv, ii)
+    return check(name, not bad, dict(bad=bad, labels=ii and ii['labels'], fields=ii and ii['fields'],
+                                     flags=rv and {i: s['flag'][:20] for i, s in rv['slots'].items()}))
+
+
+def panel_intel_texts(pid):
+    """The politics panel's 8 intelligence labels as the strategic screen shows them: the `stIntel1..8` TStaticText
+    windows of TfrmBuildCamp (one row under the flags, read cross-process with WM_GETTEXT), left to right = slots 1..8;
+    None when they are not found as one row of 8."""
+    top = next((h for h in top_windows(pid) if e2e_test.class_name(h) == 'TfrmBuildCamp'), None)
+    row = []
+    for h in children(top) if top else []:
+        t = e2e_test.window_text(h)
+        if e2e_test.class_name(h) != 'TStaticText' or t.replace('*', '').strip() not in INTEL_LEVELS:
+            continue
+        r = wt.RECT()
+        u.GetWindowRect(h, ctypes.byref(r))
+        if r.right - r.left < 80:  # not the budget's wide labels
+            row.append((r.top, r.left, t.strip()))
+    if len(row) != 8 or len({y for y, _, _ in row}) != 1:
+        return None
+    return [t for _, _, t in sorted(row, key=lambda v: v[1])]
+
+
+def intel_buttons_check(name, port, pid, me, other):
+    """0.4.1: on the PC playing nation `me` (a joined player), the politics panel's +/- buttons (`intelbtn <tag>`: the
+    button's OnClick; tag t raises, t+8 lowers slot t) change the player's own spending on the nation the slot shows:
+    under the host's flag (slot `me`) on the host's nation 0, under slot `other`'s on nation `other`; nothing else
+    changes, the slot's label and the budget's Intelligence cost follow, the log has "intel: spending on <nation> a -> b";
+    in each raised state the whole panel passes intel_panel_bad (the raised slot's nation differs from the player's own,
+    so a label of the wrong nation shows) and the labels the screen shows (`panel_intel_texts`, slot order) are those of
+    `intelinfo`; each change is put back at once (the month's state as before)."""
+    names, mark = nation_names(port), log_mark(port)
+    base = parse_intelinfo(cmd(port, 'intelinfo'))
+    if base is None:
+        return check(name, False, 'no intelinfo')
+    bad, seen, want_lines = [], [], []
+    for slot in (me, other):
+        n = 0 if slot == me else slot
+        s0 = base['fields'].get(n, (-1, 0))[0]
+        up = s0 < 3
+        first, back = (slot, slot + 8) if up else (slot + 8, slot)
+        want = s0 + (1 if up else -1)
+        r1 = cmd(port, f'intelbtn {first}')
+        a = parse_intelinfo(cmd(port, 'intelinfo'))
+        time.sleep(0.5)
+        shown = panel_intel_texts(pid) if pid else None
+        panel = intel_panel_bad(me, names, relview(port), a)
+        r2 = cmd(port, f'intelbtn {back}')
+        b = parse_intelinfo(cmd(port, 'intelinfo'))
+        seen.append((slot, n, r1, r2, a and a['fields'].get(n), a and a['labels'][slot - 1], shown, a and a['cost'],
+                     base['cost']))
+        if not (r1.startswith('ok') and r2.startswith('ok') and a and b):
+            bad.append(('reply', slot, r1, r2))
+            continue
+        if a['fields'].get(n, (-1, 0))[0] != want or any(a['fields'][j] != base['fields'][j] for j in base['fields']
+                                                          if j != n):
+            bad.append(('spending', slot, n, base['fields'], a['fields']))
+        if not intel_label_ok(a['labels'][slot - 1], want, a['fields'][n][1]) or \
+                any(a['labels'][i] != base['labels'][i] for i in range(8) if i != slot - 1):
+            bad.append(('labels', slot, base['labels'], a['labels']))
+        if panel:
+            bad.append(('panel while raised', slot, panel))
+        if shown != [x.strip() for x in a['labels']]:
+            bad.append(('shown on the screen', slot, shown, a['labels']))
+        if (a['cost'] > base['cost']) != up or a['cost'] == base['cost']:
+            bad.append(('cost', slot, base['cost'], a['cost']))
+        if (b['fields'], b['labels'], b['cost']) != (base['fields'], base['labels'], base['cost']):
+            bad.append(('not put back', slot, b['fields'], b['labels'], b['cost']))
+        want_lines += [(names.get(n, '?'), s0, want), (names.get(n, '?'), want, s0)]
+    got = [(m[1], int(m[2]), int(m[3])) for m in (re.search(r'intel: spending on (.+?) (\d+) -> (\d+)$', x)
+                                                  for x in ls_lines(port, mark, r'intel: spending on ')) if m]
+    if len(got) != len(want_lines) or any(not g[0].startswith(w[0]) or g[1:] != w[1:] for g, w in zip(got, want_lines)):
+        bad.append(('log', want_lines, got))
+    return check(name, not bad, dict(bad=bad, seen=seen))
 
 
 def designs(port, nation):
@@ -268,18 +461,26 @@ def answer_dialogs(pid, who):
         k = e2e_test.class_name(top)
         if k == 'TMessageForm' or k.startswith('Tdlg') or k in ('TfrmBuildCamp', 'RTW3MP_Window'):
             continue
+        # the aircraft types screen as the month's question (1935, after a private venture aircraft was bought: "Do you
+        # want to continue development of the aircraft type at the top of the list for 640?", Save to file/No/OK): No
+        want = ('not now', 'no') if k == 'TfrmAircraftTypes' and u.IsWindowVisible(top) and \
+            e2e_test.window_text(top).startswith('Do you want to continue development') else ('not now',)
         found = []
 
         def ccb(h, l):
             if u.IsWindowVisible(h) and u.IsWindowEnabled(h) and e2e_test.class_name(h) in ('TButton', 'TBitBtn') \
-                    and e2e_test.window_text(h).replace('&', '').strip().lower() == 'not now':
+                    and e2e_test.window_text(h).replace('&', '').strip().lower() in want:
                 found.append(h)
             return True
 
         u.EnumChildWindows(top, e2e_test.EnumProc(ccb), 0)
         if found:
             u.PostMessageW(found[0], 0x00F5, 0, 0)  # BM_CLICK
-            log(f'  {who} dialog answered: {k}:"{e2e_test.window_text(top)[:40]}"->Not now')
+            what = e2e_test.window_text(found[0]).replace('&', '').strip()
+            c = f'{k}:"{e2e_test.window_text(top)[:40]}"->{what}'
+            if what == 'No':
+                ANSWERED.append((time.time(), who, c))
+            log(f'  {who} dialog answered: {c}' + (f' (text: {e2e_test.window_text(top)[:120]!r})' if what == 'No' else ''))
 
 
 def answer_host_box(pid):
@@ -332,6 +533,12 @@ def intel(port):
 
 def intel_clean(c):
     return c[0] is not None and c[0] == c[1] and c[1] > 0
+
+
+def intel_clean_own(c):
+    """A joined player's list: no empty or repeated entries. Since 0.4.1 it holds the player's own reports (the host's
+    stay on the host), so it may be empty."""
+    return c[0] is not None and c[0] == c[1]
 
 
 def save_path(slot):
@@ -417,7 +624,18 @@ def month_checks(ctx, label, mark, cmark=None):
     event once (0.2.4; at chance 0 the roll finds no event)."""
     prev, s = ctx.intel_prev, intel_snapshot(ctx, mark, label)
     check(f'{label}: host intel list has no empty or repeated entries', intel_clean(s['host']), s['host'])
-    check(f'{label}: client intel list has no empty or repeated entries', intel_clean(s['client']), s['client'])
+    # Since 0.4.1 the joined player's own monthly check runs the game's CheckIntelligence on its PC, which can add a report
+    # it already has (dist_rc041_2 --stress run: "spy event, 4 new reports", 11 entries, 10 distinct; the mod adds none
+    # itself, and the next load drops repeats, 0.2.2): a repeat among that check's new reports is the game's own
+    newr = [int(x) for x in re.findall(r'intel: monthly check for nation \d+: (?:no )?spy event, (\d+) new reports',
+                                       log_since(C))[-1:]]
+    rep_c = s['client'][0] - s['client'][1] if None not in s['client'] else None
+    own_rep = not intel_clean_own(s['client']) and rep_c is not None and newr and 0 < rep_c <= newr[0]
+    if own_rep:
+        log(f'  NOTE {label}: the client\'s list repeats {rep_c} entr{"y" if rep_c == 1 else "ies"} among the {newr[0]} '
+            f'new reports of its own monthly check (the game\'s CheckIntelligence)')
+    check(f'{label}: client intel list has no empty or repeated entries (but a repeat among its own monthly check\'s new '
+          f'reports)', intel_clean_own(s['client']) or own_rep, f'{s["client"]}; its check\'s new reports {newr}')
     gh = s['host'][0] - prev['host'][0] if prev and None not in (s['host'][0], prev['host'][0]) else None
     gc = s['client'][0] - prev['client'][0] if prev and None not in (s['client'][0], prev['client'][0]) else None
     check(f'{label}: intel reports grow by at most {INTEL_GROWTH_MAX} a month',
@@ -488,7 +706,9 @@ def run_month(ctx, label, driver=None, slot=HOST_SLOT, checks=True):
         log(f'  WARNING: the host nation is at war (warCounter={war}); the month may start a tactical battle')
     t0 = time.time()
     cmd(C, 'submit')
-    wait(C, lambda s: s.get('submitted') == '1', 30, 'client submitted', pids=(ctx.hp, ctx.cp))
+    # (since 0.4.1 `submit` is asynchronous: its Turn questions may show; submitting=1 until it has returned)
+    wait(C, lambda s: s.get('submitted') == '1' and s.get('submitting', '0') == '0', 30, 'client submitted',
+         pids=(ctx.hp, ctx.cp))
     wait(H, lambda s: 'All players are ready' in s.get('status', ''), 30, 'host sees everyone ready',
          pids=(ctx.hp, ctx.cp))
     log(f'  [General] before the turn: slot {slot} {gen_date(slot)}, slot {CLIENT_SLOT} (submitted) '
@@ -606,6 +826,9 @@ def scenario_session(ctx):
     st = wait(C, lambda s: s.get('phase') == 'planning' and s.get('playerIdx') == '1' and
               s.get('slot') == str(CLIENT_SLOT), 120, 'client planning as nation 1', pids=(ctx.hp, ctx.cp))
     check('client plans nation 1 in slot 77', True, st.get('date'))
+    # 0.4.1: the month's roll at chance 0 finds no event and runs the client's spy check, whose game dialogs (a spy's
+    # TdlgPictureMessage, then TdlgShipStatus) block the client's bridge until answered: wait for the roll's line
+    wait_event_roll(ctx, 0)
     time.sleep(1)
     au = {who: (airunits(port), saved_airunits(slot), ls_lines(port, 0, r'air units: |' + AIR_BAD_RE))
           for who, port, slot in (('host', H, HOST_SLOT), ('client', C, CLIENT_SLOT))}
@@ -627,6 +850,19 @@ def scenario_session(ctx):
     cmd(C, 'mpwindow')
     time.sleep(1.5)
     check('client Multiplayer window open (chat log readable)', mp_window(ctx.cp) is not None)
+    relview_check('0.4.1 the joined player\'s screen shows its own nation\'s relations (`relview` on the client: slot 1 = '
+                  'the host\'s nation, every slot its relation with nation 1, its war state)', C, 1)
+    relview_check('0.4.1 the host\'s screen shows its own relations as before (`relview` on the host)', H, 0)
+    intel_panel_check('0.4.1 the relations view and the player\'s own intelligence together on the joined player\'s PC '
+                      '(`relview` + `intelinfo` on the client): every slot\'s flag and intelligence label name the same '
+                      'nation, slot 1 (the host\'s flag) shows the player\'s own spending on the host\'s nation, the '
+                      'player\'s own nation in no slot, client=1', C, 1)
+    intel_buttons_check('0.4.1 the joined player\'s +/- buttons (`intelbtn` on the client) change its own spending on '
+                        'the nation under the flag: slot 1 (the host\'s flag) on nation 0, slot 3 on nation 3; label, '
+                        'cost and log follow, the whole panel right while raised and the screen\'s labels '
+                        '(`stIntel1..8`) the same; put back', C, ctx.cp, 1, 3)
+    intel_panel_check('0.4.1 the host\'s politics panel as before (`relview` + `intelinfo` on the host): slot i = '
+                      'nation i, the host\'s own spending, client=0', H, 0)
     log('month:', st.get('date'), '| nations:', cmd(H, 'nations')[3:160])
 
 
@@ -664,7 +900,7 @@ def scenario_intel_reports(ctx):
     s = ctx.intel_hist[0] if ctx.intel_hist else None
     if not check('session start: intel snapshot taken', s, s['label'] if s else 'no snapshot (the session did not start?)'):
         return
-    check('session start: the client\'s intel list has no empty or repeated entries', intel_clean(s['client']),
+    check('session start: the client\'s intel list has no empty or repeated entries', intel_clean_own(s['client']),
           s['client'])
     check('session start: host save [IntelReports] has no empty or repeated entries (saved at the start)',
           saved_clean(s['host_file']), s['host_file'])
@@ -819,6 +1055,18 @@ def screen_top(h):
 
 def event_dialogs(pid):
     return [h for h in windows_of(pid, 'TdlgEventAnswer') if u.IsWindowVisible(h)]
+
+
+# Since 0.4.1 a joined player's month runs the player's own spying when its roll finds no event (the game's other
+# branch of the event slot), before the roll's log line; the spy-caught questions are TdlgEventAnswer dialogs too.
+INTEL_ANSWERS = ('Give it maximum publicity', 'Handle it quietly and discreetly', 'Deny any involvement',
+                 'Make the agent a national hero')
+
+
+def event_seen(seen):
+    """The random events among answered TdlgEventAnswer dialogs [(title, answers, chosen)], without the
+    intelligence check's spy-caught questions."""
+    return [s for s in (seen or []) if not any(str(a).startswith(INTEL_ANSWERS) for a in (s[1] or []))]
 
 
 def select_first_answer(pid):
@@ -1046,6 +1294,12 @@ def scenario_events(ctx):
     idx = rearm['idx']
 
     # b) before
+    # 0.4.1 (fix-intel): the session start's roll found no event, so the client ran its spy check (the game's monthly
+    # event slot: an event or CheckIntelligence); a result with something in it went to the host as the month's event
+    # (event=-1), and the host then ignores any other event of this month, the forced one too
+    spy = log_lines(log_since(H), r"event of Captain \(nation 1, #-1 'Intelligence'\)")
+    if not spy and log_lines(log_since(C), r'intel: monthly check for nation 1: spy event'):
+        spy = wait_log(H, 0, r"event of Captain \(nation 1, #-1 'Intelligence'\)", 10)
     h0, c0 = host_event_view(), client_event_view()
     log(f'  before event #{idx}: host nation 1 Prestige {h0["P"]} BudgetModifier {h0["B"]} eventlast "{h0["last"]}"; '
         f'client Prestige {c0["P"]} BudgetModifier {c0["B"]} playerIdx {c0["playerIdx"]} nations {c0["names"]}')
@@ -1078,33 +1332,49 @@ def scenario_events(ctx):
     delta = cl['delta'] if cl else {}
     db = delta.get('BudgetModifier', 0)
     check('client eventlast: delta Prestige:1', delta.get('Prestige') == 1, ev['last'])
-    hl = wait_log(H, hmark, rf'event of Captain \(nation 1, #{idx}\b', 10)
-    h1, c1 = host_event_view(), client_event_view()
-    he = parse_host_event(h1['last'])
-    a = int(h0['rel'][(1, j)][0]) if (1, j) in h0['rel'] else None
-    b = None if a is None else a if a > 40 else max(0, min(40, a + max(-20, min(20, dt))))
-    want = [(1, j, a, b)] if a is not None and a <= 40 else []
-    check(f'host eventlast: nation=1 event={idx} tension 1-{j} {a}->{b} (b = clamp(a{dt:+d}, 0, 40))' if dt else
-          f'host eventlast: nation=1 event={idx} with the relation change',
-          he and he['nation'] == 1 and he['event'] == idx and a is not None and he['tension'] == want, h1['last'])
-    t1 = h1['rel'].get((1, j))
-    check(f'host rel 1 {j}: tension {b}, war and alliance unchanged',
-          t1 and b is not None and int(t1[0]) == b and t1[1:] == h0['rel'][(1, j)][1:], f'{h0["rel"].get((1, j))} -> {t1}')
-    changed = {f'{k[0]}-{k[1]}': (h0['rel'][k], h1['rel'][k]) for k in h0['rel'] if k != (1, j) and
-               h0['rel'][k] != h1['rel'][k]}
-    check('host: every other recorded pair unchanged (nation 1 with the others, the host nation with 2-8)',
-          not changed, changed)
-    check(f'host nation 1: Prestige +1 and BudgetModifier {db:+d} (as reported)',
-          None not in (h0['P'], h1['P'], h0['B'], h1['B']) and h1['P'] == h0['P'] + 1 and h1['B'] == h0['B'] + db
-          and he and he['delta'].get('Prestige') == 1,
-          f'Prestige {h0["P"]} -> {h1["P"]}, BudgetModifier {h0["B"]} -> {h1["B"]}; host eventlast {h1["last"]}')
-    check('client nation 1 Prestige equals the host\'s', c1['P'] is not None and c1['P'] == h1['P'],
-          f'client {c1["P"]} (BudgetModifier {c1["B"]}), host {h1["P"]} ({h1["B"]})')
+    if spy:
+        ign = wait_log(H, hmark, r'second event of Captain in .* ignored \(one per month\)', 10)
+        hl = log_lines(log_since(H, hmark), rf'event of Captain \(nation 1, #{idx}\b')
+        h1, c1 = host_event_view(), client_event_view()
+        changed = {f'{k[0]}-{k[1]}': (h0['rel'][k], h1['rel'][k]) for k in h0['rel'] if h0['rel'][k] != h1['rel'][k]}
+        check(f'0.4.1: the client\'s spy check of this month reached the host first (the game\'s monthly event slot is an '
+              f'event or the intelligence check): the forced event #{idx} is the month\'s second, ignored on the host '
+              f'("second event of Captain in <date> ignored (one per month)"), the host\'s nation 1 and relations '
+              f'unchanged (the client\'s own fields reach the host with its turn)',
+              len(ign) == 1 and not hl and (h1['P'], h1['B']) == (h0['P'], h0['B']) and not changed,
+              f'{spy[:1]} {ign} {hl} P {h0["P"]}->{h1["P"]} B {h0["B"]}->{h1["B"]} {changed}')
+        log(f'  SKIP the forced event\'s application on the host in this month: the month\'s event was the spy check\'s '
+            f'(event=-1); the event path is checked again by the random path below')
+    else:
+        hl = wait_log(H, hmark, rf'event of Captain \(nation 1, #{idx}\b', 10)
+        h1, c1 = host_event_view(), client_event_view()
+        he = parse_host_event(h1['last'])
+        a = int(h0['rel'][(1, j)][0]) if (1, j) in h0['rel'] else None
+        b = None if a is None else a if a > 40 else max(0, min(40, a + max(-20, min(20, dt))))
+        want = [(1, j, a, b)] if a is not None and a <= 40 else []
+        check(f'host eventlast: nation=1 event={idx} tension 1-{j} {a}->{b} (b = clamp(a{dt:+d}, 0, 40))' if dt else
+              f'host eventlast: nation=1 event={idx} with the relation change',
+              he and he['nation'] == 1 and he['event'] == idx and a is not None and he['tension'] == want, h1['last'])
+        t1 = h1['rel'].get((1, j))
+        check(f'host rel 1 {j}: tension {b}, war and alliance unchanged',
+              t1 and b is not None and int(t1[0]) == b and t1[1:] == h0['rel'][(1, j)][1:],
+              f'{h0["rel"].get((1, j))} -> {t1}')
+        changed = {f'{k[0]}-{k[1]}': (h0['rel'][k], h1['rel'][k]) for k in h0['rel'] if k != (1, j) and
+                   h0['rel'][k] != h1['rel'][k]}
+        check('host: every other recorded pair unchanged (nation 1 with the others, the host nation with 2-8)',
+              not changed, changed)
+        check(f'host nation 1: Prestige +1 and BudgetModifier {db:+d} (as reported)',
+              None not in (h0['P'], h1['P'], h0['B'], h1['B']) and h1['P'] == h0['P'] + 1 and h1['B'] == h0['B'] + db
+              and he and he['delta'].get('Prestige') == 1,
+              f'Prestige {h0["P"]} -> {h1["P"]}, BudgetModifier {h0["B"]} -> {h1["B"]}; host eventlast {h1["last"]}')
+        check('client nation 1 Prestige equals the host\'s', c1['P'] is not None and c1['P'] == h1['P'],
+              f'client {c1["P"]} (BudgetModifier {c1["B"]}), host {h1["P"]} ({h1["B"]})')
     check('client nation list order and player index restored', c1['names'] == c0['names'] and c1['playerIdx'] == '1',
           f'{c0["names"]} -> {c1["names"]}, playerIdx {c1["playerIdx"]}')
     cline = log_lines(log_since(C, cmark), rf'\] event {idx} for nation 1: ')
     check(f'client log: "event {idx} for nation 1: ..."', len(cline) == 1, cline)
-    check(f'host log: "event of Captain (nation 1, #{idx} ..."', len(hl) == 1, hl)
+    if not spy:
+        check(f'host log: "event of Captain (nation 1, #{idx} ..."', len(hl) == 1, hl)
     log('  ', [x.split('] ', 1)[-1] for x in cline + hl])
     log(f'  host after the event: Prestige {h1["P"]} BudgetModifier {h1["B"]}; relations {fmt_rel(h1["rel"])}')
 
@@ -1268,7 +1538,8 @@ def scenario_events(ctx):
             check(f'war rule ({label}): nation 1 at war, the month\'s roll at chance 100 finds no event (`event: no '
                   f'event this month`, eventlast none, no dialog); a random `eventnow` adds none',
                   wst['pre'] == 'ok' and at_war and roll.get('rolls') == ['event: no event this month']
-                  and not roll.get('seen') and last == 'none' and rn == 'ok' and not seen_dlg and len(now) == 1
+                  and not event_seen(roll.get('seen')) and last == 'none' and rn == 'ok' and not seen_dlg
+                  and len(now) == 1
                   and now[0] in ('event: this month was already rolled', 'event: no event this month'),
                   f'eventchance 100: {wst["pre"]}; war 0-1 {r01.get("war")}, 1-2 {r12.get("war")}; roll '
                   f'{roll.get("rolls")}, dialogs {roll.get("seen")}; eventlast {last}; eventnow {rn} -> {now}, '
@@ -4850,7 +5121,7 @@ class BattleDriver:
                 s1 = read_save(save_path(HOST_SLOT))
                 if s1 and 'General' in s1 and f'Nation{self.J}Ships' in s1:
                     self.s1[int(b)] = s1
-        for b in re.findall(r'\] battle (\d+): (fought|declined|nobattle|failed|finished)', c):  # before the next one
+        for b in re.findall(r'\] battle (\d+): (fought|declined|nobattle|avoided|failed|finished)', c):  # before the next one
             r2 = self.r(int(b[0]))
             if 'done' not in r2:
                 r2['done'], r2['outcome'] = time.time(), b[1]
@@ -5054,7 +5325,8 @@ def scenario_battles(ctx):
         log(f'  no battle fought (attempt {attempt}): {[(b, r.get("outcome")) for b, r in drv.rec.items()]}; host: '
             f'{log_lines(log_since(H, drv.hmark), r"battle \d+: resolved")}')
     check('b) a battle fought on the client (attempts: id, action, outcome; "nobattle" = the game found no battle, '
-          'e.g. the AI avoided it)', fought, att)
+          '"avoided" = the enemy declined battle: since 0.4.1 its VP gain is merged and the game resolves nothing)', fought,
+          att)
     if fought:
         battle_fought_checks(ctx, K, J, area, me, them, *fought)
     report_unplanned()
@@ -5239,12 +5511,38 @@ def battle_fought_checks(ctx, K, J, area, me, them, bid, drv, date0, date1):
             f'{missing2[:5]}')
     if ap:
         vp_k, vp_j, pres = int(ap[5]), int(ap[6]), int(ap[7])
+        # the month's battles merged before this one are in the merged save as well (since 0.4.1 an avoided battle's VP
+        # gain is merged: dist_rc041_2's --stress run, battle 1 "avoided" with VP 360/0 merged before battle 2)
+        inj = {}
+        for x in log_lines(log_since(H), r'battle request \d+ injected: nation \d+ vs \d+'):
+            mi = re.search(r'battle request (\d+) injected: nation (\d+) vs (\d+)', x)
+            if mi:
+                inj[mi[1]] = (int(mi[2]), int(mi[3]))
+        prior, unknown = [], []
+        for x in log_lines(hlog, r'battle \d+ applied: '):
+            mi = re.search(APPLIED_RE, x)
+            if not mi:
+                continue
+            if mi[1] == str(bid):
+                break
+            if inj.get(mi[1]) == (K, J):
+                prior.append((int(mi[5]), int(mi[6]), int(mi[7]), mi[1]))
+            else:
+                unknown.append(x)
+        vp_k += sum(p[0] for p in prior)
+        vp_j += sum(p[1] for p in prior)
+        pres += sum(p[2] for p in prior)
         num = lambda d, n, k: int((d.get(f'Nation{n}') or {}).get(k, 0) or 0)  # noqa: E731
         b = (num(s0, K, 'VP'), num(s0, J, 'VP'), num(s0, K, 'Prestige'))
         m1 = (num(s1, K, 'VP'), num(s1, J, 'VP'), num(s1, K, 'Prestige'))
-        check(f'b) the merged save: VP of {K} {b[0]}{vp_k:+d}, VP of {J} {b[1]}{vp_j:+d}, Prestige of {K} '
-              f'{b[2]}{pres:+d} (the save as sent + the deltas of the applied line)',
-              s1 and m1 == (b[0] + vp_k, b[1] + vp_j, b[2] + pres), f'{b} -> {m1}')
+        if unknown:
+            log(f'  SKIP-note b) the merged save\'s VP and Prestige not checked: a battle of other nations was merged before '
+                f'this one ({unknown[:2]})')
+        else:
+            check(f'b) the merged save: VP of {K} {b[0]}{vp_k:+d}, VP of {J} {b[1]}{vp_j:+d}, Prestige of {K} '
+                  f'{b[2]}{pres:+d} (the save as sent + the deltas of the applied line'
+                  + (f' and of the battles merged before it: {[p[3] for p in prior]}' if prior else '') + ')',
+                  s1 and m1 == (b[0] + vp_k, b[1] + vp_j, b[2] + pres), f'{b} -> {m1}; merged before: {prior}')
         vp, p_now = vpinfo(H), nint(H, K, 'Prestige')
         mem = (vp and vp['vp'].get(K), vp and vp['vp'].get(J), p_now)
         f2 = (num(s2, K, 'VP'), num(s2, J, 'VP'), num(s2, K, 'Prestige'))
@@ -5404,7 +5702,7 @@ OPTS = dict(stress=False)  # --stress: the long variants and the lockstep_stress
 K2PROC = [None]  # the third copy's Popen while lockstep_pvp runs
 _ANS = [None]  # the dialog answerer thread of the live battles (LsAnswerer)
 KEPT_LOGS = []  # logs of copies that were killed and started again (copied before the restart)
-KEPT_LOG_RE = r'^rtw3mp_\d+\.(kill|hostkill|restart|k2restart|level|afterend|relay|vanilla|clean)\d+\.log$'  # (removed
+KEPT_LOG_RE = r'^rtw3mp_\d+\.(kill|hostkill|restart|k2restart|level|afterend|relay|vanilla|clean|twopc)\d+\.log$'  # (removed
 # at the next run's start)
 LS_MATRIX = []  # (case, checks passed, checks, seconds, note) of the lockstep scenarios' cases
 
@@ -5542,7 +5840,9 @@ class LsAnswerer(threading.Thread):
                 continue
             if k.startswith('RTW3MP') or k in ('TfrmBuildCamp', '#32770'):
                 continue
-            if k in LS_MODELESS and on:  # the battle screen's tool windows (it stays enabled): not questions
+            if k in LS_MODELESS and (on or not u.IsWindowEnabled(top)):
+                # the battle screen's tool windows (it stays enabled): not questions; disabled, another modal box (e.g.
+                # the game's "You now have reconnaisance aircraft at your disposal!") is in front of both: not this one
                 continue
             query = is_input_query(top)
             b = dlg_buttons(top)
@@ -6101,7 +6401,7 @@ def ls_rejoin(ctx, fight=True):
         ls_wait(lambda: 'Captain(' not in lsn(H).get('players', 'Captain('), 20, 'the host saw the client leave')
     hm, cm = log_mark(H), log_mark(C)
     scmd(C, f'fightbattles {1 if fight else 0}')
-    r = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {MP_PORT}')
+    r = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {NET_PROXY.get(C, MP_PORT)}')
     hpat, cpat = r'state seq \d+ -> Captain \(nation 1,', rf'LoadCampaign slot {CLIENT_SLOT} player 1 -> ok'
     sent, claimed = wait_log(H, hm, hpat, 25), False
     if not sent:
@@ -6393,6 +6693,19 @@ def ls_tick_client(ctx, rec, port):
     autorun_click(ctx, st, who, pid, frm, port)
 
 
+def live_hook(rec, what, A, B, r):
+    """A scenario's hook in a month's live battle (ls_month(live_hook=...)): called by ls_drive_live with 'load' right
+    after the start check (both copies between minutes at the loaded boundary) and with 'minutes' after the live minutes,
+    before the battle's end and the hash comparison (minutes the hook runs count). An exception is logged; the battle
+    goes on."""
+    fn = rec.get('live_hook')
+    if fn:
+        try:
+            fn(what, rec, A, B, r)
+        except Exception as e:  # noqa: BLE001
+            log(f'  !! live battle hook ({what}): {e!r}')
+
+
 def ls_drive_live(ctx, rec, A, B, mode):
     """Drive one live battle of a month (blocking; the answerer thread keeps answering every copy's dialogs). Every
     division goes to the AI (contact, damage), a few minutes run from both sides, B orders one of its divisions (AI off)
@@ -6413,6 +6726,7 @@ def ls_drive_live(ctx, rec, A, B, mode):
         log(f'  live battle {r["bid"]}: the battle\'s own date ([Environment] of its .sac) {env.get("Year")}/'
             f'{env.get("Month")}/{env.get("Day")} {env.get("Hour")}:{env.get("Minute")}; the campaign\'s ([General] of '
             f'the battle save) {gen_date(HOST_SLOT)}')
+    live_hook(rec, 'load', A, B, r)
     ma, mb = rec['marks'][A], rec['marks'][B]
     if mode == 'relayrejoin' and A == H:  # (lockstep_rejoin e): the host's own battle of that month is dropped early)
         mode = r['mode'] = 'drop3'
@@ -6431,6 +6745,7 @@ def ls_drive_live(ctx, rec, A, B, mode):
         if mode.startswith('drop'):
             n = int(mode[4:] or 10)
             r['run'] += ls_run_total(A, B, max(1, n - r['run']), A)
+            live_hook(rec, 'minutes', A, B, r)
             r['hash'] = ls_compare(A, ma, B, mb, f'battle {r["bid"]}')
             mk = log_mark(A)
             scmd(A, 'ls drop')
@@ -6442,11 +6757,13 @@ def ls_drive_live(ctx, rec, A, B, mode):
             r['back_s'] = round(time.time() - t, 1)
             r['drop'] = ls_lines(A, mk, r'dropping|left the live battle')
         elif mode in ('agree', 'game'):
+            live_hook(rec, 'minutes', A, B, r)
             r.update(ls_drive_end(A, B, mode))
             r['t_end'] = time.time()
             r['hash'] = ls_compare(A, ma, B, mb, f'battle {r["bid"]}')
             ans.view_results.update((who_of(A), who_of(B)))
         elif mode == 'endsoon':
+            live_hook(rec, 'minutes', A, B, r)
             r.update(ls_drive_endsoon(A, B))
             r['hash'] = ls_compare(A, ma, B, mb, f'battle {r["bid"]}')
             ans.view_results.update((who_of(A), who_of(B)))
@@ -6467,7 +6784,7 @@ def ls_drive_live(ctx, rec, A, B, mode):
             ls_relaunch(ctx, 'client', rec.get('relaunch_env'), tag='kill')
             scmd(C, 'fightbattles 1')
             r['rejoin_mark'] = log_mark(H)
-            r['join'] = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {MP_PORT}')
+            r['join'] = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {NET_PROXY.get(C, MP_PORT)}')
             time.sleep(15)
             r['rejoin_during'] = sstatus(C)
             log(f'  the client joined again while the host\'s battle runs: myNation '
@@ -6586,20 +6903,21 @@ class StageWatcher(threading.Thread):
                     g87={b: parse_save(r) for b, r in self.raw['g87'].items()}, steps=[s for _, s in self.steps])
 
 
-def ls_month(ctx, label, modes=('agree',), k2=False, relaunch_env=None):
+def ls_month(ctx, label, modes=('agree',), k2=False, relaunch_env=None, live_hook=None):
     """One processed month that may hold live battles (the host's own battle against nation 1 found by the game's
     CheckForBattles2, live battles between joined players, joined players' battles against AI nations). The answerer
     thread answers every copy's dialogs; each live battle that starts is driven by the next of `modes` (ls_drive_live);
     a battle screen that is not live is fought on auto-run. The host's bridge is polled only while its live battle
     runs. Ends when the client (and K2) plan the new month; then the event roll and month_checks (the roll check is
-    skipped when the client was started again). Returns a record."""
+    skipped when the client was started again). live_hook(what, rec, A, B, r): see live_hook(). Returns a record."""
     ans = ls_quiet(ctx)
     for hook in list(ctx.pre_month_hooks):
         hook(ctx, label, len(ctx.months) + 1)
     date0, d0file = sstatus(C).get('date'), save_date(HOST_SLOT)
     ports = [H, C] + ([K2] if k2 else [])
     rec = dict(label=label, date0=date0, live=[], marks={p: log_mark(p) for p in ports}, relaunched=False,
-               autorun={}, relaunch_env=relaunch_env, claimed=None, chat0=chat(ctx.cp), t0=time.time())
+               autorun={}, relaunch_env=relaunch_env, claimed=None, chat0=chat(ctx.cp), t0=time.time(),
+               live_hook=live_hook)
     rec['hmark'], rec['cmark'] = rec['marks'][H], rec['marks'][C]
     ctx.month_marks = (rec['hmark'], rec['cmark'])
     watcher = StageWatcher(rec['hmark'], rec['cmark'])
@@ -6607,9 +6925,12 @@ def ls_month(ctx, label, modes=('agree',), k2=False, relaunch_env=None):
     cmd(C, 'submit')
     if k2:
         cmd(K2, 'submit')
-    wait(C, lambda s: s.get('submitted') == '1', 30, 'client submitted', pids=(ctx.hp, ctx.cp))
+    wait(C, lambda s: s.get('submitted') == '1' and s.get('submitting', '0') == '0', 30, 'client submitted',
+         pids=(ctx.hp, ctx.cp))
     if k2:
-        wait(K2, lambda s: s.get('submitted') == '1', 30, 'K2 submitted', pids=(ctx.hp,))
+        # (its Submit may ask the game's Turn questions too, since 0.4.1: answered like the client's)
+        wait(K2, lambda s: s.get('submitted') == '1' and s.get('submitting', '0') == '0', 30, 'K2 submitted',
+             pids=(ctx.hp, pid_of(ctx, K2)))
     wait(H, lambda s: 'All players are ready' in s.get('status', ''), 30, 'host sees everyone ready',
          pids=(ctx.hp, ctx.cp))
     log(f'  [General] before the turn: slot {HOST_SLOT} {gen_date(HOST_SLOT)}, slot {CLIENT_SLOT} (submitted) '
@@ -8506,6 +8827,9 @@ def scenario_lockstep_month(ctx):
             fought.append(rec)
     check(f'the game started {len(modes)} host battle(s) against nation 1 within 8 months (CheckForBattles2 is random; '
           f'attempts: month, date, kind, live battles, battle phase)', len(fought) >= len(modes), attempts)
+    relview_check('0.4.1 at war with the host: the client\'s screen shows its own war (slot 1 = the host\'s nation at war, '
+                  '"At war with <host>.") and the host\'s screen nation 1 at war', C, 1)
+    relview_check('0.4.1 at war with the client: the host\'s screen (`relview` on the host)', H, 0)
     if J is not None:
         cmd(H, f'settension 1 {J} {tJ}')
     r01 = ls_peace01(ctx)
@@ -8516,6 +8840,7 @@ def scenario_lockstep_month(ctx):
     check('the next normal month works (both in the new month; no live battle, no battle phase)',
           LS_HOLD not in log_since(H, hm) and 'battle phase:' not in log_since(H, hm), log_lines(log_since(H, hm),
                                                                                                     LS_HOLD)[:2])
+    relview_check('0.4.1 after the peace: the client\'s screen shows its own relations at peace', C, 1)
     vh, vc, vs = vpinfo(H), vpinfo(C), saved_vp(HOST_SLOT)
     check('the month after the reloads (0.4.0): every nation\'s VP is the same in the host\'s memory, in its saved slot '
           f'{HOST_SLOT} and in the client\'s memory', vh and vc and all(vh['vp'].get(n) == vc['vp'].get(n) == vs.get(n)
@@ -8523,6 +8848,1036 @@ def scenario_lockstep_month(ctx):
           f'host {vh and vh["vp"]}; saved {vs}; client {vc and vc["vp"]}')
     ls_after_checks(ctx, 'lockstep_month')
     ls_log_scan('lockstep_month', marks0)
+
+
+# ---------------------------------------------------------------- two PCs (0.4.1, live-battle engine level 15)
+# Every other scenario plays both PCs on one PC: one Preferences file, one locale, one window size, localhost. `twopc`
+# gives the joined player's copy (B) what another PC would have (docs/TESTING.md, "Two-PC conditions"): its own
+# Preferences, read by the game's own reader at B's start (the shared file holds B's variant from B's start to the
+# scenario's end: "B's own Preferences file"; A read the run's file at its start and doesn't read it again), a comma
+# locale (RTW3MP_TEST_LOCALE=comma), its own window size (its MainFormWidth/Height at every load; both windows resized
+# with SetWindowPos between minutes) and a network with latency, jitter and a bandwidth cap (tools/net_delay_proxy.py
+# between B and the host's session port). The short variant runs by default, the full one with --stress.
+TWOPC_PROXY_PORT = 47634  # the delay proxy listens on 127.0.0.1 here and forwards to the host's MP_PORT
+TWOPC_NET = dict(short=dict(delay=120, jitter=60, kbps=4000, seed=6),  # one-way ms, +- ms, kbit/s per direction
+                 full=dict(delay=200, jitter=100, kbps=2000, seed=7))
+TWOPC_PLACE = dict(A=(20, 20, 900, 650), B=(300, 40, 1560, 980))  # the battle windows between minutes: x, y, w, h
+TWOPC_MONTHS = dict(short=4, full=6)  # months tried until the game's CheckForBattles2 starts the host's battle
+# B's value of each key: the first of its list that differs from A's (the battle preferences: A's `ls prefs`; the others:
+# the file as A read it). The battle preferences are kPrefs of src/mod/lockstep.cpp (battle_prefs_keys: a live battle
+# takes them from A); the others stay each PC's own (display, sound, messages, pauses, names, the battle window's size).
+TWOPC_ALT = dict(
+    AIControl=(0, 1, 2), FloatWarning=(0, 2, 1), ReadyPopup=(1, 0), BreakOnNewSighting=(0, 1), AirApproachMessage=(0, 1),
+    AirSurfaceMessageLvl=(2, 0, 1), LetAIControlForce=(1, 0), LOScalc=(0, 1), SoundOption=(4, 1, 0), Autosave=(30, 60),
+    FloatplaneLaunch=(0, 1), RealismSetting=(2, 1), NoFriendlyTorpHits=(1, 0), BSSMHC=(35, 40),
+    DarkMode=(1, 0), Scale=(1, 0), SoundVolume=(5, 25), FOW=(0, 1), EnglishRanks=(1, 0), ConvertCharacters=(1, 0),
+    BreakOnHit=(0, 1), BreakOnId=(0, 1), BreakOnSighting=(0, 1), BreakOnTorpedoHit=(0, 1), BreakOnSinking=(0, 1),
+    BreakOnSunk=(0, 1), LoseContactPopup=(0, 1), OpenFireMsg=(1, 5), AirCombatMessageLvl=(2, 0), ShipFlags=(1, 0),
+    DamageMeter=(1, 0), CourseIndicator=(1, 0), Compass=(1, 0), GridLines=(1, 0), MainFormWidth=(1400, 1200),
+    MainFormHeight=(880, 800))
+TWOPC_SECTIONS = dict(Break=('BreakOnHit', 'BreakOnId', 'BreakOnSighting', 'BreakOnTorpedoHit', 'BreakOnMissileHit',
+                             'BreakOnNewSighting', 'BreakOnSubSighting', 'BreakOnSinking', 'BreakOnSunk',
+                             'AirApproachMessage', 'LetAIControlForce'),
+                      MainForm=('MainFormWidth', 'MainFormHeight', 'MainFormState', 'MainFormLeftPanelWidth'))
+SBPREFS_AT = (108 + 14, 5 + 14)  # TfrmMain.sbPrefs, the battle screen's Preferences (a 28x28 TSpeedButton on Panel1)
+PREFS_LINE_RE = r"lockstep: battle preferences: (\S+)'s for the load and the simulation \((.*)\); this PC's own come back"
+PREFS_BACK_RE = r"lockstep: this PC's own battle preferences again \((.*)\)"
+PREFS_DLG_RE = r"lockstep: the Preferences dialog changed battle preferences the simulation uses \((.*)\): this battle's"
+ENSIGN_LINE = "lockstep: the battle screen shows side 1's ensign"
+LOCALE_RE = r"TEST: RTW3MP_TEST_LOCALE=comma: decimal separator"
+LOADED_RE = r'lockstep: battle loaded from slot'
+QUEUED_RE = r'lockstep: battle \d+ epoch \d+ queued for loading'
+TWOPC_DESYNC_RE = r'DESYNC at minute|the loaded battles differ'  # (not "DESYNC report ...": `ls desyncreport`'s own)
+PROXY_STATS_RE = (r'^\S+ connection (\d+)(?: closed)?: up (\d+) chunks (\d+) bytes \(bandwidth wait max ([\d.]+) s\), '
+                  r'down (\d+) chunks (\d+) bytes \(max ([\d.]+) s\)')
+NET_PROXY = {}  # bridge port -> the port that copy joins instead of MP_PORT (twopc: the delay proxy's)
+PROXY = [None]  # the delay proxy's Popen while twopc runs (stopped by the scenario, else by the runner)
+SHOTS_DIR = os.environ.get('RTW3_SHOTS', '')  # optional: PrintWindow captures of the battle windows (evidence only)
+SHOTS = []  # the captures taken (path, size)
+_u32w = ctypes.WinDLL('user32')  # twopc: window sizes, layered windows, PrintWindow (own prototypes: `u` unchanged)
+_gdiw = ctypes.WinDLL('gdi32')
+_u32w.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+_u32w.IsWindowVisible.argtypes = [wt.HWND]
+_u32w.IsWindow.argtypes = [wt.HWND]
+_u32w.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
+_u32w.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+_u32w.GetWindowLongW.restype = ctypes.c_long
+_u32w.GetLayeredWindowAttributes.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD), ctypes.POINTER(ctypes.c_ubyte),
+                                             ctypes.POINTER(wt.DWORD)]
+_u32w.GetWindowDC.argtypes = [wt.HWND]
+_u32w.GetWindowDC.restype = wt.HDC
+_u32w.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+_u32w.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
+_gdiw.CreateCompatibleDC.argtypes = [wt.HDC]
+_gdiw.CreateCompatibleDC.restype = wt.HDC
+_gdiw.CreateCompatibleBitmap.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+_gdiw.CreateCompatibleBitmap.restype = wt.HBITMAP
+_gdiw.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+_gdiw.SelectObject.restype = wt.HGDIOBJ
+_gdiw.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
+_gdiw.DeleteObject.argtypes = [wt.HGDIOBJ]
+_gdiw.DeleteDC.argtypes = [wt.HDC]
+
+
+def as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def battle_prefs_keys():
+    """The battle preferences a live battle takes from A (engine level 15): the names of kPrefs[] in
+    src/mod/lockstep.cpp (read only), in order; None when the source can't be read."""
+    try:
+        with open(os.path.join(REPO, 'src', 'mod', 'lockstep.cpp'), encoding='utf-8') as f:
+            m = re.search(r'static const PrefSpec kPrefs\[\] = \{(.*?)\n\};', f.read(), re.S)
+    except OSError:
+        return None
+    return re.findall(r'\{0x[0-9a-fA-F]+, \d+, "(\w+)"\}', m[1]) if m else None
+
+
+def parse_pref_changes(text):
+    """'AIControl 2 -> 0, RealismSetting 1 -> -1' (the mod's PrefsDiff) -> {'AIControl': (2, 0), 'RealismSetting':
+    (1, -1)}."""
+    return {m[1]: (int(m[2]), int(m[3])) for m in re.finditer(r'(\w+) (-?\d+) -> (-?\d+)', text or '')}
+
+
+def parse_prefs(reply):
+    """`ls prefs` -> dict(sim={key: value}: the battle preferences a live battle takes from A, disp={DarkMode, Scale,
+    SoundVolume, MainFormState}: each PC's own, after={key: (now, after the battle)}: B's own values kept for after its
+    live battle); {} for an error reply."""
+    if not reply.startswith('ok'):
+        return {}
+    parts = reply[2:].split(' | ')
+
+    def kv(s):
+        return {k: as_int(v) for k, v in (x.split('=', 1) for x in s.split() if '=' in x)}
+
+    out = dict(sim=kv(parts[0]), disp=kv(parts[1]) if len(parts) > 1 else {}, after={})
+    for p in parts[2:]:
+        if p.startswith('after the battle:'):
+            out['after'] = parse_pref_changes(p)
+    return out
+
+
+def parse_mapview(reply):
+    """`ls mapview` -> dict(view, on, passes, playerSide, and per side [0, 1]: shown (ships the map shows), ships (afloat),
+    wake (wakes shown), flags (division flags shown), divs (divisions)); {} for an error reply."""
+    d = kvs(reply)
+    if not d:
+        return {}
+    out = {k: as_int(d.get(k)) for k in ('view', 'on', 'passes', 'playerSide')}
+    for k in ('shown', 'ships', 'wake', 'flags', 'divs'):
+        out[k] = [None, None]
+    for s in (0, 1):
+        a, _, b = (d.get(f'side{s}') or '').partition('/')
+        f, _, g = (d.get(f'flags{s}') or '').partition('/')
+        out['shown'][s], out['ships'][s], out['wake'][s] = as_int(a), as_int(b), as_int(d.get(f'wake{s}'))
+        out['flags'][s], out['divs'][s] = as_int(f), as_int(g)
+    return out
+
+
+def map_problems(mv, view, ref=None, load=False):
+    """What is wrong with a copy's map (`ls mapview`, parsed) for the side it shows (view; engine level 15): the map pass
+    on, the game's PlayerSide = view, every own ship afloat shown (with ref: every own ship of a human force; the game
+    shows a computer force's own ships only once the enemy spotted them), no division flag of the other side, of the
+    other side's ships at most those afloat and no more wakes than ships shown. With ref (map_ref: the simulation's
+    state) also the same ships afloat per side and of the other side's ships exactly those this side sights by the
+    game's rule (its unspotted ships absent, its spotted ones shown). `load` is map_ref's (kept for the callers). []
+    when it is right."""
+    if not mv or None in mv['shown'] + mv['ships'] + mv['flags'] + mv['divs']:
+        return [f'no usable `ls mapview` reply ({mv})']
+    o, p = 1 - view, []
+    own_min = ref['own'] if ref and ref.get('own') is not None else mv['ships'][view]
+    if mv['on'] != 1:
+        p.append('the map pass is off')
+    if mv['view'] != view or mv['playerSide'] != view:
+        p.append(f'view {mv["view"]}, the game\'s PlayerSide {mv["playerSide"]} (not {view})')
+    if not own_min <= mv['shown'][view] <= mv['ships'][view]:
+        p.append(f'own ships shown {mv["shown"][view]} of {mv["ships"][view]} afloat ({own_min} of human forces)')
+    if mv['flags'][o]:
+        p.append(f'{mv["flags"][o]} of the other side\'s {mv["divs"][o]} division flags shown')
+    if mv['shown'][o] > mv['ships'][o] or (mv['wake'][o] or 0) > mv['shown'][o]:
+        p.append(f'the other side: {mv["shown"][o]} ships and {mv["wake"][o]} wakes shown, {mv["ships"][o]} afloat')
+    if ref:
+        if mv['ships'] != ref['afloat']:
+            p.append(f'ships afloat {mv["ships"]}, in the simulation\'s state {ref["afloat"]}')
+        if mv['shown'][o] != ref['sighted']:
+            p.append(f'the other side\'s ships shown {mv["shown"][o]}, sighted by this side in the simulation\'s state '
+                     f'{ref["sighted"]} (of {ref["afloat"][o]})')
+    return p
+
+
+def hexint(h):
+    """A DESYNC report's field bytes (hex, memory order) as a little-endian signed integer (None for '' or text)."""
+    try:
+        return int.from_bytes(bytes.fromhex(h), 'little', signed=True) if h else None
+    except ValueError:
+        return None
+
+
+def parse_state_ships(text):
+    """The ships of a DESYNC report's state section (the simulation's set of the dual fields, `ls desyncreport`) by
+    their division's side: {0: [dict(div, name, sunk, sight, radar, seen)], 1: [...]} (div: the division's index in
+    the battle's list, as `ls forces div`; other sides left out)."""
+    out, side, div, on = {0: [], 1: []}, None, None, False
+    for ln in text.splitlines():
+        if ln.strip() == 'state':
+            on = True
+            continue
+        if not on:
+            continue
+        m = re.match(r'D(\d+) ', ln)
+        if m:
+            div, side = int(m[1]), hexint(dict(re.findall(r' (\w+)=(\S*)', ln)).get('Side'))
+        elif re.match(r'  S\d+\.\d+ ', ln) and side in (0, 1):
+            kv = dict(re.findall(r' (\w+)=(\S*)', ln))
+            out[side].append(dict(div=div, name=re.match(r'  S\d+\.\d+ (.*?) \w+=', ln)[1],
+                                  sunk=hexint(kv.get('Sunk')) or 0, sight=hexint(kv.get('SightingLevel')) or 0,
+                                  radar=hexint(kv.get('RadarSightingLevel')) or 0,
+                                  seen=hexint(kv.get('SeenByHumanControlledShips')) or 0))
+    return out
+
+
+def force_ai_of_divs(port):
+    """{division index: its force is the computer's} from `ls forces` and `ls forces div` (both copies' are equal);
+    {} when they can't be read."""
+    forces = {f['i']: f for f in parse_forces(scmd(port, 'ls forces'))}
+    return {i: forces.get(d.get('force'), {}).get('ai') == '1' for i, d in parse_forces_div(scmd(port, 'ls forces div'))
+            .items()}
+
+
+def map_ref(ships, view, load, force_ai=None):
+    """What a copy's map must show by the game's rule, from the simulation's state (parse_state_ships; both copies'
+    states are equal, so one report serves both maps): the ships afloat per side; own: the own ships of human forces
+    (force_ai: {division: its force is the computer's}; the game shows a computer force's own ships only once the
+    enemy spotted them); sighted: the other side's ships this side sights (max(SightingLevel, RadarSightingLevel) > 0
+    and SeenByHumanControlledShips; right after a load the levels alone, as the map pass does: the load's sighting
+    routine ran while side 1 was the computer's)."""
+    o, fa = 1 - view, force_ai or {}
+    return dict(afloat=[sum(1 for s in ships[k] if not s['sunk']) for k in (0, 1)],
+                own=sum(1 for s in ships[view] if not s['sunk'] and not fa.get(s['div'])),
+                sighted=sum(1 for s in ships[o] if not s['sunk'] and max(s['sight'], s['radar']) > 0
+                            and (load or s['seen'])))
+
+
+def state_ships(port):
+    """`ls desyncreport` on a copy between minutes (a test command: this copy's DESYNC report of its boundary now) ->
+    parse_state_ships of the report, which is read and deleted at once; None without a report. Only on B: the line
+    "DESYNC report ... written" in A's log would read as a DESYNC to the month's checks."""
+    mk = log_mark(port)
+    if not scmd(port, 'ls desyncreport').startswith('ok'):
+        return None
+    m = list(re.finditer(DESYNC_REPORT_RE, log_since(port, mk)))
+    if not m or m[-1][6] != 'written':
+        return None
+    p = os.path.join(LOG_DIR, m[-1][1])
+    try:
+        with open(p, encoding='utf-8', errors='replace') as f:
+            return parse_state_ships(f.read())
+    except OSError:
+        return None
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def sac_sighting(path):
+    """Per side of a battle file (.sac) its ships afloat and those the other side sights (max(SightingLevel,
+    RadarSightingLevel) > 0): {0: (afloat, sighted), 1: (afloat, sighted)} (divisions of other sides left out), or None
+    when it can't be read."""
+    s = read_save(path)
+    if not s:
+        return None
+    out = {0: [0, 0], 1: [0, 0]}
+    for name, sec in s.items():
+        side = as_int(sec.get('Side'))
+        if not re.fullmatch(r'Division\d+', name) or side not in (0, 1):
+            continue
+        for n in range(as_int(sec.get('ShipCount')) or 0):
+            if as_int(sec.get(f'Ship{n}Sunk')):
+                continue
+            out[side][0] += 1
+            if max(as_int(sec.get(f'Ship{n}SightingLevel')) or 0, as_int(sec.get(f'Ship{n}RadarSightingLevel')) or 0) > 0:
+                out[side][1] += 1
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def battle_file(slot):
+    """The battle file (.sac) of a slot: RTWGame<slot>.sac (else the folder's first .sac), or None."""
+    d = slot_dir(slot)
+    p = os.path.join(d, f'RTWGame{slot}.sac')
+    if os.path.exists(p):
+        return p
+    try:
+        return next((os.path.join(d, f) for f in sorted(os.listdir(d)) if f.lower().endswith('.sac')), None)
+    except OSError:
+        return None
+
+
+def prefs_values(raw):
+    """{key: value} of a Preferences file's lines (its bytes; the first of a repeated key)."""
+    out = {}
+    for ln in raw.decode('utf-8-sig', errors='replace').splitlines():
+        if '=' in ln and not ln.startswith('['):
+            k, v = ln.split('=', 1)
+            out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def prefs_set(raw, values):
+    """The Preferences bytes with these key=value lines: an existing line replaced (the key at the start of its line,
+    so MainFormWidth never matches BCMainFormWidth); a key the file lacks goes into its section (TWOPC_SECTIONS, else
+    [Settings]; a missing section is added at the end). The file's line ends are kept."""
+    nl = b'\n' if raw and b'\r\n' not in raw else b'\r\n'
+    out = raw
+    for k, v in values.items():
+        line = f'{k}={v}'.encode()
+        pat = re.compile(rb'(?m)^' + re.escape(k.encode()) + rb'=[^\r\n]*')
+        if pat.search(out):
+            out = pat.sub(lambda m: line, out, count=1)
+            continue
+        hdr = ('[' + next((s for s, ks in TWOPC_SECTIONS.items() if k in ks), 'Settings') + ']').encode()
+        m = re.search(rb'(?m)^' + re.escape(hdr) + rb'\r?\n', out)
+        if m:
+            out = out[:m.end()] + line + nl + out[m.end():]
+        else:
+            out += (nl if out and not out.endswith(b'\n') else b'') + hdr + nl + line + nl
+    return out
+
+
+def twopc_variant(raw, a_sim, keys):
+    """B's Preferences for twopc: each key of TWOPC_ALT (and every battle preference: keys) set to a value that differs
+    from A's (the battle preferences: A's `ls prefs`, a_sim; the others: the file as A read it). Returns (bytes,
+    {key: (A's, B's)})."""
+    cur, want, diff = prefs_values(raw), {}, {}
+    for k, alts in TWOPC_ALT.items():
+        a = a_sim.get(k) if k in keys and a_sim.get(k) is not None else as_int(cur.get(k))
+        want[k] = next((x for x in alts if x != a), alts[0])
+        diff[k] = (a, want[k])
+    for k in keys:  # a battle preference TWOPC_ALT doesn't know (a newer source): A's value + 1
+        if k not in want and a_sim.get(k) is not None:
+            want[k] = a_sim[k] + 1
+            diff[k] = (a_sim[k], want[k])
+    return prefs_set(raw, want), diff
+
+
+def write_atomic(path, data):
+    """Write bytes through <path>.new and os.replace (safety rule 12)."""
+    with open(path + '.new', 'wb') as f:
+        f.write(data)
+    os.replace(path + '.new', path)
+
+
+def port_free(port):
+    """Nothing listens on 127.0.0.1:port (a bind succeeds)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(('127.0.0.1', port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def proxy_start(listen, target, net, path):
+    """tools/net_delay_proxy.py on 127.0.0.1:listen -> 127.0.0.1:target with twopc's delay, jitter and bandwidth cap
+    (net), its log into `path` (deleted first). Returns (ok, its first log line or why not)."""
+    proxy_stop()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    if not port_free(listen):
+        return False, f'127.0.0.1:{listen} is in use'
+    PROXY[0] = subprocess.Popen(
+        [sys.executable, os.path.join(REPO, 'tools', 'net_delay_proxy.py'), '--listen', str(listen), '--target',
+         f'127.0.0.1:{target}', '--delay', str(net['delay']), '--jitter', str(net['jitter']), '--kbps', str(net['kbps']),
+         '--seed', str(net['seed']), '--log', path, '--stats', '20'], stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    end = time.time() + 15
+    while time.time() < end:
+        if PROXY[0].poll() is not None:
+            return False, f'the proxy exited (code {PROXY[0].returncode})'
+        try:
+            with open(path, encoding='utf-8') as f:
+                first = f.readline().strip()
+            if first:
+                return True, first
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return False, 'the proxy wrote no log line within 15 s'
+
+
+def proxy_stop():
+    """The delay proxy (this runner's own child process) closed."""
+    p, PROXY[0] = PROXY[0], None
+    if p is None or p.poll() is not None:
+        return
+    p.terminate()
+    try:
+        p.wait(10)
+    except subprocess.TimeoutExpired:
+        log(f'  !! the delay proxy (PID {p.pid}) did not stop')
+
+
+def parse_proxy_log(text):
+    """The delay proxy's log: dict(head=its first line, conns={n: dict(up, down, up_wait, down_wait, closed)}): each
+    connection's latest statistics line (bytes per direction, the bandwidth cap's largest extra wait in s)."""
+    lines = [ln.strip() for ln in (text or '').splitlines() if ln.strip()]
+    out = dict(head=lines[0] if lines else '', conns={})
+    for ln in lines:
+        m = re.match(PROXY_STATS_RE, ln)
+        if m:
+            out['conns'][int(m[1])] = dict(up=int(m[3]), down=int(m[6]), up_wait=float(m[4]), down_wait=float(m[7]),
+                                           closed=' closed: ' in ln)
+    return out
+
+
+def sod(t=None):
+    """Seconds of the day (local time) of a time.time() value, as log_secs reads a mod log line."""
+    t = time.time() if t is None else t
+    lt = time.localtime(t)
+    return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (t % 1)
+
+
+class CoverWatch(threading.Thread):
+    """Watches a copy's battle window (TfrmMain, found among all its top-level windows, hidden ones too) every ~3 ms and
+    records the changes of its state: (seconds of the day, state) with state None (no battle window), 'hidden',
+    'clear' (visible, a layered window with alpha 0: the mod's cover on B while it loads) or 'shown' (visible and
+    opaque)."""
+
+    def __init__(self, pid, every=0.003):
+        super().__init__(daemon=True)
+        self.pid, self.every, self.stop, self.samples, self.n = pid, every, False, [], 0
+
+    def state(self, h):
+        if not h:
+            return None
+        if not _u32w.IsWindowVisible(h):
+            return 'hidden'
+        if _u32w.GetWindowLongW(h, -20) & 0x80000:  # GWL_EXSTYLE, WS_EX_LAYERED
+            key, a, fl = wt.DWORD(), ctypes.c_ubyte(), wt.DWORD()
+            if _u32w.GetLayeredWindowAttributes(h, ctypes.byref(key), ctypes.byref(a), ctypes.byref(fl)) \
+                    and fl.value & 2 and a.value == 0:  # LWA_ALPHA, alpha 0
+                return 'clear'
+        return 'shown'
+
+    def run(self):
+        h, t_find, last = None, 0.0, 'start'
+        while not self.stop:
+            try:
+                now = time.time()
+                if not h or now - t_find > 0.25 or not _u32w.IsWindow(h):
+                    h, t_find = battle_form_any(self.pid), now
+                s = self.state(h)
+                self.n += 1
+                if s != last:
+                    self.samples.append((sod(), s))
+                    last = s
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(self.every)
+
+
+def battle_form_any(pid):
+    """A copy's battle window (TfrmMain), visible or hidden (a visible one first), or None."""
+    out = []
+
+    def cb(h, l):
+        p = wt.DWORD()
+        u.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value == pid and e2e_test.class_name(h) == 'TfrmMain':
+            out.append(h)
+        return True
+
+    u.EnumWindows(e2e_test.EnumProc(cb), 0)
+    return next((h for h in out if _u32w.IsWindowVisible(h)), out[0] if out else None)
+
+
+def load_windows(text):
+    """A copy's live loads in a log text: [(queued, loaded)] in seconds of the day ("battle N epoch E queued for loading",
+    then the next "battle loaded from slot")."""
+    out, q = [], None
+    for ln in text.splitlines():
+        if re.search(QUEUED_RE, ln):
+            q = log_secs(ln)
+        elif LOADED_RE in ln and q is not None:
+            out.append((q, log_secs(ln)))
+            q = None
+    return out
+
+
+def cover_report(trans, loads, delta=0.05):
+    """B's battle window during its live loads from CoverWatch's state changes (trans: [(seconds of the day, state)]).
+    Per load (queued q, loaded e): exposed = the window shown opaque while the load's picture could be in it: at e -
+    delta (the mod removes the cover right before its "battle loaded" line: shown 2-3 ms after it in the live runs), or
+    after the old battle's picture was gone (the window hidden or clear) and before e - delta; cover = the window seen
+    clear during the load (the game shows it 40-160 ms before the line, the mod's cover keeps it clear while the map and
+    the ensign are put right); after = it was shown within 2 s after the load (the watch saw it at all); states = the
+    changes from q - 0.1 to e + 0.3 relative to e. [dict(exposed, cover, after, states)]."""
+    def at(t):
+        s = None
+        for ts, st in trans:
+            if ts > t:
+                break
+            s = st
+        return s
+
+    out = []
+    for q, e in loads:
+        if q is None or e is None:
+            out.append(dict(exposed=True, cover=False, after=False, states=[]))
+            continue
+        lim = e - delta
+        seq = [(q, at(q))] + [(t, s) for t, s in trans if q < t <= lim]
+        gone = next((t for t, s in seq if s in (None, 'hidden', 'clear')), None)
+        exposed = at(lim) == 'shown' or (gone is not None and any(s == 'shown' and t > gone for t, s in seq))
+        cover = at(q) == 'clear' or any(s == 'clear' for t, s in trans if q < t <= e + 0.05)
+        after = at(e + 2.0) == 'shown' or any(s == 'shown' for t, s in trans if e < t <= e + 2.0)
+        out.append(dict(exposed=exposed, cover=cover, after=after, states=[
+            (round(t - e, 3), s) for t, s in [(q - 0.1, at(q - 0.1))] + [(t, s) for t, s in trans if q - 0.1 < t <= e + 0.3]]))
+    return out
+
+
+def twopc_win_size(pid):
+    """(w, h) of a copy's visible battle window (TfrmMain), or None."""
+    f = battle_frm(pid)
+    if not f:
+        return None
+    r = wt.RECT()
+    _u32w.GetWindowRect(f, ctypes.byref(r))
+    return r.right - r.left, r.bottom - r.top
+
+
+def twopc_win_place(pid, x, y, w, h):
+    """SetWindowPos of a copy's battle window (no z-order change, not activated); returns its size afterwards."""
+    f = battle_frm(pid)
+    if f:
+        _u32w.SetWindowPos(f, None, x, y, w, h, 0x0014)  # SWP_NOZORDER | SWP_NOACTIVATE
+        time.sleep(0.3)
+    return twopc_win_size(pid)
+
+
+def write_png(path, w, h, bgra):
+    """A 24-bit PNG of top-down BGRA pixels (standard library only)."""
+    rows, stride = [], w * 4
+    for y in range(h):
+        row = bgra[y * stride:(y + 1) * stride]
+        rgb = bytearray(w * 3)
+        rgb[0::3], rgb[1::3], rgb[2::3] = row[2::4], row[1::4], row[0::4]
+        rows.append(b'\x00' + bytes(rgb))
+
+    def chunk(t, d):
+        return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+
+    write_atomic(path, b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b''))
+
+
+def shot_png(pid, path):
+    """PrintWindow (PW_RENDERFULLCONTENT) of a copy's battle window into a PNG: the game's own window, never the screen
+    (safety rule 2); evidence only. Returns (w, h) or None."""
+    f = battle_frm(pid)
+    if not f:
+        return None
+    r = wt.RECT()
+    _u32w.GetWindowRect(f, ctypes.byref(r))
+    w, h = r.right - r.left, r.bottom - r.top
+    if w <= 0 or h <= 0:
+        return None
+    hdc = _u32w.GetWindowDC(f)
+    mdc = _gdiw.CreateCompatibleDC(hdc)
+    bmp = _gdiw.CreateCompatibleBitmap(hdc, w, h)
+    old = _gdiw.SelectObject(mdc, bmp)
+    buf = ctypes.create_string_buffer(w * h * 4)
+    try:
+        _u32w.PrintWindow(f, mdc, 2)
+        bmi = (ctypes.c_ubyte * 44)()  # BITMAPINFOHEADER (top-down, 32 bit) + one RGBQUAD
+        struct.pack_into('<IiiHHIIiiII', bmi, 0, 40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+        _gdiw.GetDIBits(mdc, bmp, 0, h, ctypes.addressof(buf), ctypes.addressof(bmi), 0)
+    finally:
+        _gdiw.SelectObject(mdc, old)
+        _gdiw.DeleteObject(bmp)
+        _gdiw.DeleteDC(mdc)
+        _u32w.ReleaseDC(f, hdc)
+    write_png(path, w, h, buf.raw)
+    return w, h
+
+
+def twopc_shots(ctx, tag):
+    """With RTW3_SHOTS set: PrintWindow captures of both copies' battle windows into that folder (evidence)."""
+    if not SHOTS_DIR:
+        return
+    os.makedirs(SHOTS_DIR, exist_ok=True)
+    name = re.sub(r'\W+', '_', tag).strip('_')[:70]
+    for who, pid in (('A', ctx.hp), ('B', ctx.cp)):
+        p = os.path.join(SHOTS_DIR, f'twopc_{len(SHOTS):02d}_{who}_{name}.png')
+        try:
+            sz = shot_png(pid, p)
+        except Exception as e:  # noqa: BLE001
+            sz = repr(e)
+        SHOTS.append((p, sz))
+        log(f'  capture {who}: {os.path.basename(p)} {sz}')
+
+
+def twopc_load_checks(ctx, st, tag, hm, cm, ready):
+    """The first load of a live battle under two-PC conditions (both copies between minutes at its first boundary):
+    the start check, B's battle preferences and ensign, both maps, the window sizes."""
+    keys, a0, bv = st['keys'], st['a0'].get('sim') or {}, st['bvals']
+    ha, hb = ready if ready else ({}, {})
+    bad = ls_lines(H, hm, TWOPC_DESYNC_RE) + ls_lines(C, cm, TWOPC_DESYNC_RE)
+    check(f'{tag}: the start check (READY: the state hash `all` and the simulation\'s identification `ident` of both '
+          f'copies right after the load) equal with B on its own preferences, a comma locale, its own window size and '
+          f'behind the delay proxy; no "the loaded battles differ", no DESYNC', bool(ready) and ha.get('all')
+          and ha.get('all') == hb.get('all') and ha.get('ident') == hb.get('ident') and not bad,
+          f'A all={ha.get("all")} ident={ha.get("ident")}; B all={hb.get("all")} ident={hb.get("ident")}; {bad[:3]}')
+    pl = ls_lines(C, cm, PREFS_LINE_RE)
+    m = re.search(PREFS_LINE_RE, pl[0]) if pl else None
+    got = parse_pref_changes(m[2]) if m else {}
+    bp, ap = parse_prefs(scmd(C, 'ls prefs')), parse_prefs(scmd(H, 'ls prefs'))
+    st['battle_prefs'].append((tag, bp))
+    check(f'{tag}: B runs the battle with A\'s battle preferences: "battle preferences: {HOST_NAME}\'s for the load and '
+          f'the simulation (<all {len(keys)}: B\'s -> A\'s>); this PC\'s own come back after the battle"; `ls prefs` on '
+          f'B: the {len(keys)} are A\'s, the display ones (DarkMode, Scale, SoundVolume) B\'s own, B\'s own {len(keys)} '
+          f'kept for after the battle; A keeps its own', m and m[1] == HOST_NAME
+          and got == {k: (bv.get(k), a0.get(k)) for k in keys} and bp.get('sim') == {k: a0.get(k) for k in keys}
+          and all(bp.get('disp', {}).get(k) == bv.get(k) for k in ('DarkMode', 'Scale', 'SoundVolume'))
+          and bp.get('after') == {k: (a0.get(k), bv.get(k)) for k in keys} and ap.get('sim') == st['a0'].get('sim'),
+          f'{pl[:1]}; B {bp}; A {ap}')
+    ens = ls_lines(C, cm, re.escape(ENSIGN_LINE))
+    check(f'{tag}: B shows its own ensign ("{ENSIGN_LINE.split(": ", 1)[1]}")', ens, ls_lines(C, cm, r'ensign')[:2])
+    twopc_map_check(ctx, st, tag, load=True)
+    twopc_sizes(ctx, st, tag)
+
+
+def twopc_map_check(ctx, st, tag, load):
+    """Both maps (`ls mapview`) against the simulation's sighting state at this boundary: B's DESYNC report (`ls
+    desyncreport`, read and deleted; both copies' states are equal, so it serves A's mirror too). load: right after a
+    load (the map pass's rule then: the sighting levels alone; every own division flag; the battle file's counts
+    logged for comparison)."""
+    ships, fai = state_ships(C), force_ai_of_divs(C)
+    ma, mb = parse_mapview(scmd(H, 'ls mapview')), parse_mapview(scmd(C, 'ls mapview'))
+    ra, rb = (map_ref(ships, 0, load, fai), map_ref(ships, 1, load, fai)) if ships else (None, None)
+    pa, pb = map_problems(ma, 0, ra, load), map_problems(mb, 1, rb, load)
+    sac = sac_sighting(battle_file(BATTLE_SLOT)) if load else None
+    st['maps'].append((tag, mb.get('shown'), mb.get('ships'), rb, ma.get('shown'), ra, sac))
+    twopc_shots(ctx, tag)
+    if rb and rb['sighted'] and rb['sighted'] < (rb['afloat'][0] or 0):
+        st['partial'] = st.get('partial', 0) + 1  # (B's side sights some of A's ships, not all: the check had both kinds)
+    comp = {s: sorted({x['div'] for x in (ships or {}).get(s, []) if fai.get(x['div'])}) for s in (0, 1)}
+    check(f'{tag}: B\'s map shows B\'s side (`ls mapview` on B: view and the game\'s PlayerSide 1, the map pass on): '
+          f'every ship of B\'s afloat shown ({mb.get("shown", [0, 0])[1]} of {mb.get("ships", [0, 0])[1]}; '
+          f'{rb and rb["own"]} of them in human forces, B\'s divisions of computer forces {comp[1]}), no division flag of '
+          f'A, of A\'s ships exactly those B\'s side sights in the simulation\'s state (B\'s DESYNC report: SightingLevel '
+          f'or RadarSightingLevel > 0' + ('' if load else ' and SeenByHumanControlledShips') + f': {rb and rb["sighted"]} '
+          f'of {rb and rb["afloat"][0]}; A\'s unspotted ships absent), no more wakes than ships shown', rb and not pb,
+          f'B {mb}; simulation {rb}; battle file {sac}; {pb}')
+    check(f'{tag}: A\'s map the mirror (view 0): A\'s own ships ({ra and ra["own"]} of {ra and ra["afloat"][0]} in human '
+          f'forces; A\'s divisions of computer forces {comp[0]}: shown once spotted), no B flag, of B\'s ships exactly '
+          f'those A\'s side sights ({ra and ra["sighted"]} of {ra and ra["afloat"][1]})', ra and not pa,
+          f'A {ma}; simulation {ra}; {pa}')
+
+
+def twopc_sizes(ctx, st, tag):
+    """The two battle windows right after a load and resized with SetWindowPos for the minutes (TWOPC_PLACE): their
+    sizes differ at the load and between minutes. A new battle window takes its own Preferences' MainFormWidth x
+    MainFormHeight (A the file as A read it, B its variant); one that exists from an earlier battle keeps its size
+    (reported)."""
+    za, zb = twopc_win_size(ctx.hp), twopc_win_size(ctx.cp)
+    fa = (as_int(st['file'].get('MainFormWidth')) or 1000, as_int(st['file'].get('MainFormHeight')) or 719)
+    fb = (st['bvals'].get('MainFormWidth'), st['bvals'].get('MainFormHeight'))
+    pa, pb = twopc_win_place(ctx.hp, *TWOPC_PLACE['A']), twopc_win_place(ctx.cp, *TWOPC_PLACE['B'])
+    st['sizes'].append((tag, za, zb, pa, pb, (za == fa, zb == fb)))
+    check(f'{tag}: the two battle windows differ in size at the load (each at its own Preferences\' MainFormWidth x '
+          f'MainFormHeight when new: A {fa[0]}x{fa[1]}, B {fb[0]}x{fb[1]}; else the size it had) and between minutes '
+          f'(SetWindowPos: A {TWOPC_PLACE["A"][2]}x{TWOPC_PLACE["A"][3]}, B {TWOPC_PLACE["B"][2]}x{TWOPC_PLACE["B"][3]})',
+          za and zb and za != zb and pa == TWOPC_PLACE['A'][2:] and pb == TWOPC_PLACE['B'][2:],
+          f'loaded A {za} B {zb} (its own Preferences\' size: A {za == fa}, B {zb == fb}); resized A {pa} B {pb}')
+
+
+def twopc_resync(ctx, st, tag):
+    """A resync from A (`ls resync`): both copies load the battle again from A's save at this boundary, B's battle files
+    through the proxy; the maps against the new battle files and the windows at their own sizes again."""
+    e0 = int(lss(H).get('epoch') or 0)
+    mk = log_mark(C)
+    r = scmd(H, 'ls resync')
+    ls_wait(lambda: (lambda a: a if int(a.get('epoch') or 0) > e0 and ls_idle_equal(H, C) else None)(lss(H)), 180,
+            f'{tag}: both running again after the resync')
+    loaded = ls_lines(C, mk, LOADED_RE)
+    log(f'  {tag}: resync ({r}): B {loaded[-1:]}')
+    twopc_map_check(ctx, st, f'{tag}, after a resync', load=True)
+    twopc_sizes(ctx, st, f'{tag}, after the resync')
+
+
+def twopc_negative_control(ctx, st, tag):
+    """--stress: the map check's negative control. `ls mapview off` on B (from the next pass the game's own picture of
+    the first side, 0.4.0's), one minute: map_problems finds A's side on B's map; `ls mapview on` (a pass at once): B's
+    own picture again."""
+    r0 = scmd(C, 'ls mapview off')
+    ls_run_total(H, C, 1, H)
+    ships, fai = state_ships(C), force_ai_of_divs(C)
+    ref = map_ref(ships, 1, False, fai) if ships else None
+    off = parse_mapview(scmd(C, 'ls mapview'))
+    p_off = [x for x in map_problems(off, 1, ref) if 'map pass is off' not in x]
+    twopc_shots(ctx, f'{tag} negative control map pass off')
+    on = parse_mapview(scmd(C, 'ls mapview on'))
+    p_on = map_problems(on, 1, ref)
+    check(f'{tag}: the map check\'s negative control: with B\'s map pass off (`ls mapview off`: 0.4.0\'s picture, the '
+          f'first side\'s) the check finds A\'s side on B\'s map after a minute; `ls mapview on` puts B\'s own picture '
+          f'back at once', r0.startswith('ok') and p_off and not p_on, f'off {off} -> {p_off}; on {on} -> {p_on}')
+
+
+def twopc_prefs_dialog(ctx, st, tag):
+    """--stress: the battle screen's Preferences on B (a posted click on sbPrefs; the answerer presses OK): whatever the
+    dialog changes of the battle preferences is put back (the log line and the chat line when it changed any), B's are
+    A's again, and the dialog writes no Preferences file (B's own file unchanged)."""
+    mk, t0 = log_mark(C), time.time()
+    frm = battle_frm(ctx.cp)
+    p = battle_panel(frm) if frm else None
+    if p:
+        post_click(p, *SBPREFS_AT)
+    try:
+        ls_wait(lambda: ls_answered(_ANS[0], 'client', t0, 'TdlgPrefs'), 20, 'the Preferences dialog answered on B')
+    except RuntimeError as e:
+        log('  !!', e)
+    time.sleep(2)
+    seen = ls_answered(_ANS[0], 'client', t0, 'TdlgPrefs')
+    put = ls_lines(C, mk, PREFS_DLG_RE)
+    bp = parse_prefs(scmd(C, 'ls prefs'))
+    a0 = st['a0'].get('sim') or {}
+    chat_ok = not put or 'can\'t change until it ends' in chat(ctx.cp)
+    check(f'{tag}: the battle screen\'s Preferences on B (a posted click on its button, OK): the battle preferences stay '
+          f'A\'s ("the Preferences dialog changed battle preferences the simulation uses (...): this battle\'s values '
+          f'put back" and the chat line when it changed any), B\'s own Preferences file unchanged', p and seen and chat_ok
+          and bp.get('sim') == {k: a0.get(k) for k in st['keys']} and file_hash(PREFS_FILE) == st['var_hash'],
+          f'answered {seen[:1]}; {put[:1]}; B {bp}')
+
+
+def twopc_end_test(ctx, st, tag, s):
+    """The test battle's end: default the game itself ends it inside a minute on both copies (`ls endsoon`); --stress A
+    drops B and finishes alone on auto-run. Then B back in slot 77 with its own battle preferences, the host's battle
+    closed without a month."""
+    full = st['variant'] == 'full'
+    if full:
+        scmd(H, 'ls drop')
+        ls_wait(lambda: ls_client_back(ctx), 120, 'the client back in slot 77 after the drop')
+        closed, how = ls_finish_host(ctx), 'A dropped B, the host finished alone'
+    else:
+        ls_ans(ctx).view_results.update(('host', 'client'))
+        e = ls_drive_endsoon(H, C, until=0)
+        ls_wait(lambda: ls_client_back(ctx), 120, 'the client back in slot 77 after the battle\'s end')
+        closed = bool(ls_wait(lambda: not battle_up(ctx.hp), 120, 'the host\'s battle screen closed'))
+        how = f'the game ended it inside minute {e.get("minute")}'
+    ls_ans(ctx).view_results.clear()
+    hn = ls_wait(lambda: (lambda n: n if n.get('slotMode') == '0' else None)(lsn(H)), 30, 'slot mode off')
+    twopc_prefs_back(ctx, st, f'{tag}: the end ({how})', s['cm'], closed and hn.get('slotMode') == '0'
+                     and 'battle slot: DoStrategicTurn skipped' in log_since(H, s['hm']))
+
+
+def twopc_prefs_back(ctx, st, tag, cm, extra=True):
+    """B after a live battle: its own battle preferences again ("this PC's own battle preferences again (<all: A's ->
+    B's>)", `ls prefs` its own, nothing kept for after a battle)."""
+    keys, a0, bv = st['keys'], st['a0'].get('sim') or {}, st['bvals']
+    back = ls_lines(C, cm, PREFS_BACK_RE)
+    m = re.search(PREFS_BACK_RE, back[-1]) if back else None
+    got = parse_pref_changes(m[1]) if m else {}
+    bp = parse_prefs(scmd(C, 'ls prefs'))
+    return check(f'{tag}: B back in slot 77 with its own battle preferences again ("this PC\'s own battle preferences '
+                 f'again (<all {len(keys)}: A\'s -> B\'s>)"; `ls prefs` on B its own, nothing kept for after a battle)',
+                 extra and got == {k: (a0.get(k), bv.get(k)) for k in keys} and not bp.get('after')
+                 and bp.get('sim') == {k: bv.get(k) for k in keys}, f'{back[-1:]}; B {bp}; extra {extra}')
+
+
+def twopc_cover_check(st, tag, cw, cmark):
+    """B's battle window during its live loads (CoverWatch): clear (the mod's cover) when the game shows it near the
+    load's end, never shown opaque while the load's picture (the first side's: "B loaded showing the host's side")
+    could be in it; the watch saw the window after each load."""
+    loads = load_windows(log_since(C, cmark))
+    rep = cover_report(cw.samples, loads)
+    st['covers'].append((tag, [(r['exposed'], r['cover'], r['after']) for r in rep]))
+    log(f'  {tag}: B\'s battle window during its loads ({cw.n} samples): ' + '; '.join(
+        f'load {i + 1}: exposed {r["exposed"]}, cover seen {r["cover"]}, shown after {r["after"]}, states {r["states"]}'
+        for i, r in enumerate(rep)))
+    check(f'{tag}: B\'s battle screen during its {len(loads)} live load(s) (its state every ~3 ms: hidden, clear = '
+          f'layered with alpha 0, shown): clear when the game shows it before the load\'s end (the cover), never shown '
+          f'opaque while the load\'s first-side picture could be in it ("B loaded showing the host\'s side"), shown after '
+          f'each load', loads and all(r['cover'] and not r['exposed'] and r['after'] for r in rep),
+          f'loads {loads}; {[(r["exposed"], r["cover"], r["after"], r["states"][:8]) for r in rep]}')
+
+
+def twopc_test_battle(ctx, st):
+    """b) The live test battle under two-PC conditions (see scenario_twopc)."""
+    full, s = st['variant'] == 'full', None
+    cw = CoverWatch(ctx.cp)
+    cw.start()
+    try:
+        s = ls_start_test(ctx, 'twopc')
+        st['battles'] += 1
+        twopc_load_checks(ctx, st, 'b) test battle, the start', s['hm'], s['cm'], s['ready'])
+        ls_all_ai(H, C)
+        scmd(H, 'ls speed 3')
+        n = 10 if full else 6
+        ran = ls_run_total(H, C, n // 2, H) + ls_run_total(H, C, n - n // 2, C)
+        twopc_map_check(ctx, st, f'b) test battle, after {ran} minutes', load=False)
+        if full:
+            twopc_negative_control(ctx, st, 'b) test battle')
+            twopc_prefs_dialog(ctx, st, 'b) test battle')
+            ran += 1 + ls_run_total(H, C, 4, C)
+            twopc_map_check(ctx, st, f'b) test battle, after {ran} minutes', load=False)
+        twopc_resync(ctx, st, 'b) test battle')
+        ran += ls_run_total(H, C, 2, H)
+        twopc_map_check(ctx, st, f'b) test battle, after {ran} minutes', load=False)
+        hc = ls_compare(H, s['hm'], C, s['cm'], 'twopc test battle')
+        bad = ls_lines(H, s['hm'], TWOPC_DESYNC_RE) + ls_lines(C, s['cm'], TWOPC_DESYNC_RE)
+        check(f'b) test battle: every minute\'s state hash equal on both copies ({hc["minutes"]} minutes compared of '
+              f'{ran}, a resync among them), no DESYNC, no "the loaded battles differ"', hc['minutes'] >= max(5, ran - 1)
+              and not hc['differ'] and not bad, f'{hc} {bad[:3]}')
+        twopc_end_test(ctx, st, 'b) test battle', s)
+    finally:
+        cw.stop = True
+        cw.join(5)
+        if s:
+            twopc_cover_check(st, 'b) test battle', cw, s['cm'])
+    return f'{st["sizes"][-1:]}'
+
+
+def twopc_live_hook(ctx, st, hk, what, rec, A, B, r):
+    """ls_drive_live's hook in twopc's month: at the battle's start the load checks, before its end the maps between
+    minutes (--stress: then a resync, the maps from its files, two more minutes)."""
+    if A != H or B != C:
+        return
+    try:
+        if what == 'load':
+            hk['load'] = True
+            st['battles'] += 1
+            twopc_load_checks(ctx, st, f'{hk["tag"]}, the start', rec['marks'][A], rec['marks'][B], r.get('ready'))
+        elif what == 'minutes':
+            hk['minutes'] = True
+            full = st['variant'] == 'full'
+            if full:  # (the game ends this one inside a minute right after the hook: ten minutes before)
+                r['run'] = (r.get('run') or 0) + ls_run_total(A, B, max(0, 10 - (r.get('run') or 0)), A)
+            twopc_map_check(ctx, st, f'{hk["tag"]}, after {r.get("run")} minutes', load=False)
+            if full:
+                twopc_resync(ctx, st, hk['tag'])
+                r['run'] = (r.get('run') or 0) + ls_run_total(A, B, 2, B)
+                twopc_map_check(ctx, st, f'{hk["tag"]}, after {r.get("run")} minutes', load=False)
+    except Exception as e:  # noqa: BLE001
+        check(f'{hk["tag"]}: the two-PC checks during the battle ({what}) completed', False, repr(e))
+
+
+def twopc_month(ctx, st):
+    """c) War 0-1 and real months until the game's CheckForBattles2 starts the host's battle against nation 1, under
+    two-PC conditions (see scenario_twopc); then peace (--stress: and a normal month)."""
+    full = st['variant'] == 'full'
+    mode = 'endsoon' if full else 'drop12'
+    r01 = ls_war01(ctx)
+    check('c) setup: the host at war with nation 1 (`diplo war 1` accepted + applydiplo)', r01.get('war') == '1', r01)
+    found, attempts, limit = None, [], TWOPC_MONTHS[st['variant']]
+    for attempt in range(1, limit + 1):
+        if rel(0, 1).get('war') != '1':
+            ls_war01(ctx)
+        pct = nint(C, 1, 'ResearchPct')
+        plan = 9 if pct != 9 else 8
+        cmd(C, f'nfield 1 ResearchPct {plan}')
+        before = dict(vp=vpinfo(H) and vpinfo(H)['raw'])
+        hk = dict(tag=f'c) the month battle (M{attempt}, {mode})')
+        cw = CoverWatch(ctx.cp)
+        cw.start()
+        try:
+            rec = ls_month(ctx, f'twopc M{attempt}', modes=[mode],
+                           live_hook=lambda what, rc, A, B, r, hk=hk: twopc_live_hook(ctx, st, hk, what, rc, A, B, r))
+        finally:
+            cw.stop = True
+            cw.join(5)
+        kind = ls_host_battle(rec)
+        hb = [b for b in rec['live'] if b['A'] == H]
+        attempts.append((attempt, rec['date0'], kind, [(b['bid'], b['mode'], b.get('error')) for b in rec['live']]))
+        if kind != 'none' and not hb:
+            check(f'c) M{attempt}: the host\'s battle against nation 1 ran live under two-PC conditions', False,
+                  f'{kind}: {log_lines(log_since(H, rec["hmark"]), LS_OFF)[:3]}')
+        if hb:
+            tag = hk['tag']
+            host_battle_checks(ctx, tag, rec, hb[0], plan, before)
+            twopc_prefs_back(ctx, st, f'{tag}: after the battle', rec['cmark'], bool(hk.get('load') and
+                                                                                  hk.get('minutes')))
+            twopc_cover_check(st, tag, cw, rec['cmark'])
+            found = rec
+            break
+    check(f'c) the game started the host\'s battle against nation 1 within {limit} months (CheckForBattles2 is random; '
+          f'attempts: month, date, kind, live battles)', found, attempts)
+    r01 = ls_peace01(ctx)
+    check('c) peace 0-1 again (compromise: the host offers, the client\'s "Accept peace" button, applydiplo)',
+          r01.get('war') == '0', r01)
+    if full:
+        hm = log_mark(H)
+        run_month(ctx, 'twopc peace')
+        check('c) the next normal month under two-PC conditions (both in the new month; no live battle)',
+              LS_HOLD not in log_since(H, hm) and sstatus(H).get('date') == sstatus(C).get('date'),
+              f'host {sstatus(H).get("date")} client {sstatus(C).get("date")}')
+    return f'attempts {attempts}'
+
+
+def twopc_setup(ctx, st, var_raw):
+    """a) B under two-PC conditions (see scenario_twopc). True when B plays nation 1 in the session under them."""
+    if sstatus(C).get('role') == 'client':
+        scmd(C, 'leave')
+        try:
+            ls_wait(lambda: f'{CLIENT_NAME}(' not in lsn(H).get('players', f'{CLIENT_NAME}('), 20,
+                    'the host saw the client leave')
+        except RuntimeError as e:
+            log('  !!', e)
+    ls_kill(ctx, 'client')
+    write_atomic(PREFS_FILE, var_raw)
+    st['written'] = True
+    st['proxy_log'] = os.path.join(LOG_DIR, 'rtw3mp_twopc_proxy.log')
+    ok_p, head = proxy_start(TWOPC_PROXY_PORT, MP_PORT, st['net'], st['proxy_log'])
+    log(f'  the delay proxy (PID {PROXY[0].pid if PROXY[0] else "-"}; a pause stops it by that PID): {head}')
+    if ok_p:
+        NET_PROXY[C] = TWOPC_PROXY_PORT
+    up = ls_relaunch(ctx, 'client', {'RTW3MP_TEST_LOCALE': 'comma'}, tag='twopc')
+    st['relaunched'] = True
+    joined = bool(up and ok_p and ls_ensure_session(ctx))
+    b0, a1 = parse_prefs(scmd(C, 'ls prefs')), parse_prefs(scmd(H, 'ls prefs'))
+    keys, bv = st['keys'], st['bvals']
+    loc = ls_lines(C, 0, LOCALE_RE)
+    differ = [k for k in keys if (b0.get('sim') or {}).get(k) != (a1.get('sim') or {}).get(k)]
+    return check(f'a) B under two-PC conditions: started again with a comma locale ("TEST: RTW3MP_TEST_LOCALE=comma"), '
+                 f'its own Preferences read by the game at its start: all {len(keys)} battle preferences a live battle '
+                 f'takes from A differ from A\'s, so do {len(st["diff"]) - len(keys)} display ones (DarkMode, Scale, '
+                 f'SoundVolume, fog of war, names, messages, pauses, its battle window\'s size); A\'s own unchanged; B '
+                 f'joined through the delay proxy ({head}) and plans nation 1 in slot {CLIENT_SLOT}', joined and loc
+                 and b0.get('sim') == {k: bv.get(k) for k in keys} and len(differ) == len(keys)
+                 and all((b0.get('disp') or {}).get(k) == bv.get(k) for k in ('DarkMode', 'Scale', 'SoundVolume'))
+                 and a1.get('sim') == st['a0'].get('sim') and a1.get('disp') == st['a0'].get('disp'),
+                 f'joined {joined} (bridge {up}, proxy {ok_p}); locale {loc[:1]}; B {b0}; want {bv}; A {a1}; '
+                 f'differ {differ}')
+
+
+def twopc_final(ctx, st):
+    """d) After the battles: B's own Preferences file unchanged, both copies' preferences their own."""
+    keys, bv = st['keys'], st['bvals']
+    bp, ap = parse_prefs(scmd(C, 'ls prefs')), parse_prefs(scmd(H, 'ls prefs'))
+    fh = file_hash(PREFS_FILE)
+    check(f'd) B\'s own Preferences file unchanged after its {st["battles"]} live battle(s) and the month(s): the file '
+          f'still holds B\'s variant byte for byte (sha256 {st["var_hash"][:12]}...: nothing wrote it, neither B with '
+          f'A\'s battle preferences in memory nor A); B\'s preferences in memory its own, A\'s its own',
+          fh == st['var_hash'] and bp.get('sim') == {k: bv.get(k) for k in keys} and not bp.get('after')
+          and ap.get('sim') == st['a0'].get('sim') and ap.get('disp') == st['a0'].get('disp'),
+          f'file {fh[:12]} (B\'s variant {st["var_hash"][:12]}, the run\'s {st["run_hash"][:12]}); B {bp}; A {ap}')
+    ls_after_checks(ctx, 'd) twopc')
+
+
+def twopc_restore(ctx, st, run_raw):
+    """e) The run's own conditions again: the client leaves (the proxy logs the connection's totals: checked), the proxy
+    stops, the run's Preferences back in the file (verified by its hash), the client started again without the test
+    switch and in the session directly."""
+    if not st.get('written'):
+        return
+    if st.get('relaunched') and sstatus(C).get('role') == 'client':
+        scmd(C, 'leave')
+        try:
+            ls_wait(lambda: f'{CLIENT_NAME}(' not in lsn(H).get('players', f'{CLIENT_NAME}('), 20,
+                    'the host saw the client leave')
+        except RuntimeError as e:
+            log('  !!', e)
+        time.sleep(2)  # (the proxy logs the closed connection with its totals)
+    try:
+        with open(st.get('proxy_log') or '', encoding='utf-8') as f:
+            px = parse_proxy_log(f.read())
+    except OSError:
+        px = parse_proxy_log('')
+    proxy_stop()
+    NET_PROXY.pop(C, None)
+    if px['head']:
+        conns = px['conns']
+        down = sum(c['down'] for c in conns.values())
+        wait_max = max([c['down_wait'] for c in conns.values()] or [0])
+        need = 1_500_000 * (1 + st['battles'])  # the month package at the join and ~2 MB of battle files per start
+        check(f'd) the delay proxy carried B\'s session: {px["head"].split(" ", 1)[-1]}; {len(conns)} connection(s), '
+              f'{down} bytes towards B (>= {need}: the month package and every live start\'s and resync\'s battle '
+              f'files), the bandwidth cap made them wait (largest extra wait {wait_max:.1f} s > 1 s)',
+              conns and down >= need and wait_max > 1.0, px)
+    write_atomic(PREFS_FILE, run_raw)
+    pref_ok = file_hash(PREFS_FILE) == st['run_hash']
+    fa = (as_int(st['file'].get('MainFormWidth')) or 1000, as_int(st['file'].get('MainFormHeight')) or 719)
+    fh = battle_form_any(ctx.hp)  # (the host's battle window keeps its size into its next battle: its own size again)
+    if fh:
+        _u32w.SetWindowPos(fh, None, 0, 0, fa[0], fa[1], 0x0016)  # SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+    if any(p.pid == ctx.cp and p.poll() is None for p in PROCS):  # (never a PID of ours that is gone: it may be reused)
+        ls_kill(ctx, 'client')
+    up = ls_relaunch(ctx, 'client', None, tag='twopc')
+    joined = bool(up and ls_ensure_session(ctx))
+    b1 = parse_prefs(scmd(C, 'ls prefs'))
+    loc = ls_lines(C, 0, LOCALE_RE)
+    check(f'e) the run\'s own conditions again: the run\'s Preferences back in the file (sha256 {st["run_hash"][:12]}..., '
+          f'verified), the client started again without the test switch, its battle preferences A\'s again (one file), '
+          f'in the session directly ({MP_PORT}) and planning nation 1 in slot {CLIENT_SLOT}', pref_ok and joined
+          and not loc and b1.get('sim') == st['a0'].get('sim') and PROXY[0] is None,
+          f'Preferences {pref_ok}; joined {joined} (bridge {up}); locale lines {loc[:1]}; B {b1}')
+
+
+def scenario_twopc(ctx):
+    """Live battles under two-PC conditions (0.4.1, live-battle engine level 15; docs/TESTING.md, "Two-PC conditions").
+    a) B (the joined player's copy) leaves, is closed and started again with its own Preferences (the shared file holds
+    B's variant from then on: all battle preferences a live battle takes from A differ from A's, and display ones: its
+    battle window's size, dark mode, scale, sound, fog of war, names, messages, pauses) and a comma locale, and joins
+    through the delay proxy (latency, jitter, a bandwidth cap). b) a live test battle: the start check equal; B runs with
+    A's battle preferences and its own display ones, shows its own ensign; B's map shows B's side (its own ships, no A
+    flag, of A's ships exactly those B's side sights in the simulation's state: B's DESYNC report by `ls desyncreport`)
+    and A's map the mirror; the windows load at their own sizes and are resized between minutes; minutes in contact; a
+    resync (the maps again); --stress: the map pass off as the check's negative control and the battle screen's
+    Preferences dialog; equal minutes, no DESYNC; the end (default: the game ends it inside a minute; --stress: A drops
+    B), B's own preferences back; B's loads never shown. c) war 0-1 and real months until the game starts the host's
+    battle against nation 1: the same start and map checks, lockstep_month's checks (the month goes on: the new month on
+    both), B's own preferences back, B's load never shown (--stress: a resync in it, ended inside a minute by the game);
+    peace (--stress: and a normal month). d) B's own Preferences file unchanged (nothing wrote it, neither B with A's
+    values nor A), both copies' preferences their own; the proxy carried B's session; the log scan (no LEAK with `ls
+    leakcheck 1` on both, no lockstep error). e) the run's own conditions again (the proxy stopped, the run's
+    Preferences, the client started again normally, in the session directly)."""
+    variant = 'full' if OPTS['stress'] else 'short'
+    keys = battle_prefs_keys()
+    why = None if keys else 'the battle preferences a live battle takes from A (kPrefs) are not in src/mod/lockstep.cpp'
+    if not why and not os.path.exists(PREFS_FILE):
+        why = f'no {PREFS_FILE}: per-copy Preferences need the game\'s file (start the game once)'
+    if why:
+        SKIPPED['twopc'] = why
+        log(f'  SKIP twopc: {why}')
+        return
+    ls_ensure_session(ctx)
+    hm0 = log_mark(H)
+    with open(PREFS_FILE, 'rb') as f:
+        run_raw = f.read()
+    st = dict(variant=variant, keys=keys, net=TWOPC_NET[variant], battles=0, run_hash=file_hash(PREFS_FILE),
+              a0=parse_prefs(scmd(H, 'ls prefs')), file=prefs_values(run_raw), maps=[], sizes=[], covers=[],
+              battle_prefs=[])
+    var_raw, st['diff'] = twopc_variant(run_raw, st['a0'].get('sim') or {}, keys)
+    st['bvals'] = {k: b for k, (_, b) in st['diff'].items()}
+    st['var_hash'] = hashlib.sha256(var_raw).hexdigest()
+    log(f'  twopc ({variant}): B\'s Preferences (key: A\'s -> B\'s): {st["diff"]}; the network {st["net"]}')
+    try:
+        if twopc_setup(ctx, st, var_raw):
+            ls_case(ctx, f'twopc: a live test battle under two-PC conditions ({variant})',
+                    lambda: twopc_test_battle(ctx, st))
+            ls_case(ctx, f'twopc: the host\'s battle against the player in a real month ({variant})',
+                    lambda: twopc_month(ctx, st))
+            ls_quiet(ctx)
+            twopc_final(ctx, st)
+            log(f'  twopc: B\'s map (tag: A\'s ships shown/afloat on B, sighted by B\'s side in the simulation; the battle '
+                f'file\'s (afloat, sighted) per side at loads): ' + '; '.join(
+                    f'{t}: {s and s[0]}/{n and n[0]} sighted {rb and rb["sighted"]}' + (f' file {f}' if f else '')
+                    for t, s, n, rb, _, _, f in st['maps']) + f'; checks with A\'s ships partly sighted: '
+                f'{st.get("partial", 0)}')
+            log(f'  twopc: window sizes (tag, loaded A, B, resized A, B, (A, B) at its own Preferences\' size): '
+                f'{st["sizes"]}; B\'s loads (exposed, cover seen, shown after): {st["covers"]}')
+            ls_log_scan('twopc', {H: hm0, C: 0})
+    finally:
+        twopc_restore(ctx, st, run_raw)
 
 
 def ls_spam(A, B, seconds=60, seed=7, kinds='clock+orders'):
@@ -10271,7 +11626,7 @@ def ll_join(port=C, name=None):
     scmd(port, 'fightbattles 1')
     if lsn(port).get('enabled') != '1':
         scmd(port, 'ls enable 1')
-    return cmd(port, f'join {name} 127.0.0.1 {MP_PORT}')
+    return cmd(port, f'join {name} 127.0.0.1 {NET_PROXY.get(port, MP_PORT)}')
 
 
 def ll_live_both(A=H, B=C):
@@ -11451,6 +12806,12 @@ def rejoin_return(ctx, tag, how, a0, hm, bm, A=H, B=C, name=CLIENT_NAME, minute_
             for p, mk in ((A, hm), (B, bm))]
     waits = ls_lines(A, hm, r'lockstep: rejoin: waiting for the minute boundary \(a minute runs')
     held = ls_lines(A, hm, r'lockstep: rejoin: the next minute is held \(minute \d+')
+    # (RejoinTick can start the battle again right at the boundary, before the minute gate holds the next minute:
+    # then A starts again at the minute after the one it waited for, which holds it as well; dist_rc041_2 --stress)
+    wm = [int(m[1]) for m in (re.search(r'a minute runs; minute (\d+)', x) for x in waits) if m]
+    sm = [int(m[1]) for m in (re.search(r'starts again with .* at minute (\d+)', x) for x in start) if m]
+    if waits and not held and wm and sm and sm[0] == wm[-1] + 1:
+        held = [f'(no gate line: started again at minute {sm[0]}, right after minute {wm[-1]} it waited for)']
     check(f'{tag}: {how}: the host gives the battle back ("rejoin: {name} is back as nation <n>: ..."), A starts battle '
           f'{bid} again at its next minute boundary (epoch {a0.get("epoch")} -> {a1.get("epoch")}, "... sent (..., '
           f'rejoin)"), B accepts it, both chats "{name} is back in the live battle ..."' + (
@@ -12611,6 +13972,15 @@ def strike_battle(ctx, tag, auto, K):
             break
         scmd(H, f'settension 0 {K} 50')
         scmd(H, f'ls autostrike {auto}')
+        if os.environ.get('RTW3_LS_X87SOFT') in ('0', '1'):  # diagnosis only: A's choice of the software maths
+            log(f'  {tag}: RTW3_LS_X87SOFT={os.environ["RTW3_LS_X87SOFT"]}: '
+                f'{scmd(H, "ls x87 soft " + os.environ["RTW3_LS_X87SOFT"])[:120]}; selftest '
+                f'{scmd(H, "ls x87 selftest").split(" selftest=", 1)[-1][:400]}')
+        if os.environ.get('RTW3_LS_SHIPTYPES'):  # diagnosis only: '<A's flags>,<B's flags>[,nosync][,nohash]'
+            st = os.environ['RTW3_LS_SHIPTYPES'].split(',')
+            opts = [scmd(p, f'ls shiptypes {o}')[:60] for o in st[2:] for p in (H, C)]
+            log(f'  {tag}: RTW3_LS_SHIPTYPES: host {scmd(H, "ls shiptypes " + st[0])[:60]}; client '
+                f'{scmd(C, "ls shiptypes " + st[1])[:60]}; options {opts}')
         s = start_battle(ctx, K, F1935_MISSION)
         t0 = lss(H).get('t', '')
         hour = int(t0.split(':')[0]) if t0.split(':')[0].isdigit() else 8
@@ -12638,12 +14008,15 @@ def scenario_lockstep_strike(ctx):
     from the run's backup; a battle the game starts at 14:00 or later, or before 06:00, is replaced by another: air
     search finds nothing by night, `strike_battle`). b) the battle; both forces' search sectors toward the enemy (`ls
     airops`, `strike_sectors`: the bearing from the carriers to the enemy's ships, +-25 degrees), Fastest available,
-    until both screens have a report (the reports list's first item that opens the strike dialog: `ls strikedlg <i>`).
+    until both screens have a report (the reports list's first item that opens the strike dialog: `ls strikedlg <i>`;
+    a battle without one on a screen within 150 minutes is replaced once, a NOTE).
     c) A's strike for a report: its bomber rows checked with the mission "Naval strike"
     picked in the list's own popup, Launch and the dialog's boxes: launched on A, replayed on B, `ls airlist` identical.
     d) B's strike: "Auto select strike" (the game's choice), Launch. e) A and B launch in one pause: no resync (one order
     of the launches). f) the whole strike cycle (up to 330 minutes, `ls airlist` identical every 3 minutes): every
-    formation launched from the screen flies, at least one attacks, every minute equal, no DESYNC, no LEAK; the
+    minute equal, no DESYNC, no LEAK; every formation launched from the screen flies unless the game takes it away before
+    take-off on both copies alike (its carrier hit, the strike called off: a NOTE each; a side none of whose formations
+    flew: a SKIP-note) or the dark holds it on deck at the end, at least one flies and one attacks; the
     computer's strikes of the players' sides come only from airfields (host option off). Battle 2, the host option on (a
     fresh session, `ls autostrike 1`): g) both chats name the option and that "Order an airstrike" still launches the
     player's own strikes (engine level 12), `ls airlist` auto=1; the strike dialog opened through the tool bar's "Order
@@ -12651,7 +14024,8 @@ def scenario_lockstep_strike(ctx):
     battle ("The computer flies both sides' carrier strikes in this battle (...); the strikes you launch here fly as
     well, besides the computer's."); with both sides' search sectors toward the enemy and every division on the AI (the
     forces seek contact), within 240 minutes the computer launches a carrier strike for a side (a launched strike
-    formation based on a ship); every minute equal. h) the end:
+    formation based on a ship) when the battle can show one (a report on a screen by day, 08:00..15:00, with an hour of
+    the window left; a battle without: another battle once, then a SKIP-note); every minute equal. h) the end:
     the option put back; no lockstep error, no LEAK."""
     ok, why = fixture1935()
     if not ok and os.path.exists(F1935_BACKUP) and fixture1935(F1935_BACKUP)[0]:
@@ -12669,32 +14043,46 @@ def scenario_lockstep_strike(ctx):
     K = F1935_NATION
 
     def battle1():
-        ok, detail, s, t0, n = strike_battle(ctx, 'lockstep_strike', 0, K)
+        others = []  # the battles replaced because a screen had no report (b): the battle's own conditions)
+        for k_try in range(2):
+            ok, detail, s, t0, n = strike_battle(ctx, 'lockstep_strike', 0, K)
+            if not ok or s['res'] != 'running':
+                break
+            okc, detc = air_strike_chats(s['hm'], s['cm'], 0)
+            ra, rb = strike_search()
+            ll_release(H, C)
+            scmd(H, 'ls fastest 1')
+            ran, rep = 0, [None, None]
+            while ran < 150 and not ls_over(H):
+                ran += ls_run_total(H, C, 5, H if (ran // 5) % 2 == 0 else C)
+                for k, (port, pid) in enumerate(((H, ctx.hp), (C, ctx.cp))):
+                    if rep[k] is None:
+                        rep[k] = strike_report_probe(port, pid)
+                if None not in rep:
+                    break
+            scmd(H, 'ls fastest 0')
+            ls_run(H, C, 1, H)
+            if None not in rep or k_try:
+                break
+            # (no enemy found: the forces out of the search's reach for hours, or a dark or short day; a mod that broke
+            # the search would fail the next battle as well)
+            others.append(f'{t0}..{lss(H).get("t", "")}: no report on {"AB"[rep.index(None)]}\'s screen')
+            log(f'  NOTE b) no report on {"A" if rep[0] is None else ""}{"B" if rep[1] is None else ""}\'s screen within '
+                f'{ran} minutes (the battle started at {t0}, now {lss(H).get("t", "")}; sectors A {ra[0]}, B {rb[0]}; '
+                f'reports list items {report_count(ctx.hp)} / {report_count(ctx.cp)}): this battle can\'t show the '
+                f'strikes; another battle')
         if not check('a) a fresh 1935 session: slot 9 put back from the run\'s backup, the host hosts it, the client plans '
                      f'{F1935_NAME}', ok, detail):
             return 'no session'
         if not check(f'b) the strike battle runs on both copies (starts at {t0}, battle {n} of the session)',
                      s['res'] == 'running', s):
             return 'no battle'
-        okc, detc = air_strike_chats(s['hm'], s['cm'], 0)
         check('b) the host option off: both chats "Air strikes: launch your carriers\' strikes ...", `ls airlist` auto=0',
               okc, detc)
-        ra, rb = strike_search()
-        ll_release(H, C)
-        scmd(H, 'ls fastest 1')
-        ran, rep = 0, [None, None]
-        while ran < 150 and not ls_over(H):
-            ran += ls_run_total(H, C, 5, H if (ran // 5) % 2 == 0 else C)
-            for k, (port, pid) in enumerate(((H, ctx.hp), (C, ctx.cp))):
-                if rep[k] is None:
-                    rep[k] = strike_report_probe(port, pid)
-            if None not in rep:
-                break
-        scmd(H, 'ls fastest 0')
-        ls_run(H, C, 1, H)
         if not check(f'b) the search sectors of every force toward the enemy (`ls airops`: A {ra}, B {rb}): both screens '
-                     f'have a report within {ran} minutes (the reports list\'s first item that opens the strike dialog)',
-                     None not in rep, f'{rep}; items {report_count(ctx.hp)} / {report_count(ctx.cp)}'):
+                     f'have a report within {ran} minutes (the reports list\'s first item that opens the strike dialog; '
+                     f'a battle without one is replaced once: {others or "none replaced"})',
+                     None not in rep, f'{rep}; items {report_count(ctx.hp)} / {report_count(ctx.cp)}; replaced {others}'):
             return 'no reports'
         made = []
 
@@ -12776,27 +14164,81 @@ def scenario_lockstep_strike(ctx):
                                                                  f'{ob.get("picked")}; refused at minutes {tries}')
         # f) the cycle
         ma, mb, track, diffs, ran, ai = log_mark(H), log_mark(C), {}, [], 0, []
+        gone_at, base, nums, mind, cur = {}, {}, {}, {}, {}
         while ran < 330 and not ls_over(H):
-            ran += ls_run_total(H, C, 3, H if (ran // 3) % 2 == 0 else C)
+            # (every minute while a formation of the screen is in the air: an attack, status 7, can last a minute or two)
+            step = 1 if any(cur.get(i, {}).get('s') in (5, 6, 7) for i in made) else 3
+            ran += ls_run_total(H, C, step, H if (ran // 3) % 2 == 0 else C)
             same, _, _ = airlist_same()
             if not same:
                 diffs.append(lss(H).get('boundary'))
             _, items, _ = parse_airlist(scmd(H, 'ls airlist'))
-            cur = {x['id']: x['s'] for x in items}
+            cur = {x['id']: x for x in items}
+            now = lss(H).get('t', '')
+            if any(i in cur and i not in base for i in made):
+                bs = bases_of(H)
+                base.update((i, bs[i][1]) for i in made if i in bs and i not in base)
             for i in made:
-                st_ = cur.get(i, 'gone')
+                st_ = cur[i]['s'] if i in cur else 'gone'
+                if i in cur and cur[i]['s'] in (5, 6, 7, 8):  # (how near it came to its target point)
+                    try:
+                        d_ = bearing_nm(*(tuple(float(z) for z in cur[i][k].split(',')) for k in ('at', 't')))[1]
+                        mind[i] = min(mind.get(i, d_), d_)
+                    except (ValueError, TypeError):
+                        pass
+                if i in cur and (not nums.get(i) or nums[i][-1] != cur[i]['num']):
+                    nums.setdefault(i, []).append(cur[i]['num'])
                 if not track.get(i) or track[i][-1] != st_:
                     track.setdefault(i, []).append(st_)
+                    if st_ == 'gone':
+                        gone_at[i] = now
             ai.extend(x for x in computer_strikes(H) if x not in ai)
             if made and all(i not in cur for i in made):
                 break
         hc = ls_compare(H, ma, C, mb, 'the strike cycle')
-        flew = [i for i in made if 6 in track.get(i, [])]
+        t_end = lss(H).get('t', '')
+        check(f'f) the strike cycle ({ran} minutes, to {t_end}): `ls airlist` identical at every sample (every 3 minutes), '
+              f'every minute equal, no DESYNC', made and not diffs and hc['minutes'] >= ran - 2 and not hc['differ']
+              and not ll_desyncs(H, ma), f'differ at {diffs}; {hc}')
+        # A formation the game takes away before it takes off (its carrier hit or no longer able to fly it, the strike
+        # called off) goes on both copies at the same boundary (the samples above): the battle's own conditions, not the
+        # launch (RC 0.4.1: B's formations readying -> gone, with the hardware maths too). A formation still on deck at
+        # the end is excused only by the dark (no launch at night).
+        flew = [i for i in made if any(isinstance(x, int) and x >= 6 for x in track.get(i, []))]
         attacked = [i for i in made if 7 in track.get(i, [])]
-        check(f'f) the strike cycle ({ran} minutes): `ls airlist` identical at every sample (every 3 minutes), every '
-              f'formation launched from the screen flew (status 6), at least one attacked (7), every minute equal, no '
-              f'DESYNC', made and not diffs and len(flew) == len(made) and attacked and hc['minutes'] >= ran - 2
-              and not hc['differ'] and not ll_desyncs(H, ma), f'differ at {diffs}; tracks {track}; {hc}')
+        never = [i for i in made if i not in flew]
+        removed = [i for i in never if track.get(i, [None])[-1] == 'gone']
+        held = [i for i in never if i not in removed]
+        hour = int(t_end.split(':')[0]) if t_end.split(':')[0].isdigit() else 12
+        dark = not 8 <= hour < 16
+        bases_end = scmd(H, 'ls airbase').partition(' | bases')[2].strip()[:500]
+        for i in never:
+            log(f'  NOTE f) AF{i} ({"AB"[i >= UI_AFID[1][0]]}\'s, from {base.get(i, "?")}) never flew: states '
+                f'{track.get(i)}, aircraft {nums.get(i)}, '
+                + (f'taken away by the game before take-off at {gone_at.get(i)} on both copies alike' if i in removed
+                   else f'still on deck at the end ({t_end}{", dark" if dark else ""})')
+                + f'; the bases at the end: {bases_end}')
+        for side in (0, 1):
+            mine = [i for i in made if (i >= UI_AFID[1][0]) == bool(side)]
+            if mine and not any(i in flew for i in mine):
+                log(f'  SKIP-note f) none of {"AB"[side]}\'s {len(mine)} formations from the screen flew (the game took '
+                    f'them away before take-off or the dark held them: NOTEs above): this battle doesn\'t show '
+                    f'{"AB"[side]}\'s strikes flying')
+        bad = held if not dark else []
+        # A strike that reaches its target point and finds nothing there (the enemy moved on since the report) flies home
+        # without attacking: the battle's own conditions when a formation came within 10 nm of its target point
+        near = {i: round(mind[i], 1) for i in flew if i in mind}
+        reached = [i for i in flew if near.get(i, 99) <= 10]
+        if flew and not attacked and reached:
+            log(f'  SKIP-note f) no formation from the screen attacked (status 7, sampled every minute in the air): '
+                f'{["AF%d" % i for i in reached]} reached the target point (closest nm {near}) and found nothing to attack '
+                f'there: this battle doesn\'t show an attack')
+        check(f'f) every formation launched from the screen flew (status 6 or later) unless the game took it away before '
+              f'take-off on both copies alike (the battle\'s own conditions, a NOTE each: {removed or "none"}) or the dark '
+              f'held it on deck at the end; at least one flew, and one attacked (7) unless they found nothing at the target '
+              f'point (a SKIP-note)', flew and (attacked or reached) and not bad,
+              f'tracks {track}; taken away {removed} at {gone_at}; on deck at the end {held} ({t_end}); closest to the '
+              f'target point (nm) {near}; bases {base}')
         players_ai = [x for x in ai if x[2] != 'field']
         if ai:
             check('f) with the host option off the computer\'s strikes of the players\' sides came only from airfields (`ls '
@@ -12840,20 +14282,60 @@ def scenario_lockstep_strike(ctx):
               'flies both sides\' carrier strikes in this battle (...); the strikes you launch here fly as well, besides '
               'the computer\'s.")', [len(x) for x in notes] == [1, 1] and opened == [2, 2],
               f'notes {[len(x) for x in notes]}; dialogs opened {opened}')
-        ra, rb = strike_search()
-        n_ai = ls_all_ai(H, C)  # (the forces seek contact: the carriers come within their aircraft's range)
-        ll_release(H, C)
-        scmd(H, 'ls fastest 1')
-        ma, mb, ran, carrier, ai = log_mark(H), log_mark(C), 0, [], []
-        while ran < 240 and not ls_over(H) and not carrier:
-            ran += ls_run_total(H, C, 5, H)
-            ai.extend(x for x in computer_strikes(H) if x not in ai)
-            carrier = [x for x in ai if x[2] == 'ship']
-        hc = ls_compare(H, ma, C, mb, 'the second battle')
-        check(f'g) with the host option on the computer launches a carrier strike for a player\'s side within {ran} '
-              f'minutes (both sides\' search sectors toward the enemy, `ls airops`: A {ra}, B {rb}; {n_ai} divisions to '
-              f'the AI; a launched strike formation based on a ship, `ls airbase`); every minute equal', carrier
-              and hc['minutes'] >= ran - 2 and not hc['differ'], f'{carrier[:4]}; all computer strikes {ai[:8]}; {hc}')
+        def watch(t0):
+            """Both sides' search sectors toward the enemy and every division on the AI (the forces seek contact), then up
+            to 240 minutes until the computer launches a carrier strike for a side. Whether the battle could show one: a
+            report on a screen (the reports list's first item that opens the strike dialog) by day (08:00..15:00) with
+            an hour of the window left; a battle without contact (the forces out of reach, a dark start, no flying
+            weather) can't. Returns dict(ran, carrier, ai, hc, contact, shown, why, ra, rb, n_ai)."""
+            ra, rb = strike_search()
+            n_ai = ls_all_ai(H, C)
+            ll_release(H, C)
+            scmd(H, 'ls fastest 1')
+            ma, mb, ran, carrier, ai, rep, contact, air = log_mark(H), log_mark(C), 0, [], [], [None, None], None, set()
+            while ran < 240 and not ls_over(H) and not carrier:
+                ran += ls_run_total(H, C, 5, H)
+                ai.extend(x for x in computer_strikes(H) if x not in ai)
+                carrier = [x for x in ai if x[2] == 'ship']
+                air |= {x['side'] for x in parse_airlist(scmd(H, 'ls airlist'))[1] if x['s'] >= 6 and x['m'] == 1}
+                if contact is None:
+                    for k, (port, pid) in enumerate(((H, ctx.hp), (C, ctx.cp))):
+                        if rep[k] is None:
+                            rep[k] = strike_report_probe(port, pid)
+                    if rep != [None, None]:
+                        contact = (ran, lss(H).get('t', ''), 'A' if rep[0] is not None else 'B')
+            hc = ls_compare(H, ma, C, mb, 'the second battle')
+            t1 = lss(H).get('t', '')
+            hr = int(contact[1].split(':')[0]) if contact and contact[1].split(':')[0].isdigit() else -1
+            shown = bool(carrier) or bool(contact and 8 <= hr < 15 and ran - contact[0] >= 60)
+            why = '' if shown else (
+                f'the battle ({t0}..{t1}, {ran} minutes{", over" if ls_over(H) else ""}) had no contact: no report on '
+                f'either screen, search aircraft aloft for side {sorted(air) or "none"}' if not contact else
+                f'the first report (on {contact[2]}\'s screen) came at {contact[1]}, {ran - contact[0]} minutes before the '
+                f'window\'s end ({t1}): too late in the day or in the window')
+            return dict(ran=ran, carrier=carrier, ai=ai, hc=hc, contact=contact, shown=shown, why=why, ra=ra, rb=rb,
+                        n_ai=n_ai)
+
+        w, tried = watch(t0), []
+        if not w['shown']:  # (another battle once: a fresh session, the option on)
+            tried.append(w)
+            log(f'  NOTE g) {w["why"]}: this battle can\'t show the computer\'s carrier strike; another battle')
+            ok, detail, s, t0, n = strike_battle(ctx, 'lockstep_strike 2', 1, K)
+            if check(f'g) the replacement battle runs on both copies (starts at {t0}, battle {n} of the session)',
+                     ok and s['res'] == 'running', f'{detail}; {s}'):
+                w = watch(t0)
+        hcs = [x['hc'] for x in tried] + [w['hc']]
+        check(f'g) every minute equal in the second battle{"s" if tried else ""} (with the option on, every division on '
+              f'the AI)', all(h['minutes'] >= r['ran'] - 2 and not h['differ'] for h, r in zip(hcs, tried + [w])), hcs)
+        if w['shown']:
+            check(f'g) with the host option on the computer launches a carrier strike for a player\'s side within '
+                  f'{w["ran"]} minutes (both sides\' search sectors toward the enemy, `ls airops`: A {w["ra"]}, B '
+                  f'{w["rb"]}; {w["n_ai"]} divisions to the AI; a launched strike formation based on a ship, `ls '
+                  f'airbase`; the first report: {w["contact"]})', w['carrier'],
+                  f'{w["carrier"][:4]}; all computer strikes {w["ai"][:8]}; replaced battles: {[x["why"] for x in tried]}')
+        else:
+            log(f'  SKIP-note g) the computer\'s carrier strike with the option on not checked: neither battle could show '
+                f'it ({"; ".join(x["why"] for x in tried + [w])})')
         scmd(H, 'ls drop')
         ls_wait(lambda: ls_back(C, ctx.cp, CLIENT_SLOT, K), 120, 'the client back in slot 77')
 
@@ -12987,6 +14469,28 @@ MSL_TURN = 'will turn to fire SSM'
 AUTO_FIRE = 'Your ships are on auto-run: the computer fires their torpedoes and missiles.'  # (engine level 12: torpedo and missile salvoes on auto-run)
 
 
+MSL_LAST = {}  # {side: the `ls missiles` replies of missile_salvo's last round}
+MSL_EMPTY = re.compile(r'nothing to fire \((no missiles are left in that launcher|the launcher is destroyed)\)')
+
+
+def msl_spent(side):
+    """Why `side` can't fire any more in this battle, from missile_salvo's last round, or '': every division with SSM
+    aboard answered that its launchers are empty or destroyed (the battle's own state: its salvoes and the enemy's hits;
+    both copies agree on the stocks at every release), or it has no such division left."""
+    raws = MSL_LAST.get(side)
+    if raws is None:
+        return ''
+    if not raws:
+        return f'side {side} has no division with SSM aboard left'
+    def spent(r):
+        sh = re.search(r'\| shooters: ([^|]*)', r or '')
+        return MSL_EMPTY.search(r or '') or ('no shooter of that division listed' in (r or '') and sh and all(
+            x.strip().rsplit(':', 1)[-1] == '0' for x in sh[1].split(';') if x.strip()))
+    if all(spent(r) for r in raws):
+        return f'side {side}\'s launchers are empty or destroyed ({len(raws)} division(s): {raws[0][:150]})'
+    return ''
+
+
 def missile_salvo(port, side, divs=None, rounds=15, A=H, B=C):
     """A manual salvo of `side` (Fire one through `ls missiles <division> first 1`, the dialog's own routines) from the
     first division that gets one (`divs`, or this side's divisions with SSM aboard read anew every round): queued
@@ -12994,8 +14498,10 @@ def missile_salvo(port, side, divs=None, rounds=15, A=H, B=C):
     to fire SSM": before 1959 the launchers are fixed). Runs 2 minutes between rounds without one (not after the last).
     Returns dict(res, pend: the giver's pending targets now) or None."""
     for k in range(rounds):
+        MSL_LAST[side] = []
         for d in (divs if divs is not None else missile_ships_divs(port, side, ssm=True)):
             res = missile_try(port, d)
+            MSL_LAST[side].append(res['raw'])
             pend = int((parse_missilestat(scmd(port, 'ls missilestat')).get(f'side{side}') or {}).get('pending') or 0)
             if res['queued'] > 0 or (MSL_TURN in res['raw'] and pend > 0):
                 return dict(res=res, pend=pend)
@@ -13158,10 +14664,15 @@ def scenario_lockstep_missiles(ctx):
                 if any(x[1] for x in salvos):
                     ll_release(H, C)  # (a lone salvo of a "both" step: released, try again)
                 ls_run_total(H, C, 2, H)
+            spent = [msl_spent(sd) for sd, x in salvos if not x]
             if all(x[1] for x in salvos):
                 missile_release_check('f)', f'manual missile salvo {step}', salvos)
+            elif any(spent):  # (a side spent: dist_rc041_2 --stress, A's launchers emptied by its salvo, one destroyed)
+                log(f'  SKIP-note f) manual missile salvo {step} not checked: this battle can\'t show it any more: '
+                    f'{"; ".join(spent)}')
             else:
-                check(f'f) manual missile salvo {step}', False, f'no salvo could be ordered: {salvos}')
+                check(f'f) manual missile salvo {step}', False, f'no salvo could be ordered: {salvos}; '
+                                                              f'last replies {MSL_LAST}')
         # i) a resync with a pending heavy-missile target (`ls testpmt`; side 0 still has heavy SSM aboard)
         ship = missile_ship_index(H, 0)
         if ship is None:
@@ -13220,6 +14731,15 @@ def scenario_lockstep_missiles(ctx):
                         int(cur.get(k) or 0) < int(st0[side].get(k) or 0) for k in ('heavySSM', 'mediumSSM', 'lightSSM')):
                     fired[side] = True
         scmd(H, 'ls fastest 0')
+        # a side that fired nothing: could it? (the manual salvos before, the "both" step's lone ones too, can leave its
+        # launchers empty: dist_rc041_2 --stress, side 1 "shooters: 0:Minsk:0; ..." with 18 heavy SSM aboard). A try now
+        # that gets a salvo means the computer left a loaded launcher alone: still a FAIL
+        spent = {}
+        for side in (sd for sd in (0, 1) if not fired[sd]):
+            got = missile_salvo(H if side == 0 else C, side, rounds=1)
+            spent[side] = '' if got else msl_spent(side)
+            if spent[side]:
+                log(f'  SKIP-note d) side {side}\'s automatic fire not checked: it had nothing left to fire: {spent[side]}')
         ls_run(H, C, 1, H)
         hc = ls_compare(H, ma, C, mb, 'automatic missile fire')
         rules = [ls_lines(p, mk, r"lockstep: missile fire under the computer's rules for both sides") for p, mk in
@@ -13228,9 +14748,11 @@ def scenario_lockstep_missiles(ctx):
         check(f'd) automatic fire for both sides ({n_ai} divisions to the AI, Fastest available, {ran} minutes, {samples} '
               f'samples): both sides fired (SSM stocks fell or more missiles in the air: {fired}), `ls missilestat` '
               f'identical on both copies at every sample, every minute equal, "missile fire under the computer\'s rules '
-              f'for both sides" logged on both', all(fired.values()) and not diffs and hc['minutes'] >= ran - 2
-              and not hc['differ'] and all(rules), f'differ at {diffs}; {hc}; rules {[len(x) for x in rules]}; start '
-                                                   f'{st0}; now {stx}')
+              f'for both sides" logged on both (a side with nothing left to fire: a SKIP-note)',
+              any(fired.values()) and all(fired[sd] or spent.get(sd) for sd in (0, 1)) and not diffs
+              and hc['minutes'] >= ran - 2 and not hc['differ'] and all(rules),
+              f'differ at {diffs}; {hc}; rules {[len(x) for x in rules]}; start {st0}; now {stx}; nothing left: {spent}; '
+              f'last replies {dict((k, [r[:160] for r in v]) for k, v in MSL_LAST.items())}')
         upd = [ls_lines(p, mk, r"lockstep: the missile panel's counts are not updated on this PC \(side 1\)")
                for p, mk in ((H, s['hm']), (C, s['cm']))]
         check('d) the panel shows each player\'s own side: side 1\'s PC doesn\'t run the panel\'s count routine (it counts '
@@ -13601,6 +15123,17 @@ SCENARIOS = [  # name, months processed, what it guards, function
                           'client\'s month, the client\'s plans kept; after each battle every reload of each copy\'s '
                           'own slot keeps the saved VP under a blockade made for the check (0.4.0); peace and a normal '
                           'month', scenario_lockstep_month),
+    ('twopc', 1, 'group twopc (0.4.1, engine level 15): live battles under two-PC conditions: B (the client) started '
+                 'again with its own Preferences (every battle preference a live battle takes from A and display ones '
+                 'differ, its battle window another size; the shared file holds B\'s variant to the end) and a comma '
+                 'locale, joined through tools/net_delay_proxy.py (latency, jitter, a bandwidth cap), the windows resized '
+                 'between minutes; a test battle and the host\'s battle against the player in a real month: the start '
+                 'check (READY) equal, the minutes equal, B\'s map (`ls mapview`: B\'s own ships, no A flag, of A\'s '
+                 'ships exactly those B\'s side sights in the simulation\'s state, `ls desyncreport`), B on A\'s battle '
+                 'preferences and its own back afterwards, its own ensign, its loads never shown; the month goes on; '
+                 'B\'s own Preferences file unchanged; no LEAK (`ls leakcheck 1`). Default: short; --stress: a harsher '
+                 'network, the map pass off as a negative control, the battle screen\'s Preferences dialog, a resync in '
+                 'the month battle, a normal month; the run\'s own conditions again afterwards', scenario_twopc),
     ('lockstep_rejoin', 1, 'group rejoin, --stress: returns to a live battle (engine level 8): leave and join, a return '
                            'during a minute A runs alone, another engine level (RTW3MP_TEST_LS_LEVEL: refused, the host\'s '
                            'chat and the notice; back at this level: rejoined), a return after the battle\'s end; a relayed '
@@ -13672,6 +15205,7 @@ GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), i
     'missiles': ('lockstep_missiles',),
     'live-limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo',
                     'lockstep_air', 'lockstep_strike', 'lockstep_missiles'),
+    'twopc': ('twopc',),
 }
 # Game time per scenario in seconds: measured in the dist_ll_7 default run (the 0.3.2-era scenarios) and on the 0.4.0
 # release candidate dist_ll_16 (2026-10-18: the default run 1528 s with lockstep_ui 213, lockstep_limits 175, air_units
@@ -13681,8 +15215,9 @@ EST = dict(session=14, intel_reports=1, file_lock=4, events=4, merge=17, researc
            diplomacy=92, battles=107, victory_points=44, treaty=47, player_copy=45, lockstep=93, lockstep_ui=215,
            lockstep_limits=175, lockstep_pvp=72, lockstep_month=109, lockstep_rejoin=565, lockstep_resume=380,
            lockstep_torpedo=470, lockstep_stress=1310, lockstep_air=265, air_units=65, lockstep_strike=420,
-           lockstep_missiles=330)
-EST_STRESS = dict(lockstep_pvp=235, lockstep_month=710)  # their long variants (--stress; dist_ll_16)
+           lockstep_missiles=330, twopc=175)
+# their long variants (--stress; dist_ll_16, twopc on dist_tp_1)
+EST_STRESS = dict(lockstep_pvp=235, lockstep_month=710, twopc=200)
 
 
 # ---------------------------------------------------------------- runner
@@ -13727,11 +15262,14 @@ def leftover_backup(backup, slot_path, what, dry, problems):
                         f'or delete it first')
 
 
-def preflight(g1, copy_slots=(), k2_slots=(), dry=False, prefs=False, missile=None, air_slots=()):
+def preflight(g1, copy_slots=(), k2_slots=(), dry=False, prefs=False, missile=None, air_slots=(), proxy_port=None):
     """Why the run cannot start (a list). dry: only report (a leftover backup equal to its slot is not removed).
     prefs: the run changes RealismSetting (lockstep_torpedo). missile: missile_plan's plan (its slot's checks).
-    air_slots: air_units' throwaway slot (AIR_SLOT), which must not exist."""
+    air_slots: air_units' throwaway slot (AIR_SLOT), which must not exist. proxy_port: twopc's delay proxy port, which
+    must be free."""
     problems = []
+    if proxy_port and not port_free(proxy_port):
+        problems.append(f'127.0.0.1:{proxy_port} is in use: twopc\'s delay proxy needs it (another proxy left running?)')
     if running_pids('RTW3.exe'):
         problems.append(f'RTW3.exe is already running (PIDs {running_pids("RTW3.exe")}); close it first')
     if not running_pids('steam.exe'):
@@ -13787,12 +15325,13 @@ def preflight(g1, copy_slots=(), k2_slots=(), dry=False, prefs=False, missile=No
     return problems
 
 
-def prefs_for_run(realism=None, float_auto=False):
+def prefs_for_run(realism=None, float_auto=False, keep=False):
     """The run's battle preferences in the game's Preferences (the game reads them at its start; the first player's
     apply on both PCs): RealismSetting=<realism> when it is lower (lockstep_torpedo), FloatplaneLaunch=0 (Automatic)
     when it is not (lockstep_strike: with "Ask before launch" a live battle answers the floatplane question No for both
     sides, so no search floatplane flies: README). The file is copied to PREFS_BACKUP first and put back by
-    prefs_restore. Returns (hash of the original file or None when it was left as it is, what was done)."""
+    prefs_restore; keep (twopc, which writes B's variant into the file during its scenario): backed up even when nothing
+    changes now. Returns (hash of the original file or None when it was left as it is, what was done)."""
     try:
         with open(PREFS_FILE, 'rb') as f:
             raw = f.read()
@@ -13817,14 +15356,18 @@ def prefs_for_run(realism=None, float_auto=False):
         else:
             new = re.sub(rb'FloatplaneLaunch=\d+', b'FloatplaneLaunch=0', new, count=1)
             notes.append(f'FloatplaneLaunch {m[1].decode()} -> 0 (Automatic)')
-    if new == raw:
+    if new == raw and not keep:
         return None, '; '.join(notes)
     shutil.copyfile(PREFS_FILE, PREFS_BACKUP)
     h = file_hash(PREFS_BACKUP)
-    with open(PREFS_FILE + '.new', 'wb') as f:
-        f.write(new)
-    os.replace(PREFS_FILE + '.new', PREFS_FILE)
-    return h, '; '.join(notes) + f' for the run (the file backed up to {PREFS_BACKUP})'
+    if new != raw:
+        with open(PREFS_FILE + '.new', 'wb') as f:
+            f.write(new)
+        os.replace(PREFS_FILE + '.new', PREFS_FILE)
+        notes[-1] += ' for the run'
+    if keep:
+        notes.append('twopc writes the second player\'s variant into it during its scenario')
+    return h, '; '.join(notes) + f' (the file backed up to {PREFS_BACKUP})'
 
 
 def prefs_realism_for_run(want=2):
@@ -13947,6 +15490,13 @@ def dry_run(names, a, problems, plan, prefs_note):
                                                                          f'SKIP lockstep_missiles: {why}'))
     if 'lockstep_torpedo' in names or 'lockstep_limits' in names:
         log(f'  Preferences: RealismSetting {realism_pref()} ({PREFS_FILE}); {prefs_note}')
+    if 'twopc' in names:
+        net = TWOPC_NET['full' if a.stress else 'short']
+        log(f'  twopc ({"full" if a.stress else "short"}): the client started again with RTW3MP_TEST_LOCALE=comma and '
+            f'its own Preferences: {PREFS_FILE} holds its variant from its start to the scenario\'s end ('
+            + ('backed up, put back and verified afterwards' if os.path.exists(PREFS_FILE) else
+               'MISSING: SKIP twopc') + f'); the delay proxy on 127.0.0.1:{TWOPC_PROXY_PORT} -> {MP_PORT} (delay '
+            f'{net["delay"]} ms, jitter +-{net["jitter"]} ms, {net["kbps"]} kbit/s)')
     slots = [CLIENT_SLOT, BATTLE_SLOT] + ([K2_SLOT, K2_SLOT + 10] if {'lockstep_pvp', 'lockstep_rejoin'} & set(names)
                                           else [])
     log(f'  slots the run writes and deletes afterwards: {slots}' + (f' and player_copy\'s {list(COPY_SLOTS)} + one of '
@@ -14201,13 +15751,16 @@ def main(argv=None):
         copy_slots = COPY_SLOTS + ((_button_slot[0],) if _button_slot[0] else ())
     k2_slots = (K2_SLOT, K2_SLOT + 10) if 'lockstep_pvp' in names or 'lockstep_rejoin' in names else ()
     torpedo = 'lockstep_torpedo' in names
+    twopc = 'twopc' in names
     air_slots = (AIR_SLOT,) if 'air_units' in names else ()
     problems = preflight(g1, COPY_SLOTS if copy_slots else (), k2_slots, dry=a.dry_run, prefs=torpedo, missile=plan,
-                         air_slots=air_slots)
+                         air_slots=air_slots, proxy_port=TWOPC_PROXY_PORT if twopc else None)
     if a.dry_run:
         cur = realism_pref()
         note = ('lockstep_torpedo would set RealismSetting=2 for the run (backed up, put back and verified afterwards)'
-                if torpedo and (cur or 0) < 2 else 'the run leaves it as it is' + (
+                if torpedo and (cur or 0) < 2 else ('backed up for twopc (the second player\'s variant during its '
+                                                    'scenario), RealismSetting as it is' if twopc else
+                                                    'the run leaves it as it is') + (
                     '; lockstep_limits f) checks "Fire torpedoes" at this setting' if 'lockstep_limits' in names else ''))
         if 'lockstep_strike' in names:
             note += '; lockstep_strike would set FloatplaneLaunch=0 (Automatic: search floatplanes) for the run'
@@ -14242,8 +15795,8 @@ def main(argv=None):
         shutil.copytree(gm, b)
         log(f'backed up save slot {s} (the missile-era campaign)')
     prefs_h = None
-    if torpedo or 'lockstep_strike' in names:
-        prefs_h, note = prefs_for_run(2 if torpedo else None, float_auto='lockstep_strike' in names)
+    if torpedo or 'lockstep_strike' in names or twopc:
+        prefs_h, note = prefs_for_run(2 if torpedo else None, float_auto='lockstep_strike' in names, keep=twopc)
         log('Preferences:', note)
     RUN['realism'] = realism_pref()
     RUN['traces'].clear()
@@ -14272,6 +15825,8 @@ def main(argv=None):
         if _ANS[0] is not None:
             _ANS[0].stop = True
         left = close(procs)
+        proxy_stop()  # (twopc's delay proxy, when the scenario could not stop it)
+        NET_PROXY.clear()
         open_s = time.time() - t_open
         time.sleep(2)
         saves_ok, err = restore(g1)

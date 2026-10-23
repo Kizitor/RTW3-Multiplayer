@@ -1,4 +1,5 @@
 #include "common.h"
+#include "datafiles.h"
 #include "delphi.h"
 #include "game.h"
 #include "lockstep.h"
@@ -99,6 +100,7 @@ static void CreateDispatcher() {
     ui::Init(g_inst);
     mp::Init();
     Log("dispatcher ready on main thread %lu", GetCurrentThreadId());
+    lockstep::ApplyTestSwitches("the mod's start");  // (TEST ONLY switches; nothing without them)
     if (!g_calls.empty()) PostMessageW(g_dispatcher, WM_MP_CALL, 0, 0);
 }
 
@@ -145,6 +147,7 @@ static LONG CALLBACK DiagVeh(EXCEPTION_POINTERS* ep) {
 static DWORD WINAPI InitThread(LPVOID) {
     LogInit(ModDataDir());
     Log("RTW3MP %s starting (protocol %d)", MP_MOD_VERSION, MP_PROTOCOL);
+    datafiles::PocFileLog();  // (TEST ONLY: RTW3MP_TEST_FILELOG=1)
     char diag[8];
     if (GetEnvironmentVariableA("RTW3MP_DIAG", diag, sizeof(diag)) > 0) AddVectoredExceptionHandler(1, DiagVeh);
     if (GetEnvironmentVariableA("RTW3MP_NOINIT", diag, sizeof(diag)) > 0) {

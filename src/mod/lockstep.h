@@ -9,6 +9,9 @@ namespace lockstep {
 // ---- the engine (battle internals; also used by the poc* test commands) ----
 bool Resolve();                 // finds the battle routines and variables (by name and code patterns)
 std::string Missing();          // what Resolve could not find
+// TEST ONLY (two-PC conditions on one PC): RTW3MP_TEST_PREFS / RTW3MP_TEST_FPUCW / RTW3MP_TEST_LOCALE (main thread).
+void ApplyTestSwitches(const char* when);
+bool TestPrefsWanted();
 bool EnsureHooks();             // installs the battle hooks (once; they do nothing outside a lockstep battle or a POC)
 void* BattleForm();             // the battle screen (TfrmMain) or nullptr
 bool BattleVisible();

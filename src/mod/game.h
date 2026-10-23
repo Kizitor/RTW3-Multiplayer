@@ -174,6 +174,11 @@ void StartWar(int a, int b);                  // what the game does when a war b
 void MakePeace(int a, int b, int hostOutcome = 3);  // ends only the war between a and b; hostOutcome 1 won, 2 lost, 3 compromise
 void SetAlliance(int a, int b, int months);   // 0 ends it
 
+// The relations view: on a PC that plays nation K > 0 as the player (a joined player's PC) the game's tension panel,
+// war and alliance marks, flags, map strength bars and war state show nation K's relations (game.cpp, KViewBegin).
+int ShownNationIndex();     // K when PlayerNation is BuilderNations[K] with K in 1..8, else 0
+std::string DebugRelView();  // tests: what the strategic screen's tension panel and war state show now
+
 }  // namespace game
 
 // Callbacks from hooks (implemented by the session layer). All run on the game's main thread.

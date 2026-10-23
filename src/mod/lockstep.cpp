@@ -16,9 +16,11 @@
 //   - a player A drops goes to the computer; the battle goes on on A and stays rejoinable: when the player is back, A
 //     holds the battle at its next minute boundary and starts it again with them (Rejoin, engine level 8).
 #include "lockstep.h"
+#include "datafiles.h"
 #include "delphi.h"
 #include "game.h"
 #include "saveio.h"
+#include "x87.h"
 #include "../../third_party/minhook/include/MinHook.h"
 #include <commctrl.h>
 #include <intrin.h>
@@ -1555,6 +1557,9 @@ struct HashResult {
     int ships = 0, sunk = 0, divisions = 0, air = 0, torps = 0, sides[2] = {};
 };
 
+static bool TypeFlagsNow(uint8_t out[3]);  // (the campaign's ship-type flags; below)
+static bool g_typeFlagsHash = true;  // TEST ONLY (`ls shiptypes nohash`): the flags out of the state hash (as 0.4.1 RC)
+
 static HashResult StateHash() {
     ResolveSpecs();
     HashResult r;
@@ -1624,6 +1629,8 @@ static HashResult StateHash() {
     if (E.clockVar) Fnv(r.all, E.clockVar, 8);
     int32_t date[3];  // engine level 10: the campaign's Year, Month and Day (the weather's season, the AI's day parity)
     if (CampaignDateNow(date)) Fnv(r.all, date, sizeof(date));
+    uint8_t types[3];  // engine level 17: the ship-type flags the identification reads (TypeFlagsNow)
+    if (g_typeFlagsHash && TypeFlagsNow(types)) Fnv(r.all, types, sizeof(types));
     return r;
 }
 
@@ -1695,7 +1702,10 @@ std::string RngStats() {
     return out;
 }
 
+static void CheckFpu(const char* where);  // (the x87 control word around the steps and hashes; below)
+
 std::string HashLine(const char* tag) {
+    CheckFpu("the hash");
     HashResult h = StateHash();
     char b[760];
     int n = snprintf(b, sizeof(b), "%s t=%s min=%d all=%016llx", tag, ClockText().c_str(), Minute(),
@@ -1778,6 +1788,7 @@ struct Frame {
 static Frame g_frames[512];
 static int g_nFrames = 0;
 static bool g_leakCheck = false;  // tests (`ls leakcheck 1`): the simulation state must not change between its steps
+static bool g_leakIdent = true;   // the leak check covers the simulation's identification (engine level 17; `ls leakcheck ident 0`)
 static std::vector<int> g_uiSince;  // display routines entered since the last simulation step (leak check)
 static int g_outerIdx = -2;          // the frame that entered the simulation (leak check)
 static bool g_testThrow = false;  // tests: an exception inside this PC's next MoveAllShips (`ls throw`)
@@ -1811,6 +1822,7 @@ static int g_outerIdxFwd();
 static void FlightMinuteStart();  // DESYNC forensics (defined with the state dump)
 static void OnResultsExit();
 static void OnResultsEnter();
+static void MapAfterStep(int outerIdx);  // this PC's map after a simulation step (engine level 15)
 
 static void FrameEnterCount(int kind, int dir) {
     if (kind == K_RES) {
@@ -1832,6 +1844,9 @@ static void FrameEnterCount(int kind, int dir) {
             }
         } else if (g_sim > 0 && --g_sim == 0) {
             OnSimOuterExit();
+            ApplyViewSide();
+            MapAfterStep(g_outerIdxFwd());  // (this PC's map: the step may have set the first side's picture)
+            return;
         }
     } else {
         if (dir > 0)
@@ -2311,7 +2326,7 @@ struct Blocker {
 };
 enum { B_PAUSE, B_END, B_AUTORUN, B_DETACH, B_UNAVAILABLE, B_SAVE, B_SPEED, B_ARROW, B_FASTEST, B_CHFORCE, B_LEADBTN,
        B_SELECTLEAD, B_TORPS, B_AIROPS, B_LANDCAP, B_SEARCHDLG, B_STRIKE, B_STRIKEDLG, B_STRIKEBTN, B_SALVO, B_SALVOFIRE,
-       B_FIREATWILL };
+       B_FIREATWILL, B_PREFS };
 static Blocker g_blockers[] = {
     {"TfrmMain", "sbPauseClick", B_PAUSE},
     {"TfrmMain", "sbEndGameClick", B_END},
@@ -2319,6 +2334,9 @@ static Blocker g_blockers[] = {
     {"TfrmMain", "Detach1Click", B_DETACH},
     {"TdlgDivisionReport", "Detach1Click", B_DETACH},
     {"TfrmMain", "sbSaveClick", B_SAVE},
+    // (Self, Sender): the battle screen's Preferences (engine level 15): the dialog opens; the battle preferences the
+    // simulation uses stay this battle's until it ends (a change of them is put back, with a chat line)
+    {"TfrmMain", "sbPrefsClick", B_PREFS},
     {"TfrmMain", "cbGameSpeedChange", B_SPEED},
     {"TfrmMain", "UpDown1Click", B_ARROW},
     {"TfrmMain", "cbFastestAvailableClick", B_UNAVAILABLE},
@@ -2517,6 +2535,7 @@ bool EnsureHooks() {
         Log("lockstep: manual missile salvoes OFF (the missile dialog was not found)");
     }
     g_hooksOk = ok;
+    x87::Install();  // engine level 16: the transcendental routines (live battles use them only if all are hooked)
     Log("lockstep hooks: %s (%d of %d context hooks, %d of %d click handlers); live-battle rules: air strikes %s, air "
         "search plan %s, missile fire %s, missile panel %s, land CAP airfield side %s, scout question %s; force orders: "
         "change force %s, change lead and turn-away %s; torpedo salvoes %s; routine air ops %s, land-based CAP %s; air "
@@ -2611,11 +2630,19 @@ static struct Session {
     bool loadQueued = false;
     std::string savedPrefs;  // B: this PC's own battle preferences (restored at the end)
     std::string prefsA;      // B: A's battle preferences
+    std::string savedTypes;  // B: this PC's own ship-type flags (engine level 17; restored at the end)
+    std::string typesA;      // B: A's ship-type flags (`st=`)
     int startSpeed = 1;      // B: the game speed of the snapshot
     bool firstLoad = false;  // B: the first load of this battle (side 1 becomes human)
     bool everRunning = false;  // A: the battle ran in lockstep at least once
     bool peerReady = false;    // A: B's load finished
     std::string peerReadyHash, myReadyHash;
+    // Engine level 16: the READY hash's parts (ReadyParts) of both PCs, B's CPU vendor and own x87 control word (in its
+    // `ready`), what differed in plain words (ReadyDiag), and the transcendental maths in software on both PCs.
+    std::string peerReadyParts, myReadyParts, peerCpu, readyDiag;
+    unsigned peerOwnCw = 0, ownCw = 0;
+    int cwFixes = 0;
+    bool softMath = false;
     std::string myName;  // this PC's player name (in A's start message)
     DWORD finSince = 0;  // B: A ended the battle (B ends at the same minute or leaves)
     unsigned cw0 = 0;
@@ -3438,10 +3465,33 @@ extern "C" int __stdcall LS_MissilePanelAllowed() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Battle preferences the simulation reads (offset, length in the game's preferences record).
-static const int kPrefs[][2] = {{0x10, 4},  {0x14, 4},  {0x18, 14}, {0x26, 4},  {0x2a, 4},  {0x2e, 2},  {0x34, 5},
-                                {0x39, 4},  {0x3e, 2},  {0x42, 4},  {0x46, 4},  {0x4a, 4},  {0x4e, 4},  {0x52, 4},
-                                {0x56, 4},  {0x65, 4},  {0x34e, 1}, {0x350, 2}, {0x356, 2}, {0x36e, 9}, {0x378, 3}};
+// Battle preferences in a live battle (engine level 15). The game's preferences record (TdlgPrefs.LoadPrefs fills it
+// from the Preferences file at the game's start) holds the battle options next to many display ones. Every read of it
+// was classified by whether the battle load or the simulation reaches it and what the read decides (GAME-INTERNALS,
+// "Two PCs: the preferences, ..."): these are the ones whose value changes the loaded battle, the simulation's state or
+// its shared random numbers (some of the minute's messages and sounds draw shared random numbers only when they are
+// on). B uses A's values of these while the live battle lasts; every other preference stays each PC's own (until
+// level 14, B also took A's display options: sound volume, dark mode, window state, range circles, ...).
+struct PrefSpec {
+    int off, len;
+    const char* key;
+};
+static const PrefSpec kPrefs[] = {
+    {0x0c, 4, "AIControl"},             // every battle load: SetInitialDivAIControlFromUserPrefs (TDivision.AIControlled)
+    {0x14, 4, "FloatWarning"},          // DoDamageControl writes a ship field by it
+    {0x18, 1, "ReadyPopup"},            // TAirFormation.CheckStatus2 (the minute's air operations)
+    {0x1c, 1, "BreakOnNewSighting"},    // the sighting routine draws a shared random number by it
+    {0x25, 1, "AirApproachMessage"},    // EOTP draws a shared random number by it
+    {0x2a, 4, "AirSurfaceMessageLvl"},  // TAirFormation.AttackShips draws shared random numbers by it (attack sounds)
+    {0x2f, 1, "LetAIControlForce"},     // EOTP gives forces to the computer by it
+    {0x3f, 1, "LOScalc"},               // the sighting routine's line of sight
+    {0x42, 4, "SoundOption"},           // the minute's messages draw shared random numbers by it (sound variants)
+    {0x46, 4, "Autosave"},              // EOTP saves the battle every N minutes
+    {0x4a, 4, "FloatplaneLaunch"},      // the scout floatplane launches
+    {0x56, 4, "RealismSetting"},        // many rules (DetachShip, the sighting routine, CheckObjectives, torpedo fire)
+    {0x357, 1, "NoFriendlyTorpHits"},   // torpedo hits on own ships
+    {0x37b, 4, "BSSMHC"},               // a value of a simulation routine (0xdf0d5d in 1.01.44; no dialog sets it)
+};
 
 static std::string Hex(const uint8_t* p, int n) {
     static const char* d = "0123456789abcdef";
@@ -3468,21 +3518,185 @@ static bool Unhex(const std::string& s, uint8_t* out, int n) {
     return true;
 }
 
+static int PrefsHexLen() {
+    int n = 0;
+    for (auto& r : kPrefs) n += r.len * 2;
+    return n;
+}
 static std::string PrefsHex() {
     std::string s;
     if (!E.prefs) return s;
-    for (auto& r : kPrefs) s += Hex(E.prefs + r[0], r[1]);
+    for (auto& r : kPrefs) s += Hex(E.prefs + r.off, r.len);
     return s;
 }
 static bool SetPrefsHex(const std::string& h) {
-    if (!E.prefs) return false;
+    if (!E.prefs || (int)h.size() != PrefsHexLen()) return false;
     size_t pos = 0;
     for (auto& r : kPrefs) {
-        if (pos + r[1] * 2 > h.size()) return false;
-        if (!Unhex(h.substr(pos, r[1] * 2), E.prefs + r[0], r[1])) return false;
-        pos += r[1] * 2;
+        if (!Unhex(h.substr(pos, r.len * 2), E.prefs + r.off, r.len)) return false;
+        pos += r.len * 2;
     }
     return true;
+}
+static int PrefValue(const std::string& h, size_t i) {  // the value of kPrefs[i] in a PrefsHex text (-1: none)
+    size_t pos = 0;
+    for (size_t k = 0; k < i && k < sizeof(kPrefs) / sizeof(kPrefs[0]); k++) pos += kPrefs[k].len * 2;
+    uint8_t b[4] = {};
+    if ((int)h.size() != PrefsHexLen() || !Unhex(h.substr(pos, kPrefs[i].len * 2), b, kPrefs[i].len)) return -1;
+    return kPrefs[i].len == 1 ? b[0] : (int)(b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24);
+}
+// "Key a -> b, ..." for the preferences that differ between two PrefsHex texts ("" if none).
+static std::string PrefsDiff(const std::string& from, const std::string& to) {
+    std::string out;
+    for (size_t i = 0; i < sizeof(kPrefs) / sizeof(kPrefs[0]); i++) {
+        int a = PrefValue(from, i), b = PrefValue(to, i);
+        if (a != b)
+            out += std::string(out.empty() ? "" : ", ") + kPrefs[i].key + " " + std::to_string(a) + " -> " + std::to_string(b);
+    }
+    return out;
+}
+
+// The campaign's "ship types exist" flags (engine level 17). TfrmBuildCamp.CheckShipTypesExist sets three unit
+// variables from every nation's ships in play: a battleship exists, a battlecruiser exists, a carrier (CV or CVL)
+// exists. Only the month's processing calls it (ReduceTimeLimits, from DoTurn and DoStrategicTurn), so they hold what
+// this PC's last processed month left: the host's game has the campaign's, a joined player's game (which never processes
+// a month) 0 for all three. The battle's identification reads them (TFightingShip.SetMistakenType, IdentifyType: a
+// battleship is mistaken for a battlecruiser only if one exists, else for a heavy cruiser; a carrier for a heavy cruiser
+// if none exists; an extra Random(100) when no battleship exists), so the two PCs identified ships differently and then
+// drew different random numbers (0.4.1 RC: the lockstep_strike DESYNCs at SetMistakenType). The start message carries
+// A's (`st=`); B uses them for the load and the battle, and gets its own back when the battle ends.
+static uint8_t* g_typeFlags[3] = {};
+static bool g_typeFlagsSync = true;  // TEST ONLY (`ls shiptypes nosync`): B keeps its own flags (as 0.4.1 RC)
+static bool ResolveTypeFlags() {
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        // mov esi, eax; then three times: mov eax, [cell]; mov byte ptr [eax], 0
+        uint8_t* h = Find(dl::Method("TfrmBuildCamp", "CheckShipTypesExist"), 0x20,
+                          {0x8B, 0xF0, 0xA1, -1, -1, -1, -1, 0xC6, 0x00, 0x00, 0xA1, -1, -1, -1, -1, 0xC6, 0x00, 0x00,
+                           0xA1, -1, -1, -1, -1, 0xC6, 0x00, 0x00});
+        for (int i = 0; h && i < 3; i++) g_typeFlags[i] = (uint8_t*)VarFromCell(h + 3 + 8 * i);
+        bool ok = g_typeFlags[0] && g_typeFlags[1] && g_typeFlags[2];
+        if (!ok) g_typeFlags[0] = g_typeFlags[1] = g_typeFlags[2] = nullptr;
+        Log("lockstep: the ship-type flags (CheckShipTypesExist): %s", ok ? "found" : "NOT FOUND (each PC keeps its own)");
+    }
+    return g_typeFlags[0] != nullptr;
+}
+static std::string TypeFlagsHex() {  // "" if not found
+    if (!ResolveTypeFlags()) return "";
+    uint8_t b[3] = {*g_typeFlags[0], *g_typeFlags[1], *g_typeFlags[2]};
+    return Hex(b, 3);
+}
+static bool SetTypeFlagsHex(const std::string& h) {
+    uint8_t b[3];
+    if (h.size() != 6 || !ResolveTypeFlags() || !Unhex(h, b, 3)) return false;
+    for (int i = 0; i < 3; i++) *g_typeFlags[i] = b[i];
+    return true;
+}
+static bool TypeFlagsNow(uint8_t out[3]) {
+    if (!ResolveTypeFlags()) return false;
+    for (int i = 0; i < 3; i++) out[i] = *g_typeFlags[i];
+    return true;
+}
+
+// TEST ONLY: two-PC conditions on one PC (docs/TESTING.md "Two-PC conditions"). Applied on the main thread when the mod
+// starts and after every run of the game's Preferences reader (game.cpp hooks it when RTW3MP_TEST_PREFS is set, and its
+// writer does nothing then: the copy never writes the shared file).
+//   RTW3MP_TEST_PREFS=Key=Value;Key=Value   this copy's own preferences (in memory only)
+//   RTW3MP_TEST_FPUCW=<hex>                 this copy's x87 control word (another PC's DLLs may change it)
+//   RTW3MP_TEST_LOCALE=comma                this copy's number and date separators as a comma locale's (de-DE)
+static const struct {
+    const char* key;
+    int off, len;
+} kPrefKeys[] = {
+    {"BreakOnSighting", 0x0, 4}, {"BreakOnId", 0x4, 4}, {"OpenFireMsg", 0x8, 4}, {"AIControl", 0xc, 4},
+    {"BreakOnHit", 0x10, 4}, {"FloatWarning", 0x14, 4}, {"ReadyPopup", 0x18, 1}, {"LoseContactPopup", 0x19, 1},
+    {"AutoSubMoves", 0x1a, 1}, {"AutoASWMoves", 0x1b, 1}, {"BreakOnNewSighting", 0x1c, 1}, {"BreakOnTorpedoHit", 0x1d, 1},
+    {"BreakOnMissileHit", 0x1e, 1}, {"BreakOnSinking", 0x1f, 1}, {"BreakOnSunk", 0x20, 1}, {"BreakOnSubsighting", 0x21, 1},
+    {"BreakOnAirAttackOnShips", 0x22, 1}, {"BreakOnAirAttackOnLand", 0x23, 1}, {"BreakOnAirCombat", 0x24, 1},
+    {"AirApproachMessage", 0x25, 1}, {"AirCombatMessageLvl", 0x26, 4}, {"AirSurfaceMessageLvl", 0x2a, 4},
+    {"LargeBattles", 0x2e, 1}, {"LetAIControlForce", 0x2f, 1}, {"FOW", 0x30, 4}, {"DamageMeter", 0x34, 1},
+    {"CourseIndicator", 0x35, 1}, {"ShipFlags", 0x36, 1}, {"Compass", 0x37, 1}, {"BaseFlags", 0x38, 1},
+    {"DarkMode", 0x39, 4}, {"GridLines", 0x3d, 1}, {"CourseClick", 0x3e, 1}, {"LOScalc", 0x3f, 1},
+    {"ConvertCharacters", 0x40, 1}, {"SpaceBarRestarts", 0x41, 1}, {"SoundOption", 0x42, 4}, {"Autosave", 0x46, 4},
+    {"FloatplaneLaunch", 0x4a, 4}, {"BackgroundSound", 0x4e, 4}, {"SoundVolume", 0x52, 4}, {"RealismSetting", 0x56, 4},
+    {"HistoricalForces", 0x5a, 1}, {"MainFormState", 0x65, 4}, {"Scale", 0x34e, 1}, {"FFRLow", 0x356, 1},
+    {"NoFriendlyTorpHits", 0x357, 1}, {"EnglishRanks", 0x358, 1}, {"AutoAssignCO", 0x364, 1}, {"SupportForce", 0x36e, 1},
+    {"BSSMHC", 0x37b, 4},
+};
+
+static std::string EnvStr(const char* name) {
+    char buf[512];
+    DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) ? std::string(buf, n) : std::string();
+}
+static unsigned FpuCw();
+static void SetFpuCw(unsigned v);
+
+bool TestPrefsWanted() { return !EnvStr("RTW3MP_TEST_PREFS").empty(); }
+
+void ApplyTestSwitches(const char* when) {
+    static bool fpuDone = false, localeDone = false;
+    std::string prefs = EnvStr("RTW3MP_TEST_PREFS");
+    if (!prefs.empty()) {
+        if (!Resolve() || !E.prefs) {
+            Log("TEST: RTW3MP_TEST_PREFS not applied (%s): the preferences record was not found", when);
+        } else {
+            std::string done;
+            size_t pos = 0;
+            while (pos < prefs.size()) {
+                size_t e = prefs.find(';', pos);
+                std::string kv = prefs.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+                pos = e == std::string::npos ? prefs.size() : e + 1;
+                size_t eq = kv.find('=');
+                if (eq == std::string::npos) continue;
+                std::string k = kv.substr(0, eq);
+                int v = atoi(kv.c_str() + eq + 1);
+                bool known = false;
+                for (auto& p : kPrefKeys)
+                    if (!_stricmp(p.key, k.c_str())) {
+                        known = true;
+                        int old = p.len == 1 ? E.prefs[p.off] : *(int*)(E.prefs + p.off);
+                        if (p.len == 1)
+                            E.prefs[p.off] = (uint8_t)v;
+                        else
+                            *(int*)(E.prefs + p.off) = v;
+                        done += " " + k + " " + std::to_string(old) + "->" + std::to_string(v);
+                    }
+                if (!known) done += " " + k + "(unknown)";
+            }
+            Log("TEST: RTW3MP_TEST_PREFS (%s): this copy's preferences in memory:%s (never written to the file)", when,
+                done.c_str());
+        }
+    }
+    std::string cw = EnvStr("RTW3MP_TEST_FPUCW");
+    if (!cw.empty() && !fpuDone && GetCurrentThreadId() == MainThreadId()) {
+        fpuDone = true;
+        unsigned before = FpuCw(), v = (unsigned)strtoul(cw.c_str(), nullptr, 16);
+        SetFpuCw(v);
+        Log("TEST: RTW3MP_TEST_FPUCW: the main thread's x87 control word %04x -> %04x", before, FpuCw());
+    }
+    std::string loc = EnvStr("RTW3MP_TEST_LOCALE");
+    if (!loc.empty() && !localeDone) {
+        localeDone = true;
+        // TCustomIniFile.ReadFloat: mov edx, [<FormatSettings cell>]; mov eax, [ebp-4]; call StrToFloat
+        uint8_t* h = Find(dl::Method("TCustomIniFile", "ReadFloat"), 0x80, {0x8B, 0x15, -1, -1, -1, -1, 0x8B, 0x45, 0xFC, 0xE8});
+        uint8_t* fs = h && InImage(*(uint32_t*)(h + 2)) ? (uint8_t*)(uintptr_t) * (uint32_t*)(uintptr_t) * (uint32_t*)(h + 2) : nullptr;
+        if (!fs || !InImage((uintptr_t)fs)) {
+            Log("TEST: RTW3MP_TEST_LOCALE not applied: FormatSettings not found");
+        } else {
+            // TFormatSettings (this RTL): DateSeparator +6, TimeSeparator +8, ListSeparator +0xA, ThousandSeparator
+            // +0xC0, DecimalSeparator +0xC2 (TextToFloat reads +0xC2)
+            wchar_t* d = (wchar_t*)(fs + 0xC2);
+            wchar_t before = *d;
+            *(wchar_t*)(fs + 0xC0) = L'.';
+            *d = L',';
+            *(wchar_t*)(fs + 0x6) = L'.';
+            *(wchar_t*)(fs + 0xA) = L';';
+            Log("TEST: RTW3MP_TEST_LOCALE=%s: decimal separator '%lc' -> ',', thousands '.', date '.', list ';'",
+                loc.c_str(), before ? before : L'?');
+        }
+    }
 }
 
 static unsigned FpuCw() {
@@ -3494,11 +3708,15 @@ static void SetFpuCw(unsigned v) {
     unsigned short cw = (unsigned short)v;
     __asm fldcw cw
 }
-// The x87 control word must not change during a battle (rounding/precision decide hits and positions).
+// The x87 control word must not change during a battle (rounding/precision decide hits and positions). Engine level 16:
+// checked around every simulation step and every hash on both PCs (A's word: S.cw0); each difference is logged (the
+// first 20, then every 100th) and counted for the READY diagnostics.
 static void CheckFpu(const char* where) {
     unsigned cw = FpuCw();
     if (S.cw0 && cw != S.cw0) {
-        Log("lockstep: FPU control word %04x at %s (expected %04x); restored", cw, where, S.cw0);
+        if (++S.cwFixes <= 20 || S.cwFixes % 100 == 0)
+            Log("lockstep: FPU control word %04x at %s, the battle's (A's) is %04x: put back (%d times in this battle)", cw,
+                where, S.cw0, S.cwFixes);
         SetFpuCw(S.cw0);
     }
 }
@@ -3812,10 +4030,11 @@ static void DetectEdits(const char* why) {
     QueueBatch(items, why);
 }
 
-// Leak check (tests): the simulation's state (everything hashed except the orders and the display's identification,
-// plus the order of the division and ship lists, the forces' division lists and each division's force and Admin) at the
-// end of a simulation step must be the same at the start of the next one; a difference was made by this PC's display
-// code or the mod (it would desync the two PCs).
+// Leak check (tests): the simulation's state (everything hashed except the orders, plus the order of the division and
+// ship lists, the forces' division lists and each division's force and Admin) at the end of a simulation step must be
+// the same at the start of the next one; a difference was made by this PC's display code or the mod (it would desync the
+// two PCs). Since engine level 17 that includes the simulation's set of the identification (IdentifiedAsType: the
+// display's own set is swapped out between the steps, so a change there is a display write into the simulation's set).
 struct LocalHash {
     uint64_t g[G_COUNT + 1];
 };
@@ -3835,7 +4054,7 @@ static void LocalSimHash(LocalHash& h) {
             if (!sp) continue;
             Fnv(h.g[G_COUNT], &sp, 4);
             for (auto& f : g_shipFields)
-                if (f.off >= 0 && f.size > 0 && f.group != G_IDENT && f.group != G_ORD)
+                if (f.off >= 0 && f.size > 0 && f.group != G_ORD && (f.group != G_IDENT || g_leakIdent))
                     Fnv(h.g[f.group], (uint8_t*)sp + f.off, f.size);
             std::string mb = MountBytes(sp);  // the torpedo and missile mounts (engine level 5)
             Fnv(h.g[G_AMMO], mb.data(), mb.size());
@@ -3905,7 +4124,8 @@ static void LeakCheckEnter(int idx) {
         size_t pos = 0;
         for (auto& f : g_shipFields) {
             if (f.off < 0 || f.size <= 0) continue;
-            if (f.group != G_IDENT && f.group != G_ORD && now.compare(pos, f.size, e.second, pos, f.size) != 0 && nf++ < 4)
+            if (f.group != G_ORD && (f.group != G_IDENT || g_leakIdent) && now.compare(pos, f.size, e.second, pos, f.size) != 0 &&
+                nf++ < 4)
                 fields += " " + W2U(ObjName(e.first)) + "." + f.name + " " + Hex((uint8_t*)e.second.data() + pos, f.size) +
                           "->" + Hex((uint8_t*)now.data() + pos, f.size);
             pos += f.size;
@@ -3956,6 +4176,7 @@ static void OnSimOuterEnter() {
 
 static void OnSimOuterExit() {
     if (!S.on || S.st != St::Running || g_loading) return;
+    CheckFpu("the step's end");  // (engine level 16: a word changed during the step is logged and put back)
     __try {
         TakeAgreed();
         LeakCheckExit(g_outerIdx);
@@ -5999,6 +6220,220 @@ static void RefreshView() {
     InvalidateRect(game::FormHwnd(m), nullptr, TRUE);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The map of this PC's side (engine level 15). The game decides what its map shows inside the simulation and in every
+// battle load, for its PlayerSide (0 on both PCs there) and its side table's computer side (1 after a resume): the
+// sighting routine's SetHiddenDiv shows the flag of every division whose force is not the computer's and its ships, then
+// hides a computer side's ship unless it is sighted (GetBestSightingLevel > 0 and SeenByHumanControlledShips), shows the
+// human side's spotted ships (moving their division's flag to the flagship) and labels every ship (names for the human
+// side, the identification for the other). In a live battle both sides' forces are human: B's map showed side 0's
+// picture (its own ships hidden until side 0 saw them, side 0's ships and names shown) and both maps showed every
+// division's flag (A saw where B's fleet was). After every simulation step and every live load each PC applies the
+// same rules for its own side, outside the simulation (the ship's Hidden is a display field there, the flags, wakes and
+// labels are display objects). The simulation never reads what this writes.
+static struct MapApi {
+    bool tried = false, ok = false;
+    void *setVisible = nullptr, *setHidden = nullptr, *relabel = nullptr;
+    int fFlag = -1, fDivForce = -1, fRole = -1, fForceAI = -1, fFlagPoint = -1, fBothComputer = -1;
+    int fOwnSpotted = -1, fOwnRadar = -1, fSeen = -1, fSight = -1, fRadar = -1, fLoc = -1, fType = -1, fSunk = -1;
+    int fGeoState = 0x28;  // TGlobeObject's state word (bit 4: hidden), read only for the probe
+} g_mapApi;
+static bool g_mapOn = true;  // tests (`ls mapview off`): the game's own picture (as 0.4.0)
+static bool g_cwBeforeLoad = true;
+static int g_softWanted = -1;  // TEST ONLY (`ls x87 soft 0|1`): A's choice of the software maths (-1: RTW3MP_TEST_X87SOFT)  // tests (`ls testcwload 0`): B loads with its own x87 control word (as 0.4.0)
+static int g_mapPasses = 0;
+static std::string g_mapLast;  // the last pass's counts (logged when they change)
+
+static bool ResolveMapView() {
+    MapApi& m = g_mapApi;
+    if (m.tried) return m.ok;
+    m.tried = true;
+    m.setVisible = dl::Method("TFightingShip", "SetVisible");
+    // TfrmMain.SetHiddenDiv starts: cmp [esi+Side], 3; jne; mov eax, [esi+myFlag]; mov dl, 1; call <TGlobeObject hidden>
+    if (uint8_t* h = Find(dl::Method("TfrmMain", "SetHiddenDiv"), 0x30, {0x8B, 0x46, -1, 0xB2, 0x01, 0xE8}))
+        m.setHidden = CallTarget(h + 5);
+    // CbShipNameDisplayChange: mov [edx], eax (the names setting); mov eax, ebx; call <label every ship>
+    if (uint8_t* h = Find(dl::Method("TfrmMain", "CbShipNameDisplayChange"), 0x30, {0x89, 0x02, 0x8B, 0xC3, 0xE8}))
+        m.relabel = CallTarget(h + 4);
+    m.fFlag = dl::Field("TDivision", "myFlag");
+    m.fDivForce = dl::Field("TDivision", "myForce");
+    m.fRole = dl::Field("TDivision", "Role");
+    m.fForceAI = dl::Field("TForce", "AIControlled");
+    m.fFlagPoint = dl::Field("TDivLocation", "FlagPoint");
+    m.fBothComputer = dl::Field("TfrmMain", "BothComputer");
+    m.fOwnSpotted = dl::Field("TFightingShip", "OwnShipSpotted");
+    m.fOwnRadar = dl::Field("TFightingShip", "OwnShipRadarSpotted");
+    m.fSeen = dl::Field("TFightingShip", "SeenByHumanControlledShips");
+    m.fSight = dl::Field("TFightingShip", "SightingLevel");
+    m.fRadar = dl::Field("TFightingShip", "RadarSightingLevel");
+    m.fLoc = dl::Field("TFightingShip", "ShipLocation");
+    m.fType = dl::Field("TFightingShip", "ShipType");
+    m.fSunk = dl::Field("TFightingShip", "Sunk");
+    m.ok = m.setVisible && m.setHidden && m.relabel && m.fFlag >= 0 && m.fDivForce >= 0 && m.fRole >= 0 &&
+           m.fForceAI >= 0 && m.fFlagPoint >= 0 && m.fBothComputer >= 0 && m.fOwnSpotted >= 0 && m.fOwnRadar >= 0 &&
+           m.fSeen >= 0 && m.fSight >= 0 && m.fRadar >= 0 && m.fLoc >= 0 && m.fType >= 0 && m.fSunk >= 0 &&
+           E.fShips >= 0 && E.fDivSide >= 0 && E.fShipSide >= 0;
+    Log("lockstep: map of this PC's side: %s (SetVisible=%p hidden=%p labels=%p)", m.ok ? "ok" : "NOT AVAILABLE (the map "
+        "shows the first side's picture)", m.setVisible, m.setHidden, m.relabel);
+    return m.ok;
+}
+
+// The map's picture for this PC's side (see MapApi). Runs outside the simulation with this PC's view in place.
+static void ApplyMapView(const char* why) {
+    void* frm = BattleForm();
+    int view = g_viewSide;
+    if (!g_mapOn || !frm || view < 0 || view > 1 || g_loading || g_sim > 0 || !ResolveMapView()) return;
+    MapApi& m = g_mapApi;
+    if (dl::At<uint8_t>(frm, m.fBothComputer)) return;  // (the game's computer-vs-computer battle shows everything)
+    // Right after a load SeenByHumanControlledShips holds only the first side's sightings (the load's sighting routine ran
+    // while the second side's forces were still the computer's): the sighting levels alone decide until the next minute.
+    bool afterLoad = !strcmp(why, "load");
+    int shown[2] = {}, ships[2] = {}, flags[2] = {};
+    bool ok = TryRun([&] {
+        g_ui++;  // (display work: random draws of the labels' identification go to this PC's own stream)
+        void* divs = List(E.divisionsVar);
+        for (int i = 0; i < dl::ListCount(divs); i++) {
+            void* dv = dl::ListItem(divs, i);
+            if (!dv) continue;
+            int side = dl::At<int>(dv, E.fDivSide);
+            if (side != 0 && side != 1) continue;  // (side 3: the game's own rule)
+            bool own = side == view;
+            void* flag = dl::At<void*>(dv, m.fFlag);
+            void* force = dl::At<void*>(dv, m.fDivForce);
+            bool forceAI = force && dl::At<uint8_t>(force, m.fForceAI);
+            // SetHiddenDiv for the human side: a computer force's division hides its flag and its ships
+            bool flagHidden = !own || forceAI;
+            void* list = dl::At<void*>(dv, E.fShips);
+            for (int j = 0; j < dl::ListCount(list); j++) {
+                void* s = dl::ListItem(list, j);
+                if (!s || dl::At<uint8_t>(s, m.fSunk)) continue;
+                bool vis;
+                if (own)
+                    vis = !flagHidden || dl::At<int>(s, m.fOwnSpotted) > 0 || dl::At<int>(s, m.fOwnRadar) > 0 ||
+                          dl::At<uint8_t>(s, m.fType) == 12;
+                else
+                    vis = std::max(dl::At<int>(s, m.fSight), dl::At<int>(s, m.fRadar)) > 0 &&
+                          (afterLoad || dl::At<uint8_t>(s, m.fSeen));
+                dl::Call(m.setVisible, U(s), vis ? 1 : 0);
+                ships[side]++;
+                if (vis) shown[side]++;
+            }
+            // the human side's main division of a computer force keeps its flag (SetHiddenDiv's last rule)
+            if (own && forceAI && dl::At<uint8_t>(dv, m.fRole) == 0) flagHidden = false;
+            if (!flag) continue;
+            dl::Call(m.setHidden, U(flag), flagHidden ? 1 : 0);
+            if (!flagHidden) flags[side]++;
+        }
+        dl::Call(m.relabel, U(frm));  // every ship's map label for this PC's side
+        g_ui--;
+    });
+    if (!ok && g_ui > 0) g_ui--;
+    g_mapPasses++;
+    char b[160];
+    snprintf(b, sizeof(b), "own ships shown %d of %d, the other side's %d of %d, flags shown: own %d, other %d",
+             shown[view], ships[view], shown[1 - view], ships[1 - view], flags[view], flags[1 - view]);
+    if (!ok || g_mapLast != b) {
+        g_mapLast = b;
+        Log("lockstep: map of side %d (%s): %s%s", view, why, b, ok ? "" : " (FAILED: an exception)");
+    }
+    InvalidateRect(game::FormHwnd(frm), nullptr, FALSE);
+}
+
+// The ensign at the battle screen's top left (TfrmMain.ImgFlag): the resume copies the campaign screen's flag into it
+// (LoadScenarioInProgress: frmMain.ImgFlag.Picture := <the campaign screen's flag image>.Picture), and the battle slot's
+// campaign is the first player's, so B showed A's ensign. On the PC that shows side 1 it gets that side's flag, which
+// the load read from the battle file (TfrmMain.LoadSideFlags: SideFlags[side] from the side's FlagFile). Display only.
+static void ApplyOwnFlag() {
+    static const int fImg = dl::Field("TfrmMain", "ImgFlag"), fSideFlags = dl::Field("TfrmMain", "SideFlags"),
+                     fPicture = dl::Field("TImage", "FPicture");
+    static void* const assign = dl::Method("TPicture", "Assign");
+    void* frm = BattleForm();
+    int view = g_viewSide;
+    if (!g_mapOn || !frm || view != 1 || fImg < 0 || fSideFlags < 0 || fPicture < 0 || !assign) return;
+    void* img = dl::At<void*>(frm, fImg);
+    void* flag = dl::At<void*>(frm, fSideFlags + 4 * view);
+    void* pic = img ? dl::At<void*>(img, fPicture) : nullptr;
+    if (!pic || !flag || !dl::IsInstanceOf(flag, "TGraphic")) {
+        Log("lockstep: the ensign of side %d not shown (no flag picture)", view);
+        return;
+    }
+    bool ok = false;
+    SafeCall(assign, U(pic), U(flag), 0, 0, nullptr, &ok);
+    static int lastBid = -1;
+    if (!ok || lastBid != S.bid) {
+        lastBid = S.bid;
+        Log("lockstep: the battle screen shows side %d's ensign%s", view, ok ? "" : " (FAILED: an exception)");
+    }
+}
+
+// After the outermost simulation step that can set the map's visibility (the minute's start and end, a detach).
+static void MapAfterStep(int outerIdx) {
+    static bool busy = false;
+    if (busy || !S.on || S.st != St::Running || g_loading || g_viewSide < 0) return;
+    if (outerIdx != H_STARTMINUTE && outerIdx != H_EOTP && outerIdx != H_DETACH && outerIdx != H_CSDD) return;
+    busy = true;
+    ApplyMapView(outerIdx == H_EOTP ? "minute" : outerIdx == H_STARTMINUTE ? "minute start" : "detach");
+    busy = false;
+}
+
+// B's battle screen while it loads: the game shows it and draws the first side's picture (its flags, the map centred on
+// its fleet) before this PC's side is in place. It stays transparent until the load is done and this PC's map is drawn.
+static HWND g_coverHwnd = nullptr;
+static void CoverBattleForm(bool on) {
+    static void* handleNeeded = dl::Method("TWinControl", "HandleNeeded");
+    if (on) {
+        void* f = BattleForm();
+        if (!f || !handleNeeded) return;
+        bool ok = false;
+        SafeCall(handleNeeded, U(f), 0, 0, 0, nullptr, &ok);
+        HWND h = game::FormHwnd(f);
+        if (!ok || !h) return;
+        SetWindowLongW(h, GWL_EXSTYLE, GetWindowLongW(h, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+        g_coverHwnd = h;
+        return;
+    }
+    HWND h = g_coverHwnd;
+    g_coverHwnd = nullptr;
+    if (!h || !IsWindow(h)) return;
+    SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+    SetWindowLongW(h, GWL_EXSTYLE, GetWindowLongW(h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+    RedrawWindow(h, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+}
+
+// The probe (`ls mapview`): per side the ships the map shows (Hidden off) and the flags shown.
+static std::string MapViewProbe() {
+    if (!ResolveMapView()) return "error the map pass is not available";
+    MapApi& m = g_mapApi;
+    int shown[2] = {}, ships[2] = {}, flags[2] = {}, divs2[2] = {}, wake[2] = {};
+    void* divs = List(E.divisionsVar);
+    for (int i = 0; i < dl::ListCount(divs); i++) {
+        void* dv = dl::ListItem(divs, i);
+        int side = dv ? dl::At<int>(dv, E.fDivSide) : -1;
+        if (side != 0 && side != 1) continue;
+        divs2[side]++;
+        void* flag = dl::At<void*>(dv, m.fFlag);
+        if (flag && !(dl::At<uint16_t>(flag, m.fGeoState) & 4)) flags[side]++;
+        void* list = dl::At<void*>(dv, E.fShips);
+        for (int j = 0; j < dl::ListCount(list); j++) {
+            void* s = dl::ListItem(list, j);
+            if (!s || dl::At<uint8_t>(s, m.fSunk)) continue;
+            ships[side]++;
+            if (g_fHidden >= 0 && !dl::At<uint8_t>(s, g_fHidden)) shown[side]++;
+            static int fWake = dl::Field("TFightingShip", "Wake");
+            void* w = fWake >= 0 ? dl::At<void*>(s, fWake) : nullptr;
+            if (w && !(dl::At<uint16_t>(w, m.fGeoState) & 4)) wake[side]++;
+        }
+    }
+    char b[256];
+    snprintf(b, sizeof(b),
+             "ok view=%d on=%d passes=%d side0=%d/%d wake0=%d flags0=%d/%d side1=%d/%d wake1=%d flags1=%d/%d "
+             "playerSide=%d",
+             g_viewSide, g_mapOn ? 1 : 0, g_mapPasses, shown[0], ships[0], wake[0], flags[0], divs2[0], shown[1],
+             ships[1], wake[1], flags[1], divs2[1], E.playerSideVar ? *E.playerSideVar : -1);
+    return b;
+}
+
 static int CurSpeed() {
     void* m = BattleForm();
     return m ? dl::At<int>(m, E.fGameSpeed) : 0;
@@ -6179,7 +6614,9 @@ static void RefreshMarkerAfterSave() {
 // DESYNC forensics (defined with the state dump below).
 static void FlightBoundary();
 static void FlightReset();
-static void DesyncReport(int minute, const std::string& peerHash);
+static void DesyncReport(int minute, const std::string& peerHash, const char* why = nullptr);
+static void CorruptForTest();
+static bool g_testReadyDiff = false;  // tests (`ls testreadydiff`): this PC's next live load differs
 
 // Loads the slot's battle with the shared seed (both PCs do exactly this). first = the first start of this battle;
 // ai0/ai1 = side 0's and side 1's computer-control flags in A's snapshot (SideAiFlags): side 0's go back after every
@@ -6198,6 +6635,7 @@ static bool LoadSnapshot(int slot, uint32_t seed, int speed, int fastest, bool f
     S.minuteRunning = false;
     S.tokens = 0;
     bool ok = ResetBattleForm();
+    if (ok && !S.isA) CoverBattleForm(true);  // (B: the first side's picture of the load is never shown)
     if (ok) {
         SetRng(2, seed);
         g_sharedOther = true;
@@ -6211,11 +6649,16 @@ static bool LoadSnapshot(int slot, uint32_t seed, int speed, int fastest, bool f
     }
     g_loading = false;
     if (!ok || !BattleVisible()) {
+        CoverBattleForm(false);
         err = ok ? "the battle did not open" : "the game could not load the battle";
         Log("lockstep: load of slot %d FAILED (%s)", slot, err.c_str());
         return false;
     }
-    if (S.cw0) SetFpuCw(S.cw0);
+    if (S.cw0) {
+        unsigned cw = FpuCw();
+        if (cw != S.cw0) Log("lockstep: the x87 control word changed during the load: %04x (the battle's: %04x)", cw, S.cw0);
+        SetFpuCw(S.cw0);
+    }
     AlignLogLists(BattleForm(), "the load");  // (display data: else the next minute shows "Log lines out of sync!")
     SharedBegin();
     bool setup = TryRun([&] {
@@ -6273,9 +6716,14 @@ static bool LoadSnapshot(int slot, uint32_t seed, int speed, int fastest, bool f
         SetSimSideFromAuto();
         ApplyFastest(fastest != 0);  // the battle save doesn't keep it (a new battle screen has it up)
         ApplySpeed(speed);
+        if (g_testReadyDiff) {  // TEST ONLY (`ls testreadydiff`): this PC's load differs (the loaded battles differ)
+            g_testReadyDiff = false;
+            CorruptForTest();
+        }
     });
     SharedEnd();
     if (!setup) {
+        CoverBattleForm(false);
         err = "the loaded battle could not be set up";
         return false;
     }
@@ -6290,6 +6738,9 @@ static bool LoadSnapshot(int slot, uint32_t seed, int speed, int fastest, bool f
     g_traceSeq.clear();
     FlightReset();  // (DESYNC forensics: the loaded objects as the boundary before the next minute)
     RefreshView();
+    ApplyMapView("load");  // (engine level 15: this PC's map; the load drew the first side's picture)
+    ApplyOwnFlag();
+    CoverBattleForm(false);
     LockMissilePanel();
     ShowFireAtWill();  // (a new battle screen: the box as the agreed setting of this player's side)
     SetAutoButton(S.autoRun[S.mySide]);  // (the game's FormShow put it up)
@@ -6299,9 +6750,53 @@ static bool LoadSnapshot(int slot, uint32_t seed, int speed, int fastest, bool f
 }
 
 static std::string HashNow() {
+    CheckFpu("the hash");
     char b[48];
     snprintf(b, sizeof(b), "%016llx-%08x", (unsigned long long)StateHash().all, g_simState);
     return b;
+}
+
+// Engine level 16: the READY hash in parts, for the diagnostics of a mismatch: each hash group (32 bits, kGroupNames'
+// order), the battle clock with the campaign date, and the random-number state, as hex.
+static const char* const kPartWords[G_COUNT + 2] = {"positions", "damage", "ammunition", "sightings", "identification",
+                                                    "orders", "aircraft", "torpedoes", "forces", "submarines", "clock",
+                                                    "random numbers"};
+static std::string ReadyParts() {
+    HashResult h = StateHash();
+    std::string s;
+    char b[24];
+    for (int g = 0; g < G_COUNT; g++) {
+        snprintf(b, sizeof(b), "%08x", (unsigned)(h.group[g] ^ (h.group[g] >> 32)));
+        s += b;
+    }
+    uint64_t ck = 1469598103934665603ull;
+    if (E.clockVar) Fnv(ck, E.clockVar, 8);
+    int32_t date[3];
+    if (CampaignDateNow(date)) Fnv(ck, date, sizeof(date));
+    snprintf(b, sizeof(b), "%08x%08x", (unsigned)(ck ^ (ck >> 32)), g_simState);
+    return s + b;
+}
+
+// A: what differed between the two loads, in a few words a player can read out: the differing parts, both CPU vendors
+// if they differ, both x87 control words if B's own differs from the battle's ("" when nothing is known).
+static std::string ReadyDiag() {
+    std::string out;
+    const std::string &a = S.myReadyParts, &b = S.peerReadyParts;
+    if (a.size() == b.size() && a.size() == (G_COUNT + 2) * 8)
+        for (int i = 0; i < G_COUNT + 2; i++)
+            if (a.compare(i * 8, 8, b, i * 8, 8)) out += std::string(out.empty() ? "" : ", ") + kPartWords[i];
+    std::string me = x87::CpuVendor();
+    auto nm = [](const std::string& n, const char* d) { return n.empty() ? std::string(d) : n; };
+    if (!S.peerCpu.empty() && S.peerCpu != me)
+        out += (out.empty() ? "CPUs " : "; CPUs ") + me + " (" + nm(S.myName, "A") + "), " + S.peerCpu + " (" +
+               nm(S.peerName, "B") + ")";
+    if (S.peerOwnCw && S.peerOwnCw != S.cw0) {
+        char cw[96];
+        snprintf(cw, sizeof(cw), "%scontrol words %04X (%s), %04X (%s)", out.empty() ? "" : "; ", S.cw0,
+                 nm(S.myName, "A").c_str(), S.peerOwnCw, nm(S.peerName, "B").c_str());
+        out += cw;
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6958,6 +7453,30 @@ static int LS_BlockImpl(int idx, void* self, void* sender, uint32_t arg3) {
     const Blocker& b = g_blockers[idx];
     void* m = BattleForm();
     switch (b.policy) {
+        case B_PREFS: {  // (see g_blockers) the dialog runs here; afterwards the battle preferences are this battle's again
+            static bool open = false;
+            if (open || !b.orig || !E.prefs) return 0;
+            std::string agreed = PrefsHex();  // (A: its own, as sent; B: A's)
+            open = true;
+            bool ok = false;
+            SafeCall(b.orig, U(self), U(sender), 0, 0, nullptr, &ok);
+            open = false;
+            std::string now = PrefsHex();
+            if (S.on && now != agreed) {
+                // (not kept for after the battle: opened from the battle screen the dialog writes some of them back
+                // other than it got them, e.g. RealismSetting -1 after a plain Ok in a test)
+                std::string d = PrefsDiff(agreed, now);
+                SetPrefsHex(agreed);
+                Log("lockstep: the Preferences dialog changed battle preferences the simulation uses (%s): this battle's "
+                    "values put back", d.c_str());
+                RunOnMainThread([] {
+                    Chat("Battle preferences that the live battle's simulation uses (Realism, AI control, floatplane "
+                         "launch, ...) can't change until it ends: change them after the battle. Display preferences "
+                         "change at once.");
+                });
+            }
+            return 1;
+        }
         case B_PAUSE:
             RunOnMainThread([] { ClockRequest("pause", 0); });
             return 1;
@@ -7223,12 +7742,29 @@ static void Cleanup() {
     SetRng(0, 0);
     FreezeView();  // keep this PC's view (as in a single-player battle)
     if (!g_loading) UnlockMissilePanel();  // (Fire at will keeps this player's setting: the game's own rule from here)
-    if (!S.isA && !S.savedPrefs.empty()) SetPrefsHex(S.savedPrefs);
+    // This PC's own battle preferences as before the battle (B ran with A's; on either PC the Preferences dialog's
+    // changes of them during the battle were put back)
+    if (!S.savedPrefs.empty()) {
+        std::string d = PrefsDiff(PrefsHex(), S.savedPrefs);
+        if (SetPrefsHex(S.savedPrefs) && !d.empty()) Log("lockstep: this PC's own battle preferences again (%s)", d.c_str());
+    }
     S.savedPrefs.clear();
+    if (!S.savedTypes.empty()) {  // B: this PC's own ship-type flags again (engine level 17)
+        if (S.savedTypes != TypeFlagsHex() && SetTypeFlagsHex(S.savedTypes))
+            Log("lockstep: this PC's own ship-type flags again (%s)", S.savedTypes.c_str());
+        S.savedTypes.clear();
+    }
     if (g_cwSaved) {  // B: back to this PC's own x87 control word
         SetFpuCw(g_cwSaved);
         g_cwSaved = 0;
     }
+    if (x87::Soft() || x87::TotalCalls()) {  // engine level 16: this CPU's own transcendental routines again
+        Log("lockstep: x87 routines since the load: %s (%s); control word put back %d times", x87::Counts().c_str(),
+            x87::Soft() ? "software" : "this CPU's", S.cwFixes);
+        x87::SetSoft(false);
+        x87::ResetCounts();
+    }
+    datafiles::SetPhase("after the battle");
     ClearOrders("the live battle ended");
     S.tokens = 0;
     S.minuteRunning = false;
@@ -7439,7 +7975,7 @@ static void DoResync() {
     g_resyncPending = false;
     if (!S.on || S.st == St::Ended) return;
     if (++S.resyncs > 3) {
-        DropPeer("the battles could not be kept in sync");
+        DropPeer("the battles could not be kept in sync" + (S.readyDiag.empty() ? std::string() : " (" + S.readyDiag + ")"));
         return;
     }
     ChatBoth("Synchronising the battle again (" + g_resyncWhy + ")...");
@@ -7971,8 +8507,15 @@ static bool StartTransfer(bool resync, std::string& err) {
     h["fastest"] = std::to_string(fastest);   // clock state the battle save doesn't keep
     h["lv"] = std::to_string(AnnouncedLsLevel());  // B refuses another live-battle engine (0.3.x sends none: level 1)
     h["prefs"] = PrefsHex();
+    h["st"] = TypeFlagsHex();  // engine level 17: the ship-type flags the identification reads (B uses A's)
     h["gd"] = W2U(GameDir());
     h["cw"] = std::to_string(S.cw0);
+    // Engine level 16: the transcendental maths in software on both PCs (x87.cpp; TEST: RTW3MP_TEST_X87SOFT=0 keeps each
+    // PC's own), A's CPU vendor (diagnostics), and the game data files' hash (B refuses a battle whose files differ).
+    S.softMath = x87::Installed() && (g_softWanted >= 0 ? g_softWanted != 0 : EnvStr("RTW3MP_TEST_X87SOFT") != "0");
+    h["sm"] = S.softMath ? "1" : "0";
+    h["cpu"] = x87::CpuVendor();
+    if (!resync && datafiles::Ready(3000)) h["dh"] = datafiles::Combined();
     h["s0"] = S.sideNames[0];
     h["s1"] = S.sideNames[1];
     h["from"] = S.myName;
@@ -8000,13 +8543,21 @@ static bool StartTransfer(bool resync, std::string& err) {
     Log("lockstep: battle %d epoch %d sent (%u files, %u bytes, seed %u, speed %d, fastest %d, auto-run %s%s)", S.bid,
         S.epoch, (unsigned)b.files.size(), (unsigned)body.size(), S.seed, speed, fastest, autoState.c_str(),
         S.rejoin && !S.everRunning ? ", rejoin" : "");
+    x87::SetSoft(S.softMath);
+    x87::ResetCounts();
+    datafiles::SetPhase("battle load");  // (TEST ONLY probe: RTW3MP_TEST_FILELOG)
     if (!LoadSnapshot(slot, S.seed, speed, fastest, !resync && !S.everRunning, ai0, ai1, autoState, ncap, faw, pmt, pa,
                       err))
         return false;
     S.st = St::WaitReady;
     CanonBegin();
     S.myReadyHash = HashNow();
+    S.myReadyParts = ReadyParts();
     CanonEnd();
+    Log("lockstep: loaded (x87 routines during the load: %s; transcendental maths: %s)", x87::Counts().c_str(),
+        S.softMath ? "software" : "this CPU's");
+    x87::ResetCounts();
+    datafiles::SetPhase("battle");
     S.lastPeerMsg = GetTickCount();
     if (S.peerAI) S.peerReady = true;
     ACheckReady();
@@ -8016,11 +8567,26 @@ static bool StartTransfer(bool resync, std::string& err) {
 static void ACheckReady() {
     if (!S.isA || S.st != St::WaitReady || (!S.peerReady && !S.peerAI)) return;
     if (!S.peerAI && S.peerReadyHash != S.myReadyHash) {
-        Log("lockstep: the loaded battles differ: here %s, %s %s", S.myReadyHash.c_str(), S.peerName.c_str(),
-            S.peerReadyHash.c_str());
-        RequestResync("the loaded battles differ");
+        S.readyDiag = ReadyDiag();
+        std::string what = "the loaded battles differ" + (S.readyDiag.empty() ? std::string() : ": " + S.readyDiag);
+        Log("lockstep: the loaded battles differ: here %s, %s %s (%s)", S.myReadyHash.c_str(), S.peerName.c_str(),
+            S.peerReadyHash.c_str(), S.readyDiag.empty() ? "no parts from the other PC" : S.readyDiag.c_str());
+        // (engine level 15) Both PCs stand at the loaded boundary: each writes its DESYNC report (the loaded objects'
+        // bytes and the state), B on this message (sent before the resync's start), so two players' reports show what
+        // their loads made differently.
+        DesyncReport(S.boundary, S.peerReadyHash, "the loaded battles differ");
+        KV kv;
+        kv["t"] = "desync";
+        kv["n"] = std::to_string(S.boundary);
+        kv["h"] = S.myReadyHash;
+        kv["why"] = "ready";
+        kv["diag"] = S.readyDiag;  // engine level 16: B's notice says what differed
+        SendMsg(kv);
+        if (g_hooks.notice) g_hooks.notice("Live battle: " + what + " (loading again)");
+        RequestResync(what);
         return;
     }
+    S.readyDiag.clear();
     KV kv;
     kv["t"] = "go";
     kv["n"] = std::to_string(S.boundary);
@@ -8082,7 +8648,51 @@ static void TryLoadQueued() {
         err = "damaged battle files";
     else if (WriteBattleFiles(b, S.slot, err)) {
         FixFlagFiles(S.slot, S.gameDirA);
-        if (!S.prefsA.empty()) SetPrefsHex(S.prefsA);
+        // A's battle preferences (engine level 15: only those the simulation uses) for the load and the battle
+        if ((int)S.prefsA.size() == PrefsHexLen()) {
+            if (S.firstLoad) {
+                std::string d = PrefsDiff(S.savedPrefs, S.prefsA);
+                Log("lockstep: battle preferences: %s's for the load and the simulation (%s); this PC's own come back "
+                    "after the battle", S.peerName.c_str(), d.empty() ? "the same as this PC's" : d.c_str());
+            }
+            SetPrefsHex(S.prefsA);
+        } else if (!S.prefsA.empty()) {
+            Log("lockstep: %s's battle preferences have another layout (%d characters): this PC's own stay",
+                S.peerName.c_str(), (int)S.prefsA.size());
+        }
+        // Engine level 17: A's ship-type flags (the identification reads them; a joined player's game has 0 for all)
+        if (g_typeFlagsSync && !S.typesA.empty()) {
+            std::string mine = TypeFlagsHex();
+            if (!SetTypeFlagsHex(S.typesA))
+                Log("lockstep: %s's ship-type flags '%s' not applied (not found here): this PC's own stay",
+                    S.peerName.c_str(), S.typesA.c_str());
+            else if (mine != S.typesA)
+                Log("lockstep: ship-type flags %s here, %s's %s: the load and the battle use %s's", mine.c_str(),
+                    S.peerName.c_str(), S.typesA.c_str(), S.peerName.c_str());
+        } else if (!g_typeFlagsSync) {
+            Log("lockstep: TEST: this PC keeps its own ship-type flags %s (%s's: %s)", TypeFlagsHex().c_str(),
+                S.peerName.c_str(), S.typesA.c_str());
+        }
+        // A's x87 control word also for the load (until level 14 only after it: a PC whose DLLs had changed its own
+        // computed the loaded battle with another precision or rounding)
+        if (S.cw0 && g_cwBeforeLoad) {
+            unsigned mine = FpuCw();
+            if (mine != S.cw0)
+                Log("lockstep: x87 control word %04x here, %s's %04x: the load and the battle use %s's", mine,
+                    S.peerName.c_str(), S.cw0, S.peerName.c_str());
+            SetFpuCw(S.cw0);
+        } else if (!g_cwBeforeLoad && g_cwSaved) {  // TEST ONLY (`ls testcwload 0`): as level 14's loads
+            SetFpuCw(g_cwSaved);
+            Log("lockstep: TEST: this load runs with this PC's own x87 control word %04x (the battle's: %04x)", g_cwSaved,
+                S.cw0);
+        }
+        // Engine level 16: the transcendental maths in software on both PCs from the load on (x87.cpp)
+        x87::SetSoft(S.softMath);
+        Log("lockstep: CPU %s here, %s at %s; transcendental maths: %s", x87::CpuVendor().c_str(),
+            S.peerCpu.empty() ? "?" : S.peerCpu.c_str(), S.peerName.c_str(),
+            S.softMath ? "software (the same on both PCs)" : "each PC's own x87");
+        x87::ResetCounts();
+        datafiles::SetPhase("battle load");
         LoadSnapshot(S.slot, S.seed, S.startSpeed, S.startFastest, S.firstLoad, S.startAi0, S.startAi1, S.startAuto,
                      S.startNcap, S.startFaw, S.startPmt, S.startPa, err);
     }
@@ -8101,9 +8711,19 @@ static void TryLoadQueued() {
     kv["t"] = "ready";
     kv["lv"] = std::to_string(AnnouncedLsLevel());  // A drops a PC with another live-battle engine (0.3.x: none)
     CanonBegin();
-    kv["h"] = HashNow();
+    S.myReadyHash = HashNow();  // (also for this PC's report when the loaded battles differ)
+    kv["g"] = ReadyParts();     // engine level 16: what differs, in A's diagnostics (ReadyDiag)
     CanonEnd();
+    kv["h"] = S.myReadyHash;
     kv["n"] = std::to_string(S.boundary);
+    kv["cpu"] = x87::CpuVendor();
+    char cw[8];
+    snprintf(cw, sizeof(cw), "%04x", S.ownCw);
+    kv["cw"] = cw;  // this PC's own x87 control word (the battle runs with A's)
+    Log("lockstep: loaded (x87 routines during the load: %s; control word put back %d times)", x87::Counts().c_str(),
+        S.cwFixes);
+    x87::ResetCounts();
+    datafiles::SetPhase("battle");
     SendMsg(kv);
 }
 
@@ -8149,6 +8769,32 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
         if (g_hooks.notice) g_hooks.notice("A live battle could not start: " + from + "'s mod plays live battles at another level");
         return;
     }
+    // Engine level 16: the game data files (datafiles.cpp). A's start carries their hash; a different set here would load
+    // and play the battle differently (endless resyncs): refused with this PC's list, A names the differing files to
+    // both players (`datadiff`) and fights the battle against the computer.
+    std::string dh = KVStr(h, "dh");
+    if (!resync) {
+        bool ready = datafiles::Ready(3000);
+        if (dh.empty() || !ready)
+            Log("lockstep: battle %d: the game data files were not compared (%s)", bid,
+                dh.empty() ? "no hash from the other PC" : "this PC's hash is not ready");
+        else if (dh == datafiles::Combined())
+            Log("lockstep: battle %d: the game data files are the same on both PCs (%d files, %s)", bid,
+                datafiles::FileCount(), dh.c_str());
+    }
+    if (!resync && !dh.empty() && datafiles::Ready() && dh != datafiles::Combined()) {
+        KV kv;
+        kv["t"] = "abort";
+        kv["bid"] = std::to_string(bid);
+        kv["epoch"] = std::to_string(epoch);
+        kv["why"] = "the game data files differ";
+        kv["lv"] = std::to_string(AnnouncedLsLevel());
+        kv["dm"] = datafiles::Encoded();
+        Log("lockstep: battle %d refused: the game data files differ (%s here, %s at %s; %d files)", bid,
+            datafiles::Combined().c_str(), dh.c_str(), KVStr(h, "from", "the other player").c_str(), datafiles::FileCount());
+        if (replyTo) replyTo(PackHB(KVEncode(kv), ""));
+        return;
+    }
     bool rejoin = KVInt(h, "rj") != 0 && !resync;  // A starts the battle again after it dropped this player (phase 5a)
     bool restart = S.on && !resync;                // ... while this PC still has the battle (see below)
     std::string rejoinMin = KVStr(h, "min", "?");
@@ -8164,6 +8810,8 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
         }
         int slot = g_hooks.battleSlot ? g_hooks.battleSlot() : -1;
         if (why.empty() && slot < 50) why = "no battle slot";
+        if (why.empty() && KVInt(h, "sm") && !x87::Installed())  // (engine level 16; the same game build finds them)
+            why = "this PC can't use the battle's CPU-independent maths (the game's x87 routines were not found)";
         if (!why.empty()) {
             refuse(why);
             return;
@@ -8177,10 +8825,12 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
         S.send = replyTo;
         ResetSimSides();
         if (!g_cwSaved) g_cwSaved = FpuCw();  // this PC's own x87 control word (A's is used during the battle)
+        S.ownCw = g_cwSaved;
         S.peerName = KVStr(h, "from", "the other player");
         S.sideNames[0] = KVStr(h, "s0");
         S.sideNames[1] = KVStr(h, "s1");
         S.savedPrefs = PrefsHex();
+        S.savedTypes = TypeFlagsHex();
         S.firstLoad = true;
         if (g_hooks.slotMode) g_hooks.slotMode(true);
         if (rejoin) {
@@ -8230,8 +8880,11 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
     S.startFastest = KVInt(h, "fastest", 0) != 0 ? 1 : 0;
     S.clockFastest = S.startFastest;
     S.prefsA = KVStr(h, "prefs");
+    S.typesA = KVStr(h, "st");
     S.gameDirA = KVStr(h, "gd");
     S.cw0 = (unsigned)KVInt(h, "cw");
+    S.softMath = KVInt(h, "sm") != 0 && x87::Installed();  // engine level 16: A decides; B can (checked above)
+    S.peerCpu = KVStr(h, "cpu");
     S.startAi1 = KVStr(h, "ai1");
     S.startAi0 = KVStr(h, "ai0");
     S.startAuto = KVStr(h, "auto", "00");  // auto-run per side (applied after the load)
@@ -8280,6 +8933,13 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
         CancelRejoin(KVStr(h, "why", "the other player disconnected"));
         return;
     }
+    if (t == "datadiff" && (!S.on || bid == S.bid) && !S.isA) {  // engine level 16: A names the files (B refused)
+        std::string why = KVStr(h, "why", "your game data files differ");
+        Log("lockstep: battle %d: %s", bid, why.c_str());
+        Chat("The live battle could not start: " + why + ". The battle is fought against the computer.");
+        if (g_hooks.notice) g_hooks.notice("No live battle: " + why);
+        return;
+    }
     if (!S.on || bid != S.bid) {
         if (t != "hb") Log("lockstep: '%s' for battle %d ignored (this PC: %d, %s)", t.c_str(), bid, S.bid, S.on ? "on" : "off");
         return;
@@ -8298,6 +8958,18 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
         if (S.isA) {
             int lv = KVInt(h, "lv");
             if (lv > 0) S.peerLevel = lv;  // (B's level: whether a rejoin could ever work)
+            std::string dm = KVStr(h, "dm");
+            if (!dm.empty()) {  // engine level 16: B's game data files differ (B's list: name it to both players)
+                auto names = datafiles::Differ(dm);
+                std::string list = names.empty() ? "?" : datafiles::NamesText(names);
+                Log("lockstep: %s's game data files differ from this PC's: %d files: %s", S.peerName.c_str(),
+                    (int)names.size(), datafiles::NamesText(names, 40).c_str());
+                KV kv;
+                kv["t"] = "datadiff";
+                kv["why"] = "your game data files differ from " + S.myName + "'s: " + list;
+                SendMsg(kv);
+                why = "the game data files differ: " + list;
+            }
             DropPeer(lv > 0 && lv != MP_LS_LEVEL ? LevelMismatchText(S.peerName, lv) : S.peerName + ": " + why);
         } else {
             AbortB(t == "drop" ? "the AI commands your side now (" + why + ")" : why);
@@ -8335,6 +9007,12 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
             }
             S.peerReady = true;
             S.peerReadyHash = KVStr(h, "h");
+            S.peerReadyParts = KVStr(h, "g");  // engine level 16: B's parts, CPU vendor and own control word
+            S.peerCpu = KVStr(h, "cpu");
+            S.peerOwnCw = (unsigned)strtoul(KVStr(h, "cw").c_str(), nullptr, 16);
+            if (!S.peerCpu.empty() && S.peerCpu != x87::CpuVendor())
+                Log("lockstep: CPU %s here, %s at %s (transcendental maths: %s)", x87::CpuVendor().c_str(),
+                    S.peerCpu.c_str(), S.peerName.c_str(), S.softMath ? "software on both PCs" : "each PC's own");
             ACheckReady();
         } else if (t == "done") {
             S.peerDoneN = KVInt(h, "n", -1);
@@ -8378,8 +9056,19 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
         S.clockAuto[1] = KVInt(h, "a1", S.clockAuto[1]);
         std::string msg = KVStr(h, "msg");
         if (!msg.empty()) Chat(msg);
-    } else if (t == "desync") {  // A found a DESYNC at this boundary: this PC's report too (DesyncReport)
-        if (S.st == St::Running) DesyncReport(KVInt(h, "n", -1), KVStr(h, "h"));
+    } else if (t == "desync") {  // A found a DESYNC at this boundary (level 15: or that the loaded battles differ): this
+                                 // PC's report too (DesyncReport)
+        bool ready = KVStr(h, "why") == "ready";
+        if (S.st == St::Running || (ready && S.st == St::WaitReady))
+            DesyncReport(KVInt(h, "n", -1), KVStr(h, "h"), ready ? "the loaded battles differ" : nullptr);
+        std::string diag = KVStr(h, "diag");  // engine level 16: what differed (A's ReadyDiag)
+        if (ready) {
+            S.readyDiag = diag;
+            Log("lockstep: %s: the loaded battles differ (%s)", S.peerName.c_str(), diag.empty() ? "?" : diag.c_str());
+            if (g_hooks.notice)
+                g_hooks.notice("Live battle: the loaded battles differ" + (diag.empty() ? std::string() : ": " + diag) +
+                               " (loading again)");
+        }
     }
 }
 
@@ -8391,7 +9080,10 @@ void SetHooks(const Hooks& h) {
 }
 
 bool Available() { return Resolve() && E.sessionOk; }
-bool Prepare() { return Available(); }
+bool Prepare() {
+    datafiles::StartScan();  // (engine level 16: the game data files' hash for the live battles' start)
+    return Available();
+}
 bool Active() { return S.on && S.st != St::Ended; }
 bool Busy() { return (S.on && S.st != St::Ended) || S.leavePending; }
 bool IsAuthority() { return S.on && S.isA; }
@@ -10193,6 +10885,24 @@ std::string Debug(const std::vector<std::string>& a) {
         Log("lockstep: TEST mute %d", g_muted ? 1 : 0);
         return "ok muted=" + std::to_string(g_muted ? 1 : 0);
     }
+    if (c == "leakcheck" && arg(2, "") == "ident") {  // ls leakcheck ident 0|1: the identification in the leak check
+        g_leakIdent = arg(3, "1") != "0";
+        g_exitHashOk = false;
+        return "ok leakident=" + std::to_string(g_leakIdent ? 1 : 0);
+    }
+    if (c == "testident") {  // ls testident <ship index> <type> (TEST ONLY, between minutes, on one PC): a display write
+        // of the identification into the simulation's set, as the leak check must catch it (LEAK ... ident)
+        void* sp = dl::ListItem(List(E.allShipsVar), atoi(arg(2, "-1").c_str()));
+        if (!IsFightingShip(sp)) return "error ship";
+        if (g_sim > 0 || S.minuteRunning) return "error not between minutes";
+        auto it = g_dual.find(sp);
+        if (it == g_dual.end() || !it->second.known || !g_viewOn) return "error no display set in place";
+        int was = it->second.simType;
+        it->second.simType = it->second.lastSimType = (uint8_t)atoi(arg(3, "3").c_str());
+        Log("lockstep: TEST %s's identification in the simulation's set %d -> %d", W2U(ObjName(sp)).c_str(), was,
+            it->second.simType);
+        return "ok ship=" + W2U(ObjName(sp)) + " was=" + std::to_string(was);
+    }
     if (c == "leakcheck") {  // ls leakcheck 0|1: the simulation state may not change between its steps (logs LEAK)
         g_leakCheck = arg(2, "1") != "0";
         g_exitHashOk = false;
@@ -10211,6 +10921,58 @@ std::string Debug(const std::vector<std::string>& a) {
     if (c == "view") {  // ls view 0|1: the display swap to this PC's side (from the next load)
         g_noView = arg(2, "1") == "0";
         return "ok view=" + std::to_string(g_noView ? 0 : 1);
+    }
+    if (c == "mapview") {  // ls mapview [on|off|apply]: what this PC's map shows per side (engine level 15)
+        std::string v = arg(2, "");
+        if (v == "off") g_mapOn = false;
+        if (v == "on") g_mapOn = true;
+        if (v == "apply" || v == "on") ApplyMapView("probe");
+        return MapViewProbe();
+    }
+    if (c == "testcwload") {  // ls testcwload 0|1 (TEST ONLY): 0 = B loads with its own x87 control word (as 0.4.0)
+        if (a.size() > 2) g_cwBeforeLoad = arg(2, "1") != "0";
+        return "ok testcwload=" + std::to_string(g_cwBeforeLoad ? 1 : 0) + " cw=" + std::to_string(FpuCw()) +
+               " battle=" + std::to_string(S.cw0);
+    }
+    if (c == "testdatafile") {  // ls testdatafile <name>[;<name>...]|off (TEST ONLY): those data files differ on this copy
+        datafiles::SetTestDiff(arg(2, ""));
+        return "ok data=" + datafiles::Combined() + " files=" + std::to_string(datafiles::FileCount());
+    }
+    if (c == "x87") {  // ls x87 [bench|selftest|check|reset|soft 0|1|pert ext|dbl|off [N]]: engine level 16's
+                       // transcendental routines (TEST ONLY: `soft` A's choice for the next start, `pert` this copy's nudge)
+        std::string sub = arg(2, "");
+        if (sub == "reset") x87::ResetCounts();
+        if (sub == "soft" && a.size() > 3) g_softWanted = arg(3, "1") != "0";
+        if (sub == "pert" && a.size() > 3) x87::SetPerturb(arg(3, "off"), atol(arg(4, "1").c_str()));
+        char cw[8];
+        snprintf(cw, sizeof(cw), "%04x", FpuCw());
+        std::string out = "ok installed=" + std::to_string(x87::Installed() ? 1 : 0) +
+                          " soft=" + std::to_string(x87::Soft() ? 1 : 0) + " battleSoft=" + std::to_string(S.softMath ? 1 : 0) +
+                          " cpu=" + x87::CpuVendor() + " peerCpu=" + (S.peerCpu.empty() ? "-" : S.peerCpu) + " cw=" + cw +
+                          " cwFixes=" + std::to_string(S.cwFixes) + " calls=" + x87::Counts() +
+                          " test=" + (x87::TestSwitch().empty() ? "-" : x87::TestSwitch()) +
+                          " data=" + (datafiles::Ready() ? datafiles::Combined() : "-") +
+                          " files=" + std::to_string(datafiles::FileCount()) +
+                          " readyDiag=" + (S.readyDiag.empty() ? "-" : S.readyDiag);
+        if (sub == "bench") out += " bench=" + x87::Bench();
+        if (sub == "selftest") out += " selftest=" + x87::SelfTest();
+        if (sub == "check") out += " check=" + x87::StubCheck();
+        for (auto& ch : out)
+            if (ch == '\n') ch = ' ';
+        return out;
+    }
+    if (c == "prefs") {  // ls prefs: the battle preferences of this PC's record now (engine level 15: the ones the
+                         // simulation uses), and this PC's own kept for after a live battle
+        std::string out = "ok";
+        std::string h = PrefsHex();
+        for (size_t i = 0; i < sizeof(kPrefs) / sizeof(kPrefs[0]); i++)
+            out += std::string(" ") + kPrefs[i].key + "=" + std::to_string(PrefValue(h, i));
+        if (E.prefs)
+            out += " | DarkMode=" + std::to_string(*(int*)(E.prefs + 0x39)) + " Scale=" + std::to_string(E.prefs[0x34e]) +
+                   " SoundVolume=" + std::to_string(*(int*)(E.prefs + 0x52)) + " MainFormState=" +
+                   std::to_string(*(int*)(E.prefs + 0x65));
+        if (!S.savedPrefs.empty()) out += " | after the battle: " + PrefsDiff(h, S.savedPrefs);
+        return out;
     }
     if (c == "nest") {  // ls nest <s>: a nested message loop on the main thread for s seconds (as ProcessMessages)
         int sec = std::max(1, std::min(60, atoi(arg(2, "5").c_str())));
@@ -10243,6 +11005,19 @@ std::string Debug(const std::vector<std::string>& a) {
             Log("lockstep: TEST: the next snapshot of this PC as A carries a pending missile target for ship %d",
                 g_testPmtShip);
         return "ok testpmt=" + std::to_string(g_testPmtShip);
+    }
+    if (c == "shiptypes") {  // ls shiptypes [<6 hex digits> | sync | nosync | hash | nohash] (TEST ONLY): the ship-type
+        std::string v = arg(2, "");  // flags (BB, BC, carrier exist): read; set this copy's own (between battles, as a
+        if (v == "sync" || v == "nosync")  // processed month leaves them); nosync: as B, keep this copy's own for the
+            g_typeFlagsSync = v == "sync";  // live battles; nohash: the flags out of the state hash (both: as 0.4.1 RC)
+        else if (v == "hash" || v == "nohash")
+            g_typeFlagsHash = v == "hash";
+        else if (!v.empty() && !SetTypeFlagsHex(v))
+            return "error flags (6 hex digits, or the flags were not found)";
+        else if (!v.empty())
+            Log("lockstep: TEST ship-type flags set to %s", v.c_str());
+        return "ok shiptypes=" + TypeFlagsHex() + " sync=" + std::to_string(g_typeFlagsSync ? 1 : 0) +
+               " hash=" + std::to_string(g_typeFlagsHash ? 1 : 0);
     }
     if (!S.on) return "error no live battle";
     NoteDispatchInSim(("bridge `ls " + c + "`").c_str());
@@ -10295,6 +11070,8 @@ std::string Debug(const std::vector<std::string>& a) {
         return ok ? "ok" : "error " + err;
     }
     if (c == "desync") return S.forceDesync = 1, "ok (this PC's next minute differs)";
+    if (c == "testreadydiff")  // TEST ONLY: this PC's next live load differs (A finds that the loaded battles differ)
+        return g_testReadyDiff = true, "ok (this PC's next live load differs)";
     if (c == "torp") return TorpCommand(a);  // (async: DebugIsAsync)
     if (c == "fireatwill") return FireAtWillCommand(a);
     if (c == "missiles") return MissilesCommand(a);  // (async: DebugIsAsync)
@@ -10315,7 +11092,11 @@ std::string Debug(const std::vector<std::string>& a) {
         if (g_sim > 0 || S.minuteRunning) return "error not between minutes";
         int off = CurrentSpeedOff(), was = dl::At<int>(sp, off);
         dl::At<int>(sp, off) = atoi(arg(3, "0").c_str());
-        if (g_exitHashOk) LeakCheckExit(g_exitFrame);  // (the leak check's baseline includes the test's own write)
+        if (g_exitHashOk) {  // (the leak check's baseline includes the test's own write; taken with the simulation's
+            CanonBegin();    // set of the display-swapped fields in place, as at a step's end)
+            LeakCheckExit(g_exitFrame);
+            CanonEnd();
+        }
         Log("lockstep: TEST %s's current speed %d -> %d", W2U(ObjName(sp)).c_str(), was, dl::At<int>(sp, off));
         return "ok ship=" + W2U(ObjName(sp)) + " was=" + std::to_string(was);
     }
@@ -10679,7 +11460,7 @@ static void PruneDesyncReports() {
     for (size_t i = 0; i + 11 < files.size(); i++) DeleteFileW((dir + files[i].second).c_str());
 }
 
-static void DesyncReport(int minute, const std::string& peerHash) {
+static void DesyncReport(int minute, const std::string& peerHash, const char* why) {
     if (!BattleForm()) return;
     if (g_sim > 0 || g_loading) {  // (only at a boundary: never inside a simulation step or a load)
         Log("lockstep: DESYNC report of minute %d not written (not between minutes here)", minute);
@@ -10690,8 +11471,10 @@ static void DesyncReport(int minute, const std::string& peerHash) {
                       std::to_string(S.mySide) + " battle " + std::to_string(S.bid) + " epoch " + std::to_string(S.epoch) +
                       " minute " + std::to_string(minute) + " (boundary here " + std::to_string(S.boundary) +
                       ", engine level " + std::to_string(MP_LS_LEVEL) + ")\r\n";
-    out += "hash here " + S.myHash + (peerHash.empty() ? std::string() : std::string(S.isA ? " B " : " A ") + peerHash) +
+    const std::string& mine = why ? S.myReadyHash : S.myHash;  // (the loaded battles: the hash the READY check compared)
+    out += "hash here " + mine + (peerHash.empty() ? std::string() : std::string(S.isA ? " B " : " A ") + peerHash) +
            "\r\n";
+    if (why) out += std::string("why ") + why + "\r\n";
     out += "base " + std::to_string((uint32_t)dl::g_base) + " t=" + ClockText() + "\r\n";
     std::string pend;
     for (auto& ov : g_overlay) pend += " " + ov.first.substr(0, 60);

@@ -9,7 +9,9 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
 - [How to read the addresses](#how-to-read-the-addresses)
 - [Where the facts come from](#where-the-facts-come-from)
 - [The game and the mod: facts you can rely on](#the-game-and-the-mod-facts-you-can-rely-on)
+- [Relations, wars and battles: nation 0's and the others'](#relations-wars-and-battles-nation-0s-and-the-others)
 - [Research speed and the missile era](#research-speed-and-the-missile-era)
+- [Intelligence, trade protection and foreign stations](#intelligence-trade-protection-and-foreign-stations)
 - [Tactical battles](#tactical-battles)
   - [Battle commands](#battle-commands)
 
@@ -160,6 +162,59 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   calls go through `RunOnMainThread`. A modal game dialog runs its own message loop, so mod code keeps running under
   it: guard against re-entry.
 
+## Relations, wars and battles: nation 0's and the others'
+Static reading of 1.01.44 and live runs of 2026-10-20 ([MODLOG](../MODLOG.md#investigation-2026-10-20-each-players-own-relations-tension-wars-and-battles-of-a-joined-players-nation-v041)).
+The game is written for one player, nation 0; it runs every other nation, a joined player's nation K included, as AI.
+
+- **Tension per nation.** Each `TBuilderNation` holds one array: +0x256 `Tension` (the relation with nation 0) and
+  +0x25a `AITension[1..8]`; alliances `Allied` +0x29a (with nation 0) and `AIAlliance` (cells +0x276+4j for j 1..8);
+  war = above 40. Nation a's relation with b: `b.Tension` when a = 0, else `a.AITension[b]` (`SetAITension` writes both
+  directions). `game.cpp`: `TensionCell`, `Tension(a, b)`, `AllianceMonths`. So K's relations with every nation exist
+  in the data, apart from the host's.
+- **The screens read nation 0's relations** and compare with `PlayerNation` (+0x3204): the strategic screen's tension
+  panel (`UpdateUIValues` 0xc8018c names slots 1-8, `ShowTensionLevels` 0xc7f4d8 / `ShowOneTensionLevel` 0xc7f1e4,
+  `lbWar<i>`, `imgAlly<i>`, `lbBlock<i>`, `stIntel<i>`), the flags (`SetValues` 0xc7fbcc; a click:
+  `TdlgNationData.Execute(slot)`, the player's own flag 0), the War results box `gbWar`, `lbWar` "At war for N months."
+  and `lbPlayerNation`'s hint "At peace for ..." (the war counter), the map's strength bars (`DrawAreaStrengthBars`
+  0xd10900: nation 0 silver, the others by `GetTensionColor(Tension)`). `TdlgRelations` (the 9x9 matrix) shows every
+  pair. Helpers: `IsEnemy` 0xc66410 (the player's coalition only), `NationIsAtWar` 0xc634f8 (PlayerNation: War > 0),
+  `IsAtAIWar` 0xc68ecc (false for PlayerNation), `GetRandomEnemy` 0xccd5cc (Tension > 40), `GetRandomEnemyForAI`
+  0xc77500 (AITension[1..8]). Side effects: while War > 0 `UpdateUIValues` calls `CancelTreaty` (a box when a
+  disarmament treaty ends) and zeroes every nation's DisplacementLimit. Since 0.4.1 a PC whose PlayerNation is nation
+  K > 0 shows K's relations (the relations view, ARCHITECTURE).
+- **The war counter** `[General] War` (global 0xf52ff4; `0xccd5fc` = War > 0) is nation 0's: months at war (> 0) or
+  at peace (<= 0); `WarStartsWithNation` 0xd333bc sets 1 when it was <= 0, DoStrategicTurn (0xce1f69) adds 1 at war and
+  subtracts 1 at peace (at -2 a clean-up 0xd26fc8 runs), `DoPeace` ends the war. K has none.
+- **Nation 0's machinery.** Tension: `RandomTensionChanges` 0xc81100 (from `CheckTurnEvents`; about 50
+  `TensionChangeWithMessage` 0xd46a3c calls with explanations, which add "Tension with X increases <why>" to the turn
+  messages when a setting allows it, [0xf278b4]+0x361; speeches, questions to the player) and
+  `TensionEffectOfPreviousWars`. Wars:
+  `CheckForWar` 0xc84f04 (from DoEndOfTurn: common-enemy relief, the `WillGoToWar` countdown +0x1bd with spy warnings
+  and rumours, declarations, allies joining on either side, surprise attacks and landings) -> `WarStartsWithNation`
+  (Tension 50, War := 1, Allied and TechSharing 0, both nations' BudgetModifier raised). Peace: `GetPeaceEvent`,
+  `NegotiatePeace`, `DoPeace`. War effects: `CheckBlockadeStatus`' VP, `CheckRaiderActivity`, `WarHelpFromAllies`,
+  `CheckBuildingShipsForWar`, war loans in `CheckTurnEvents`. Battles: `CheckForBattles2` 0xcecb10 (only while War > 0;
+  PlayerNation against nations with Tension > 40: invasions, raiders vs patrols, home areas, possessions,
+  `GetRandomEnemy`, each through `CheckAttackLocation`).
+- **The AI's machinery** (every other nation, K included): `CheckAITensionEvents` 0xd2dc68 and `DoAITensionChanges`
+  per nation; `ChangeAITension` 0xc67904 moves a pair by +-1 (its cause goes into the host's turn messages: "Tension
+  between USA and France decreases because ..."; questions to the player when a pair involves its ally). An AI war
+  breaks out (0xd2e598) for nation i's most tense partner when 10 < t < 40 and Random(100) < t, only while nation 0 is
+  NOT at war (0xd2e602; otherwise the tension drops by 1), with "War has broken out between X and Y!" on the host's
+  screen, `SetAITension` 50 and the allies (`AllyWithAINationsFightingTheSameEnemy`, `CheckIfAlliedAINationsJoinWar`).
+  AI peace: `HandleAIPeace` 0xd32f98 (war weariness, while nation 0 is not at war and the nation not at war with it, or
+  forced by unrest; "The war between ... has ended", VP of nations 1-8 zeroed). So a joined nation's wars with AI
+  nations follow these rules and freeze while the host is at war; nothing of it reaches K's PC.
+- **Battles between nations the game runs.** `CheckAIvsAIBattles` 0xd32a50: for pairs i, j in 1..8 with AITension > 40
+  (nations walked in order, 50 % each) the areas are tried with `CheckAivsAIBattleInArea` 0xd32c2c (50 %, ships of
+  both in the area, Random(10) < the counts, then a size-based chance) -> `DoBattleBetweenAINations` (resolved without
+  a battle screen; the mod defers a joined nation's battle to its battle phase). A joined nation with a low index
+  usually attacks.
+- **`AIDeclinesBattle`** 0xcd2188 (from `CheckAttackLocation`): when the AI side declines, "The <nation> navy declines
+  battle! You gain N VP!" and PlayerNation's VP += N (`add [eax+0x175], edx`), before any preview (the battle setup
+  `DoBattle` is not entered). The player's own decline in the preview gives the enemy VP ("Decline will give the enemy
+  ..."; `DoPlayerDecline`).
+
 ## Research speed and the missile era
 What is known as of 2026-10-17 (static reading of 1.01.44, and a single-player test campaign played by a driver from
 1935 to 1958 with ResearchSpeed 400 from April 1937). The evidence is quoted here; there is no MODLOG entry.
@@ -219,8 +274,102 @@ What is known as of 2026-10-17 (static reading of 1.01.44, and a single-player t
     demanding that they back down!" or "We should increase our cooperation with France."). Answering them with the
     first radio led a passive player's nation into a war.
 
+## Intelligence, trade protection and foreign stations
+Static reading of 1.01.44 (2026-10-20), confirmed live on the 0.4.0 release and on 0.4.1
+([MODLOG](../MODLOG.md#fix-2026-10-20-joined-players-intelligence-mirrored-the-hosts-no-trade-protection-warnings-v041)).
+Which routines act for nation 0 (the save's player) only: `CheckTurnEvents` and its `CheckIntelligence`,
+`PlayerChecksBeforeTurn`, the player's part of `CheckShipsOnForeignStations` and `CheckPatrols`,
+`MovePlayerShipsOnForeignStations`, `GetIntelCostForPlayerNation`, `ShowTensionLevels`' slots 1-8.
+- **Where the game keeps a player's intelligence: on the target nations.** `TBuilderNation.IntelligenceSpending`
+  (+0x171, 0 None .. 3 High) and `IntelEffort` (+0x1ac, the effort reached, 0..3) of nation j are nation 0's spending on
+  and effort against j (saved per `[Nation<j>]`, like `Tension`). Nation 0's own pair is unused.
+  - The politics panel (`pnPolitics`) shows nations 1..8 (`ShowTensionLevels` 0xc7f4d8, indices hard-coded); the label
+    under each flag (`stIntel1..8`) is `IntelToString(i)` (0xd3c408: None/Low/Med/High, " *" while IntelEffort <
+    IntelligenceSpending); the +/- speed buttons (Tag 1..8 raise, 9..16 lower) call `SpeedButton1Click` ->
+    `ChangeIntel` (0xd3c538: nation Tag (or Tag-8) IntelligenceSpending +1 up to 3 / -1 down to 0) ->
+    `UpdateBudgetNumbers`, `ShowTensionLevels`.
+  - The budget's Intelligence line (`stIntelligence` +0x690, `Label23`) is `GetIntelCostForPlayerNation` (0xc989b8):
+    the sum over nations 1..8 of IntelligenceSpending x 10 x FleetSize.
+  - `TBuilderNation.GetMonthlyBalance` (0xc5d2ec): for PlayerNation it subtracts GetIntelCostForPlayerNation and
+    `GetInvasionTargetCost`; for every other nation it ADDS `ComputeAINationIntelCost(nation)` (0xcae594: FleetSize x
+    30 at Tension 0 with nation 0, 40 at 1-4, 50, 60, 70, 80 at 5-8, 90 above). `ComputeExpenses` (0xca049c, in
+    `DoStrategicTurn`) adds GetMonthlyBalance to Funds: PlayerNation, then nations 1..8, which also get 25 x FleetSize a
+    month (and another 25 x FleetSize while poorer than nation 0 and Tension > 6), and their BaseResources adjusted.
+  - The reports: `AddIntelReport(aNation, text)` (0xcb176c) adds "Intelligence report <nation>: text" to
+    `TurnMessages` (+0x3208) and "<Mon yyyy> <nation> - text" to `IntelReports` (+0x320c), the one list the Intel
+    reports screen shows and `[IntelReports]` saves (`ReportNo`, `Intel0..`). Its callers: `SpySuccess` (the player's
+    spying) and passive reports from the AI routines, mostly gated by the target's IntelEffort (DoResearch: "There are
+    reports that <X> scientists have invented ..." at Random(100) < 18 x IntelEffort; AINationAdjustBudget,
+    HaltMostExpensiveShip, ReduceTimeLimits, CheckForWar, CheckForConstructionDelays, ShowGunImprovementMessage,
+    AIFortifyArea, CheckTechSharing) or reactions to nation 0 itself (AIMonthlyBuild: "Alarmed by our dreadnought
+    building program ...").
+- **The monthly spying check (nation 0 only).** `CheckTurnEvents` (0xce30f0) fills one event slot a month: at war a
+  peace event, else officer events, `BuyTechnology`, then with Random(3) = 1 `GetRandomEvent` (only half of those
+  while the war counter is -10 or more: at war or within 10 months of a war), else `CheckIntelligence` (0xc86244; if
+  it reports nothing, or 1 in 8, `RandomTensionChanges`).
+  - `CheckIntelligence`: nations 1..8 in a random direction; `CheckAircraftIntel(i)` when at war with i;
+    `CheckIntelligenceForNation(i)` (0xcc1288); after a hit 60 % stop.
+  - `CheckIntelligenceForNation(i)`: in peace only when Random(10) <= |war counter|; the head of naval intelligence's
+    suggestion when at war with i and spending None (Random(100) < 10, a message box); effort +1 with Random(5) = 1
+    while below the spending; not at war: our spy caught when effort > Random(200) and effort x 30 > Random(100)
+    (`TdlgEventAnswer.ExecuteOurSpyCaught`: "Deny any involvement" Prestige -, Tension +; "Make the agent a national
+    hero!" Prestige +, Tension +; the effort drops); else `SpySuccess(0, i)` when effort > Random(20) or effort + 4 >
+    Random(100) (at war also 1 in 50); a communist PlayerNation 1 in 36 more; enemy spy caught at (Tension/3 + 1) >
+    Random(100) and 50 % (`ExecuteEnemySpyCaught`: "Give it maximum publicity ..." BudgetModifier +1, Tension +1); the
+    effort drops by 1 while above the spending.
+  - `SpySuccess(Spying, Target)` (0xc9c744): for Spying = 0 reports on training, docks, ships under construction and
+    rebuilds (with a ship data sheet `TdlgShipStatus` or "Our top spy has acquired the plans ..." picture message),
+    hidden budgets, research percentage, balance, aircraft data (`ShowEnemyAircraftData`), and gun theft (the
+    target's gun quality into GetBNation(0).Guns: "We are now able to produce such guns!"); for an AI spy only the gun
+    theft, silently. `CheckAISpying(i)` (0xcba67c, DoStrategicTurn for i = 1..8): the AI's spying on nation 0
+    (chance (GetBNation(0).Tension + 5)/170) and on the others (7/150).
+  - Ship-level beliefs are the player's too: `TCampaignShip.EnemyClassName` (+0x19), `EnemySpeed` (+0x59),
+    `EnemyBelt` (+0x5d), `PlayerIntel` (+0xc3), saved with each nation's ships.
+- **Trade protection and foreign stations.**
+  - `PlayerChecksBeforeTurn` (0xce28c4, `DoTurn2` before the month; `DoTurn` 0xce09f4 is unused): AMC limits,
+    commanders and admirals (auto-assign questions), treaty tonnage, carriers' aircraft, funds into the red, air base
+    capacity, mothballed ships, then **trade protection** at war (war counter > 0): `CountShipsOnPatrol(nil)` (Status 3)
+    < `GetPatrolRequirement(PlayerNation)` -> "You have N ships on trade protection duties, but M are required. This
+    will give VP to the enemy and might hurt your prestige. Continue anyway?" (No = back to the screen), then
+    `CheckForceOnForeignStations(True)`, then unrestricted submarine warfare with few submarines.
+  - `GetPatrolRequirement(aNation)` (0xcc78a8): for PlayerNation the operational submarines of GetBNation(1..8) at
+    Tension >= 40 (a third less for those with none in its BuildArea), scaled by FleetSize, BaseResources,
+    GlobalNavalPower and the economic rating; for any other nation it counts the PLAYER's submarines. The budget panel
+    shows "N of M" (`stPatrol`).
+  - `CheckForceOnForeignStations(Warn)` (0xcf5f54): returns True at war when PlayerNation is blockaded; per map area
+    HasRequiredForceInArea(area, False) (`GetTonnageInArea - GetRequiredTonnageInArea`) shortfalls are summed and
+    compared with the colonial tonnage of the operational Status 6 ships. Warn: the question "There are insufficient
+    ships on foreign stations! Continue anyway?" (and, 6 % each, advice on destroyers and scouting cruisers). Not Warn
+    (the month, peace only, never in January, 1 in 5 within four months of a war): Random(2 x required) < shortfall ->
+    "The YY has been made aware ..." the first time (`LeaderWarnedAboutForeignStations` +0xae2), "The YY is displeased
+    ... Your prestige suffers." (Prestige -1) the next; else the same chance -> a rebellion in a random possession of
+    the player whose area lacks force (`TPossession.Rebellion` +0x6d := Random(10) + 2, not where `NaturalOwnerName` is
+    the owner); else Random(required) < shortfall and 50 % -> trading companies or the navy league complain. In both
+    modes it then rolls world events: independence and rebellions of random possessions of ANY nation (the player's
+    own independence question `TdlgEventAnswer.ExecuteGeneral`), Cuba and the Philippines against Spain.
+  - `DoStrategicTurn` (0xce1938): `CheckShipsOnForeignStations` (0xcb6718, peace only:
+    CheckForceOnForeignStations(False) for nation 0, `AISendShipToColonies` for 1..8), `CheckPatrols` (0xcc7dc4: at
+    war, nation 0 short of patrols by more than Random(40) -> "The YY is annoyed that you cannot safeguard our coasts
+    with adequate patrols ..." (a message only); the AI patrols and raiders of nation 0's enemies), submarine warfare
+    only between nation 0 and its enemies
+    (`CheckSubmarineActivity`, the `TdlgSubmarineWarfareSummary`, `CheckResultOfSinkings`), `CheckRebellionAndInvasions`
+    (unnamed, 0xcf8824: every possession's rebellion counts down).
+  - `MovePlayerShipsOnForeignStations` (0xcfc3b8, DoTurn2) moves PlayerNation's Status 6 ships to the areas that lack
+    force; the AI's `AISendShipsToForeignStations`/`AISendShipToColonies` do it for the others.
+  - `GetTonnageInArea(area)` (0xc61210) counts the operational ships in the area with Status 0, 3 or 6 (active, trade
+    protection, foreign stations); ships under way count where they are, so a shortfall can close by itself when they
+    arrive (seen with the USA in the 1900 test campaign).
+- **AI routines the mod doesn't skip that still change a joined nation's money** (observed in the 2026-10-20 proofs):
+  `ComputeExpenses` (the monthly AI money and the BaseResources floor, above), `CheckBBNumbers` (0xccb6d8, from
+  `CheckTurnEvents` for nations 1-8, at peace before 1940, 1 in 10 a month when a rival has two more battleships:
+  "<nation> has increased the naval budget to remain a global naval power.", Funds + FleetSize x 6000 and
+  BudgetModifier + 1; the player's branch costs prestige and gives FleetSize x 1000), `ReduceTimeLimits`
+  (`HaltMostExpensiveShip` while the monthly balance is negative and Funds are below twice the deficit), and the
+  PLAYER's spies: `SpySuccess`'s "<nation> is secretly spending an additional 10% on the navy above their official
+  figures" adds a fifth of the target's budget to its Funds.
+
 ## Tactical battles
-What is known as of 2026-10-17 (0.3.3).
+The battle facts, gathered since the battle investigation of 2026-10-14; the later findings carry their dates.
 
 - **The battle form.** `TfrmMain` is the battle screen. Its buttons:
   - `sbPlay` "Run one minute", `sbRun5` "Run 5 minutes if engaged, 20 if not", `sbRun` "Run until break";
@@ -242,10 +391,11 @@ What is known as of 2026-10-17 (0.3.3).
   - `[General] BattleAlliedNationIdx` / `BattleEnemyAlliedNationIdx` (allies in battle).
 - **Debug menu items** (possible test entry points): `Testbattle1Click`, `Testareabattle1Click`,
   `Generaterandombattle1Click`, `Battle1Click`.
-- **Today, in the mod (0.3.3):**
+- **In the mod (since 0.3.0; the current design is in [ARCHITECTURE.md](ARCHITECTURE.md)):**
   - Joined players fight their battles against AI nations on their own PC: the host defers `DoBattleBetweenAINations`,
     the player fights in a battle slot (client slot + 10) made with the Copy-game transform, and the host merges the
-    result field by field (`saveio::ApplyBattleResult`).
+    result field by field (`saveio::ApplyBattleResult`). Since 0.4.1 a battle the AI declines (`AIDeclinesBattle`)
+    comes back with the outcome `avoided` and is merged with its VP only.
   - Battles between players are fought live in lockstep (`src/mod/lockstep.cpp`): a seeded `Random32Proc`, simulation
     and display contexts, a minute gate, an order guard with state sync, a per-minute hash with resync from a `.sac`
     snapshot, and AI takeover on silence.
@@ -716,6 +866,22 @@ What is known as of 2026-10-17 (0.3.3).
     reports routine (0xdc960c, EOTP), `TfrmMain.UpdateReport`, and the air attacks (`TAirFormation.AttackShips`,
     `AirBombShip`, `AirdropASM`: `IdentifyType`). The box "Unknown ship sighted!" also comes outside minutes (seen at a
     battle's first display on the host's copy).
+  - *The campaign's ship-type flags (0.4.1, engine level 17).* `TFightingShip.SetMistakenType` (0xe4979c, from
+    `IdentifyType`, `AttackShips` and `ShowMissileRanges`) and `IdentifyType` read three unit Booleans (0xf54935,
+    0xf54936, 0xf54937: a battleship, a battlecruiser, a carrier (CV or CVL) exists; cells 0xf26dc8, 0xf27b34,
+    0xf26df0). Only `TfrmBuildCamp.CheckShipTypesExist` (0xd4e314) writes them, from every nation's ships in play
+    (`CountShipsOfType(type, InPlay)` for nations 0..8), and only `ReduceTimeLimits` calls it (from `DoTurn` and
+    `DoStrategicTurn`: the month's processing). So they hold what this process's last processed month left: 0 in a
+    game that never processed a month (a joined player's, or the host's first battle after its game started), the
+    campaign's after one. The rules: a battleship whose roll says "mistaken" (Random(100) < 21) becomes a battlecruiser
+    if the year is before 1907 or a battlecruiser exists, else a heavy cruiser (no extra draw); a carrier or light
+    carrier becomes a heavy cruiser if no carrier exists; a ship identified as a battleship when none exists draws
+    another Random(100) (0xe49e36) for a pre-dreadnought or heavy cruiser. The 0.4.1 RC's lockstep_strike DESYNCs
+    (minutes 53 and 74) parted exactly there: the host had processed 1935 months (flags 1), the joined player not (0);
+    the identification differed silently from minute 47, and the epoch after the first resync parted at the same draw
+    with the identification equal at its boundary. No display path wrote the identification (the display's only writer
+    is `GetTypeAndNameForEnemy`, a hooked display routine whose writes go to the display set). The mod finds the three
+    through `CheckShipTypesExist`'s prologue (`mov esi, eax`, then three `mov eax, [cell]; mov byte ptr [eax], 0`).
 - **Missiles (2026-10-17, static reading of 1.01.44, for engine level 9; `verify_p4.py` checks the patterns).** The
   weapons research of 2026-10-16 (`limits-weapons.md` §2, §3) with the details the build needed.
   - *Automatic fire.* `CheckMissileFiringForAllShips` (0xda91fc, EOTP after 1940), per division with ships and `Side` <
@@ -851,6 +1017,135 @@ What is known as of 2026-10-17 (0.3.3).
   - *Fire mode* (`rgMissileDoctrine.ItemIndex` +0x2e0) is read only in 0xda7ccc and only for ships whose side is
     PlayerSide: the chance to keep firing starts at 40 %, +25 with *Half* (and more than 2 heavy SSM left), +55 with
     *All*; the other side's ships get +10 against a large target instead.
+- **Two PCs: the preferences, the number format and the map of a side (2026-10-19, static reading of 1.01.44 with
+  the offline workspace's call graph, and the live runs nb1-nb8 of
+  [MODLOG](../MODLOG.md#investigation-2026-10-19-live-battles-between-two-pcs-v041); for engine level 15).**
+  - *The Preferences file* (`<Documents>\My Games\Rule the Waves 3\Preferences`, an INI file, section `[Settings]`) is
+    read by `TdlgPrefs.LoadPrefs` (0xe0b0b8) into one record at 0xf5327c (cell 0xf278b4), called from
+    `TfrmCampaign.FormCreate` (the game's start), `TfrmSelectNation2.FormPaint` and the dialog's reset. It is written
+    by `SavePrefs` (0xe0d588) only from `TdlgCampaignStart.FormClose` and `TfrmSelectNation2.FormClose`: never during a
+    battle or at the game's exit. The battle screen's *Preferences* (`TfrmMain.sbPrefsClick` 0xdcf764 ->
+    `TdlgPrefs.Execute` 0xe08dd0) writes the record directly on Ok (e.g. `RealismSetting := rgRealism.ItemIndex` at
+    0xe09143; opened from a battle screen and closed with a plain Ok it wrote `RealismSetting` -1 in a test).
+  - *Which preferences a battle uses* (every read of the record classified by whether the battle load,
+    `LoadScenarioInProgress` 0xcd01b0, or the simulation roots, StartMinute 0xdab630, EOTP 0xdaf83c, MoveAllShips
+    0xd8c2f4, MoveTorpedoes 0xda5ee0, the detach routines, reach it, and what the read decides). **The simulation's**
+    (they change the loaded battle, the simulation's state or its shared random numbers; a live battle runs both PCs
+    with A's since level 15): `AIControl` +0xc (every load: `SetInitialDivAIControlFromUserPrefs` 0xd765f4, called by
+    the scenario loader 0xd64f80 for every division, sets `TDivision.AIControlled`), `FloatWarning` +0x14
+    (`DoDamageControl` writes a ship field by it), `ReadyPopup` +0x18 (`TAirFormation.CheckStatus2`),
+    `BreakOnNewSighting` +0x1c (the sighting routine 0xdc960c draws a shared `Random(100)` by it),
+    `AirApproachMessage` +0x25 (EOTP draws `Random(10)` by it), `AirSurfaceMessageLvl` +0x2a and `SoundOption` +0x42
+    (`TAirFormation.AttackShips` and the message routine 0xd8fd5c draw sound variants by them), `LetAIControlForce`
+    +0x2f (EOTP gives forces to the computer), `LOScalc` +0x3f (line of sight in the sighting routine), `Autosave`
+    +0x46 (EOTP saves every N minutes), `FloatplaneLaunch` +0x4a, `RealismSetting` +0x56 (18 routines: the detach, the
+    sighting routine, the objectives, torpedo fire, ...), `NoFriendlyTorpHits` +0x357, `BSSMHC` +0x37b (a value of the
+    simulation routine 0xdf0d5d; no dialog sets it). **Display, sound or the clock** (each PC's own): the breaks
+    (`BreakOnSighting` +0x0, `BreakOnId` +0x4, `BreakOnHit` +0x10, `BreakOnTorpedoHit`, `BreakOnMissileHit`,
+    `BreakOnSinking`, `BreakOnSunk`, `BreakOnSubsighting`, `BreakOnAirAttackOnShips/OnLand`, `BreakOnAirCombat`
+    +0x1d..+0x24: a box and the routine's break result; in a live battle A's break stops the clock for both, B's is
+    ignored, and boxes inside a minute get the mod's fixed answer), `OpenFireMsg` +0x8, `LoseContactPopup` +0x19 (only
+    the box "... switches to AI control!", 0xde3aad), `AirCombatMessageLvl` +0x26, `DamageMeter`, `CourseIndicator`,
+    `ShipFlags`, `Compass`, `BaseFlags` (+0x34..+0x38), `DarkMode` +0x39, `GridLines`, `CourseClick`,
+    `SpaceBarRestarts`, `BackgroundSound` +0x4e, `SoundVolume` +0x52, the window sizes and states, the colours,
+    `NoBorders`, `Scale` +0x34e, the deck colours, the range circles, `InsetView`, `FireLines`, `EnglishRanks` +0x358
+    (officer rank texts, 0xd39184/0xd39344) and `ConvertCharacters` +0x40 (`ConvertGermanCharactersInName` 0xd4ce8c:
+    ä->ae, ö->oe, ü->ue, å->aa and the capitals, in the campaign loaders `TBuilderNation.LoadMe`, `TPossession.LoadMe`,
+    `TCampaignShip.LoadMe` and the naming routines; a battle's ships keep the battle file's `Ship<n>Name`). **Not read
+    in a battle:** `FOW` +0x30 (one reader, outside the battle code), `AutoSubMoves`, `AutoASWMoves`; `LargeBattles`,
+    `SupportForce` and `HistoricalForces` shape only the battle A sets up before it saves it; `AutoAssignCO` +0x364
+    only the aftermath (the result screen 0xdc4154 -> `HandleBattleAftermath`, each player's own).
+  - *Live checks of the classification:* B with `ConvertCharacters=1` on 0.4.0 (A 0): READY and 10 minutes equal; B
+    with 34 preferences different from A's on level 15 (both lists): every hash equal over 48 minutes of two battles.
+    `AIControl` differing on 0.3.2 and 0.4.0: READY equal (0.4.0's `ai0`/`ai1` put the computer control back).
+  - *Number format.* The game takes the user's locale (`FormatSettings`, variable 0xf2b6c8, cell 0xf27848:
+    `ThousandSeparator` +0xC0, `DecimalSeparator` +0xC2, `DateSeparator` +0x6, `ListSeparator` +0xA) but only for
+    display ("Day sighting range: 24.000 yds" on a comma locale). Its files hold no decimal numbers and no
+    locale-formatted dates: every save file (`.bcs`, `.off`, `.sta`, `.des`, `MapData<n>.dat`, the battle's `.sac`) is
+    UTF-8 with a BOM and integer-only (the battle clock is `Day`, `Month`, `Hour`, `Minute`, `TimeElapsed`), and no
+    game code parses a float from a file (the float conversions are list sorts and `TCustomIniFile.ReadFloat`, which
+    `LoadPrefs` doesn't use). So neither the separators nor the ANSI code page change what a PC reads from another PC's
+    files. The battle file's only absolute path is `FlagFile=` (the side flags; the mod rewrites it to the reading PC's
+    game folder, `FixFlagFiles`).
+  - *The map of a side.* The game decides what the map shows inside the simulation and in every load, for its
+    PlayerSide (0 on both PCs of a live battle) and the computer side of the side table 0xf278e4 (0x47-byte records
+    per side; the resume makes side 1 the computer's): the sighting routine 0xdc960c calls
+    `TfrmMain.SetHiddenDiv` (0xdb2424) for every division (its flag hidden for side 3 or a computer force
+    (`TForce.AIControlled`), else shown; a role-0 division of a computer force keeps its flag), sets each ship of a
+    human side visible unless its division's flag is hidden, hides each ship of the computer side unless
+    `GetBestSightingLevel() > 0` and `SeenByHumanControlledShips` (skipped when `TfrmMain.BothComputer` +0x7b5),
+    shows a human side's ships that the enemy spotted (`OwnShipSpotted` +0xb21, `OwnShipRadarSpotted` +0xb25,
+    `ShipType` 12) and labels every ship (0xde4ce4: names for the human side, the identification for the other; all
+    ships through 0xde3f88, the routine `CbShipNameDisplayChange` calls). `TFightingShip.SetVisible` (0xe3f498) sets
+    `Hidden` (+0xaf5) and its wake objects (`Wake` +0xaec, `SmokeLine` +0xae1, `Wake1` +0xaf0); the hidden setter of a
+    `TGlobeObject` is 0xab2ff8 (bit 4 of the state word +0x28). Division flags are `TDivision.myFlag` (+0x53,
+    `TDivLocation`) and move with their divisions. At far zoom the drawing (0xd8d570) shows newly sighted enemy ships
+    too (the game's own rule). With both sides human the second side's PC got side 0's picture: its own ships hidden
+    under their flags until side 0 saw them, side 0's ships and names shown, every division's flag on both maps.
+    Right after a load `SeenByHumanControlledShips` holds the first side's sightings only (the load's sighting routine
+    ran while side 1 was still the computer's).
+  - *The ensign and the form during a load.* The resume (`LoadScenarioInProgress`, 0xcd02c9..0xcd02e2) copies the
+    campaign screen's flag image (`TfrmBuildCamp` +0x554) into `TfrmMain.ImgFlag` (+0x530) with `TImage.SetPicture`
+    (0xa0e5dc: `FPicture.Assign`); the battle slot's campaign is the first player's, so the second PC showed A's
+    ensign. `TfrmMain.LoadSideFlags` (0xdf6b60) loads `SideFlags[0]` (+0x754) and `SideFlags[1]` (+0x758) (TGraphic,
+    `LoadFromFile` at VMT +0x58) from the side records' flag file (side table +4 and +0x4b), falling back to
+    `<game>\Flags\<its file name>`. The load shows the battle screen and draws the first side's picture (the map on
+    its fleet, its flags) before anything else can run, and gives the form its saved size again (1000x719 on the
+    suite's PC, the values of its Preferences' `MainFormWidth` +0x5d and `MainFormHeight` +0x61), so every load draws
+    at that size whatever the window was before.
+  - *The x87 control word.* A process starts with 0x37F; the game sets 0x27F later (both copies at battle time on one
+    PC). A DLL loaded into one PC's game (drivers, overlays, hooks) could change it there; the loaded battle and every
+    minute compute with it.
+- **Two PCs: CPUs and data files (2026-10-20, 1.01.44, engine level 16).**
+  - *x87 transcendentals.* Intel and AMD don't round FSIN, FCOS, FSINCOS, FPTAN, FPATAN, FYL2X, FYL2XP1 and F2XM1
+    identically (+ - * / and FSQRT are exact). In this build every such instruction sits in one of 11 tiny RTL leaf
+    routines (standard frame, Extended arguments on the stack, the result in ST0); a byte scan of the code (with a
+    boundary vote and a look at the neighbours: the other 11 hits are float constants after a `ret` or bytes inside a
+    call's displacement) finds no other, and no FYL2XP1 at all:
+    | Routine | Address | Instruction | Arguments |
+    |---|---|---|---|
+    | System Exp | 0x837d84 | F2XM1 (and FSCALE) | Extended, `ret 0xc` |
+    | System Cos / Sin | 0x837da4 / 0x837db4 | FCOS / FSIN | Extended, `ret 0xc` |
+    | System SinCos | 0x837dc4 | FSINCOS | Extended; EAX = @Sin, EDX = @Cos |
+    | System Ln | 0x837dd8 | FYL2X | Extended, `ret 0xc` |
+    | System ArcTan | 0x837dec | FPATAN | Extended, `ret 0xc` |
+    | ArcSin(Single) | 0x87c0a8 | FPATAN(x, FSQRT(1-x*x)) | Single, `ret 4` |
+    | ArcTan2(Y, X) | 0x87c0c0 | FPATAN | X at +8, Y at +0x14, `ret 0x18` |
+    | Tan (a second math unit) | 0xa8cb68 | FPTAN | Extended, `ret 0xc` |
+    | SinCos, ArcTan2 (second copies, identical bytes) | 0xa8cd0c, 0xa8cdd4 | FSINCOS, FPATAN | as above |
+    Game code reaches the System routines through four helpers: sub_e594e0 (Cos and ArcTan of the day of the year: the
+    sun, 76 calls: dawn and dusk, `TFightingShip.IsTimeOKToLaunchAC`, the air formations' launch and darkness checks,
+    the battle timer's region, the campaign), sub_adc840 (Sin and ArcSin: `FireMount`'s region,
+    `IsFriendlyShipInLineOfFire`, the torpedo targets), sub_db63fc (Cos and ArcTan: `CheckSupportingDDToDetach`,
+    `GetClosestEnemyShipFromAll`) and sub_eb206c (Sin and Cos, the air unit). The second unit's SinCos and ArcTan2 are
+    the globe library's geodesy (distances and bearings between latitude/longitude points), and the simulation calls
+    it two levels down: `TFightingShip.GetBearingToShip`, `GetTargetBearing`, `GetHitChance`, `AngleDistToPoint`,
+    `TDivision.FormLineAhead`, `UpdateLineAbreastPoints`, `TAirFormation.MoveMe`, `AdjustCourseToTarget`, ... (and the
+    map's projections and drawing call it millions of times a battle minute). Counted live (test battle, 48 ships): a
+    battle load calls Exp 31-33, Cos 10-14k, Sin 10-13k, Ln 284-286, ArcTan 0.8-1.8k, Tan 17, SinCos(2) 4.8-8.8k,
+    ArcTan2(2) 4.6-6.3k times, the same count on both PCs; 40 minutes with gunfire about SinCos(2) 73M, ArcTan2(2) 15M,
+    Sin 2.1M, Cos 0.9M, ArcTan 49k (most of them the map's drawing). Nudging every result of one copy by one unit in
+    the last place of a double (`RTW3MP_TEST_X87=dbl`, 2048 times a real CPU difference) changed neither the READY hash
+    nor 40 minutes of hashes; by about 1e-6 (`ppm`) every load differed in the computer-controlled divisions' orders
+    (`DivisionCourse`, `DivisionSpeed`): the results reach the state through roundings.
+  - *What the x87 routines compute (0.4.1, measured on an AMD CPU against mpmath).* The battle's control word is 0x27F
+    (53-bit precision, round to nearest). Precision control rounds FMUL/FADD/FSUB/FSQRT but not the transcendental
+    instructions (64-bit significands). So the game's Exp rounds `x*log2(e)` (FLDL2E's 64-bit constant) and
+    `1 + F2XM1(f)` to 53 bits: it is up to 6 ulps of a double off the true value for |x| < 10, 44 below 50, 352 below
+    700 (exact with 0x37F). FSIN, FCOS, FSINCOS and FPTAN reduce the argument with a 66-bit pi (0x3243F6A8885A308D3 *
+    2^-64, 4.04e-21 below pi; no other precision from 62 to 80 bits fits): cos of pi/2 as a double gives
+    6.1230317691118863e-17 (true: 6.123233995736766e-17), sin(334416.25...) is 15884 ulps off, and near multiples of
+    pi/2 the relative error reaches 4e13 ulps of the tiny result. From |x| >= 2^63 (and for infinities) they leave the
+    argument in ST0 and set C2: Sin and Cos return the argument, Tan returns the indefinite NaN (FPTAN pushed nothing,
+    the routine's `fstp st(0)` pops the argument), SinCos stores the argument as the cosine and the indefinite NaN as the
+    sine. FPATAN with two NaNs returns the one with the larger significand. softmath.h reproduces all of it (to within
+    1 ulp of a double on 20 million arguments per range; 388 edge cases bit-identical): MODLOG "Fix 2026-10-22".
+  - *The data files a battle reads* (`RTW3MP_TEST_FILELOG`, the test battle of 1900): the load opens `Data\Gundata.dat`,
+    `HorPen.dat`, `VerPen.dat`, `Torpedodata.dat`, `BasicData.dat`, `MapData.dat`, every nation's `<Nation>WarInfo.dat`,
+    the map layers `WorldRTW.LYR`, `RTWShallow.LYR` and `NoGo.LYR`, the coastal batteries' designs
+    `Data\IDes\<n> in Coastal Battery.sdf`, the ensigns in `Flags\*.bmp`, and the battle's save files (slot 87 on B:
+    `RTWGame<n>.sac/.bcs/.off/.sta`, `MapData<n>.dat`, `DesignFiles0-8.des`). The minutes open no game file (only the
+    slot's files). At its start the game reads the other `Data` tables and 384 of `Data\Graphics`' drawings.
 
 ### Battle commands
 From a static reading of 1.01.44 on 2026-10-16 (no game run; summary and evidence in

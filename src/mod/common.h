@@ -14,7 +14,7 @@
 #include <deque>
 #include <functional>
 
-#define MP_MOD_VERSION "0.4.0"
+#define MP_MOD_VERSION "0.4.1"
 #define MP_PROTOCOL 3
 // The live-battle engine level (lockstep.cpp): a live battle is fought only between two PCs with the same level, while
 // the rest of the session stays compatible within MP_PROTOCOL. A client announces it in its hello (`ls=<level>`;
@@ -45,8 +45,21 @@
 // side 0's computer control kept over a reload (`ai0=` in the start message: the game's resume gives side 0's divisions
 // of computer forces to the computer, also one the host's player had taken back). 14 = TFightingShip.LightState kept
 // out of the display's reach and in the state hash (the map's sighting circles wrote it between minutes; the division
-// routine of StartMinute reads it: the dawn and dusk DESYNCs).
-#define MP_LS_LEVEL 14
+// routine of StartMinute reads it: the dawn and dusk DESYNCs). 15 = two-PC conditions (0.4.1): the start message's
+// `prefs=` carries only the battle preferences the load and the simulation use (AIControl, FloatWarning, ReadyPopup,
+// BreakOnNewSighting, AirApproachMessage, AirSurfaceMessageLvl, LetAIControlForce, LOScalc, SoundOption, Autosave,
+// FloatplaneLaunch, RealismSetting, NoFriendlyTorpHits, BSSMHC; the display ones stay each PC's own), B loads with A's
+// x87 control word, each PC's map shows its own side (the game decides the map's picture for the first side; B's
+// screen stays transparent while it loads, B shows its own ensign), and a READY mismatch writes both PCs' DESYNC
+// reports (the `desync` message with `why=ready`). 16 = CPUs and data files (0.4.1): the game's x87 transcendental
+// routines (FSIN, FCOS, FPATAN, ...: CPU-dependent rounding) computed in software on both PCs from the load on (`sm=1` in
+// the start message; x87.cpp), A's x87 control word checked around every step and hash, the start's `dh=` (the game
+// data files' hash: B refuses a battle whose files differ, A names them: `datadiff`), and the READY diagnostics (`g=`,
+// `cpu=`, `cw=` in the ready message; `diag=` in the desync message). 17 = the campaign's ship-type flags (0.4.1: a
+// battleship, a battlecruiser, a carrier exists; only a processed month sets them, so a joined player's game had 0 and
+// identified ships otherwise than the host's): the start's `st=` carries A's, B uses them for the battle, and they are
+// in the state hash; the leak check covers the simulation's identification.
+#define MP_LS_LEVEL 17
 // The level this copy announces (hello `ls=`, the start's, ready's and rejoin's `lv=`): MP_LS_LEVEL. TEST ONLY: env
 // RTW3MP_TEST_LS_LEVEL (read once) announces another level, so one build can play a peer of another mod version; this
 // copy's own checks keep MP_LS_LEVEL.

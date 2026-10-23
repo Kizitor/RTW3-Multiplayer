@@ -65,9 +65,11 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
    backup/restore keeps it exactly as it is.
 8. **Never modify `RTW3.exe`, the Steam DRM stub, or game data files.** The user's Preferences
    (`<Documents>\My Games\Rule the Waves 3\Preferences`) change only inside a run that includes `lockstep_torpedo`
-   (`RealismSetting=2`) or `lockstep_strike` (`FloatplaneLaunch=0`, Automatic: with "Ask before launch" no search
-   floatplane flies in a live battle): the runner backs the file up, changes those lines and puts it back (verified
-   by hash); a leftover backup that differs from the file makes it refuse to start. Never edit the Preferences by hand.
+   (`RealismSetting=2`), `lockstep_strike` (`FloatplaneLaunch=0`, Automatic: with "Ask before launch" no search
+   floatplane flies in a live battle) or `twopc` (the second player's own Preferences in the file from that copy's
+   restart to the scenario's end: two PCs' Preferences on one PC): the runner backs the file up, changes it and puts it
+   back (verified by hash); a leftover backup that differs from the file makes it refuse to start. Never edit the
+   Preferences by hand.
 9. **No personal data in the repo** (no absolute user paths, IPs, names). The repo is public.
 10. **When the game is in use elsewhere, work offline.** If the caller says another agent runs the game, don't launch
     `RTW3.exe`, don't install DLLs and don't touch the game folder, the saves or the Preferences: validate with
@@ -75,7 +77,8 @@ as needed: `docs/ARCHITECTURE.md` (how the mod works), `docs/GAME-INTERNALS.md` 
     and `python tools/regression_selftest.py [--logs <recorded run>]`.
 11. **When the caller says "pause", stop at the next safe point and leave everything as it was.** Killing the game
     copies alone does not stop a run (later parts start new copies): stop the runner's `python` (its PID), then
-    `taskkill /PID` the `RTW3.exe` processes it started (their parent PID), then put back what the run changed with the
+    `taskkill /PID` the `RTW3.exe` processes it started (their parent PID; with `twopc` also its delay proxy, a `python`
+    child: the PID in the run's line "the delay proxy (PID n; ...)"), then put back what the run changed with the
     runner's own helpers (slot 1 from its backup, `remove_client_slot()`, the battle slot, the snapshot copies, the
     event files; slot 9, the Preferences, slots 48/49 and the third copy's slots when the run used them), reinstall the
     DLLs the caller names, check that no `RTW3.exe` of yours is left, commit the suite work and report where you
@@ -90,8 +93,8 @@ restriction (`WHERE id = 'rg-...'` or `WHERE id LIKE 'rg-%'`).
 
 ## The installed build and mixed versions
 - Test a build from its frozen snapshot (`--dist <snapshot>`: the runner compares the installed DLLs with it). At the
-  end of every run of yours put the released version's DLLs back into the game folder (the caller names it: since
-  2026-10-18 v0.3.3, `dist_033`; compare the hashes), restore the slots and the Preferences, and leave no `RTW3.exe`.
+  end of every run of yours put the released version's DLLs back into the game folder   (the caller names it: on
+  2026-10-21 v0.4.0, `dist_vp_2`; compare the hashes), restore the slots and the Preferences, and leave no `RTW3.exe`.
 - Mixed versions (a release candidate against the released version): copy the game folder outside the Steam library,
   put the released DLLs into the copy and the candidate into the Steam folder, and start each copy from its folder
   (TESTING.md, "Mixed versions"; the 0.4.0 driver `mixed_040.py` is kept with the developers' session files). Delete
@@ -115,7 +118,10 @@ restriction (`WHERE id = 'rg-...'` or `WHERE id LIKE 'rg-%'`).
   closes it (its PID) at the end; `lockstep_rejoin` e) does the same. `lockstep_stress`, `lockstep_limits` i),
   `lockstep_rejoin` and `lockstep_resume` kill and restart copies (taskkill /F of their own PIDs; PROCS,
   `ctx.hp`/`ctx.cp` and the answerer follow the new PIDs; `ll_kill`/`ll_relaunch` keep each run's log for the scan),
-  some with `RTW3MP_TEST_LS_LEVEL=<level-1>` (another live-battle engine level).
+  some with `RTW3MP_TEST_LS_LEVEL=<level-1>` (another live-battle engine level). `twopc` closes the client and starts it
+  again with `RTW3MP_TEST_LOCALE=comma` and its own Preferences, joined through `tools/net_delay_proxy.py` (127.0.0.1:
+  47634 -> 47624, a `python` child process of the runner, stopped by the scenario or else by the runner), then once more
+  as usual at the scenario's end (its logs kept as `rtw3mp_47702.twopc<N>.log`).
 - Logs: `<Documents>\My Games\Rule the Waves 3\RTW3MP\rtw3mp_<port>.log` (one per instance; a start renames the old
   one to `.prev.log`, one generation, so log marks of a copy are invalid after it was started again; the runner copies
   the log of a killed copy to `rtw3mp_<port>.<tag><N>.log` (`kill`, `hostkill`, `restart`, `k2restart`, `level`,
@@ -152,12 +158,41 @@ restriction (`WHERE id = 'rg-...'` or `WHERE id LIKE 'rg-%'`).
   resync, land CAP with the own-airfield rule, strikes through the real dialog: the short variant). `--stress` or
   `--group` run the long ones: `rejoin` (`lockstep_rejoin`, `lockstep_resume`), `air` (`lockstep_air`, `air_units`,
   `lockstep_strike`), `airunits` (`air_units`), `torpedo` (`lockstep_torpedo`, Realism 2), `missiles`
-  (`lockstep_missiles`), `live-limits` (all). `--list` shows each scenario's estimated game time (measured on the 0.4.0
-  release candidate dist_ll_16: the default run ~25 min, `--stress` ~92 min); `--dry-run` the whole plan. Engine
+  (`lockstep_missiles`), `live-limits` (all), `twopc` (`twopc`). `--list` shows each scenario's estimated game time
+  (measured on the 0.4.0 release candidate dist_ll_16, `twopc` on dist_tp_1: the default run ~27 min, `--stress` ~98
+  min); `--dry-run` the whole plan. Engine
   level 12 (ll-polish): Auto-run off gives a side
   back as single player does (only the lead divisions), torpedo and missile salvoes are refused on auto-run (also while
   the order is pending), B's result box shows B's side, the drop chat promises the ships back only when a rejoin can
   work, level notices give both levels, and the battle's chat lines stay on each PC.
+- Two PCs (0.4.1, engine level 16): `twopc` (group `twopc`; short in the default run, the full variant with `--stress`)
+  gives B what a second PC would have: its own Preferences (every battle preference a live battle takes from A
+  differs, display ones too, another battle window size), a comma locale, the windows at other sizes, and a network
+  with latency, jitter and a bandwidth cap (the proxy). In a test battle and in the host's battle against B in a real
+  month it checks the start check (READY), the minutes, `ls prefs` (A's 14 during the battle, B's own afterwards), B's
+  ensign, B's map (`ls mapview` against the simulation's sighting state from B's own DESYNC report, `ls desyncreport`:
+  B's own ships shown, A's flags never, of A's ships exactly the sighted ones), B's loads never shown, `ls leakcheck 1`,
+  the month going on, and B's own Preferences file unchanged (the shared file holds B's variant until the scenario's
+  end). `RTW3_SHOTS=<folder>` adds PrintWindow captures of both battle windows at each map check.
+- 0.4.1 release candidate (dist_rc041_1, 2026-10-21; MODLOG, Testing 2026-10-21): `session` checks the politics panel
+  on the joined player's PC (`intel_panel_check`, `intel_buttons_check`: `relview` + `intelinfo` + `intelbtn`, the
+  screen's `stIntel1..8` texts) and waits for the client's month roll, whose spy check can show the game's spy dialogs
+  (they block the client's bridge). A spy result is the player's event of the month on the host, so `events`' forced
+  event can be "second event ... ignored" (expected). The month's answerer presses No on the 1935 aircraft types
+  question (`TfrmAircraftTypes`); the battle answerer leaves a disabled tool window alone. Mixed versions: the driver
+  `mixed_041.py` (`--case a|r`) in the developers' session files. The `lockstep_strike` DESYNC it found (`ident=` differed
+  first: the game's ship-type flags, set only by a processed month) is fixed in f1fad94 (engine level 17: A's start
+  carries the flags, `st=`); a DESYNC there now is a regression: keep the DESYNC reports and both logs. `RTW3_LS_X87SOFT=0|1` (diagnosis only) picks the live battle's maths
+  for `lockstep_strike`.
+- 0.4.1 release candidate 2 (dist_rc041_2, rel-041 f1fad94, engine level 17; MODLOG, Testing 2026-10-22): a check whose
+  behaviour a battle can't show is replaced by another battle or logged as `SKIP-note <check>: <reason>` (no check):
+  `lockstep_strike` b) no report (replaced once), f) a formation the game takes away before take-off on both copies (a
+  NOTE), no attack after reaching the target point, g) no contact by day (replaced once, then a SKIP-note);
+  `lockstep_missiles` f)/d) a side whose launchers are spent. Read the SKIP-notes in a run's output. A product issue to
+  report when it recurs: the game box "Error in AdjustForcesForBattle procedure! Access violation at address 0096C748
+  ... Read of address 02EBC02F" on the third copy (k2, its player copy in slot 86) at a relayed battle's start
+  (`lockstep_rejoin` e), once on 2026-10-22); the battle goes on; keep the k2 log. The mixed-version driver
+  `mixed_041.py` takes the candidate's level (17).
 - Battle screen controls are tested with posted messages only (`click_tool`, `click_arrow`, `post_click`, tree views
   and list views read cross-process) and the bridge probes `ls ctl`, `ls airwin`, `pocstate fastest=`; the battle's
   modeless tool windows must be closed (`close_modeless`) before anything answers dialogs with `answer_dialogs`.

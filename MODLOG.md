@@ -143,6 +143,21 @@ commits titled "WIP 0.4.0", "WIP 0.5.0" and "WIP 0.6.0" are development commits 
     [0.4.0 release candidate](#docs-2026-10-18-040-release-candidate-v040);
     [final pre-release pass](#docs-2026-10-18-final-pre-release-pass-v040);
     [0.4.0 release docs](#docs-2026-10-18-040-release-docs-v040)
+- **0.4.1**
+  - Fix:
+    [a joined player's screen showed the host's relations; an enemy's decline became a battle](#fix-2026-10-20-a-joined-players-screen-showed-the-hosts-relations-an-enemys-decline-became-a-battle-v041);
+    [joined players' intelligence mirrored the host's; no trade protection warnings](#fix-2026-10-20-joined-players-intelligence-mirrored-the-hosts-no-trade-protection-warnings-v041);
+    [the strike battles' DESYNC (the ship-type flags) and the software maths checked](#fix-2026-10-22-the-strike-battles-desync-the-ship-type-flags-and-the-software-maths-checked-v041)
+  - Investigation:
+    [live battles between two PCs](#investigation-2026-10-19-live-battles-between-two-pcs-v041);
+    [live battles between two PCs, CPUs and data files](#investigation-2026-10-20-live-battles-between-two-pcs-cpus-and-data-files-v041);
+    [each player's own relations: tension, wars and battles of a joined player's nation](#investigation-2026-10-20-each-players-own-relations-tension-wars-and-battles-of-a-joined-players-nation-v041)
+  - Testing:
+    [twopc, live battles under two-PC conditions](#testing-2026-10-20-twopc-live-battles-under-two-pc-conditions-v041);
+    [the 0.4.1 release candidate dist_rc041_1](#testing-2026-10-21-the-041-release-candidate-dist_rc041_1-v041);
+    [the 0.4.1 release candidate 2 dist_rc041_2](#testing-2026-10-22-the-041-release-candidate-2-dist_rc041_2-v041)
+  - Docs:
+    [0.4.1 release candidate](#docs-2026-10-21-041-release-candidate-v041)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -3651,3 +3666,722 @@ Docs agent, live-limits, after the regression's GO on dist_vp_2 (the entry befor
   id.
 - **Checks:** `build.bat` without warnings, `git diff c9055dd HEAD -- src` empty, the offline self-test, the links and
   anchors, the MODLOG index, the personal-data scan.
+
+## Investigation 2026-10-19: live battles between two PCs (v0.4.1)
+Research agent, branch `fix-net` (from main d539e4d = v0.4.0). A report from two players on 0.3.2, on two PCs over a
+network, verbatim: "when trying to load player vs player battels the non host player is loading in as the host
+nations side the battle closes and send the error message Synchronising the battle again (the loaded battles
+differ)... this is also over a network connection, one battle did work but the non player hosts ships were not
+visible on the map." Every earlier test ran both PCs on one PC: one Preferences file, one locale, one screen, one
+game folder, localhost; and no test looked at B's battle map. Static work in the offline workspace (`rdis.py`, its call
+graph, `rtti\`), live runs nb1-nb9 with the session folder's driver (`files\nb\nb_repl.py`, jobs `j_nb*.py`,
+PrintWindow evidence in `files\nb\shots\`). Game open 2087 s in the runs nb1-nb9 and 377 s + 390 s in the two
+regression runs (2854 s, 48 min); slot 1 restored after every run, slot 2 untouched, the Preferences file's hash
+unchanged after every run, 0.4.0 (`dist_vp_2`) back in the game folder after every run.
+- **The reading, in 0.3.2's code (and 0.4.0's).** A loads and takes its READY hash (`StartTransfer`: `StateHash().all`
+  with the clock, plus the RNG state); B loads and sends `ready` with its own; `ACheckReady` compares them and on a
+  difference logs `the loaded battles differ` and requests a resync: both chats say "Synchronising the battle again
+  (the loaded battles differ)...", B's battle screen closes and loads again; after three resyncs A drops B ("the
+  battles could not be kept in sync") and the computer fights B's side. The hash covers positions, damage, ammunition,
+  sighting, orders (with the divisions' and ships' names), air formations and torpedoes, not the identification.
+- **Reproduced on 0.4.0 (nb1; B with other Preferences than A):** PrintWindow captures of B's battle screen during its
+  load and its resync load show side 0's picture: the map on the British fleet and coast, the British division flags,
+  the British ensign (`nb1_Bload_*`, `nb1_Bresync_*`). After the load (minutes 0 and 5) B's map is side 0's: the
+  British ships with names and flags shown, B's own German ships hidden under their division flags until side 0's
+  ships see them (`nb1_B_m5_out3.png`), and A's map shows B's division flags. READY and the minutes stay equal: the
+  hashes don't cover what the map shows.
+- **Causes of the display symptoms (static reading, GAME-INTERNALS "Two PCs").**
+  - *The map.* The game decides in the simulation and in every load what the map shows, for its PlayerSide, which is
+    0 on both PCs of a live battle, and the side table's computer side, which the resume sets to side 1: the sighting
+    routine 0xdc960c calls `SetHiddenDiv` 0xdb2424 for every division (flags hidden only for a computer force), shows
+    the ships of a human side, hides the computer side's unless sighted by human-controlled ships, and labels every
+    ship (names for the human side). The 0.3.0 display swap gives B its PlayerSide and its own copy of `Hidden`, but
+    nothing ever applied the rules for B's side, so B's copy kept side 0's picture: B's ships as side 0 sees enemies,
+    side 0's as own ships. Both sides' forces are human in a live battle, so both maps showed every flag.
+  - *The load's picture.* The resume shows the battle screen and draws the first side's picture before anything else
+    runs (the map centred on side 0's fleet).
+  - *The ensign.* The resume copies the campaign screen's flag into `TfrmMain.ImgFlag` (`LoadScenarioInProgress`
+    0xcd02c9..0xcd02e2, `TImage.SetPicture` 0xa0e5dc); the battle slot's campaign is the first player's.
+- **The READY mismatch on every attempt: not reproduced.** No condition we can set on one PC made the loaded battles
+  differ, on 0.3.2, 0.4.0 or 0.4.1:
+  - *Preferences* (the main suspect: the Preferences reader and every read of the record classified by whether the
+    battle load or the simulation reaches it, GAME-INTERNALS): `AIControl` differing on 0.3.2 (nb2: B 0, nb3: B 1, A 2)
+    and on 0.4.0: READY `all` equal (the battle file's per-division `AIControl` wins over the preference on a resume;
+    0.3.2 differed only in `ident=`, the known 0.3.2 identification, which `all` leaves out). `ConvertCharacters` (the
+    only preference that changes names, `ConvertGermanCharactersInName` 0xd4ce8c: ö->oe in the campaign loaders) on B
+    on 0.4.0 (nb5, verified in B's memory): READY and 10 minutes equal; the battle's ships keep the battle file's
+    `Ship<n>Name`. 34 preferences different on 0.4.1 (nb6): equal.
+  - *Number format and code page:* every save file and the battle file is UTF-8 with a BOM and holds integers only (no
+    decimal number, no locale-formatted date); nothing parses a float from a file (`FormatSettings` 0xf2b6c8 is used
+    for display only); B with a comma locale (nb6, `RTW3MP_TEST_LOCALE=comma`): equal, its screen shows "24.000 yds".
+  - *Window size and screen:* the load gives the battle form its saved size (the Preferences' `MainFormWidth`/`Height`,
+    1000x719 here) whatever the window was; with the copies resized to 1600x1000/820x600 (nb4) and 1560x980/900x650
+    (nb6, then a resync) every minute stayed equal.
+  - *Latency, jitter, bandwidth:* the client through `tools/net_delay_proxy.py` (nb6: 120 ms +-60 ms each way, 4000
+    kbit/s): a test battle and a month battle equal.
+  - *Paths:* the battle file's only absolute path is `FlagFile=` (0.3.0's `FixFlagFiles` with A's `gd=`). *The game
+    version:* the hello's build fingerprint refuses another `RTW3.exe`.
+  - What one PC can't test: **different CPUs** (the x87 transcendental instructions can differ in the last bit between
+    vendors; a comparison that flips at a threshold during the load would flip again at every reload of the same
+    state, which fits "every attempt", but such a flip is rare) and **different game data files** (nothing checks
+    `Data\`; a modded file the battle reads would make the battles differ). And the report is from 0.3.2, which still
+    had the air units doubled with every reload (0.3.3, campaigns with aircraft); its effect on a live load is not
+    known (the resume takes the battle's air formations from the battle file).
+  - So since engine level 15 a READY mismatch writes both PCs' DESYNC reports (below): the next report from two PCs
+    shows which fields their loads made differently.
+- **Fixes (engine level 15, `MP_MOD_VERSION` 0.4.1, protocol 3; `src/mod/lockstep.cpp` unless noted):**
+  - *Each PC's map shows its own side* (`ApplyMapView`, after the outermost StartMinute, EOTP, detach and CSDD steps,
+    from `FrameEnterCount`, and after every load): the game's rules for this PC's view side, outside the simulation
+    and with the display's random draws (`g_ui`): own ships visible unless their division's flag is hidden, or when the
+    enemy spotted them (`OwnShipSpotted`, `OwnShipRadarSpotted`, `ShipType` 12); the other side's only while
+    `max(SightingLevel, RadarSightingLevel) > 0` and `SeenByHumanControlledShips` (right after a load the sighting
+    levels alone: the load's sighting routine ran while side 1 was the computer's); flags only for own divisions not of
+    a computer force (and a role-0 division of one); the game's relabel of every ship; nothing when `BothComputer`.
+    `TFightingShip.SetVisible` is found by name, the flags' hidden setter in `SetHiddenDiv` (`8B 46 ?? B2 01 E8`), the
+    relabel in `CbShipNameDisplayChange` (`89 02 8B C3 E8`). `Hidden` is in the display's dual set and the flags,
+    wakes and labels are display objects: the hashes and `ls leakcheck` see nothing (checked in every run).
+  - *B's battle screen is transparent while it loads* (`CoverBattleForm`: `TWinControl.HandleNeeded`, then a layered
+    window with alpha 0 from the battle form's reset to the end of the load and the map pass; removed on every failure
+    path too).
+  - *B shows its own ensign* (`ApplyOwnFlag`: `TPicture.Assign(ImgFlag.Picture, SideFlags[1])`, the side flag
+    `LoadSideFlags` 0xdf6b60 read from the battle file).
+  - *Battle preferences:* the start, resync and rejoin carry only the 14 the simulation uses (`kPrefs`: `AIControl`,
+    `FloatWarning`, `ReadyPopup`, `BreakOnNewSighting`, `AirApproachMessage`, `AirSurfaceMessageLvl`,
+    `LetAIControlForce`, `LOScalc`, `SoundOption`, `Autosave`, `FloatplaneLaunch`, `RealismSetting`,
+    `NoFriendlyTorpHits`, `BSSMHC`; until level 14 21 byte ranges from +0x10 to +0x37a, 0.3.0's, which gave B A's
+    display options too (sound volume, dark mode, window state, scale, deck colours, range circles) and missed
+    `AIControl` +0xc and `BSSMHC` +0x37b, which the simulation routine 0xdf0d5d reads). B logs the differences at the
+    first load (`battle preferences: <A>'s for the load and the simulation (...)`) and gets its own back at the end
+    (`this PC's own battle preferences again (...)`, also after a drop or an abort), in memory only. The battle
+    screen's Preferences button (`B_PREFS`, `TfrmMain.sbPrefsClick`) runs the dialog, then puts the 14 back with a log
+    line and a chat line (the dialog opened from the battle screen wrote `RealismSetting` -1 after a plain Ok).
+  - *A's x87 control word for B's load too* (until level 14 B set it only after the load), logged when B's own
+    differs.
+  - *A READY mismatch writes both PCs' DESYNC reports* (`ACheckReady` -> `DesyncReport(..., "the loaded battles
+    differ")`, `desync` message with `why=ready` to B, which writes its own at `WaitReady`; the report's line `why the
+    loaded battles differ`). nb9 (`ls testreadydiff` on B, then `ls resync`): both reports written, `desync_diff.py`
+    found the one field (`D0 GB Battle Division 2 DivisionCourse` 0x58/0x7d), the resync loaded equal battles, 4
+    minutes equal.
+  - Test switches and probes: `RTW3MP_TEST_PREFS`, `RTW3MP_TEST_FPUCW`, `RTW3MP_TEST_LOCALE` (`ApplyTestSwitches`;
+    `game.cpp` hooks the Preferences reader and disables the writer only with `RTW3MP_TEST_PREFS`), `ls mapview`, `ls
+    prefs`, `ls testcwload`, `ls testreadydiff`; `tools/net_delay_proxy.py` (docs/TESTING.md, "Two-PC conditions").
+- **Live proofs:**
+  - nb4 (dist_nb_1, B with `RTW3MP_TEST_PREFS` and `RTW3MP_TEST_FPUCW`): READY equal; 5, 20, 15 and 3 minutes and a
+    resync equal, no LEAK; B's map: own 31/31 ships, A's 0 -> 4 -> 10 of 16 as sighted, no A flags
+    (`nb4_B_m25_out4.png`, the mirror `nb4_A_m25_out4.png`); windows 1600x1000 and 820x600: 15 minutes equal. 508 s.
+  - nb6 (dist_nb_2; combined): B with a comma locale and 34 other Preferences (file juggling: the game's own reader),
+    the windows 900x650/1560x980, the client through the delay proxy. Test battle: READY equal, 12 minutes, a resync
+    after the resize, 6 minutes: equal, no LEAK, no DESYNC (`nb6_B_m0.png`, `nb6_B_m12_out3.png`, `nb6_B_m18.png`).
+    The host's battle against the client in a real month (CheckForBattles2 -> DoBattle, `ls_month` drop12): READY
+    equal, 12 minutes equal, no LEAK, no DESYNC, 9/9 month checks, the month on to September (`nb6_Bmonth_000.png`:
+    B's fleet at night, no British ship). The Preferences file unchanged. 386 s.
+  - nb7: the client announcing level 14 (a 0.4.0 player): `battle against Captain: fought against the AI (live-battle
+    engine level 14, the host's 15)`, the client's chat names both levels. 104 s.
+  - nb8 (dist_nb_3): B's ensign is the German one (`nb8_B_m0.png`, `the battle screen shows side 1's ensign`); the
+    Preferences dialog on B: `RealismSetting 1 -> -1` put back, chat line, 5 minutes equal, B's own (Realism 2,
+    floatplanes off) back at the end. 165 s.
+  - nb9 (dist_nb_4): the READY-mismatch reports (above). 124 s.
+- **Where battles between players come from, and who is A:** the host's month (`CheckForBattles2` -> `DoBattle`, the
+  host's nation side 0: A = the host), test battles (the same `DoBattle`), and battles between two joined players
+  (`HostDeferPvpBattle`: the battle is sent to the first nation's player, who sets it up with its nation as side 0 =
+  A; the other is B). A joined player's battle phase never makes a battle against the host: `HostDeferBattle` defers
+  only battles of a joined player's nation against an AI nation and between two joined players' nations; the host's
+  own battles come from its `CheckForBattles2`. In every case B is side 1, and the map, cover and ensign fixes key on
+  the PC's view side.
+- **Regression:** `--only lockstep,lockstep_ui,lockstep_month` on dist_nb_3: 121/121 (session 11, lockstep 30,
+  lockstep_ui 40, lockstep_month 40), 377 s; on the final build dist_nb_4 (the committed source but for comments):
+  122/122 (`lockstep_ui` 41: its fleets engaged this time, so the arrows' cap in contact was checked too), 390 s. The
+  offline self-test: 89/89.
+- **Open:** the battle log tab lists both sides' messages on both PCs (it was so before; "CL Hela opens fire ..." on
+  A); `SoundOption`, `AirApproachMessage`, `BreakOnNewSighting` and `AirSurfaceMessageLvl` stay A's because the game
+  draws shared random numbers under them for message and sound variety: those draws could become display draws, and
+  the options each PC's own; a check of the game data files (a fingerprint of `Data\` in the hello) and the CPU
+  question remain; the suite has no two-PC scenario yet (TESTING proposes one).
+
+## Investigation 2026-10-20: live battles between two PCs, CPUs and data files (v0.4.1)
+Research agent, branch `fix-net` (round 2 of the report above: A's start check failed on every attempt, "the loaded
+battles differ"; the players can't send logs). Engine level 16. Static work in the offline workspace (a byte scan for
+the x87 transcendental opcodes, `rdis.py`'s call graph); live runs nb10-nb13 with the session folder's driver (jobs
+`j10_*.py` to `j13_*.py`). The test PC has an AMD CPU (Zen 5).
+- **Where the CPU could matter.** Intel and AMD don't round FSIN, FCOS, FSINCOS, FPTAN, FPATAN, FYL2X, FYL2XP1 and
+  F2XM1 identically (+ - * / and FSQRT are exact). In 1.01.44 every such instruction sits in one of 11 tiny RTL leaf
+  routines (GAME-INTERNALS, "Two PCs: CPUs and data files"): System's Exp, Cos, Sin, SinCos, Ln, ArcTan, an
+  ArcSin(Single), an ArcTan2, and the globe unit's Tan, SinCos and ArcTan2, which the simulation calls for bearings,
+  hit chances, line-abreast and line-ahead points and air formation moves. A battle load calls them ~25-40k times
+  (the same count on both PCs), a battle minute ~2M times (mostly the map's projections).
+- **What a CPU difference does (perturbation: `RTW3MP_TEST_X87` on B, both PCs on their own x87).** Every result of
+  the 11 routines on B nudged by one unit in the last place of the 64-bit mantissa (the size of a real Intel/AMD
+  difference): READY equal, 5 minutes equal. By one unit of a double (2048x more): READY equal over a resync, 40
+  minutes equal with gunfire (3.4M results nudged). By about 1e-6 of the value (`ppm`): **every load differed**
+  ("the loaded battles differ: orders", four resyncs, then B dropped): the computer-controlled divisions' orders
+  (`DivisionCourse`, `DivisionSpeed`, desync_diff) go through these routines and a rounding. So the dependency exists,
+  but a real CPU difference is 2^-64 relative, about 13 orders of magnitude below what changed a load here: not the
+  players' cause on its own.
+- **The same maths on every CPU anyway (`x87.cpp`, `softmath.h`).** The 11 routines are hooked by their exact bytes
+  (all of them are found before any is hooked: the two copies of SinCos and ArcTan2 have identical bytes). Outside a
+  live battle a hook jumps to the game's own routine. In a live battle (from the load to its end, both PCs: the
+  start's `sm=1`) the argument is rounded to a double by the x87 (the battle's control word) and computed by fdlibm's
+  algorithms in SSE2 doubles (only + - * / and sqrt, round to nearest, every SSE exception masked by a guard): the
+  same bits on every x86 CPU. Accuracy against this CPU's x87 (offline, 300k arguments each): sin, cos, tan, atan,
+  atan2, exp, log within 1-2 ulps for the game's arguments (for |x| ~ 1e5 the x87's own 66-bit pi is the error: this
+  AMD returns the classic Intel sin(pi) = 1.2246063538223773e-16). A stub check at install calls each hook as the
+  game's Delphi code does (registers, stack, results) and the battle keeps each CPU's own maths if it fails. **Proof:**
+  B nudging by `ppm` with the software maths on: READY equal, 40 minutes equal (gunfire from minute 31), B's
+  `nudged` count unchanged from the load to minute 40 (the hardware path unused).
+- **Speed.** Per call (in-game `ls x87 bench`, ns, this CPU/software): sin 17.5/41.4, cos 20.3/42.7, atan 36.6/32.2,
+  exp 9.6/18.0, ln 16.3/30.9; a battle minute calls them ~3-4M times (the globe's SinCos and ArcTan2 for the map), about 70-90 ms of CPU per 10 battle minutes. Wall time of 10 battle minutes in one battle, alternating with a resync between (nb13): software 6.99, 7.95, 6.90 s; each CPU's own 8.98, 9.00, 6.82 s: no measurable cost.
+- **The x87 control word.** Since level 15 B loads with A's word; level 16 checks it on both PCs before and after every
+  simulation step, at every minute's boundary, every release and every hash, puts A's back and logs it (`lockstep: FPU
+  control word <w> at <where>, the battle's (A's) is <a>: put back (<n> times in this battle)`, the first 20, then every
+  100th). B's own word goes into its `ready` and into the diagnostics when it differs from A's.
+- **The game data files (`datafiles.cpp`).** A file-open probe (`RTW3MP_TEST_FILELOG`) of the 1900 test battle: the load
+  opens Gundata, HorPen, VerPen, Torpedodata, BasicData, MapData and every nation's WarInfo `.dat`, the map layers
+  WorldRTW, RTWShallow and NoGo, two coastal battery designs in `Data\IDes`, the ensigns in `Flags`, and the slot's
+  save files; the minutes open no game file. `Data` but its `Graphics` (drawings only) is hashed when a session
+  starts (1417 files; 11 s on a cold disk while two copies start, a background thread). A's start carries the
+  combined hash (`dh=`); a B whose hash differs refuses before loading with its list (`dm=`, `name:hash|`), A names the
+  files to both (`datadiff`) and drops B, who never loaded: no resync. nb12 (`ls testdatafile
+  Data\Gundata.dat;Data\Extra.dat` on B): A `Captain's game data files differ from this PC's: 2 files:
+  Data\Gundata.dat, Data\Extra.dat (only on one PC)`, `Captain left the live battle (...). The AI commands Germany now`;
+  B `The live battle could not start: your game data files differ from Admiral's: Data\Gundata.dat, Data\Extra.dat
+  (only on one PC). The battle is fought against the computer.` and the notice `No live battle: ...`.
+- **Diagnostics a player can relay.** B's `ready` carries the READY hash's parts (`g=`: the ten groups, the clock with
+  the date, the random-number state), its CPU vendor and own control word; A's `desync` carries `diag=`. The chat line
+  on both PCs: `Synchronising the battle again (the loaded battles differ: orders; CPUs AMD (Admiral), Intel
+  (Captain))...`, the notice on both: `Live battle: the loaded battles differ: orders; CPUs AMD (Admiral), Intel
+  (Captain) (loading again)`, the final drop: `the battles could not be kept in sync (orders; CPUs ...)` (nb10,
+  `ls testreadydiff`; nb11's `ppm` run). Parts in plain words: positions, damage, ammunition, sightings,
+  identification, orders, aircraft, torpedoes, forces, submarines, clock, random numbers. The hello and the welcome
+  carry `cpu=` and `dh=`: `Captain: CPU Intel (this host: AMD); game data files the same as this host's|DIFFERENT|not
+  compared yet` and `joined Admiral: CPU AMD there (this PC: Intel); ...`.
+- **Gotchas.** Hooking the first copy of SinCos/ArcTan2 changed its bytes, so a search after it found only the second
+  (nb10: 9 of 11 hooked): collect every target first. `KVEncode` turns newlines into spaces: a list in one KV value
+  needs another separator (nb11 named all 1418 files "only on one PC"). The client never ran `lockstep::Prepare` (host
+  only): its scan starts in `Join`. MSVC's inline asm can't put a label inside a macro: each stub's software and test
+  paths are their own naked functions (`jne NAME_soft`, C4414 silenced for them). A Python `open(p, 'w',
+  newline='\\n')` raised after truncating the file.
+- **Open:** the players' failure stays unexplained by the CPU (13 orders of magnitude) and by every two-PC condition
+  tried; with level 16 a data-file difference no longer reaches the start check, and the next report will name what
+  differed. Regression on the final build (`files\dist_nb_9`): `--only lockstep,lockstep_ui,lockstep_month` 122/122, game open 424 s; offline self-test 89/89. Game open in nb10-nb13: 174 + 585 + 571 + 150 s; slot 1 restored and the Preferences file unchanged after every run, 0.4.0 (`dist_vp_2`) back in the game folder after every run.
+
+## Investigation 2026-10-20: each player's own relations: tension, wars and battles of a joined player's nation (v0.4.1)
+- Research agent, branch `fix-strat` from main d539e4d (0.4.0). A report from a match of two players on 0.3.2 (the host
+  plays nation 0, the joined player nation K): "Tension is the same as the host and non host player they should be
+  separate", "The wars were shared amongst players since the tension bars are not independent", and no battles for the
+  joined player, neither against computer nations nor against the host. Static reading of 1.01.44, then a facts run on
+  the released 0.4.0 (dist_vp_2, game open 155 s) with the 1900 test campaign (host Great Britain = 0, client Germany =
+  1, Spain = 7, Russia = 3); the client's screen was read from its memory (the strategic screen at RVA 0x723000 and its
+  controls; no screen capture).
+- **The data.** Every nation holds one tension array (TBuilderNation +0x256 `Tension` = its relation with nation 0,
+  +0x25a.. `AITension[1..8]`; `Allied` +0x29a with nation 0, `AIAlliance[1..8]` cells +0x276+4j; war = above 40), so
+  nation K's relations exist on their own: K-host in K's `Tension`, K-j in K's `AITension[j]` (and j's, `SetAITension`
+  writes both). In the facts run K's data was 0:5 2:7 3:3 4:3 5:3 6:3 7:4 8:3, the host's 1:5 2:8 3:4 4:4 5:1 6:2 7:3 8:3.
+- **Everything that shows relations reads nation 0's.** `TfrmBuildCamp.UpdateUIValues` (0xc8018c) names slots 1-8 of
+  the tension panel (`imgFlag<i>.Hint` = GetBNation(i).Name, " (Treaty)" while `Allied` > 0) and calls
+  `ShowTensionLevels` (0xc7f4d8): per slot `ShowOneTensionLevel(i, Tension<i>)` (0xc7f1e4: size, colour, "Tension with X
+  is N" or "You are at war with X" from GetBNation(i).Tension), `lbWar<i>` (Tension > 40), `lbBlock<i>` (Blockaded),
+  `imgAlly<i>` (Allied > 0), `stIntel<i>` (IntelToString: GetBNation(i).IntelligenceSpending). The war state comes from
+  the war counter ([0xf52ff4], `0xccd5fc` = War > 0): the "War results" box `gbWar`, `lbWar` "At war for N months.",
+  `lbPlayerNation`'s hint "At peace for ..."; while War > 0 UpdateUIValues also calls `CancelTreaty` and zeroes every
+  nation's DisplacementLimit (+0x17d). `SetValues` (0xc7fbcc) loads the flags (imgPlayerNation from PlayerNation,
+  imgFlag<i> from GetBNation(i)) and ends with UpdateUIValues. A flag's click opens `TdlgNationData.Execute(i)` (the
+  player's own flag: 0). The map's strength bars (`DrawAreaStrengthBars` 0xd10900, from DrawMapDetails) colour nations
+  1-8 by GetTensionColor(Tension). The relations window (`TdlgRelations.Execute`, the 9x9 matrix) reads Tension for
+  pairs with 0 and AITension otherwise: complete. The game's own helpers compare with PlayerNation but read `Tension`:
+  `TBuilderNation.IsEnemy` 0xc66410 (only through the player's coalition), `NationIsAtWar` 0xc634f8 (PlayerNation: War
+  > 0), `IsAtAIWar` 0xc68ecc (false for PlayerNation).
+- **So the joined player's screen showed the host's relations** (PlayerNation = K, the fields relative to nation 0): in
+  Aug 1900 the client's panel equalled the host's ("1:Germany is 5 ... 8:Austria-Hungary is 3", slot 1 being Germany
+  itself with its tension with the host), after `settension 1 7 50` (K at war with Spain in the data, as `battles`
+  does) still "Spain is 3", and after a war of the host with Russia (reserve 3, `diploas 0 war 3`, applydiplo, release
+  3: WarStartsWithNation) "3: You are at war with Russia [WAR]", the War results box and "At war for 2 months." on the
+  client, while K's relation with Russia stayed 3 in the data. The host's war never touched K's data; on the screen it
+  looked like the client's war, and the client's real war (Spain) was invisible.
+- **K's relations follow the game's AI rules** (the game runs every nation but nation 0 as AI): `CheckTurnEvents` runs
+  `CheckAITensionEvents` (0xd2dc68) and `DoAITensionChanges` per nation; `ChangeAITension` (0xc67904) moves a pair by
+  +-1 with a cause that goes into the host's turn messages ("Tension between USA and France decreases because they share
+  common values."). An AI war breaks out (0xd2e598) for nation i's most tense AI partner m when 10 < t < 40 and
+  Random(100) < t, and only while the player is NOT at war (0xd2e602 `call 0xccd5fc`; otherwise the tension drops by 1);
+  "War has broken out between X and Y!" appears on the host. AI peace (`HandleAIPeace` 0xd32f98: "The war between ...
+  has ended", VP of nations 1-8 zeroed) comes at random, only while the player is NOT at war and the nation is not at
+  war with the player (0xd2ddd9..0xd2dde9), or forced by unrest. So K can go to war on its own, but only by the AI's
+  rule, frozen while the host is at war, and without any message on K's PC. Over the months K's tensions drifted by
+  +-1..2 (`lockstep_month`: France 7 -> 5 -> 3). K's relation with the host follows the host's player rules (below).
+- **Nation 0 only (the player's machinery):** `RandomTensionChanges` (0xc81100: 50 `TensionChangeWithMessage` calls with
+  explanations, the leader's speeches, "X asks your opinion" questions), `TensionChangeWithMessage` (0xd46a3c: the
+  turn message "Tension with X increases ..."), `CheckForWar` (0xc84f04, from DoEndOfTurn: the `WillGoToWar` countdown
+  +0x1bd with spy warnings "they plan to declare war on us in N months", rumours, "X has declared war on us!", allies
+  joining, surprise attacks, invasions), `WarStartsWithNation` (0xd333bc: Tension 50, War := 1, Allied 0, TechSharing
+  0, BudgetModifier +1), `TensionEffectOfPreviousWars`, the peace events (`GetPeaceEvent`, `NegotiatePeace`, `DoPeace`),
+  the war counter step (DoStrategicTurn 0xce1f69: ++ at war, -- at peace), `CheckBlockadeStatus`' VP,
+  `CheckRaiderActivity`, `WarHelpFromAllies`, `CheckBuildingShipsForWar`, and the battle generator `CheckForBattles2`
+  (0xcecb10: PlayerNation against nations with Tension > 40: invasions, raider vs patrols, home areas, possessions,
+  `GetRandomEnemy` -> `CheckAttackLocation`). Events for K are rolled on K's PC with K's relations swapped in (0.2.4).
+- **Battles of K.** Against AI nations: `CheckAIvsAIBattles` (0xd32a50) for pairs with AITension > 40 (50 % per
+  nation, areas walked) -> `CheckAivsAIBattleInArea` (0xd32c2c: 50 %, ships of both in the area, Random(10) < the ship
+  counts, a size-based chance) -> `DoBattleBetweenAINations`, which the mod defers to K's battle phase. In the facts run
+  the first month gave "battle request 1: nation 1 vs 7 in Northern Europe (29:16 ships)", sent to the client, where
+  the game's `CheckAttackLocation` said "The Spanish navy declines battle! You gain 300 VP!" (`AIDeclinesBattle`
+  0xcd2188, before any preview: `add [PlayerNation+0x175], N`); the client reported "nobattle" and the host let the
+  game resolve it as a battle between AI nations: "In a battle in Northern Europe ... the German ship DD S22 has been
+  sunk". Since CheckAIvsAIBattles walks nations 1..8 in order, a joined nation with a low index usually attacks, and a
+  weaker AI enemy usually declines: such a player saw battles announced and never fought them. Against the host: the
+  host's `CheckForBattles2` -> DoBattle -> a live battle (`lockstep_month` gets one in the first war month in this
+  branch's runs). The host's own war with Russia brought the host a battle in its first month in the facts run.
+- **Design** for the per-player war machinery, awaiting a decision: (1) keep the game's AI rules for K's pairs and make
+  them fair and visible (a war counter per player sent with the month; K's AI wars and AI peace no longer frozen while
+  the host is at war; the host forwards the month's messages about K to K's player; "Propose peace" to an AI enemy);
+  (2) the player's relation routines (RandomTensionChanges, CheckForWar, peace events) for K on K's own PC at the start
+  of its month under the K swap, the AI rules switched off for K's pairs on the host, the results applied by the host
+  like events, and K's per-relation state (WillGoToWar, ...) kept by the mod; (3) the same in the host's month (its
+  dialogs would open on the host; not recommended). The player's battle generator for K (CheckForBattles2 in K's view,
+  its CheckAttackLocation turned into K's battle-phase requests) is a separate step for either.
+
+## Fix 2026-10-20: a joined player's screen showed the host's relations; an enemy's decline became a battle (v0.4.1)
+- **The relations view (`game.cpp`).** `ShownNationIndex()` is K when PlayerNation is BuilderNations[K] with K in 1..8
+  (a joined player's PC, also after leaving the session), else 0 (the host, single player, a battle slot where K is
+  nation 0). While a display routine runs, `KViewBegin` puts nation K at index 0 and the host's nation at index K and
+  sets every nation's `Tension`/`Allied` to its relation with K (computed from the cells first); `KViewEnd` puts
+  everything back, also when a game exception unwinds (`__finally`); depth-counted, and not while an event dialog has
+  its own swap. Hooks (all on the main thread, no-ops when ShownNationIndex() is 0): `ShowTensionLevels` (in the view;
+  first the flags' hints, as UpdateUIValues sets them, from the view's nations), `DrawAreaStrengthBars` (in the view),
+  `SetValues` (afterwards slot K's flag picture = the host's `GetFlagFileName`), `TdlgNationData.Execute` (a flag's
+  nation index 0 <-> K), `UpdateUIValues` (afterwards the War results box, `lbWar` and the player name's hint follow K's
+  own wars: "At war with Spain." / "At war with N nations." / "At peace."; K's war months are unknown, the war counter
+  is the host's). VCL and RTL routines without RTTI names, from call sites checked at startup: TControl.SetVisible
+  (0x981b54, `setg dl; mov eax,[ebx+lbWar1]; call` in ShowTensionLevels), TControl.SetText (0x981ca0, `mov edx,[ebp-4];
+  mov eax,[ebx+stIntel1]; call`), System._UStrAsg (0x83bccc, `mov eax,[ebx+imgFlag1]; add eax,FHint; call` in
+  UpdateUIValues; it copies a literal string, refcount < 0). Log: `Relations view: ok (...)`, and on every change
+  `relations view: nation 1 sees its own relations: Great Britain 5 France 7 ...; at peace`.
+- What it shows on K's PC: slot K = the host's nation (flag, name, K's tension with it, war and alliance marks), the
+  other slots K's relations, the War results box and the war line from K's wars, a flag's click the nation of its
+  slot. Left as they were: the intelligence labels (slot K shows the host's own record; per-player intelligence is
+  another branch's work), the blockade marks (a nation's own Blockaded flag, set by the host's blockade check), the
+  relations window (it shows every pair already), the turn messages and warnings (the host's month: see the
+  investigation). The game's war-counter side effects of UpdateUIValues (CancelTreaty, DisplacementLimit) still follow
+  the host's counter.
+- **An enemy's decline is no battle (`session.cpp`).** The client compares nation 0's VP (K in the battle slot) around
+  `StartPlayerBattle`; no preview and points gained, in a battle against an AI nation, means the game's
+  `AIDeclinesBattle`: the client saves the battle slot and sends the result (`ExtractBattleResult`) with the outcome
+  `avoided`; the host merges it like a fought battle (the VP only) and resolves nothing: `battle N applied: 0 ships
+  changed (0 fields), 0 removed, VP 300/0, prestige 0 (...); the enemy declined battle`, chat "The Spanish navy declined
+  battle against Germany in Northern Europe." Before, the client's "nobattle" made the host run
+  `DoBattleBetweenAINations`. A battle the player declines in the preview, and a live battle, are unchanged.
+- **Bridge:** `relview` (read-only, also while an event dialog is open). **Runner:** `relview`/`relview_check`;
+  `session` checks the client's and the host's screens, `lockstep_month` both screens at war and the client's after the
+  peace; BattleDriver knows the outcome `avoided`. MP_MOD_VERSION 0.4.1; protocol 3 and engine level 14 unchanged.
+- **Older peers.** A 0.4.0 client (or host) shows the host's relations as before; the view needs no message, so a
+  0.4.1 client shows its own relations under any host. A 0.4.0 host takes `avoided` for a battle not fought and has the
+  game resolve it (the 0.4.0 behaviour); a 0.4.0 client still reports "nobattle" to a 0.4.1 host, which resolves it.
+- **Tests** (frozen builds dist_rf_1, dist_rf_2; the research driver `rf_live.py` in the session folder, regression.py's
+  helpers): dist_rf_1, 16/16 (game open 61 s): the client's panel "1:Great Britain is 5 | 2:France is 7 | 3:Russia is
+  3 | ... | 7:Spain is 4", "At peace."; a month later "7:You are at war with Spain [WAR]", War results box, "At war with
+  Spain."; with the host at war with Russia the client's Russia slot "Tension with Russia is 3" and K's data at peace
+  with Russia; the flags' clicks open nation 0 (slot 1) and nation 2 (slot 2); the host's screen unchanged throughout.
+  dist_rf_2: the same display checks, a battle Spain started fought on the client and merged ("battle 1 applied: 18 ships
+  changed", 93 s); with two injected battles Germany started, battle 1 `avoided` and merged with VP 300/0, battle 2
+  fought (444 s: the driver then left a third battle without auto-run, a driver bug). Suite `--only
+  session,lockstep_month,lockstep_pvp` on dist_rf_2: 82/82 (session 13/13, lockstep_pvp 26/26, lockstep_month 43/43, a
+  live battle in the first war month; game open 260 s).
+
+## Fix 2026-10-20: joined players' intelligence mirrored the host's; no trade protection warnings (v0.4.1)
+Research agent, branch `fix-intel` from main d539e4d (the 0.4.0 release). Two reports from a match between two PCs on
+0.3.2: "Non host player spying mirrors host." and "non host player does not get warnings for not having ships on
+Trade protection." Static work on 1.01.44 (the game facts are in
+[GAME-INTERNALS](docs/GAME-INTERNALS.md#intelligence-trade-protection-and-foreign-stations)), validation on the
+installed 0.4.0, the fix, live proofs with host and client on one PC. Commits 256d1f6 (the mod), b1e2848 (the
+runner), 385517b (a bridge read), then the docs. Protocol 3 and live-battle engine level 14 unchanged.
+- **0.4.0, as validated** (the release DLLs, slot 1 at Aug 1900, host Great Britain = nation 0, client Germany =
+  nation 1, two months):
+  - The client's politics panel and budget showed the host's intelligence (flag labels `Med *|None|Med *|None|Low|...`,
+    the budget's Intelligence line 150 on both PCs). Its + on France was lost with its turn; its + under its own flag
+    (Germany) raised the host's spending on Germany (`[Nation1] IntelligenceSpending` 2 in the host's save after the
+    merge). Its report list was the host's (6 -> 7 -> 8 entries, with the host's reports on Germany itself: "Apr 1900
+    Germany - New ship under construction of class B Brandenburg is rumoured to carry 9 in main guns.").
+  - Germany paid nothing for intelligence and got the AI's intelligence money: funds 3934 -> 5999 -> 8064 (+2065 a
+    month) while the client's screen showed a monthly balance of 123, then -27.
+  - The host's Turn asked "There are insufficient ships on foreign stations! Continue anyway? ..." both months; the
+    client's Submit asked nothing (Germany has no shortfall in 1900; proof 3 uses a nation with one).
+- **Cause.**
+  - The game keeps its player's intelligence on the target nations: `IntelligenceSpending` (+0x171) and `IntelEffort`
+    (+0x1ac) of nation j are nation 0's spending on and effort against j; the reports are one list
+    (`TfrmBuildCamp.IntelReports` +0x320c, saved as `[IntelReports]`). The month package is the host's save, so the
+    client loaded the host's values and reports. Its +/- (`SpeedButton1Click` -> `ChangeIntel` 0xd3c538) changed the
+    `[Nation<j>]` of other nations, which its turn doesn't carry, and under its own flag its own `[NationK]`, which the
+    merge took. `GetIntelCostForPlayerNation` (0xc989b8) sums nations 1-8; `GetMonthlyBalance` (0xc5d2ec) subtracts it
+    for PlayerNation only and adds `ComputeAINationIntelCost` (0xcae594) for every other nation: in the host's month K
+    got the AI's intelligence money. The monthly spying (`CheckTurnEvents` -> `CheckIntelligence` 0xc86244) is the
+    player's only; `CheckAISpying` (0xcba67c) ran for K as for an AI.
+  - The Turn's questions are in `PlayerChecksBeforeTurn` (0xce28c4, from `DoTurn2`), which a joined player's Turn never
+    runs: it submits. In the month the player's parts of `CheckShipsOnForeignStations` (0xcb6718 ->
+    `CheckForceOnForeignStations(False)` 0xcf5f54) and `CheckPatrols` (0xcc7dc4) act for PlayerNation only, and the
+    mod skips the AI's `AISendShipsToForeignStations`/`AISendShipToColonies` for human nations (since 0.1.0): K got
+    neither the player's warnings and consequences nor the AI's ship moves.
+- **Fix** (`src/mod/nationplay.cpp`, design in
+  [ARCHITECTURE](docs/ARCHITECTURE.md#per-player-intelligence-trade-protection-and-foreign-stations)):
+  - The host keeps each joined nation's spending, effort, reports and foreign-station warning in `rtw3mp_nations.ini`
+    (its slot, with the campaign key), puts them into the player's month package (`MSG_STATE` header `intel=1`) and
+    takes them back from its turn (`[MPIntel] Spend=/Effort=` and `[IntelReports]` in `nation.bcs`). The merge keeps
+    the host's `IntelligenceSpending`/`IntelEffort` in `[NationK]`.
+  - Player's PC: `GetIntelCostForPlayerNation`, `IntelToString` and `ChangeIntel` hooked (every nation but its own
+    counts; its own flag stands for the host's nation). The monthly spying check is the game's `CheckIntelligence` with
+    K seen as the player (the "view": nation list 0 <-> K, every nation's relation with K, the war counter from K's
+    wars), run when the month's event roll finds no event; the game's dialogs show on the player's PC, the results go
+    to the host at once as an `MSG_EVENT` (`event=-1`, `intel=1`, `ireports`, `ieffort`, `tension`, `delta`).
+  - Host month: `ComputeAINationIntelCost` returns minus K's cost (levels x 10 x FleetSize); `CheckAISpying` is skipped
+    for K; after `CheckShipsOnForeignStations` the player's parts of it and of `CheckPatrols` run for each joined
+    nation in the view, with the game's chances and texts, as a replica (`CheckForceOnForeignStations` also rolls world
+    events); the texts reach the player as notices with the new month.
+  - Submit asks `PlayerChecksBeforeTurn`'s trade protection (at war) and foreign stations questions for K in the game's
+    message box (`MessageDlgPosHelp` 0xa06eb0, found by its call there); No goes back ("Not submitted: you chose to go
+    back at the game's warning."); a submit the time limit forces asks nothing. `GetPatrolRequirement` hooked: the
+    budget panel's "N of M" is K's.
+- **What an old peer sees** (both directions keep protocol 3): a 0.4.0 player of a 0.4.1 host gets its own
+  intelligence in its month (empty at first) but no spying check and no questions; its spending changes are lost
+  (no `[MPIntel]`; the merge keeps the host's keys), it pays nothing and gets no AI intelligence money; the month's
+  foreign-station and patrol consequences apply to its nation and their notices reach it as chat lines. A 0.4.1 player
+  of a 0.4.0 host (no `intel=1`) keeps the 0.4.0 intelligence (the host's) and gets the Turn's questions (local).
+- **Live proofs** (the drivers are kept outside the repo; host and client on one PC):
+  - Proof 1 (dist_it_4, slot 1, Germany, 3 months): the client's own panel after `intelbtn` 2,2,2,1,1,3 (France High,
+    the host's nation Med under its own flag, Russia Low; Intelligence 180, balance -57), the host's unchanged (its own
+    Russia Med and Japan Low; `[Nation1] IntelligenceSpending` 0). Host: `intel: nation 1's turn: spending
+    2,0,3,1,0,0,0,0,0 (cost 180 a month)`, `AI suppressed: CheckAISpying for nation 1`, `intelinfo` `month1=intel:-180`.
+    The client's list was its own: 0, then 7 after its checks ("Sep 1900 Russia - New ship under construction of class
+    DD Verni is rumoured to carry 2 in main guns.", "Sep 1900 Great Britain - The ship CA Europa will reportedly be
+    commissioned in 0 months.", "Sep 1900 USA - USA has a budget balance of 489"), also as chat lines; the host's its
+    own (6 -> 10); the saves separate (slot 1: 8 entries, slot 77: 7). An enemy spy caught on the client in the third
+    month: host `event of Captain (nation 1, #-1 'Intelligence'): tension 1-4 3->4 BudgetModifier+1`. Germany's funds
+    +1343 and +1784 in months 2 and 3 (0.4.0: +2065); month 1 gave +18,460 (see the observations).
+  - Proof 3 (dist_it_6, slot 1, the USA = nation 4, its 45 ships put in reserve on the client so that its shortfall
+    lasts; 4 months): Submit -> the foreign stations question -> No: not submitted, `submit: cancelled at a Turn
+    warning`; Submit -> Yes: submitted; the question again each month. Host: `nation 4 month: at peace, foreign
+    stations short of 10000 (required 10000) in 2 areas, ships on foreign stations 0: insufficient` every month; Oct
+    1900 "The President has been made aware of a lack of ships on foreign stations. He strongly urges you to remedy the
+    situation.", Dec 1900 "The President is displeased with the lack of ships on foreign stations! Your prestige
+    suffers. (Prestige 20 -> 19)", both as chat notices on the client; prestige 19 on both PCs; the quiet months
+    logged (`no consequence this month (rebellion roll: the possession's area has its force; war counter -68,
+    1900/09)`). `fsmonth 4 12`: 10 notices, prestige 19 -> 16. Without the reserve (dist_it_5) the USA's shortfall
+    (6000 of 6000 tons in one area) closed during the first month, when ships under way arrived: the question at the
+    first Submit, nothing afterwards (correct: the game counts ships where they are).
+  - Proof 2 (dist_it_8, slot 9 at Jan 1935, Germany at war with France by `settension 1 2 50`): Submit -> "You have 0
+    ships on trade protection duties, but 16 are required. This will give VP to the enemy and might hurt your
+    prestige. Continue anyway?" (No, then Yes); the month: `nation 1 month: at war, 0 ships on trade protection of 16
+    required` and "The Führer is annoyed that you cannot safeguard our coasts with adequate patrols. ..." on the
+    client; the client's budget panel "0 of 8" at peace and "0 of 16" at war (the host's own "0 of 11"); the client's
+    spying check at war showed the game's "The head of naval intelligence suggests that as we are war with France,
+    ..." and aircraft data on the client.
+  - Suite on dist_it_8 (= 385517b): `session` 11/11, `lockstep_month` 40/40 (dist_it_7: the same). Game open in all:
+    about 12 minutes (validation 49 s, proofs 106 + 77 + 74 + 92 + 55 + 58 s, suites 99 + 109 s).
+- **Test tooling.** Bridge: `intelinfo`, `tradecheck`, `shipstatus`, `intelbtn`, `intelcheck`, `fsmonth`; `submit` is
+  asynchronous (`status` `submitting=1` until done). Runner: the client's intel list may be empty; run_month and
+  ls_month wait for `submitting=0` (proof 2 on dist_it_6 met "Error in SaveBuildCampaign procedure! Cannot create
+  file" when the runner read slot 77 while the resubmit saved); events i) ignores the spy-caught questions.
+- **Observations, not changed:**
+  - The AI's money still reaches joined nations: `ComputeExpenses` (25 x FleetSize a month and more for poorer
+    nations, BaseResources floor) and `CheckBBNumbers` ("<nation> has increased the naval budget to remain a global
+    naval power.", Funds + FleetSize x 6000 and BudgetModifier + 1, 1 in 10 a month when a rival has two more
+    battleships): very likely Germany's +18,460 in proof 1's first month (18,000 at FleetSize 3). `ReduceTimeLimits`
+    can halt a joined nation's most expensive ship (`HaltMostExpensiveShip`) when its balance is negative and its funds
+    low; paying for its own intelligence makes that a little likelier.
+  - `MovePlayerShipsOnForeignStations` (the game's moves of its player's foreign-station ships) is not run for joined
+    nations; the AI routines' passive reports and the beliefs about enemy ships (`EnemyClassName`, `PlayerIntel`,
+    aircraft data) stay the host's.
+  - The spy events change K's relations through the event path (`tension` key, clamped as events'): fix-strat's
+    tension work sees them as event changes of the K-j pair.
+
+## Testing 2026-10-20: twopc, live battles under two-PC conditions (v0.4.1)
+Regression agent, branch `reg-041` (from `fix-net` 2931c17: engine level 15, 0.4.1, protocol 3). The suite gets the
+two-PC scenario the investigation of 2026-10-19 proposed, built from its harness pieces; no product code changed.
+Snapshot `dist_tp_1` (built in `reg-041` from 2931c17 without warnings; RTW3MP D95BE2AB2010788A) installed for each
+run, `dist_vp_2` (0.4.0) back after each run, slot 1 and the Preferences restored (verified by hash), slot 2 untouched.
+- **The scenario `twopc`** (group `twopc`; the default run: short; `--stress`: full; docs/TESTING.md, the catalog and
+  "Two-PC conditions"):
+  - a) B (the client) leaves, is closed and started again with `RTW3MP_TEST_LOCALE=comma`; the shared Preferences file
+    holds B's variant from B's start to the scenario's end (the runner backs the file up for a run with `twopc`): the 14
+    battle preferences a live battle takes from A (`kPrefs`, read from the source) each differ from A's `ls prefs`, and
+    22 display keys (dark mode, scale, sound volume, fog of war, English ranks, German characters, the break and message
+    options, ship flags, damage meter, ..., the battle window's 1400x880). B joins through `tools/net_delay_proxy.py` on
+    47634 (default 120 ms +-60 ms each way, 4000 kbit/s; `--stress` 200 +-100 ms, 2000 kbit/s; `NET_PROXY` in the
+    runner).
+  - b) a test battle: the start check (READY `all` and `ident`), B's battle preferences (the log line with all 14 B's ->
+    A's, `ls prefs`: A's 14, B's display ones, B's own kept for after), B's ensign, both maps at the load, the window
+    sizes, every division on the AI, minutes from both sides, the maps between minutes, a resync (the maps again), the
+    minutes' hashes, the end (default: `ls endsoon`, the game ends it inside a minute; `--stress`: A drops B) and B's
+    own preferences back; `--stress` adds the map check's negative control (`ls mapview off` on B) and the battle
+    screen's Preferences dialog on B.
+  - c) war 0-1 and real months until CheckForBattles2 starts the host's battle against nation 1 (`ls_month` with a new
+    `live_hook`): the same start, preference, ensign, map and size checks, lockstep_month's `host_battle_checks` (the
+    month goes on), B's own preferences back; `--stress`: a resync in that battle, the game ends it inside a minute,
+    and a normal month after the peace.
+  - d) B's own Preferences file unchanged (the shared file still B's variant byte for byte: nothing wrote it, neither B
+    with A's battle preferences in memory nor A), both copies' `ls prefs` their own, `ls_after_checks`, `ls_log_scan` (no
+    LEAK with `ls leakcheck 1` on both copies, no lockstep error, the identification), the proxy's statistics (bytes
+    towards B, the bandwidth cap's waits). e) the run's conditions again: B leaves, the proxy stops, the run's
+    Preferences back (hash), B started again normally and in the session directly, the host's battle window its own size.
+- **B's map check** compares `ls mapview` with the simulation's sighting state at the same boundary: B's own DESYNC
+  report (`ls desyncreport`, the state section: each ship's `SightingLevel`, `RadarSightingLevel`,
+  `SeenByHumanControlledShips`, `Sunk` by its division's `Side`; read and deleted at once; both copies' states are
+  equal, so it serves A's mirror too). B's map must show every own ship of a human force (the game hides a computer
+  force's own ships until they are spotted: A had 9 of its 11 ships in computer forces in the month battles), no
+  division flag of A, no more A wakes than A ships shown, and of A's ships exactly those B's side sights
+  (`max(SightingLevel, RadarSightingLevel) > 0` and `SeenByHumanControlledShips`; right after a load the levels alone,
+  as the map pass does). So "B's own ships visible, A's unspotted ships absent" is checked exactly at every load and
+  between minutes. The battle file is no reference: the load's own sighting routine sets the levels again (the
+  resync's file said 3 of A's 16 ships sighted, the loaded state 4, B's map 4).
+- **The probe the product could offer:** `ls mapview` counts what a map shows but not what the side sights; the
+  report file works, but `ls mapview ships` (per ship `side:index:shown:sight:radar:seen:sunk`) or `sighted0=`/
+  `sighted1=` counts (each side's ships the other side sights by the game's rule) would make the check one bridge call
+  and name the ship that differs.
+- **Runs** (`--dist` dist_tp_1, the game lock held for each run; game open 150 s + 192 s + 219 s = 561 s):
+  - Run 1, `--group twopc`: 65/68. Every check of the product passed (the start checks, the minutes, the maps with A's
+    ships partly sighted 4 times, B's preferences and ensign, the month, the Preferences file, the proxy: 9.4 MB towards
+    B, no LEAK); three failures were the suite's own assumptions: a battle window keeps its size into the next battle of
+    the same game (the month battle started at the test battle's 900x650 and 1560x980; only a new window and a resync
+    load take the Preferences' size), and B's battle window is hidden for most of a load and shown only at its end, so a
+    30 ms watch with a 0.4 s margin saw nothing of two loads and took the old battle's picture before a resync for the
+    load's. Fixed in the suite (ae51d08): the size check asserts that the windows differ; `CoverWatch` polls the form's
+    handle every ~3 ms and keeps the state changes.
+  - Run 2, `--group twopc`: **68/68** (twopc 57/57 in 175 s). B's 3 loads: hidden, then clear 42-161 ms before "battle
+    loaded from slot", shown 2-3 ms after it: the cover works, so the check now requires the clear state on every load
+    (an uncovered load would show the window opaque for that last ~0.1 s) with a 50 ms margin. B's map: 0, 3, 2, 2 of
+    A's 16 ships in the test battle, 0 and 3 of 12 in the month battle, each exactly the sighted ones; the resync's file
+    said 3 sighted, the loaded state 2. The month: Aug -> Sep 1900 with the host's battle in its first month (`drop12`,
+    12 minutes equal), lockstep_month's checks, peace.
+  - Run 3, `--group twopc --stress`: **88/88** (twopc 77/77 in 201 s). The negative control: with B's map pass off, a
+    minute later B's map showed 4 of A's ships with all 16 of their wakes and all 8 of A's flags (0.4.0's picture; the
+    capture shows the British ships named and flagged on B's map), the check named both; `ls mapview on` gave B's
+    picture back at once. The battle screen's Preferences on B with OK: "RealismSetting 1 -> -1 ... put back" and the
+    chat line, B's 14 still A's, B's file unchanged. 17 minutes and a resync in the test battle, the month battle with a
+    resync and the game's own end inside a minute (`endsoon`), a normal month after the peace (Aug -> Oct 1900). The
+    proxy at 200 +-100 ms and 2000 kbit/s: 13.3 MB towards B, the battle files waiting up to 7.7 s. 4 of B's loads,
+    each clear 43-173 ms before its end.
+  - After every run: slot 1 restored, the Preferences back (8208607E..., verified), slots 77/87 gone, slot 2 untouched,
+    no RTW3.exe or proxy left, no DESYNC report left, `dist_vp_2` back in the game folder (hashes compared), the lock
+    released. The offline self-test: 115/115.
+- **The three reported symptoms under two-PC conditions** (on one PC: Preferences, locale, window sizes, network): B
+  never showed the host's side while loading (the watch) and showed its own ensign; the start check was equal on every
+  load (2 test battle loads and 1-2 month battle loads per run, with all 14 battle preferences and 22 display ones
+  different, `AIControl` among them); B's own ships were all shown at every check. What one PC can't give (another CPU,
+  other data files) stays with fix-net's second round.
+- **Product findings:** none failing. Observations: a sighted ship of the other side shows without its wake on both
+  maps (B: 0 wakes for 4 of A's ships shown; nb6: 1 of 7), a display detail with no fog-of-war effect; the battle
+  screen's Preferences dialog still writes `RealismSetting` -1 on a plain OK (the game's), which the mod puts back;
+  B's `ConvertCharacters=1` (umlauts converted in its own campaign) changed nothing the month checks see.
+- **Testing gotchas** (docs/TESTING.md, Known traps): `ls desyncreport` logs "DESYNC report ... written" (match
+  `DESYNC at minute`; never on A in a month: `ls_drive_live` counts every DESYNC line of A); compare maps with the
+  simulation's state, not the battle file; a computer force's own ships are hidden until spotted; B's battle window is
+  shown only at a load's end (watch at ~3 ms); a battle window keeps its size into the next battle; the client is
+  closed to change its environment, so its unsubmitted plans are lost (the scenario plans after the restart).
+- Commits (branch `reg-041`, not pushed): 15cdb11 (the scenario, offline), ae51d08 (after the first live run), and the
+  docs with the final suite changes.
+
+## Docs 2026-10-21: 0.4.1 release candidate (v0.4.1)
+Docs agent, branch `docs-041` from `rel-041` ffe1677 (`MP_MOD_VERSION` 0.4.1, `MP_LS_LEVEL` 16, protocol 3; the merges
+of fix-strat, fix-intel, fix-net and reg-041). Docs only: `git diff ffe1677 HEAD -- src tools` is empty.
+- **CHANGELOG:** the drafts of the merged branches made one entry: a summary of who must update (both players of a
+  live battle; the host and the joined players for the campaign fixes), Added (the same maths on every CPU, the data
+  files compared, the start check's diagnostics and reports), Fixed (each side's map, the load's cover and ensign, the
+  battle preferences, the battle screen's Preferences, the x87 control word, the relations view, the AI's decline, the
+  joined players' intelligence, the trade protection and foreign station warnings), Compatibility (protocol 3, each
+  mix of 0.4.0 and 0.4.1) and Known issues. The heading keeps `<!-- TODO release: date -->`. Corrected from the
+  drafts: the declined battle needs 0.4.1 on the host and on the player's PC (the client reports `avoided`, a 0.4.0
+  client still "nobattle"); *AI control* was missing before level 15 (`AIControl` +0xc, and `BSSMHC` +0x37b, which no
+  dialog sets), so it doesn't count "as before".
+- **README:** Joining a session: the Submit questions, what a joined player's screen shows (relations, intelligence,
+  trade protection and foreign stations) and the versions each needs. Live battles: the battle preferences listed,
+  the second player's own back at the end, the data file check, the map and the load per side, "0.4.0 or newer" for
+  the version check. Known limitations: intelligence (the game's passive reports and the beliefs about other navies'
+  ships stay the host's), the monthly messages, the money of joined nations (`ComputeExpenses`, `CheckBBNumbers`,
+  `HaltMostExpensiveShip`; `MovePlayerShipsOnForeignStations` for the host's nation only), the rework for a later
+  release, the unexplained start-check failure. Troubleshooting: "the loaded battles differ" as its own item (what to
+  check, what to send or read out, the join log lines with the CPUs and the data files). Upgrading: 0.4.1. The
+  install example names the 0.4.1 zip.
+- **ARCHITECTURE:** `x87.cpp`, `x87.h`, `softmath.h`, `datafiles.cpp` and `datafiles.h` in the source table and the
+  module map; the x87 hooks next to the live battles' other hooks; the client's Turn hook asks the questions; a
+  level-16 bullet in the live-battle design (it was only in the version history); the version history: 16 = 0.4.1,
+  15 a development level, the log's first line of 0.4.1, level 14 also missed `AIControl`. After the merge of the
+  relations view: the intelligence label and +/- of the player's own nation's slot are the host's nation's inside the
+  view and outside it (`NP_IntelIdx` maps only the PlayerNation object, which the view moves to index 0).
+- **GAME-INTERNALS:** the tactical battles section no longer says "as of 2026-10-17 (0.3.3)"; "In the mod" names the
+  `avoided` outcome.
+- **MODLOG index:** 0.4.1's kinds in the index's order (Fix, Investigation, Testing, Docs), without "(not released
+  yet)"; this entry.
+- **Checks:** the links and anchors of every tracked Markdown file, the MODLOG index (every entry linked once, the
+  file in date order), the personal-data scan of the changed files, `git diff ffe1677 HEAD -- src tools` empty.
+
+## Testing 2026-10-21: the 0.4.1 release candidate dist_rc041_1 (v0.4.1)
+Regression agent, branch `reg-041b` from rel-041 ffe1677. The frozen build `dist_rc041_1` (rel-041 ffe1677: 0.4.1,
+live-battle engine 16, protocol 3) installed with `--dist`, the released 0.4.0 (`dist_vp_2`) put back after every run;
+slots 1 and 9 and the Preferences identical to the pre-run copies after every run (MD5). Game open 11,226 s in all.
+- **Runs** (checks passed; game open):
+  - The default run (twopc short): 737/738 (1629 s). The fail: `lockstep_air` c) "after a minute": the 1935 battle's
+    "You now have reconnaisance aircraft at your disposal!" box disabled the battle screen and the answerer closed A's
+    Air formations window behind it (suite; fixed: a disabled `LS_MODELESS` window is never a question). Again with the
+    fix: `lockstep_air` 41/41.
+  - `--stress` (missile fixture): 979/989 (6575 s): `twopc` full 77/77, `lockstep_stress` 101/101 (S8 15 of 15),
+    `lockstep_rejoin` 47/47, `lockstep_resume` 37/37, `lockstep_torpedo` 20/20, `lockstep_missiles` 23/23,
+    `lockstep_month` 70/70, `lockstep_pvp` 27/27. The fails, all suite: `events` 27/32 (below), `air_units` M1 stalled
+    240 s on the aircraft types question of a 1935 month (`TfrmAircraftTypes` "Do you want to continue development of
+    the aircraft type at the top of the list for 640?" after a bought private venture), and behind it `lockstep_air` b)
+    and `lockstep_strike` b), g) could not start their battles. The month's answerer now presses No; the form was
+    closed by a posted click so `lockstep_missiles` ran valid. Again (`--only events --group air`): `events` 47/47,
+    `air_units` 10/10, `lockstep_air` 41/41, `lockstep_strike` 11/14 (below).
+  - `--only lockstep_month --stress`: 77/86 first: the client's spy check (0.4.1) showed the game's spy dialogs at the
+    session start ("Our top spy has managed to get hold of the blueprints for ...", then the ship status window) and
+    the client's bridge refused the session's checks behind them; `session` now waits for the roll
+    (`wait_event_roll`): 86/86 (186 s; battles agree 514 minutes and endsoon).
+- **events** (suite): a spy check that found something goes to the host as the player's event of the month (event=-1,
+  "event of Captain (nation 1, #-1 'Intelligence')"), and the host ignores any other event of that month, so the
+  scenario's forced `eventnow 5` was "second event of Captain in Aug 1900 ignored (one per month)". Consistent with the
+  game (its monthly event slot is an event or `CheckIntelligence`); the scenario expects it when it happens and checks
+  the event's application only in a month whose slot is free.
+- **New checks** (the caller's request): the relations view and the player's own intelligence together on the joined
+  player's PC (`session`): `relview` + `intelinfo` name the same nation in every slot (slot 1 = the host's flag with the
+  player's own spending on the host's nation, the player's own nation in no slot, client=1); the +/- buttons
+  (`intelbtn 1`/`9`, `3`/`11`) change the player's own spending on nation 0 and nation 3, the label, the cost (0 -> 30)
+  and the log follow, the whole panel is right while raised and the screen's `stIntel1..8` texts (TStaticText, read
+  cross-process) show 'Low *' under the raised flag only; the host's panel as before. Pass on every run since.
+- **lockstep_strike, a product issue** (the second strike battle of `--only events --group air`, 07:00 start, the host
+  option on): two DESYNCs between the two copies on one PC, at minutes 53 and 74 (resynced, the battle went on). The
+  `ident=` part of the hash differs from minute 48 while `sight=` and `all` agree; `desync_diff.py`: at boundary 52 the
+  simulation's `TFightingShip.IdentifiedAsType` of S1.0 London and S1.2 Anson is 00 on A and 03 on B; the draws part at
+  minute 53, draw 2635 (B draws at rva 0x619e3b first). B's map shows its own side since 0.4.1, and B's copy identified
+  ships of the other side that A's did not: a display write into the simulation that the identification's two sets
+  (`SwapShip`) and the leak check did not catch. The reports and both logs are kept with the developers' session files
+  (`r41\desync_strike`). Not seen in 0.4.0's strike runs, nor in the other five strike battles of this candidate.
+  The same run's first battle (13:03) had no search report within 150 minutes; a later one B's four strike formations
+  never took off (status 4 "spotted", then gone). With the software maths off (`RTW3_LS_X87SOFT=0`, new, diagnosis
+  only) 19/19 once, with them 18/19 and 19/19: these two are not tied to the maths by this sample. `ls x87 selftest`:
+  the software routines within 1 ulp of this CPU (tan 2); it does not cover SinCos and ArcTan2, the most called ones.
+- **Mixed versions** (TESTING.md, Mixed versions): a) a 0.4.1 host with a 0.4.0 player 22/22, r) a 0.4.0 host with a
+  0.4.1 player 25/25; the host's battle against the player is fought against the computer with both levels named, the
+  0.4.1 features degrade as documented.
+- **Verdict:** NO-GO for publishing 0.4.1 until the identification DESYNC above is understood: everything else passes
+  after the suite fixes.
+- Commits (branch `reg-041b`, not pushed): 3435b4a, 3b7ce30, 6430e6a and the docs.
+
+## Fix 2026-10-22: the strike battles' DESYNC (the ship-type flags) and the software maths checked (v0.4.1)
+The 0.4.1 RC regression's NO-GO: a DESYNC in `lockstep_strike`'s second battle (the host option "Computer flies
+carrier strikes"), the identification hash apart from minute 48, two of the host's ships identified only on B's copy;
+and doubts about the software maths (one strike battle without a search report in 150 minutes, one where B's strikes
+never took off; the self-test didn't cover SinCos and ArcTan2). Engine level 17, protocol 3.
+- **Cause: the campaign's ship-type flags, not a display path.** Both DESYNCs (minutes 53 and 74) part at the same
+  draw: B makes an extra Random(100) in `TFightingShip.SetMistakenType` (0xe49e36, rva 0x619e3b). That branch reads a
+  unit Boolean, "a battleship exists" (0xf54935); its neighbours say a battlecruiser (0xf54936) and a carrier
+  (0xf54937) exists. Only `TfrmBuildCamp.CheckShipTypesExist` (0xd4e314) writes them, called only by
+  `ReduceTimeLimits` in the month's processing: the host had processed 1935 months earlier in that run (1), the
+  joined player's game never does (0). `SetMistakenType`'s battleship case then mistakes a battleship for a
+  battlecruiser on A and a heavy cruiser on B without a draw (the silent identification difference of minutes 48 to
+  52: London and Anson A 00, B 03); its carrier case makes a carrier a heavy cruiser on B. Proof that it is no display
+  write: after the first resync (epoch 2) the two PCs' states at boundary 73 were identical, identification included,
+  and minute 74 still parted at the same draw. The display's only identification writer is `GetTypeAndNameForEnemy`, a
+  hooked display routine (its writes go to the display set); the other writers (`IdentifyType`, `IdentifyClass`,
+  `SetMistakenType`, `UpdateReport`, the sighting routine's 0x16 reset at 0xdcb223, `AttackShips`) run in the
+  simulation (static scan of every write to +0xd70/+0xd6c). A read-only memory diff of the two copies' globals (the
+  443 that the simulation's code references) during a strike battle found the flags equal when the host had processed
+  no month yet (both 0): why most strike battles passed.
+- **Reproduced:** `RTW3_LS_SHIPTYPES=010101,000000,nosync,nohash` (A's flags as after a 1935 month, B's 0, the RC's
+  rules): DESYNC at minute 113, the call sites part inside `SetMistakenType` (B's extra draws at rva 0x619d9c,
+  0x619dd8, 0x619e3b), Painlevé (a French carrier) identified as a light carrier on A and a heavy cruiser on B.
+- **Fix:** A's start carries the three flags (`st=`, every start, resync and rejoin); B sets them before the load and
+  gets its own back when the battle ends ("lockstep: ship-type flags 000000 here, Admiral's 010101: the load and the
+  battle use Admiral's"); the flags are in the state hash (a difference is a READY mismatch at the load: with
+  `nosync` alone both strike battles were given up after "the loaded battles differ"). With `010101,000000` (the fix)
+  `lockstep_strike` and `lockstep_air` ran without a DESYNC.
+- **Guard:** the leak check (`ls leakcheck 1`, on in every live battle of the suite) now hashes the simulation's set of
+  `IdentifiedAsType` between the steps: a display write of the identification into the simulation's set is a LEAK
+  `(ident)` (`ls testident <ship> <type>` provokes one; `ls leakcheck ident 0` turns it off). First catch: the suite's
+  own `ls testcurspeed` took the leak check's new baseline with the display set in place (a false LEAK of three
+  enemies' identification in `lockstep_ui` j/k); the baseline is now taken with the simulation's set in place.
+- **The software maths, offline** (a 32-bit test program with build.bat's compiler running the 11 routines' exact x87
+  instruction sequences under the battle's control word 0x27F against softmath.h; truth from mpmath; 20 million
+  arguments per range: small, large, tiny, denormal, near multiples of pi/2, every ArcTan2 quadrant, logarithms near 1
+  and at or below 0, F2XM1's range). Before the fix (max error against the CPU's result, in ulps of a double): Exp 6
+  (|x| < 10) to 352 (|x| < 700), Sin/Cos up to 15884 for |x| in 10..1e6 and 4e13 relative near multiples of pi/2,
+  Tan 1.84, ArcTan2 1.27 (1.40 at 20M), ArcSin(Single) 1.74, Ln 0.81, ArcTan 0.76; garbage for huge arguments
+  (sin(1e19) = 1.6e237, sin(1e300) NaN, cos(1e300) -inf); 45 edge cases differed (cos(pi/2), sin(pi), tan(1),
+  tan(pi/2), the out-of-range rules, NaN pairs). The large differences are the CPU's: FSIN/FCOS/FSINCOS/FPTAN reduce
+  with a 66-bit pi (0x3243F6A8885A308D3 * 2^-64, confirmed: 0.43-0.53 ulp of the 64-bit result on 48 arguments up to
+  k = 10^12; no other precision fits) and the game's Exp rounds `x*log2(e)` and `1 + F2XM1` to 53 bits. softmath.h now
+  reproduces both, the out-of-range rules (|x| >= 2^63: Sin and Cos return the argument, Tan the indefinite NaN,
+  SinCos the argument as the cosine and NaN as the sine), fdlibm's tangent kernel, an ArcTan2 with the division's
+  remainder, FPATAN's NaN-pair rule, Ln of a negative NaN and ArcTan2(+-1, -denormal). After (20M per range, 0x27F):
+  | Routine | max ulp (64-bit) | max ulp (double) | double differs | class/sign |
+  |---|---|---|---|---|
+  | Exp | 2048 | 1.000 | 2.7e-6 | 0 |
+  | Sin, Cos, SinCos | 1740 | 0.850 | 3.3% (0.02% near k*pi/2) | 0 |
+  | Tan | 1843 | 0.900 | 3.6% | 0 |
+  | ArcTan2 | 1737 | 0.848 | | 0 |
+  | ArcSin(Single) | 1742 | 0.851 | | 0 |
+  | Ln, ArcTan | 1861, 1732 | 0.909, 0.846 | | 0 |
+  388 edge cases bit-identical (also under 0x37F). Exp's rare 1-ulp differences: 1 + F2XM1 within 1e-4 ulp of a
+  rounding midpoint where this CPU's F2XM1 is half an ulp off (no software can predict it). 32-bit MSVC had computed a
+  few final operations on the x87 (results depending on the precision control): forced to SSE2. Cost per call (ns,
+  before/after): sincos 34/33, sin 33/30, atan2 31/35, tan 35/40, exp 8/52 (about 40 Exp calls per battle).
+- **In-game self-test** (`ls x87 selftest`, logged at install): under 0x27F, now with sincos and atan2 and arguments
+  at multiples of pi/2 and 45 degrees: `exp 0 cos 1 sin 1 ln 1 atan 1 tan 1 sincos 1 atan2 1` (AMD).
+- **A/B, the battles' oddities:** with the CPU's own maths (`RTW3_LS_X87SOFT=0`, the final engine) one strike battle
+  had no search report in 150 minutes (07:00 start) and in another a formation of B launched from the strike dialog
+  went from readying straight to gone (never flew): both oddities happen with the hardware maths too, so they are the
+  battles' own conditions (the distance and the hour against 150 minutes of 150 nm search, the game's handling of a
+  readying strike), not the maths; the suite's checks b) and f) are too strict for them. Software battles: reports
+  within 50-155 minutes when found; the same "no report" case at 06:49, 06:53 and 13:32 starts.
+- **Policy:** the software maths stays on in every live battle. It now matches the CPU's own results to within one
+  ulp of a double everywhere and every special case exactly, costs nothing measurable, and the CPU vendor alone
+  doesn't promise equal x87 results (microcode and generations differ; the vendor stays in the hello and the READY
+  diagnostics). `RTW3MP_TEST_X87SOFT=0` / `ls x87 soft 0` keep the CPU's maths for diagnosis.
+- **Runs** (final build dist_f41_5, every copy with `ls leakcheck 1`): `lockstep_ui` 41/41, `twopc` 57/57 (G1, 383 s); `lockstep_strike` 19/19 (battle 1 06:47, reports in 60 minutes; battle 2 with the host option, the computer's carrier strike within 45 minutes) and `lockstep_air` 41/41 (G2, 644 s); `lockstep_strike` 17/19 and `lockstep_air` 41/41 (G3, 765 s: f) one formation of B launched from the dialog went from readying to gone, as with the hardware maths in H1; g) no computer carrier strike within 240 minutes of a 07:00 battle, as in the RC's air4 run: the battle's conditions); `lockstep_missiles` 23/23 (G4, the missile-era fixture, 137 s). No DESYNC, no LEAK, every minute equal and the identification equal in every strike battle (`ident_differ` empty). Four strike battles, two with the host option.
+- Diagnosis runs on the way (dist_rc041_1, dist_f41_1..4): D1, R1/R1b (the `ls shiptypes` gate, then the READY
+  mismatch), R1c (the reproduction), F1/F2 (build 4: twopc 57/57, lockstep_air 41/41, the false LEAK above), H1/H2
+  (hardware maths). Game open: 4628 s in all. Not pushed.
+
+## Testing 2026-10-22: the 0.4.1 release candidate 2 dist_rc041_2 (v0.4.1)
+Regression agent, branch `reg-041c` from rel-041 f1fad94. The frozen build `dist_rc041_2` (f1fad94: 0.4.1, live-battle
+engine 17, protocol 3) installed with `--dist`; the released 0.4.0 (`dist_vp_2`) put back after every run; slots 1 and 9
+and the Preferences identical to the pre-run copies after every run (MD5); no copy, proxy or folder copy left. Game open
+11,492 s in all.
+- **Runs** (checks passed; game open):
+  - The default run: 736/736 (1846 s).
+  - `--stress` with the missile fixture: 1021/1025 (6209 s). PASS: `twopc` full 77/77, `lockstep_stress` 101/101 (S8),
+    `lockstep_resume` 37/37, `lockstep_torpedo` 19/19, `air_units` 12/12, `lockstep_air` 41/41, `lockstep_strike` 21/21,
+    `lockstep_month` long 70/70, `lockstep_pvp` 27/27, events 27/27 and every default scenario but `battles`. The four
+    fails were the suite's (below).
+  - Re-runs of the affected scenarios: `battles`, `lockstep_rejoin`, `lockstep_missiles`, `lockstep_strike` 161/163 (2000
+    s; two more suite issues, fixed); `lockstep_strike`, `lockstep_rejoin` 74/76 (1050 s; strike 21/21 with a battle
+    replaced; the fails: the product issue below, counted by `lockstep_rejoin` and `session`).
+  - `lockstep_month --stress`: 86/86 (144 s).
+  - Mixed versions at level 17 (`mixed_041.py`, the 0.4.0 game in a folder copy, deleted): a) 0.4.1 host, 0.4.0 player
+    22/22 (145 s: "Captain: mod 0.4.0, live-battle engine 14 (this host: 17)", the month, the host's battle against the
+    player fought against the computer naming levels 14 and 17); r) 0.4.0 host, 0.4.1 player 25/25 (98 s: "mod 0.4.1,
+    live-battle engine 17 (this host: 14)", the player's intelligence kept as 0.4.0's, the battle to the computer with
+    both levels). Nothing stuck, no game box.
+- **The fix of f1fad94:** no DESYNC and no LEAK in any live battle, six strike battles among them (and three replaced).
+- **Suite issues** (fixed on `reg-041c`, the affected scenarios re-run):
+  - `lockstep_strike` b), f), g) and the battles' own conditions (RC 1 and the fix's runs): a battle without a report
+    on a screen within 150 minutes is replaced once (two 07:0x battles found nothing: no search aircraft aloft); f)
+    is now two checks, the lockstep part strict, and a formation the game takes away before take-off on both copies
+    alike is a NOTE (its base, states, aircraft; seen for one formation in two battles), the dark excuses one on deck at
+    the end, a side none of whose formations flew is a SKIP-note; the cycle runs a minute at a time while a formation
+    is in the air, and with no attack seen a strike that reached its target point (10 nm) is a SKIP-note (re-run 1:
+    four flew 6 -> 8, none seen at 7 in 3-minute samples); g) checks the carrier strike when the battle can show one (a
+    report by day with an hour left), else another battle once (re-run 1: 07:00..11:01 without contact, replaced: a
+    strike in 50 minutes), then a SKIP-note; every minute equal is its own check.
+  - `battles` b): since 0.4.1 an avoided battle's VP gain is merged; the stress run's month merged battle 1 (avoided,
+    VP 360/0) before battle 2, and the check added battle 2's deltas only (374 = 360 + 14).
+  - `lockstep_rejoin` b): RejoinTick can start the battle again right at the boundary of the minute A waited for,
+    before the minute gate logs "the next minute is held"; a start at the next minute counts.
+  - `lockstep_missiles` f) and d): the manual salvos (the both-step's lone ones released on a retry too) can empty a
+    side's launchers ("nothing to fire (no missiles are left in that launcher)", "the launcher is destroyed", every
+    shooter at 0): a SKIP-note; d) tries a silent side once by hand at the end (a salvo there is still a FAIL).
+  - Month checks: the joined player's own monthly check (the game's CheckIntelligence on its PC, since 0.4.1) can add a
+    report it already has (`lockstep_rejoin` M1: "spy event, 4 new reports", 11 entries, 10 distinct; the mod adds none
+    itself, the next load drops repeats): a repeat up to that check's new reports is a NOTE.
+- **Product issue to follow up** (once, re-run 2): the third copy (k2, a fresh process, nation 2) showed the game box
+  "Error in AdjustForcesForBattle procedure! Access violation at address 0096C748 in module 'RTW3.exe'. Read of address
+  02EBC02F" in `DoBattle` of the relayed battle of `lockstep_rejoin` e) (`battles injectpvp`, its player copy in slot
+  86); the game caught it, the battle ran, and every check of it passed. 0096C748 lies among the System string routines
+  (`@UStrAsg` 0096BCCC): a bad string pointer, like the older SaveBuildCampaign box. Not seen in any earlier run of the
+  session; whether it predates 0.4.1 is open.
+- **Verdict: GO** for 0.4.1 with dist_rc041_2: the RC 1 blocker is gone, every other fail was the suite's and passed on
+  re-run, mixed versions work; the AdjustForcesForBattle box is rare, caught by the game and harmless in the run, to be
+  investigated after the release. Not pushed.

@@ -1,8 +1,11 @@
 #include "session.h"
+#include "datafiles.h"
 #include "game.h"
 #include "lockstep.h"
+#include "nationplay.h"
 #include "net.h"
 #include "saveio.h"
+#include "x87.h"
 #include <iterator>
 #include <tuple>
 #include <climits>
@@ -128,6 +131,7 @@ static long long g_clientIdStart = 0;
 static bool g_haveState = false;
 static bool g_submitted = false;
 static bool g_forceSubmitPending = false;
+static bool g_submitForcedByHost = false;  // the host's time limit ran out: submit without the Turn's questions
 static std::string g_pendingState;
 static int g_remoteRemaining = -1;
 static Phase g_remotePhase = Phase::Lobby;
@@ -156,6 +160,7 @@ struct BattleReq {
     // player commands the other side from its PC (B); the host relays their messages.
     bool pvp = false;
     std::string player2;
+    bool avoided = false;  // the enemy declined battle on the player's PC (the player's VP gain was merged, 0.4.1)
 };
 static std::vector<BattleReq> g_battles;
 static int g_battleNextId = 1;
@@ -451,6 +456,7 @@ static void LoadReservations() {
     g_warVP.clear();
     g_treaties.clear();
     g_enemyVPSeen = -1;
+    if (g_hostSlot > 0) nplay::HostAttach(game::SaveDir(g_hostSlot), CampaignKey());  // the joined nations' own records
     std::string s;
     if (g_hostSlot <= 0 || !ReadFileBytes(SessionFile(), s)) return;
     KV kv = KVDecode(s);
@@ -1247,6 +1253,10 @@ static void HostApplyEvent(Player& p, const KV& kv) {
         if (f.size() == 2 && kSet.count(f[0]) && game::AdjustNationField(K, f[0], atoi(f[1].c_str()), false))
             applied += " " + f[0] + "=" + f[1];
     }
+    if (KVInt(kv, "intel")) {  // the player's monthly spying check (the game's other branch of its event slot)
+        nplay::HostAttach(game::SaveDir(g_hostSlot), CampaignKey());
+        nplay::HostTakeIntelEvent(kv, K, applied);
+    }
     g_lastHostEvent = "nation=" + std::to_string(K) + " event=" + KVStr(kv, "event") + applied;
     Log("event of %s (nation %d, #%s '%s'):%s", p.name.c_str(), K, KVStr(kv, "event").c_str(),
         KVStr(kv, "caption").substr(0, 60).c_str(), applied.empty() ? " no effects" : applied.c_str());
@@ -1260,6 +1270,9 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
         Notice("Cannot package the game for " + p.name + ": " + err);
         return;
     }
+    // The player's own intelligence (spending, effort, reports) instead of the host's (nationplay.cpp).
+    nplay::HostAttach(dir, CampaignKey());
+    nplay::HostTransformState(b, p.nation);
     KV h;
     h["seq"] = std::to_string(g_seq);
     h["nation"] = std::to_string(p.nation);
@@ -1267,6 +1280,7 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     h["year"] = std::to_string(y);
     h["month"] = std::to_string(m);
     h["remaining"] = std::to_string(RemainingSec());
+    h["intel"] = "1";  // per-player intelligence: the player's turn carries its own (0.4.0 peers ignore the key)
     std::string payload = PackHB(KVEncode(h), b.Pack());
     if (payload.size() > net::MaxMessageBytes()) {
         Notice("The month is too large to send to " + p.name + " (" + std::to_string(payload.size() >> 20) +
@@ -1587,8 +1601,11 @@ static bool FinishBattlePhase() {
     }
     for (auto& r : g_battles) {
         if (r.state == 2) {
-            AddChat("* The battle of " + CampaignNationName(r.human) + " against " + CampaignNationName(r.opp) + " in " +
-                    W2U(r.area) + " was fought by " + r.player + ".");
+            AddChat("* " + (r.avoided ? "The " + CampaignNationName(r.opp) + " navy declined battle against " +
+                                            CampaignNationName(r.human) + " in " + W2U(r.area) + "."
+                                      : "The battle of " + CampaignNationName(r.human) + " against " +
+                                            CampaignNationName(r.opp) + " in " + W2U(r.area) + " was fought by " +
+                                            r.player + "."));
             continue;
         }
         if (r.state != 3) continue;
@@ -1630,8 +1647,10 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
     for (auto& r : g_battles) {
         if (r.id != id || r.state != 1 || r.peer != p.peer) continue;
         std::string outcome = KVStr(h, "outcome");
+        // "avoided" (0.4.1): the enemy declined battle on the player's PC (no battle, the player's VP gain is applied).
+        bool avoided = outcome == "avoided";
         Bundle b;
-        if (outcome != "fought" || !b.Unpack(body)) {
+        if ((outcome != "fought" && !avoided) || !b.Unpack(body)) {
             BattleFallback(r, outcome == "declined"   ? p.name + " declined it"
                               : outcome == "nobattle" ? "no battle came about"
                                                       : "it was not fought (" + KVStr(h, "why", outcome) + ")");
@@ -1654,9 +1673,11 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
             return;
         }
         r.state = 2;
+        r.avoided = avoided;
         g_battleMerged = true;
         if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
-        Log("battle %d applied: %s (player: %s)", id, summary.c_str(), KVStr(h, "summary").c_str());
+        Log("battle %d applied: %s (player: %s)%s", id, summary.c_str(), KVStr(h, "summary").c_str(),
+            avoided ? "; the enemy declined battle" : "");
         const std::string* deltas = b.Get("deltas");
         KV dk = deltas ? KVDecode(*deltas) : KV();
         CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K")), std::max(0, KVInt(dk, "dVP_J")));
@@ -1697,6 +1718,7 @@ static void RunHostTurn() {
         return;
     }
     std::wstring dir = game::SaveDir(g_hostSlot);
+    nplay::HostAttach(dir, CampaignKey());
     int merged = 0;
     for (auto& s : g_submissions) {
         auto it = g_players.find(s.first);
@@ -1704,6 +1726,7 @@ static void RunHostTurn() {
         std::string err;
         if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err)) {
             merged++;
+            nplay::HostTakeSubmission(s.second, it->second.nation);  // its own intelligence spending and reports
         } else {
             Log("host turn: %s's turn NOT applied: %s", it->second.name.c_str(), err.c_str());
             AddChat("* Could not apply " + it->second.name + "'s turn: " + err);
@@ -2092,6 +2115,13 @@ static void HostOnMessage(net::Msg& m) {
             p->mod = KVStr(kv, "mod").substr(0, 24);
             Log("%s: mod %s, live-battle engine %d (this host: %d)", name.c_str(), p->mod.c_str(), p->lsLevel,
                 MP_LS_LEVEL);
+            {
+                std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
+                std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
+                Log("%s: CPU %s (this host: %s); game data files %s", name.c_str(), cpu.empty() ? "?" : cpu.c_str(),
+                    x87::CpuVendor().c_str(),
+                    dh.empty() || mine.empty() ? "not compared yet" : dh == mine ? "the same as this host's" : "DIFFERENT");
+            }
             // A returning player gets their nation back. Once the session runs, the campaign is the host's even while
             // its strategic screen is hidden (a battle).
             if (CampaignLoaded() || (g_phase != Phase::Lobby && g_hostSlot > 0 && game::NationCount() >= 9)) {
@@ -2106,6 +2136,8 @@ static void HostOnMessage(net::Msg& m) {
             w["peer"] = std::to_string(m.peer);
             w["host"] = g_myName;
             w["name"] = name;
+            w["cpu"] = x87::CpuVendor();  // (the player's log names both)
+            if (datafiles::Ready()) w["dh"] = datafiles::Combined();
             net::Send(m.peer, net::MSG_WELCOME, KVEncode(w));
             AddChat("* " + name + " joined" + (p->nation > 0 ? " as " + CampaignNationName(p->nation) : ""));
             BroadcastLobby();
@@ -2286,6 +2318,9 @@ static void ClientApplyPendingState() {
     g_haveState = true;
     g_submitted = false;
     g_forceSubmitPending = false;
+    g_submitForcedByHost = false;
+    // A host with per-player intelligence sent this nation's own spending and reports (the header's `intel`).
+    nplay::ClientSetMonth(nation, KVInt(h, "intel") != 0, g_clientSlot);
     g_remoteRemaining = KVInt(h, "remaining", -1);
     g_date = DateStr(KVInt(h, "year"), KVInt(h, "month"));
     game::SetTurnButtonCaption(L"Submit");
@@ -2382,6 +2417,7 @@ static void ClientStartBattle() {
     auto sw = [K](int v) { return v == 0 ? K : v == K ? 0 : v; };
     AddChat("* Battle! " + W2U(game::NationName(0)) + " meets " + KVStr(h, "oppName") + " in " + W2U(area) + ".");
     int setups = game::DoBattleCalls();
+    int vp0 = game::NationVP(0);  // the player's nation is nation 0 in the battle slot
     bool started = game::StartPlayerBattle(sw(a), sw(bb), area);
     bool entered = game::DoBattleCalls() != setups;  // the game set the battle up (its preview was shown)
     if (g_role != Role::Client || g_cb.id != id) {  // the session ended during the battle preview
@@ -2391,6 +2427,26 @@ static void ClientStartBattle() {
     g_cb.starting = false;
     if (!started || !game::BattleActive()) {
         bool declined = entered && !game::BattleActive();
+        int gain = game::NationVP(0) - vp0;
+        if (!entered && gain > 0 && !KVInt(h, "pvp")) {
+            // The enemy declined battle (the game's AIDeclinesBattle before any preview: "The <nation> navy declines
+            // battle! You gain N VP!"): as in single player there is no battle and the player keeps the points. Before
+            // 0.4.1 this was "no battle came about" and the host let the game resolve it as a battle between AI nations.
+            std::string after, summary, err;
+            Bundle res;
+            game::SaveGame();
+            if (ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", after) &&
+                saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err)) {
+                SendBattleResult(id, "avoided", "", &res, summary);
+                AddChat("* The " + KVStr(h, "oppName") + " navy declined battle: " + W2U(game::NationName(0)) + " gains " +
+                        std::to_string(gain) + " VP.");
+            } else {
+                SendBattleResult(id, "nobattle", "cannot read the result: " + err, nullptr, "");
+                AddChat("* No battle came about; the game resolves it.");
+            }
+            LeaveBattleSlot();
+            return;
+        }
         SendBattleResult(id, declined ? "declined" : "nobattle", "", nullptr, "");
         AddChat(declined ? "* You declined the battle; the game resolves it." : "* No battle came about; the game resolves it.");
         LeaveBattleSlot();
@@ -2528,6 +2584,27 @@ static void UpdateEventCooldowns(int month) {
     g_evUsedMonth = month;
 }
 
+// The other branch of the game's monthly event slot (CheckTurnEvents: about one month in three a random event, else
+// the player's intelligence check): the player's spying as the game does it for its player, with this nation seen as
+// the player (nationplay.cpp). The results go to the host at once, as an event's do.
+static void ClientIntelCheck() {
+    if (!nplay::ClientIntelActive()) return;
+    KV kv;
+    std::vector<std::string> reports;
+    std::string summary;
+    int seq = g_clientSeq;
+    bool send = nplay::ClientRunIntel(g_myNation, kv, reports, summary);
+    Log("intel: monthly check for nation %d: %s", g_myNation, summary.c_str());
+    for (auto& r : reports) AddLocalChat("* Intelligence report: " + r);
+    if (!send) return;
+    kv["seq"] = std::to_string(seq);
+    kv["nation"] = std::to_string(g_myNation);
+    kv["event"] = "-1";
+    kv["caption"] = "Intelligence";
+    net::Send(0, net::MSG_EVENT, KVEncode(kv));
+    game::RefreshUI();
+}
+
 // forcedIdx >= 0: that event now (tests). Otherwise this month's roll: once per calendar month, even if the month
 // is sent again (rejoin, nation pick, a turn that didn't advance).
 static void ClientRunEvent(int forcedIdx) {
@@ -2546,6 +2623,7 @@ static void ClientRunEvent(int forcedIdx) {
         g_evRolledMonth = month;
         SaveEventCooldowns();
         if (std::uniform_int_distribution<int>(0, 99)(g_rng) >= g_eventChancePct) {
+            ClientIntelCheck();
             g_lastEvent = "none";
             Log("event: no event this month");
             return;
@@ -2662,6 +2740,8 @@ static void ClientOnMessage(net::Msg& m) {
             kv["pw"] = g_password;
             kv["battles"] = g_fightBattles ? "1" : "0";
             kv["ls"] = g_lsEnabled && lockstep::Available() ? std::to_string(AnnouncedLsLevel()) : "0";  // engine level
+            kv["cpu"] = x87::CpuVendor();  // (logged by both sides: a live battle's diagnostics name differing vendors)
+            if (datafiles::Ready()) kv["dh"] = datafiles::Combined();  // the game data files (logged; checked at a start)
             net::Send(0, net::MSG_HELLO, KVEncode(kv));
             Notice("Connected, waiting for the host...");
             break;
@@ -2672,6 +2752,7 @@ static void ClientOnMessage(net::Msg& m) {
             g_role = Role::None;
             g_phase = Phase::Lobby;
             g_haveState = false;
+            nplay::ClientReset();
             game::SetTurnButtonCaption(L"Turn");
             net::Shutdown();
             lockstep::OnPeerLost("the connection to the host was lost");
@@ -2689,6 +2770,13 @@ static void ClientOnMessage(net::Msg& m) {
             std::string assigned = KVStr(kv, "name", g_myName);
             if (assigned != g_myName) AddChat("* That name was taken; you joined as " + assigned);
             g_myName = assigned;
+            {
+                std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
+                std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
+                Log("joined %s: CPU %s there (this PC: %s); game data files %s", KVStr(kv, "host").c_str(),
+                    cpu.empty() ? "?" : cpu.c_str(), x87::CpuVendor().c_str(),
+                    dh.empty() || mine.empty() ? "not compared yet" : dh == mine ? "the same as the host's" : "DIFFERENT");
+            }
             AddChat("* Joined " + KVStr(kv, "host") + "'s game");
             Notice("Joined. Pick a nation in the list and press Claim nation.");
             break;
@@ -2760,6 +2848,7 @@ static void ClientOnMessage(net::Msg& m) {
         case net::MSG_FORCE_SUBMIT:
             if (g_haveState && !g_submitted) {
                 g_forceSubmitPending = true;
+                g_submitForcedByHost = true;
                 Notice("Time is up: submitting your turn now.");
                 SubmitTurn();
             }
@@ -2790,6 +2879,8 @@ void Init() {
     if (AnnouncedLsLevel() != MP_LS_LEVEL)
         Log("TEST: RTW3MP_TEST_LS_LEVEL: this copy announces live-battle engine %d (its own is %d)", AnnouncedLsLevel(),
             MP_LS_LEVEL);
+    // The month's news about a joined nation's foreign stations and trade protection goes to its player.
+    nplay::SetNewsSink([](int nation, const std::string& line) { g_playerNews[nation].push_back(line); });
     lockstep::Hooks lh;
     // A live battle's lines are this PC's own: the host's AddChat would send every "* " line to all players (the other
     // player then read the host's side's game texts and pause reasons, and its own lines twice); the other player gets
@@ -2945,6 +3036,7 @@ bool Join(const std::string& name, const std::string& ip, int port, const std::s
     Leave();
     g_myName = CleanName(name);
     g_password = password;
+    if (g_lsEnabled) datafiles::StartScan();  // (the game data files' hash: a live battle's start compares it)
     if (!net::Connect(ip, (uint16_t)port, err)) return false;
     g_role = Role::Client;
     g_phase = Phase::Lobby;
@@ -2980,6 +3072,9 @@ void Leave() {
     g_eventRollSeq = -1;
     g_submissions.clear();
     g_haveState = g_submitted = false;
+    g_submitForcedByHost = false;
+    nplay::HostDetach();
+    nplay::ClientReset();
     g_pendingState.clear();
     g_hostWantsTurn = g_turnRunning = g_afterTurnPending = false;
     g_autoStart = false;
@@ -3212,6 +3307,15 @@ void SubmitTurn() {
         Notice("Another game is loaded; cannot submit.");
         return;
     }
+    // The game's Turn asks its player about missing trade protection and foreign stations (PlayerChecksBeforeTurn);
+    // the player's Submit asks the same for the player's nation, with the same choice to go back (not when the host's
+    // time limit submits).
+    if (!g_submitForcedByHost && !nplay::ClientTurnWarnings(g_myNation)) {
+        if (!g_submitForcedByHost) g_forceSubmitPending = false;  // (the time limit may have run out meanwhile)
+        Notice("Not submitted: you chose to go back at the game's warning. Press Submit when your orders are ready.");
+        Log("submit: cancelled at a Turn warning");
+        return;
+    }
     game::SaveGame();
     Bundle b;
     std::string err;
@@ -3219,6 +3323,7 @@ void SubmitTurn() {
         Notice("Cannot package your turn: " + err);
         return;
     }
+    nplay::ClientAddSubmission(b, game::SaveDir(g_clientSlot), g_clientSlot, g_myNation);  // own intelligence
     KV h;
     h["seq"] = std::to_string(g_clientSeq);
     h["nation"] = std::to_string(g_myNation);
@@ -3343,6 +3448,10 @@ void DebugEvent(int forcedIdx) {
 }
 
 void DebugEventChance(int pct) { g_eventChancePct = std::max(0, std::min(100, pct)); }
+
+void DebugIntelCheck() {
+    if (g_role == Role::Client && g_haveState && !game::EventActive()) ClientIntelCheck();
+}
 
 std::string DebugLastEvent() { return g_role == Role::Host ? g_lastHostEvent : g_lastEvent; }
 

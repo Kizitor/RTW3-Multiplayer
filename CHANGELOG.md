@@ -9,6 +9,125 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.4.1 (2026-10-22)
+Fixes from the reports of two players who played 0.3.2 on two PCs: live battles between two PCs, each player's own
+relations, and each player's own intelligence and trade protection warnings. **Both players of a live battle need
+0.4.1** (live-battle engine 17): until both have it, their battles are fought against the computer or resolved by the
+game, and the chat says why. **Update the host and the joined players:** a joined player on 0.4.1 sees their own
+relations under any host, but their own intelligence and a battle that the computer's navy declines need 0.4.1 on
+the host and on the player's PC, and the month's trade protection and foreign station warnings for joined players
+come from a host on 0.4.1. The protocol is still 3.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.4.1)
+
+### Added
+- **The same maths on every CPU.** Intel and AMD processors can round the game's sine, cosine and arctangent slightly
+  differently, and the battle uses them for bearings, formations, hit chances and the sun. In a live battle both PCs
+  now compute them the same way, so two different processors load and play the same battle. The results match the
+  processor's own to the last digit of a double for every argument, including the processor's own rounding of angles
+  near right angles and its handling of special values (checked on millions of arguments). In tests this cost no
+  measurable speed.
+- **The game data files are compared** when a live battle starts. If a file of the game's `Data` folder differs
+  between the two PCs (a mod, a damaged or different install), the battle isn't tried: it is fought against the
+  computer, and both players' chat and notice name the files (for example "your game data files differ from
+  Admiral's: Data\Gundata.dat"). Ship drawings (`Data\Graphics`) don't count. When a player joins, the host's and the
+  player's logs also say whether their game data files are the same and name the other PC's processor maker.
+- **When the loaded battles differ,** the chat line and the notice on both PCs now say in a few words what differed,
+  short enough to read out: for example "the loaded battles differ: orders; CPUs AMD (Admiral), Intel (Captain)"
+  (positions, damage, ammunition, sightings, identification, orders, aircraft, torpedoes, forces, submarines, the
+  clock, the random numbers; the two processors' makers and floating-point settings when they differ). Both PCs also
+  write their reports (`ls_desync_*.txt`, next to the log), as they do when a running battle gets out of step: send
+  both with the logs when you report it.
+
+### Fixed
+- **Live battles with battleships, battlecruisers or carriers could go out of step** (a "DESYNC" and a short
+  resynchronisation). Whether a sighted ship can be mistaken for a battlecruiser or a carrier depends on which ship
+  types exist in the world, which the game works out only when it processes a month. The joined player's game never
+  does that, so it identified some sighted ships differently from the host's (a carrier as a heavy cruiser), and the
+  two battles drifted apart. Both PCs now use the host's.
+- **The second player's map showed the first player's view.** Their own ships stayed hidden under their division
+  flags until the first player's ships had seen them, the first player's ships were shown with their names, and both
+  maps showed every division's flag, so each player could see where the other's fleet was. Each player's map now
+  shows their own ships and flags, and the other side's ships only while they are sighted, never their flags.
+- **The second player's screen showed the first player's side while the battle loaded:** the map on the first
+  player's fleet and flags, and their nation's ensign at the top left. The battle screen now appears when the load is
+  done, with your own nation's ensign.
+- **Battle preferences.** The second player's PC took the first player's display options too (sound volume, colours,
+  range circles, dark mode) and missed *AI control*. Now exactly the first player's battle preferences that the
+  battle's rules use count on both PCs: *Realism*, *AI control*, *Floatplane launch*, line of sight, friendly torpedo
+  hits, autosave, and some message and sound options that change the battle's random numbers. Every other option
+  stays each player's own. The second player's PC holds the first player's in memory only and has its own back when
+  the battle ends.
+- **The battle screen's *Preferences* during a live battle** changed a battle preference on that PC only, which could
+  make the two PCs disagree. The battle preferences now stay as they are until the battle ends, and the chat says so;
+  display options change at once.
+- **Floating-point settings.** The second player's PC loaded the battle with its own processor settings for
+  floating-point numbers (the x87 control word, which drivers and other programs can change) and took the first
+  player's only after the load. Both PCs now use the first player's from the load on and put them back whenever
+  something changes them during the battle (the log says so).
+- **A joined player's tension bars showed the host's relations.** The tension panel, its war and alliance marks, the
+  flags' names and the *War results* box now show your own nation's relations: your tension with every other nation
+  (the host's nation takes the place of your own), your wars and your alliances. Before, you saw the host's: a war of
+  the host looked like yours, and your own wars didn't show. The map's strength bars are coloured by your tensions,
+  and a flag opens the data of the nation shown there. The line under your nation's name reads, for example,
+  "At war with Spain." (the game keeps the months at war for the host's nation only).
+- **An enemy that declined a battle still fought it.** When the computer's navy declines a battle against you ("The
+  ... navy declines battle! You gain N VP!"), there is now no battle and you keep the points, as in single player.
+  Before, the host's game then resolved the battle as one between computer nations, often with losses on both sides,
+  so a stronger player's navy never got to fight. This needs 0.4.1 on the host and on the player's PC.
+- **A joined player's intelligence was the host's.** The intelligence levels under the flags, the budget's
+  *Intelligence* line and the intelligence reports showed the host's; a change with + or - was lost, or changed the
+  host's spending on your own nation; your nation paid nothing for intelligence and got the computer's intelligence
+  money instead; and the monthly spying ran for your nation as for a computer nation. Now the spending, its effort,
+  the reports and the cost are your own, and your monthly spying check runs on your PC with the game's own messages,
+  for example about a caught enemy spy.
+- **Joined players got no trade protection or foreign station warnings.** *Submit* now asks the game's questions of
+  the *Turn* button when too few ships are on trade protection (at war) or on foreign stations; *No* goes back to
+  your planning. During the month the host runs the game's checks for every joined player's nation, with the game's
+  chances and consequences (for example lost prestige), and you get its messages as notices with the new month. The
+  budget panel's trade protection line shows your own nation's requirement.
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0 and 0.4.1 can join each other's hosts and play the campaign together.
+- Live battles need the same version on both players' PCs (live-battle engine 17), and a host on 0.4.0 or 0.4.1
+  requires its own: its own battle against a player on the other version is fought against the computer, and a
+  battle between two joined players is fought live only when both have the host's version, otherwise the game
+  resolves it. The chat and the players' notices name both versions. A host on 0.3.x checks no versions, as with
+  0.4.0 (see 0.4.0's *Compatibility*).
+- Your own relations need 0.4.1 only on your PC. A battle that the computer's navy declines needs 0.4.1 on the host
+  and on the player's PC; otherwise the game resolves it as before.
+- Intelligence and warnings:
+  - A host on 0.4.1 and a player on 0.4.0: the player's month holds their own intelligence (empty at first), but
+    there is no spying check and no question at *Submit*, and their spending changes are lost; their nation pays
+    nothing for intelligence and no longer gets the computer's intelligence money. The month's trade protection and
+    foreign station checks apply to their nation, and their messages arrive as chat lines.
+  - A host on 0.4.0 and a player on 0.4.1: the player sees the host's intelligence as in 0.4.0, and *Submit* asks the
+    trade protection and foreign station questions, but the month brings no warnings or consequences for their
+    nation.
+
+### Known issues
+- **"The loaded battles differ" on every attempt**, as the two players reported it, is not explained: tests ruled out
+  different CPUs, number formats, preferences, window sizes and network delays, and a difference in the game data
+  files now stops the battle before it loads. If it happens to you, the chat line and the notice say what differed:
+  send both PCs' `ls_desync_*.txt` reports and logs, or copy or read out that line.
+- The battle's message log tab lists the messages of both sides on both PCs, from the first player's point of view
+  (as before).
+- A few message and sound options are battle preferences in a live battle (the first player's count on both PCs),
+  because the game draws the battle's random numbers for them.
+- A joined nation's relations with computer nations still follow the game's rules for computer nations: small steps
+  without explanations on the player's screen, and wars that break out and end by the computer's rules, only while
+  the host's nation is at peace. A larger rework, with the player's own rules, peace terms and battles for joined
+  players, is being built for a later release.
+- The computer's money bonuses still reach joined nations: the monthly money that the game gives computer nations,
+  and "... has increased the naval budget to remain a global naval power."
+- For joined players, the intelligence reports that the game makes outside the spying check (for example about
+  another nation's inventions) reach only the host, what their nation knows about other navies' ships (classes,
+  aircraft) is still the host's, and the game moves ships on foreign stations to the areas that lack them for the
+  host's nation only.
+- Seen once in tests, at the start of a live battle between two joined players: the game's own box "Error in
+  AdjustForcesForBattle procedure! Access violation" on one player's PC. The game went on and the battle ran normally;
+  the cause is not known yet.
+- The known issues of 0.4.0 remain.
+
 ## 0.4.0 (2026-10-18)
 Live battles between players without most of their limits: air strikes and routine air operations, missiles, torpedo
 salvoes, force orders, auto-run, *Fastest available* and *Save* work for both players, and a player who drops out can

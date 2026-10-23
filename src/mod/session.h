@@ -102,6 +102,7 @@ void DebugReserve(int nation, const std::string& player);                       
 void DebugApplyDiplomacy();  // tests (host): run the month-end diplomacy step now
 void DebugEvent(int forcedIdx);  // tests (client): roll this month's event now (-1 = random, else that event)
 void DebugEventChance(int pct);  // tests (client): chance of an event per month (default 33)
+void DebugIntelCheck();          // tests (client): the monthly intelligence check now (the game's dialogs may show)
 std::string DebugLastEvent();    // tests: last event sent (client) or applied (host)
 std::string DebugWarVP(int a, int b, int va, int vb, bool set);  // tests (host): read or set a war's victory points
 std::string DebugTerms(int a, int b);                            // tests (host): the peace terms right now
