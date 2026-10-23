@@ -14,6 +14,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 - [Network setup](#network-setup)
 - [Hosting a session](#hosting-a-session)
 - [Joining a session](#joining-a-session)
+- [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)
 - [Diplomacy between players](#diplomacy-between-players)
 - [Tactical battles](#tactical-battles)
 - [Known limitations](#known-limitations)
@@ -36,20 +37,24 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 - Players can ally with each other, declare war and make peace with buttons in the Multiplayer window (see
   [Diplomacy between players](#diplomacy-between-players)). A war between players ends with peace terms for the
   winner, as in single player: land, ships and reparations.
+- Each joined player's nation follows the player's rules of single player with the computer's nations: its own
+  tension changes, war warnings, wars and peace, with their dialogs on that player's screen at the start of the month,
+  and the player's money rules (see
+  [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)).
 - Every player fights their own nation's tactical battles on their own PC; battles between players are fought live by
   both players at the same time (see [Tactical battles](#tactical-battles)).
 
 ## Requirements
 - Rule the Waves 3 version **1.01.44** from Steam, on Windows. Steam must be running when you play.
-- **Every player needs the same game version and the same mod version.** The host refuses a player whose game version
-  differs, or whose mod version can't play with the host's (see [CHANGELOG.md](CHANGELOG.md)).
+- **Every player needs the same game version, and should have the same mod version.** The host refuses a player whose
+  game version differs, or whose mod version can't play with the host's (see [CHANGELOG.md](CHANGELOG.md)).
 - A network between the players: Hamachi, ZeroTier, Radmin VPN or a real LAN. The host's PC must accept incoming
   connections (see [Network setup](#network-setup)).
 
 ## Install
 Every player:
 1. Close the game.
-2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.4.1-win32.zip`) from the
+2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.5.0-win32.zip`) from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract all its files into the
    game folder, next to `RTW3.exe`. When you update, replace the older files.
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
@@ -130,7 +135,9 @@ examples.
 2. Choose a nation in the list and press **Claim nation**. You can do this before the host has a campaign; your pick
    is matched when the host opens one. A refused pick is explained in the chat.
 3. When the host starts, the month loads automatically and you play as your nation. Your copy lives in save slot
-   `Game77` (your battles in `Game87`), so your own saves are never touched.
+   `Game77` (your battles in `Game87`), so your own saves are never touched. At the start of each month, first answer
+   your nation's dialogs: its random event, if any, and its relations (see
+   [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)).
 4. Plan your month and press **Submit**. You can keep changing orders and submit again until the host processes the
    turn. Like the game's **Turn** button, **Submit** first asks whether to go on when too few of your ships are on
    trade protection (at war) or on foreign stations; **No** takes you back to your planning. (A submit forced by the
@@ -148,7 +155,8 @@ examples.
 
 Your screen shows your own nation's side of the campaign:
 - **Relations:** the tension panel, its war and alliance marks, the map's strength bars and the *War results* box
-  show your nation's relations, wars and alliances. The host's nation takes your own nation's place in the panel.
+  show your nation's relations, wars and alliances. The host's nation takes your own nation's place in the panel. The
+  line under your nation's name counts your nation's own months at war ("At war for N months.") or at peace.
 - **Intelligence:** the levels under the flags and their + and - buttons, the budget's *Intelligence* line and the
   intelligence reports are your own, and your nation pays for its spending. Your monthly spying check runs on your
   PC, with the game's own messages.
@@ -156,12 +164,82 @@ Your screen shows your own nation's side of the campaign:
   **Submit** asks the game's questions (step 4), and the host's month gives your nation the game's warnings and
   their consequences (for example lost prestige), which you get as notices with the new month.
 
-Your relations need 0.4.1 on your PC; your intelligence and the month's warnings need it on the host too (see
+Your relations on the screen need 0.4.1 or newer on your PC, and your own months at war need 0.5.0 on your PC and on
+the host; your intelligence and the month's warnings need 0.4.1 or newer on the host too (see
 [Upgrading from an older version](#upgrading-from-an-older-version)). What still comes from the host or the computer:
 see [Known limitations](#known-limitations).
 
 To test on one PC, run two copies of the game and join `127.0.0.1` (`RTW3MP_SecondCopy.bat` from the release starts
 the second copy). Both copies share one settings file, so the joining copy gets a numbered name (e.g. "Friend 2").
+
+## Your nation's relations, wars and money
+With 0.5.0 on the host and on your PC, your nation's relations with the computer's nations, its wars, its peace and
+its money follow the player's rules, as when you play your nation in single player. The computer's rules for the
+nations it plays no longer decide them. (With an older version on either PC, your nation keeps the computer's rules
+for its relations, and with an older host for its money too: see [Known limitations](#known-limitations).)
+
+**The start of your month.** When the new month loads, your game first shows the messages of your nation's money
+rules from the month just processed, if any (in the game's turn report: see *Money* below), then rolls for your
+random event, then runs your nation's relation routines, and you answer their dialogs on your own screen:
+- random tension changes, with the game's explanations, your leader's speeches, and other nations' questions and
+  alliance offers (only in a month without a random event, as in single player);
+- the effect of previous wars on tension;
+- war plans with your spies' warnings and rumours, declarations of war ("Russia has declared war on us!"), and
+  nations that join a war against you or on your side;
+- at war with a computer nation, the game's peace offer, when it makes one (see *Peace* below).
+
+Then the game's turn report lists the month's messages (for example "Tension with Spain is reduced as they do not
+want to raise tensions with a strong nation."). The host applies the results at once, before it runs the month. Its
+screen shows none of your dialogs, and everyone's chat gets a line for a new war ("* War: Russia and Germany are now
+at war.") or a peace. Answer the dialogs while the host still waits for the month's turns: if the host starts the
+month first (its time limit, or **Advance turn now**), they don't count for that month. The routines run only on your
+PC, so they don't run in a month in which you aren't connected. If the host's game stops during the month, the host
+keeps what it has applied: it saves its campaign right after applying your relation turn or peace (while one of its
+game's dialogs is open, as soon as it closes).
+
+**Wars.** A war between your nation and a computer nation comes by these rules: the computer nation plans it (your
+spies may warn you) and declares it when tension is high enough, and other nations may join either side. The host's
+month no longer starts or ends your wars by the computer's rules. Your nation counts its own months at war or at
+peace (the line under your nation's name), and your events and relation routines go by it.
+
+**Peace.** As in single player, your nation makes peace with all the computer's nations at war with it at once, in
+one of two ways:
+- **The game's peace offer:** at the start of a month at war, the game can bring you its peace event, and you answer
+  it as in single player.
+- **Propose peace:** the **Diplomacy** list of the Multiplayer window has a row for each computer nation at war with
+  you (player "computer", relation "At war", and your war score against it, *VP yours:theirs*). Select it, press
+  **Propose peace** and confirm: the game's own peace talks start at once, with their dialogs on your screen. Your
+  proposal is the game's offer of a compromise peace, and the enemy can refuse it. You can propose once a month,
+  after the month's relation dialogs and before you submit, and not in a month in which you answered a peace offer.
+  Single player has no such button.
+
+The terms are the game's, with its dialogs: possessions you gain (you choose them in "Select possessions as part of
+peace agreement") or cede, ships you hand over when you lose, base resources, prestige, and the end of your months at
+war and of the blockades. The host applies them at once, so the possessions and ships change hands for everyone, and
+the chat shows the treaty ("* Peace treaty between Germany and Spain: Germany wins.") or that the negotiations came
+to nothing. Your war score against a computer nation counts the battles since the war began, as in a war between
+players, and the game weighs it when it decides on its peace offers. A peace with the computer's nations doesn't end
+your wars with other players (see [Diplomacy between players](#diplomacy-between-players)); while one goes on, your
+nation stays at war: its months at war, budget, unrest and blockade stay as they are.
+
+**Money.** The host's month gives your nation the balance of its budget at the player's prices, as the game does for
+the player in single player, and the player's money rules, with your nation's own months at war:
+- war loans during a war;
+- penalties for debts (lost prestige and morale), and the money lost to corruption;
+- cuts when your nation hoards money: budget cuts, money taken, and army offensives that take a tenth of your budget
+  for some months (your budget screen shows the cut);
+- at peace, the rules for a small fleet: complaints, and budget changes (for example when another nation threatens
+  yours);
+- under a naval treaty, the player's budget cut (two steps).
+
+Their messages come at the start of the new month, in the game's turn report. The bonuses that the computer gives
+the nations it plays no longer reach your nation (a monthly sum that grows with the fleet, "... has increased the
+naval budget to remain a global naval power."), and the computer no longer decides for your nation in the host's
+month: it doesn't halt or resume your ships under construction, set your doctrine or ammunition, send ships home
+from colonies, order and pay for escorts and ASW patrols, change your air groups, offer the host technology deals in
+your name, buy scrapped ships with your money, scrap your armed merchant cruisers after a peace, or, when you play
+China, cut its base resources and budget by its concessions rule. The money rules need 0.5.0 only on the host. A few
+of the game's rules still work differently for joined nations: see [Known limitations](#known-limitations).
 
 ## Diplomacy between players
 Human players decide war and alliances with each other themselves; they don't have to wait for the relation
@@ -183,14 +261,22 @@ relation, the tension value of the relation bar, and anything pending. Select a 
 - Agreements made with the buttons are kept: an alliance between players doesn't run out and the AI never cancels it.
   A war declared with the buttons lasts until both players agree to peace, even if the game's own peace routines
   would end it (for example a peace treaty the host signs with an AI nation, which in Rule the Waves ends all of the
-  host's wars at once).
-- The relation bar keeps working as in single player: tension still rises and falls, and the game can still start
-  wars on its own (rising tension, or an ally being drawn into a war). Those wars can be ended with **Propose peace**
-  too.
-- AI nations are unchanged: they get no buttons, and their diplomacy (with each other and with the players) is decided
-  by the game as in single player.
+  host's wars at once, or a joined player's peace with the computer's nations).
+- The relation bar keeps moving as in single player: the joined players' relation routines, the host's and the events
+  still raise and lower the tension between players. But a joined player's nation that follows the player's rules
+  (0.5.0 on the host and on that player's PC) never goes to war with another player's nation by itself: such a war
+  starts only with **Declare war**. Under an older host, or with an older version on the joined player's PC, the
+  nation keeps the computer's rules, and the game can still start a war between it and another player's nation on
+  its own (rising tension, or an ally being drawn into a war). Those wars can be ended with **Propose peace** too.
+- Computer nations can join a war between players on either side, as other nations join the player's wars in single
+  player (the host is told, for example, "Spain has entered the war against you on Germany's side!").
+- Computer nations get no buttons, except **Propose peace** in the rows of the computer's nations at war with a
+  joined player (see [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)). Their
+  diplomacy with each other and with the host's nation is decided by the game as in single player, and with a joined
+  player's nation by the player's rules on that player's PC.
 - When the host makes peace with its last enemy, the game's normal end-of-war routine runs on the host (budget cut,
-  released prisoners, and the usual messages).
+  released prisoners, and the usual messages). A joined player's peace with the computer's nations runs it on that
+  player's PC.
 
 ### Peace terms between players
 A war between two players ends like a war against the AI in single player: the side that is clearly ahead wins
@@ -249,15 +335,17 @@ fight the same battle **at the same time**, each on their own PC and each comman
 players in the battle need **Fight my battles** on (the host's own box makes no difference; it only applies when
 joining a session). If it is off, the host fights its battle against that nation's ships under computer control, and a
 battle between two joined players' nations is resolved by the game.
-- **Same mod version:** a live battle needs the same mod version on both players' PCs, and a host on 0.4.0 or newer
-  checks it for every live battle: its own battle against a player on another version is fought against the
-  computer, and a battle between two joined players is resolved by the game unless both have the host's version. The
-  chat and the players' notices say why, naming both versions ("live battles need the same mod version on both PCs:
-  ..."), and the month goes on. A host on 0.3.x checks no versions: when it fights its own battle against a player on
-  0.4.0 or newer, the player's game refuses the battle with a notice, its chat naming both live-battle levels, and the
-  host's computer fights the player's side. Two joined players with the same version (0.4.0 or newer) fight their
-  battle against each other live under such a host, which only passes its messages on; a player who drops out of it
-  doesn't get their ships back (see [Known limitations](#known-limitations)).
+- **Same live-battle engine:** a live battle needs the same live-battle engine on both players' PCs. 0.4.1 and 0.5.0
+  have the same one, older versions others. A host on 0.4.0 or newer checks it for every live battle: its own battle
+  against a player with another engine is fought against the computer, and a battle between two joined players is
+  resolved by the game unless both have the host's engine. The chat and the players' notices say why, naming both
+  versions (from a host on 0.5.0, for example "live battles need the same live-battle engine on both PCs: the host has
+  0.5.0 (engine 17), you have 0.4.0 (engine 14)"; older hosts say "the same mod version"), and the month goes on. A
+  host on 0.3.x checks no versions: when it fights its own battle against a player on 0.4.0 or newer, the player's
+  game refuses the battle with a notice, its chat naming both live-battle levels, and the host's computer fights the
+  player's side. Two joined players with the same engine (0.4.0 or newer) fight their battle against each other live
+  under such a host, which only passes its messages on; a player who drops out of it doesn't get their ships back
+  (see [Known limitations](#known-limitations)).
 - **Same game data files:** when a live battle starts, the two PCs compare the files of the game's `Data` folder
   (ship drawings aside). If one differs (a mod, an older or damaged install), the battle is fought against the
   computer, and the chat and the notice name the files.
@@ -336,8 +424,9 @@ game resolves the battle.
 **Getting your ships back:** join the session again with the same name while the battle goes on (start the game
 again first if it stopped; if you are still connected, press *Leave*, then *Join game*). You get your nation back,
 the battle loads on your PC (also from the title screen), and you command your ships again from its next minute. The
-battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0,
-the same version as yours; otherwise the computer keeps your ships (a host on 0.4.0 tells you why).
+battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0 or
+newer with the same live-battle engine as yours (0.4.1 and 0.5.0 have the same one); otherwise the computer keeps your
+ships (a host on 0.4.0 or newer tells you why).
 
 **When the host's game stops** (it crashes or is closed) during its live battle against a joined player, the joined
 player's game leaves the battle and the session. To go on:
@@ -383,8 +472,10 @@ players' nations for the rest of that month. A battle between two joined players
   so the mod fills in a joined player's.) Points the host's enemies score outside battles (blockades, sinkings,
   control of sea areas) are shared evenly among the host's enemies when the host fights several nations at once. VP
   go back to 0 when a nation's last war ends.
-- **Decided by the game for joined nations:** diplomacy with AI nations and new aircraft types. Diplomacy between
-  players is decided with the buttons.
+- **Decided by the game for joined nations:** new aircraft types (the computer develops their prototypes and licences)
+  and the first air groups of newly launched carriers. Diplomacy between players is decided with the buttons, and a
+  joined nation's relations with the computer's nations by the player's rules on its player's PC (see
+  [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)).
 - **Design studies of joined players** count down every month on the host, including the game's occasional one-month
   "technical issues" delay, and the player is told in the Multiplayer chat when a design is ready for construction.
   The game's random committee and Air Force events about design studies only happen for the host's nation.
@@ -392,38 +483,59 @@ players' nations for the rest of that month. A battle between two joined players
   number of months as in single player, and the player is told in the Multiplayer chat.
 - **Random events of joined players** ("Event - ..." dialogs) appear on the joined player's own screen at the
   start of a month, about one month in three, and the player answers them as in single player. The answer changes
-  their own nation (budget, prestige, unrest, ...) and their relations with the other nations. Events about the host's
-  own war (peace offers, army offensives), arms-control treaties, colonial rebellions and sabotage of another navy's
-  ships only happen for the host's nation. While their nation is at war, the game only has war events, so joined
-  players at war get no random events. Officer messages and the other monthly messages also stay with the host,
-  except the spying check's and the trade protection and foreign station warnings (see
-  [Joining a session](#joining-a-session)).
+  their own nation (budget, prestige, unrest, ...) and their relations with the other nations. Events about an army
+  offensive, arms-control treaties, colonial rebellions and sabotage of another navy's ships only happen for the
+  host's nation. While their nation is at war, the game only has war events: joined players at war get the game's
+  peace offers of their wars with the computer's nations (see
+  [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)), but no other random events.
+  Officer messages and the other monthly messages also stay with the host, except the spying check's, the trade
+  protection and foreign station warnings (see [Joining a session](#joining-a-session)), and the messages of the
+  player's relation routines and money rules.
 - **Not transferred from joined players:** officers, divisions, and changes to air units (1920s+). Ships, designs,
   budget, research, training, doctrine, deployments, forts and base improvements are transferred.
 - **Your relations and intelligence on your screen** are your own nation's (see
-  [Joining a session](#joining-a-session)). The line under your nation's name names your enemy instead of the months
-  at war, which the game keeps only for the host's nation. The intelligence reports that the game makes outside the
-  spying check (for example about another nation's inventions) reach only the host, and what your nation knows about
-  other navies' ships (classes, aircraft) is the host's. The Diplomacy list in the Multiplayer window shows your own
-  relations with the other players.
-- **Your relations with computer nations** change by the game's rules for computer nations, not by the player's:
-  tension moves in small steps without explanations on your screen, a war between your nation and a computer nation
-  breaks out by the computer's rule and only while the host's nation is at peace, and it ends by the computer's own
-  peace (also only while the host is at peace). The war warnings, tension messages, peace offers and peace terms of
-  single player are the host's. Your battles against computer nations come from the game's battles between computer
-  nations: when your ships and theirs meet in an area. Your relation with the host's nation follows the host's. A
-  larger rework, with the player's own rules, peace terms and battles for joined players, is being built for a later
-  release.
-- **Money of joined nations:** the game still treats a joined nation's money partly as a computer nation's. It gets
-  the computer nations' monthly sum, which grows with the fleet, and now and then a raised naval budget ("... has
-  increased the naval budget to remain a global naval power."); and while its monthly balance is negative and its
+  [Joining a session](#joining-a-session)). Unless the host and your PC have 0.5.0, the line under your nation's name
+  names your enemy instead of the months at war, which the game keeps only for the host's nation. The intelligence
+  reports that the game makes outside the spying check (for example about another nation's inventions) reach only the
+  host, and what your nation knows about other navies' ships (classes, aircraft) is the host's. The Diplomacy list in
+  the Multiplayer window shows your own relations with the other players.
+- **Not yet for joined nations** (planned for a later version): the effects of a war that the game runs only for the
+  host's nation: victory points for blockades, the raider and submarine war on merchant shipping, the help of allies
+  ("The operations of our ally ... adds N VP"), and surprise attacks and landings, which are switched off for joined
+  nations until then. In a war with the host's nation, the game's rules for a revolution in an enemy nation and for
+  the war help of allies still treat a joined nation as a computer nation, and a joined nation's army offensive gives
+  no victory points. A joined nation has no total war of its own either (the game keeps that state for the host's
+  nation), so its peace offers follow the rules of a war that isn't total.
+- **Your battles against computer nations** still come from the game's rules for battles between computer nations:
+  when your ships and theirs meet in an area. The game's battle rules for the player (invasions, raider
+  interceptions, battles in home waters and at possessions) don't run for joined nations yet. When the computer's
+  navy declines a battle, there is no battle (see [Battles against AI nations](#battles-against-ai-nations)).
+- **With an older version on the host or on your PC** (0.4.1 or older), your relations with computer nations change
+  by the game's rules for computer nations, not by the player's: tension moves in small steps without explanations on
+  your screen, a war between your nation and a computer nation breaks out by the computer's rule and only while the
+  host's nation is at peace, and it ends by the computer's own peace (also only while the host is at peace). The war
+  warnings, tension messages, peace offers and peace terms of single player are the host's, and your relation with
+  the host's nation follows the host's.
+- **Money of joined nations:** under a host on 0.5.0 it follows the player's rules (see
+  [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)), with a few exceptions. The
+  corruption question isn't asked for joined nations: the money is lost, and "improve accounting" isn't available.
+  The Air Force's event of 1950 to 1975 isn't run for them. Some of the computer's rules still apply: budget cuts that
+  come with high unrest, the world economy's changes of base resources, coups (the government changes without the
+  player's dialog), and a few smaller budget rules, which follow the computer's version or the host's months at war.
+  Under a host on 0.4.1 or older, the game treats a joined nation's money partly as a computer nation's: it gets the
+  computer nations' monthly sum, which grows with the fleet, and now and then a raised naval budget ("... has
+  increased the naval budget to remain a global naval power."), and while its monthly balance is negative and its
   funds are low, the game can halt its most expensive ship under construction. The game also moves ships on foreign
   stations to the areas that lack them only for the host's nation.
+- **A host restart during a month:** if the host's game stops after applying a joined player's relation turn or peace
+  but before saving it (for example while one of its dialogs is open), that change is lost for the month, never
+  applied twice. Ships that a joined player scraps in a peace come back if the host restarts in the same month.
 - **Resigning** is not possible during a session: leave the session first.
 - **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
-  play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same mod version
-  on both players' PCs, and a host on 0.4.0 or newer pairs only players with its own version (see
-  [Battles between players](#battles-between-players-live)). Joined players use save slot 77, and slot 87 for their
+  play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same live-battle
+  engine on both players' PCs (0.4.1 and 0.5.0 have the same one), and a host on 0.4.0 or newer pairs only players
+  with its own (see [Battles between players](#battles-between-players-live)). Joined players use save slot 77, and
+  slot 87 for their
   battles.
 - **A host on 0.3.x** passes on the live battles between two joined players on 0.4.0, but can't start such a battle
   again for a player who dropped out: the computer keeps that player's ships to the end of the battle, although the
@@ -443,8 +555,9 @@ players' nations for the rest of that month. A battle between two joined players
 - **The log** is `Documents\My Games\Rule the Waves 3\RTW3MP\rtw3mp.log`; `rtw3mp.prev.log` is the log of the start
   before. Add it when you report a problem.
 - **No Multiplayer button:** check that `version.dll` and `RTW3MP.dll` are both next to `RTW3.exe`. Some antivirus
-  programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name); restore it or add an exception for
-  the game folder.
+  programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name), and Windows Defender once removed a
+  test build of `RTW3MP.dll` as `Trojan:Win32/Phonzy.A!ml` (a guess of its machine learning); restore the file or add
+  an exception for the game folder.
 - **You can't connect:** check that you're in the same Hamachi network and that the firewall allows `RTW3.exe`. Then
   test with the host's 25.x.x.x IP.
 - **"The host refused the connection: ..."**
@@ -472,8 +585,9 @@ players' nations for the rest of that month. A battle between two joined players
 - **"... your game data files differ ..." in the chat:** a file of the game's `Data` folder isn't the same on the two
   PCs (a mod, an older or damaged install), so the live battle is fought against the computer. The message names the
   files: make them the same on both PCs (Steam's *Verify integrity of game files* puts back the original ones).
-- **"... live battles need the same mod version" in the chat:** both players of a live battle need the same mod
-  version, and a host on 0.4.0 or newer needs both on its own; until then, such battles are fought against the
+- **"... live battles need the same live-battle engine" in the chat** (from a host on 0.4.1 or older: "... the same
+  mod version"): both players of a live battle need versions with the same live-battle engine (0.4.1 and 0.5.0 have
+  the same one), and a host on 0.4.0 or newer needs both on its own; until then, such battles are fought against the
   computer or resolved by the game. See [Upgrading from an older version](#upgrading-from-an-older-version).
 - **The computer took over your ships in a live battle, or the host's game stopped during one:** see
   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops).
@@ -490,6 +604,21 @@ players' nations for the rest of that month. A battle between two joined players
   has room for: open its air group and move squadrons to the reserve.
 
 ### Upgrading from an older version
+- **0.5.0** plays with 0.4.1, 0.4.0 and 0.3.x (protocol 3). Everyone should update, the host too:
+  - A joined player's own relations, wars, months at war and peace with the computer's nations need 0.5.0 on the host
+    and on that player's PC. Until both have it, the player's nation keeps the computer's rules for its relations, as
+    in 0.4.1 (see [Known limitations](#known-limitations)).
+  - The money rules for joined nations need 0.5.0 only on the host, and apply to every joined nation; a player on
+    0.4.x doesn't get the messages of those rules.
+  - 0.4.1 and 0.5.0 have the same live-battle engine (17), so their players fight their live battles live, with each
+    other and under a host on either version. A player on 0.4.0 (engine 14) or older can't fight a live battle with a
+    host or player on 0.5.0: the chat says why (from a host on 0.5.0: "live battles need the same live-battle engine
+    on both PCs: ..."), and the battle is fought against the computer or resolved by the game.
+  - Existing campaigns go on from where they are: your nation keeps its relations, wars and money (nothing is taken
+    back). Its months at war or at peace start from a guess: the host's count when the host's nation is also at war
+    (or also at peace), else 1 month at war or 12 months at peace. The war score of a war with a computer nation that
+    is already going on starts at 0:0, and the effect of previous wars on tension counts only the wars that end from
+    now on. Ships that the computer halted for your nation stay halted: resume them yourself.
 - **0.4.1** plays with 0.4.0 and 0.3.x (protocol 3). Everyone should update, the host too:
   - A live battle needs 0.4.1 on both players' PCs, and a host on 0.4.0 or 0.4.1 pairs only players with its own
     version: until everyone has updated, a battle between versions is fought against the computer or resolved by the

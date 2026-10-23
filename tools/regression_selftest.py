@@ -553,6 +553,45 @@ def intel_samples():
           (R.intel_panel_bad(1, names, rv, ii), R.intel_panel_bad(0, names, view(0), host_ii)))
 
 
+def relations_samples():
+    """Relations v2 (0.5.0): the joined player's own events of the new month change nation 1's pairs after the host's
+    month (event_tension_changes, read by relrules_month_check), in log order, both pair orders, other nations' events
+    left out."""
+    hl = ("22:25:56.596 [47160] event of Captain (nation 1, #-1 'Intelligence'): tension 1-4 3->4 intel: 0 reports\n"
+          "22:26:43.264 [47160] event of Captain (nation 1, #34 'A new Government (wants) to reduce: naval'): tension "
+          "1-2 10->11 tension 1-3 3->4 tension 4-1 4->5\n"
+          "22:26:44.000 [47160] event of Bot (nation 2, #5 'XX appears'): tension 2-3 7->9\n"
+          "22:26:45.000 [47160] second event of Captain in Aug 1900 ignored (one per month)\n")
+    got = R.event_tension_changes(hl)
+    check('event_tension_changes: nation 1\'s event tension changes in log order (the intelligence result, a random event '
+          'with "(" and ":" in its caption, j-1 as 1-j), another nation\'s event and an ignored second event left out',
+          got == [(4, 3, 4), (2, 10, 11), (3, 3, 4), (4, 4, 5)] and R.event_tension_changes(hl, 2) == [(3, 7, 9)], got)
+    el = ("22:27:19.165 [47160] economy: nation 1 (Germany) 1901-01: funds 10505 -> 13780 (balance +3275 at the player's "
+          "prices, maintenance +0); withheld: subsidy 150; the player's money rules (war counter -72): debt none; army "
+          "offensive 0 month(s) (budget -0), ParliamentDelay 0; month's end funds 13780 (other changes +0); left out for "
+          "the player: escorts/ASW 0\n"
+          "22:28:06.358 [47160] economy: nation 1 (Germany) 1901-01: no ComputeExpenses; withheld: subsidy 0; the player's "
+          "rules: preeminence 0 (+0), war start +1 (computer's +2); month's end funds unknown; left out for the player: 0\n")
+    pat = R.ECON_LINE_RE.format(n=1, date=re.escape('1901-01'))
+    lines = R.log_lines(el, pat)
+    m = re.search(pat, lines[-1]) if lines else None
+    check('ECON_LINE_RE: the month\'s own economy line of nation 1 (funds a -> b, the month\'s end funds and other '
+          'changes), not the "no ComputeExpenses" line of a war that started after the month\'s end, not nation 2',
+          len(lines) == 1 and m and m.groups() == ('10505', '13780', '13780', '+0')
+          and not R.log_lines(el, R.ECON_LINE_RE.format(n=2, date=re.escape('1901-01'))), (lines, m and m.groups()))
+
+    def copy_war(war, k_at_war, kwar):
+        src = {'General': {'War': str(war), 'EnemyVP': '0'}, 'Nation0': {'Tension': '0'},
+               'Nation1': {'Tension': '0', 'AITension2': '50' if k_at_war else '3', 'VP': '0'},
+               'Nation2': {'Tension': '3', 'AITension1': '50' if k_at_war else '3', 'VP': '7'}}
+        return R.expected_copy(src, 1, None, kwar)[0]['General']['War']
+    got = [copy_war(-1, False, 0), copy_war(-1, False, None), copy_war(5, False, -3), copy_war(-1, True, 4),
+           copy_war(-1, True, -2), copy_war(5, False, 2)]
+    check('expected_copy (0.5.0): the copy\'s [General] War = K\'s own war counter when it agrees with K\'s wars (0 at '
+          'peace after the last war, -3, 4 at war), else the host\'s guess (-1; -12 after the host\'s war; 1 at war)',
+          got == ['0', '-1', '-3', '4', '1', '-12'], got)
+
+
 def tracefiles(sandbox):
     d = os.path.join(sandbox, 'traces')
     os.makedirs(d)
@@ -952,6 +991,7 @@ def main():
     samples()
     twopc_samples()
     intel_samples()
+    relations_samples()
     sandbox = os.path.abspath('regression_selftest_sandbox')
     if os.path.exists(sandbox):
         shutil.rmtree(sandbox)

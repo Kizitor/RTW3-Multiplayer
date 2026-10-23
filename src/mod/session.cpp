@@ -1,5 +1,6 @@
 #include "session.h"
 #include "datafiles.h"
+#include "economy.h"
 #include "game.h"
 #include "lockstep.h"
 #include "nationplay.h"
@@ -33,6 +34,7 @@ struct Player {
     int lsLevel = 0;        // its live-battle engine level (hello `ls`; 0.3.x: 1; 0 = no live battles)
     std::string mod;        // its mod version (hello)
     int offeredSerial = -1;  // the last rejoinable battle offered to this player (lockstep RejoinInfo.serial, phase 5b)
+    int relLevel = 0;        // relations v2: the player's PC runs the player's relation routines (hello `rel`; 0 = no)
 };
 
 // The ten nations of the game, offered for lobby picks before the host has a campaign.
@@ -121,6 +123,32 @@ static int g_doctrineSeq = -1;                            // month (g_seq) whose
 static std::map<int, std::vector<std::string>> g_playerNews;  // nation -> lines for its player
 static std::map<int, std::vector<std::string>> g_treatyNews;  // nation -> peace treaty for its player's dialog
 static std::mt19937 g_rng((unsigned)(GetTickCount() ^ (GetCurrentProcessId() << 16)));
+// The war counter of each joined player's nation (relations v2, B1), kept as the game keeps nation 0's ([General] War):
+// months at war (> 0) or at peace (<= 0). Stepped once per month by the host; saved with the month; sent with it.
+static std::map<int, int> g_kWar;                         // nation -> counter
+static int g_kWarSteppedSeq = -1;                         // the month (g_seq) whose processing last stepped them
+// The joined nations whose relations follow the player's rules (relations v2, B2: the last player who held the nation
+// runs the player's relation routines; kept per campaign), and the ones a test switched on (bridge `relrules`).
+static std::set<int> g_relNations, g_relForced;
+// Relations v2, B3 (host): each such nation's own per-relation state, kept for it as the game keeps nation 0's in the
+// other nations' records: their war plans against it (WillGoToWar) and its tech-sharing deals (TechSharing), nine values
+// each, saved with the month; its past wars (opponent, end as Year*12+Month, winner 1 it / 2 the other / 0 unknown) and
+// its enemies of the last month (a war that ended goes into the history).
+static std::map<int, std::vector<int>> g_kWill, g_kTs;
+struct KPastWar {
+    int opp, end, winner;
+};
+static std::map<int, std::vector<KPastWar>> g_kHist;
+static std::map<int, std::set<int>> g_kEnemies;
+// nation -> Year*12+Month of its last relation turn applied (saved with the month: a host that hosts again in the same
+// month doesn't apply it a second time)
+static std::map<int, int> g_kRelMonth;
+static std::string g_lastHostRelations;
+// Relations v2, B4 (host): each such nation's month whose peace with the computer's nations was settled (a proposal, or a
+// peace event of its turn): one a month (saved with the month, as g_kRelMonth). Its war score with each computer nation
+// lives in g_warVP (LedgerPair).
+static std::map<int, int> g_kPeaceMonth;
+static std::string g_lastHostPeace;
 
 static std::pair<int, int> PairKey(int a, int b) { return {std::min(a, b), std::max(a, b)}; }
 
@@ -141,6 +169,24 @@ static std::vector<PlayerView> g_lobbyPlayers;
 static bool g_remoteCampaignReady = false, g_remoteCampaignLoaded = false;
 static std::string g_myWant;
 static bool g_fightBattles = true;  // fight this nation's battles against AI nations (sent with the hello)
+// Relations v2, B3 (client): the month whose player's relation routines are still to run (the host's header `rel`),
+// the month whose event dialog was shown (the game gives the player one of the two a month), the setup from the header.
+static int g_relTurnSeq = -1;
+static int g_evShownSeq = -1;
+static game::PlayerTurnSetup g_relSetup;
+static std::string g_lastRelations = "none";
+// Relations v2, B4 (client): the host applies this nation's peace with the computer's nations (its header's kvp); the war
+// scores of those wars (nation -> this nation's points, theirs); the month (Year*12+Month) in planning and the one whose
+// peace was settled here (a proposal or a peace event: one a month); a "Propose peace" waiting for an idle moment; the
+// next turn's forced peace event (tests); the last result; the Diplomacy rows of the computer's nations at war with it.
+static bool g_peaceHost = false;
+static std::map<int, std::pair<int, int>> g_peacePairs;
+static int g_peaceStateMonth = 0, g_peaceMonth = 0;
+static int g_peaceProposal = -1;
+static int g_forcedPeaceCode = 0;
+static int g_forcedPeaceChance = 0;  // tests: that event's NegotiatePeace chance (0: its answer's)
+static std::string g_lastPeace = "none";
+static std::vector<DiploRow> g_peaceRows;
 
 // Tactical battles of joined players (see game.cpp). Host: battles of a joined player's nation against an AI nation are
 // recorded during the month instead of being resolved by the game; after the month the host sends each one to its
@@ -210,6 +256,11 @@ static int g_evRolledMonth = 0;        // Year*12+Month whose event roll was mad
 static int g_eventChancePct = 33;      // chance of an event in a month (the game's own roll is about 1 in 3)
 static std::string g_lastEvent;        // summary of the last event (tests and log)
 
+// The messages of the player's economy rules the host ran for this PC's nation (the month's `econnews`), shown once in
+// the game's turn report before the month's event roll.
+static std::vector<std::wstring> g_econNews;
+static int g_econNewsSeq = -1;
+
 static const int kIdStride = 20000;
 
 static void Changed() {
@@ -264,10 +315,10 @@ static std::string LevelWhy(const Player& p, LevelReader r) {
     std::string lv = std::to_string(p.lsLevel), host = std::to_string(MP_LS_LEVEL);
     std::string who = r == LevelReader::Player ? "you" : p.name;
     std::string hostIs = r == LevelReader::Host ? "this host" : "the host";
-    if (p.mod != MP_MOD_VERSION)
-        return "live battles need the same mod version on both PCs: " + hostIs + " has " MP_MOD_VERSION
-               " (live-battle level " + host + "), " + who + (r == LevelReader::Player ? " have " : " has ") +
-               (p.mod.empty() ? std::string("an older one") : p.mod) + " (level " + lv + ")";
+    if (p.mod != MP_MOD_VERSION)  // (different mod versions can share an engine: 0.4.1 and 0.5.0 are both level 17)
+        return "live battles need the same live-battle engine on both PCs: " + hostIs + " has " MP_MOD_VERSION
+               " (engine " + host + "), " + who + (r == LevelReader::Player ? " have " : " has ") +
+               (p.mod.empty() ? std::string("an older one") : p.mod) + " (engine " + lv + ")";
     return (r == LevelReader::Player ? std::string("your") : p.name + "'s") + " mod plays live battles at level " + lv +
            ", " + (r == LevelReader::Host ? std::string("this host's") : std::string("the host's")) + " at level " + host +
            " (both mod " MP_MOD_VERSION ", but different builds): live battles need the same level on both PCs";
@@ -312,6 +363,12 @@ static std::string HostDate() {
     int y = 0, m = 0;
     if (g_hostSlot > 0) saveio::ReadDate(game::SaveDir(g_hostSlot), g_hostSlot, y, m);
     return DateStr(y, m);
+}
+
+static int HostMonth() {  // Year*12+Month of the host's save on disk, 0 if unknown
+    int y = 0, m = 0;
+    if (g_hostSlot > 0) saveio::ReadDate(game::SaveDir(g_hostSlot), g_hostSlot, y, m);
+    return y > 0 ? y * 12 + m : 0;
 }
 
 // A campaign is open on the strategic screen (also during the initial-fleet steps).
@@ -403,6 +460,98 @@ static void DecodeWarVP(const std::string& s) {
     }
 }
 
+static std::string EncodeKWar() {
+    std::string o;
+    for (auto& w : g_kWar) o += std::to_string(w.first) + ":" + std::to_string(w.second) + ",";
+    return o;
+}
+
+static void DecodeKWar(const std::string& s) {
+    g_kWar.clear();
+    for (auto& e : Split(s, ',')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2 || f[0].empty() || f[1].empty()) continue;
+        int n = atoi(f[0].c_str());
+        if (n >= 1 && n <= 8) g_kWar[n] = atoi(f[1].c_str());
+    }
+}
+
+// A month (Year*12+Month) per nation: "K:month,..." (g_kRelMonth, g_kPeaceMonth).
+static std::string EncodeMonthMap(const std::map<int, int>& m) {
+    std::string o;
+    for (auto& e : m)
+        if (e.second > 0) o += std::to_string(e.first) + ":" + std::to_string(e.second) + ",";
+    return o;
+}
+
+static std::map<int, int> DecodeMonthMap(const std::string& s) {
+    std::map<int, int> m;
+    for (auto& e : Split(s, ',')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2 || f[0].empty() || f[1].empty()) continue;
+        int n = atoi(f[0].c_str()), v = atoi(f[1].c_str());
+        if (n >= 1 && n <= 8 && v > 0) m[n] = v;
+    }
+    return m;
+}
+
+// Nine values per nation: "K:v0.v1...v8,..." (relations v2, the per-relation state of each nation under the player's rules).
+static std::string EncodeKArr(const std::map<int, std::vector<int>>& m) {
+    std::string o;
+    for (auto& e : m) {
+        o += std::to_string(e.first) + ":";
+        for (size_t i = 0; i < e.second.size(); i++) o += (i ? "." : "") + std::to_string(e.second[i]);
+        o += ",";
+    }
+    return o;
+}
+
+static std::vector<int> DecodeArr9(const std::string& s) {
+    std::vector<int> v(9, 0);
+    auto f = Split(s, '.');
+    for (size_t i = 0; i < f.size() && i < 9; i++) v[i] = atoi(f[i].c_str());
+    return v;
+}
+
+static std::map<int, std::vector<int>> DecodeKArr(const std::string& s) {
+    std::map<int, std::vector<int>> m;
+    for (auto& e : Split(s, ',')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2) continue;
+        int n = atoi(f[0].c_str());
+        if (n >= 1 && n <= 8) m[n] = DecodeArr9(f[1]);
+    }
+    return m;
+}
+
+static std::string EncodeKHist() {  // "K:opp.end.winner|opp.end.winner,..."
+    std::string o;
+    for (auto& e : g_kHist) {
+        o += std::to_string(e.first) + ":";
+        for (size_t i = 0; i < e.second.size(); i++)
+            o += (i ? "|" : "") + std::to_string(e.second[i].opp) + "." + std::to_string(e.second[i].end) + "." +
+                 std::to_string(e.second[i].winner);
+        o += ",";
+    }
+    return o;
+}
+
+static void DecodeKHist(const std::string& s, int nowMonth) {
+    g_kHist.clear();
+    for (auto& e : Split(s, ',')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2) continue;
+        int n = atoi(f[0].c_str());
+        if (n < 1 || n > 8) continue;
+        for (auto& w : Split(f[1], '|')) {
+            auto x = Split(w, '.');
+            if (x.size() != 3) continue;
+            KPastWar p{atoi(x[0].c_str()), atoi(x[1].c_str()), atoi(x[2].c_str())};
+            if (p.opp >= 0 && p.opp <= 8 && p.opp != n && (nowMonth <= 0 || p.end <= nowMonth)) g_kHist[n].push_back(p);
+        }
+    }
+}
+
 static std::string EncodeTreaties() {
     std::string o;
     for (auto& t : g_treaties) {
@@ -444,6 +593,18 @@ static void SaveReservations() {
     kv["enemyVPSeen"] = std::to_string(g_enemyVPSeen);
     kv["diplomacy"] = EncodeDipItems(g_dip);
     kv["treaties"] = EncodeTreaties();
+    kv["kwar"] = EncodeKWar();
+    kv["kecon"] = economy::EncodeState();  // the player's economy rules: each joined nation's own state
+    kv["kwill"] = EncodeKArr(g_kWill);
+    kv["kts"] = EncodeKArr(g_kTs);
+    kv["khist"] = EncodeKHist();
+    kv["krelm"] = EncodeMonthMap(g_kRelMonth);
+    kv["kpeacem"] = EncodeMonthMap(g_kPeaceMonth);
+    {
+        std::string rr;
+        for (int n : g_relNations) rr += std::to_string(n) + ",";
+        kv["relRules"] = rr;
+    }
     kv["diplomacyDate"] = HostDate();  // pending decisions belong to this month only
     WriteFileBytes(SessionFile(), KVEncode(kv));
 }
@@ -455,6 +616,16 @@ static void LoadReservations() {
     g_pactWars.clear();
     g_warVP.clear();
     g_treaties.clear();
+    g_kWar.clear();
+    g_kWarSteppedSeq = -1;
+    economy::ClearState();
+    g_relNations.clear();
+    g_kWill.clear();
+    g_kTs.clear();
+    g_kHist.clear();
+    g_kEnemies.clear();
+    g_kRelMonth.clear();
+    g_kPeaceMonth.clear();
     g_enemyVPSeen = -1;
     if (g_hostSlot > 0) nplay::HostAttach(game::SaveDir(g_hostSlot), CampaignKey());  // the joined nations' own records
     std::string s;
@@ -473,16 +644,31 @@ static void LoadReservations() {
     if (kv.count("turnLimitSec")) g_turnLimitSec = KVInt(kv, "turnLimitSec");
     g_pactAllies = DecodePairs(KVStr(kv, "pactAllies"));
     g_pactWars = DecodePairs(KVStr(kv, "pactWars"));
-    // War scores, pending decisions and agreed terms belong to the month they were saved with: an older save of the
-    // campaign would count its battles again (the scores then restart from the nations' points, see WarVP).
+    for (auto& e : Split(KVStr(kv, "relRules"), ',')) {
+        int n = atoi(e.c_str());
+        if (n >= 1 && n <= 8) g_relNations.insert(n);
+    }
+    DecodeKHist(KVStr(kv, "khist"), HostMonth());  // past wars: any save of the campaign (later ones dropped)
+    // War scores, pending decisions, agreed terms, the joined nations' war counters and economy state (ParliamentDelay,
+    // army offensive months) and the months whose relation turn and peace were applied belong to the month they were
+    // saved with: an older save of the campaign would count its battles and months again (the scores then restart from
+    // the nations' points, see WarVP; the counters from the nations' wars, see KWar). A host that hosts again in the same
+    // month applies no second relation turn or peace.
     if (KVStr(kv, "diplomacyDate") == HostDate()) {
         DecodeWarVP(KVStr(kv, "warVP"));
         g_enemyVPSeen = KVInt(kv, "enemyVPSeen", -1);
         g_dip = DecodeDipItems(KVStr(kv, "diplomacy"));
         DecodeTreaties(KVStr(kv, "treaties"));
-    } else if (!KVStr(kv, "diplomacy").empty() || !KVStr(kv, "warVP").empty()) {
-        Log("pending diplomacy and war scores from %s dropped (campaign is at %s)", KVStr(kv, "diplomacyDate").c_str(),
-            HostDate().c_str());
+        DecodeKWar(KVStr(kv, "kwar"));
+        economy::DecodeState(KVStr(kv, "kecon"));
+        g_kWill = DecodeKArr(KVStr(kv, "kwill"));
+        g_kTs = DecodeKArr(KVStr(kv, "kts"));
+        g_kRelMonth = DecodeMonthMap(KVStr(kv, "krelm"));
+        g_kPeaceMonth = DecodeMonthMap(KVStr(kv, "kpeacem"));
+    } else if (!KVStr(kv, "diplomacy").empty() || !KVStr(kv, "warVP").empty() || !KVStr(kv, "kwar").empty() ||
+               !KVStr(kv, "kecon").empty()) {
+        Log("pending diplomacy, war scores, war counters and economy state from %s dropped (campaign is at %s)",
+            KVStr(kv, "diplomacyDate").c_str(), HostDate().c_str());
     }
 }
 
@@ -540,14 +726,114 @@ static std::string PlayerNationLabel(const Player& p) {
 
 static bool IsHumanNation(int n) { return n == 0 || hookcb::IsHumanRemoteNation(n); }
 
+// ---------------------------------------------------------------------------------------------
+// The joined nations' war counters (relations v2, B1). The game counts nation 0's months at war or at peace in
+// [General] War: WarStartsWithNation sets 1 when it was <= 0, DoStrategicTurn adds 1 at war and subtracts 1 at peace,
+// DoPeace sets 0. The host does the same for each joined nation K: the month's step at the end of the month, then the
+// wars the month started or ended. A nation the host has no counter for yet (an existing campaign, a new player)
+// starts from its wars, with the host's counter as the best guess of how long (the guess the events always used).
+static int& KWar(int K) {
+    auto it = g_kWar.find(K);
+    if (it == g_kWar.end()) {
+        int host = game::WarCounter();
+        bool war = game::AtWarWithAnyone(K);
+        int start = war ? (host > 0 ? host : 1) : (host > 0 ? -12 : host);
+        Log("war counter of nation %d starts at %d (%s; the host's nation's: %d)", K, start, war ? "at war" : "at peace",
+            host);
+        it = g_kWar.emplace(K, start).first;
+    }
+    return it->second;
+}
+
+// A war of K started (1) or its last war ended (0) since the counter was stepped.
+static void KWarFollow(int K, const char* why) {
+    int& n = KWar(K);
+    bool war = game::AtWarWithAnyone(K);
+    int before = n;
+    if (war && n <= 0) n = 1;
+    if (!war && n > 0) n = 0;
+    if (n != before) {
+        Log("war counter of nation %d: %d -> %d (%s)", K, before, n, why);
+        if (n == 0) economy::OnWarChanged(K);  // its army offensive ends at the peace, as the game's at DoPeace
+    }
+}
+
+// Relations v2, B3: the wars of each joined nation that ended since the last look go into its history
+// (TensionEffectOfPreviousWars), with `nowMonth` (Year*12+Month) as the end.
+static void KHistUpdate(int nowMonth) {
+    for (int K = 1; K <= 8 && K < game::NationCount(); K++) {
+        if (!hookcb::IsHumanRemoteNation(K)) continue;
+        std::set<int> enemies;
+        for (int j = 0; j <= 8 && j < game::NationCount(); j++)
+            if (j != K && game::AtWar(K, j)) enemies.insert(j);
+        auto pe = g_kEnemies.find(K);
+        if (pe != g_kEnemies.end())
+            for (int j : pe->second)
+                if (!enemies.count(j)) {
+                    g_kHist[K].push_back({j, nowMonth, 0});
+                    Log("relations v2: the war of nation %d with nation %d ended; in its history", K, j);
+                }
+        g_kEnemies[K] = enemies;
+    }
+}
+
+// Host, once per processed month (g_seq: the month in planning when the Turn started; a resent month doesn't step),
+// after the month and the players' diplomacy, before the new month goes out.
+static void KWarMonthStep() {
+    if (g_kWarSteppedSeq == g_seq) return;
+    g_kWarSteppedSeq = g_seq;
+    for (int K = 1; K <= 8 && K < game::NationCount(); K++) {
+        if (!hookcb::IsHumanRemoteNation(K)) {
+            g_kWar.erase(K);  // a nation the computer plays has no counter of its own; a new player starts afresh
+            g_kWill.erase(K);
+            g_kTs.erase(K);
+            g_kEnemies.erase(K);
+            continue;
+        }
+        int& n = KWar(K);
+        int before = n;
+        n = n > 0 ? n + 1 : n - 1;
+        KWarFollow(K, "the month");
+        Log("war counter of nation %d: %d -> %d (%s, month %d)", K, before, n,
+            game::AtWarWithAnyone(K) ? "at war" : "at peace", g_seq);
+    }
+}
+
+// Relations v2, B2: a joined nation's relations follow the player's rules when its player's PC runs the player's
+// relation routines (hello `rel`). While the player is away the nation keeps what its last player announced (kept per
+// campaign); a nation given to the computer goes back to the computer's rules. Tests can switch it on (`relrules`).
+static void NoteRelRules() {
+    for (auto& kv : g_players) {
+        const Player& p = kv.second;
+        if (!p.connected || !p.welcomed || p.nation < 1 || p.nation > 8) continue;
+        bool on = p.relLevel >= 1, was = g_relNations.count(p.nation) > 0;
+        if (on == was) continue;
+        if (on)
+            g_relNations.insert(p.nation);
+        else
+            g_relNations.erase(p.nation);
+        Log("relations v2: nation %d follows the %s rules (%s)", p.nation, on ? "player's" : "computer's", p.name.c_str());
+    }
+}
+
 static std::string NationPlayerName(int n) {
     if (n == 0) return CleanName(g_myName) + " (host)";
     return ClaimedBy(n);
 }
 
+// Relations v2, B4: the war score of a joined nation under the player's rules (K) with a computer nation (J) is kept as
+// a war between two players' (g_warVP): the player's peace decision on K's PC weighs it (K's VP and EnemyVP there). A new
+// war starts at 0:0; the pair is erased at peace.
+static bool LedgerPair(int a, int b) {
+    auto one = [](int k, int j) {
+        return k >= 1 && k <= 8 && j >= 1 && j <= 8 && j != k && hookcb::PlayerRulesNation(k) && !IsHumanNation(j);
+    };
+    return one(a, b) || one(b, a);
+}
+
 // Victory points of a war between two players. A war seen for the first time starts from the nations' own points
-// when they fight nobody else (the game counts them per nation), otherwise from zero. `seeded` tells whether the
-// start came from the nations' points.
+// when they fight nobody else (the game counts them per nation), otherwise from zero (a war of the B4 ledger: zero).
+// `seeded` tells whether the start came from the nations' points.
 static std::pair<int, int>& WarVP(int a, int b, bool* seeded = nullptr) {
     auto key = PairKey(a, b);
     if (seeded) *seeded = false;
@@ -559,7 +845,7 @@ static std::pair<int, int>& WarVP(int a, int b, bool* seeded = nullptr) {
         return true;
     };
     int lo = key.first, hi = key.second, vLo = 0, vHi = 0;
-    if (onlyEnemy(lo, hi) && onlyEnemy(hi, lo)) {
+    if (!LedgerPair(lo, hi) && onlyEnemy(lo, hi) && onlyEnemy(hi, lo)) {
         if (seeded) *seeded = true;
         if (lo == 0) {
             vLo = std::max(0, game::NationVP(0));
@@ -571,6 +857,20 @@ static std::pair<int, int>& WarVP(int a, int b, bool* seeded = nullptr) {
     }
     Log("war score %d-%d starts at %d:%d", lo, hi, vLo, vHi);
     return g_warVP[key] = {vLo, vHi};
+}
+
+// Relations v2, B4: nation K's war scores with the computer's nations it is at war with (`pairs`: "J:K's:J's,..."),
+// summed: the player's VP and EnemyVP of K's peace decision.
+static void KLedger(int K, int& vp, int& evp, std::string* pairs) {
+    vp = evp = 0;
+    for (int j = 1; j <= 8 && j < game::NationCount(); j++) {
+        if (j == K || !LedgerPair(K, j) || !game::AtWar(K, j)) continue;
+        auto& w = WarVP(K, j);
+        int mine = K < j ? w.first : w.second, theirs = K < j ? w.second : w.first;
+        vp += mine;
+        evp += theirs;
+        if (pairs) *pairs += std::to_string(j) + ":" + std::to_string(mine) + ":" + std::to_string(theirs) + ",";
+    }
 }
 
 // What a peace between two players would bring now, with the thresholds of the game's own war-progress checks:
@@ -1141,9 +1441,11 @@ static void ApplyDiplomacy() {
         if (!keep) changed = true;
         return !keep;
     });
-    // Scores and terms of wars that are over (ended by the game, or a nation went back to the AI).
+    // Scores and terms of wars that are over (ended by the game, or a nation went back to the AI); the B4 ledger's wars
+    // of a nation under the player's rules with a computer nation stay while they last.
     for (auto it = g_warVP.begin(); it != g_warVP.end();)
-        if (!both(it->first.first, it->first.second) || !game::AtWar(it->first.first, it->first.second)) {
+        if (!(both(it->first.first, it->first.second) || LedgerPair(it->first.first, it->first.second)) ||
+            !game::AtWar(it->first.first, it->first.second)) {
             it = g_warVP.erase(it);
             changed = true;
         } else {
@@ -1263,6 +1565,347 @@ static void HostApplyEvent(Player& p, const KV& kv) {
     BroadcastLobby();
 }
 
+// Relations v2, B4 (host): the rest of a peace the player's PC made with the computer's nations (its relation changes
+// are applied by HostApplyRelations, as the routines'): possessions and ships with the game's own routines (a possession
+// must still have its owner, a ship must still be in its nation's list: else logged and skipped), the war state of the
+// possessions of the war, the other nations' changes (BudgetModifier only of a nation left without a war: the game's
+// peace demobilizes), blockades, the nation's VP (0 without a war, as the game's DoPeace does for the player), the
+// war scores, chat lines for everyone. No DoPeace on the host: that is the host's own end of war.
+static void HostApplyPeace(int K, const KV& kv, std::string& applied, std::vector<std::string>& chat) {
+    auto Nm = [](int n) { return n < 0 ? std::string("independence") : CampaignNationName(n); };
+    bool accepted = KVInt(kv, "paccepted") == 1;
+    int winner = KVInt(kv, "pwinner");
+    std::vector<int> enemies;
+    for (auto& e : Split(KVStr(kv, "penemies"), ','))
+        if (!e.empty() && atoi(e.c_str()) >= 1 && atoi(e.c_str()) <= 8 && atoi(e.c_str()) != K) enemies.push_back(atoi(e.c_str()));
+    int lands = 0, ships = 0, states = 0, nations = 0, skipped = 0;
+    auto skip = [&](const std::string& what, const std::string& why) {
+        skipped++;
+        Log("relations v2: peace of nation %d: %s skipped: %s", K, what.c_str(), why.c_str());
+    };
+    for (auto& rec : Split(KVStr(kv, "pland"), kSepRec)) {
+        auto f = Split(rec, kSepField);
+        if (f.size() < 4) continue;
+        int from = atoi(f[1].c_str()), to = atoi(f[2].c_str());
+        if (from < -1 || from > 8 || to < -1 || to > 8 || from == to) continue;
+        std::string why = game::MovePossession(U2W(f[0]), from, to, f[3] == "1");
+        if (!why.empty()) {
+            skip("possession " + f[0], why);
+            continue;
+        }
+        lands++;
+        applied += " land " + f[0] + " " + std::to_string(from) + "->" + std::to_string(to);
+    }
+    for (auto& rec : Split(KVStr(kv, "pships"), kSepRec)) {
+        auto f = Split(rec, kSepField);
+        if (f.size() < 6) continue;
+        int id = atoi(f[0].c_str()), from = atoi(f[1].c_str()), to = atoi(f[2].c_str());
+        if (from < 0 || from > 8 || to < 0 || to > 8 || from == to) continue;
+        std::string why = game::HandOverShip(id, from, to, U2W(f[3]), U2W(f[4]), U2W(f[5]));
+        if (!why.empty()) {
+            skip("ship " + f[0] + " (" + f[3] + ")", why);
+            continue;
+        }
+        ships++;
+        applied += " ship " + f[0] + " " + std::to_string(from) + "->" + std::to_string(to);
+    }
+    for (auto& rec : Split(KVStr(kv, "ptaken"), kSepRec)) {
+        auto f = Split(rec, kSepField);
+        if (f.size() < 6) continue;
+        game::PeaceTaken t;
+        t.name = U2W(f[0]);
+        t.owner = atoi(f[1].c_str());
+        t.takenFrom = atoi(f[2].c_str());
+        t.invaded = atoi(f[3].c_str());
+        t.support = atoi(f[4].c_str());
+        t.rebellion = atoi(f[5].c_str());
+        if (t.owner < -1 || t.owner > 8) continue;
+        std::string why = game::SetPossessionWarState(t);
+        if (!why.empty()) {
+            skip("war state of " + f[0], why);
+            continue;
+        }
+        states++;
+    }
+    std::set<int> changed;
+    for (auto& e : Split(KVStr(kv, "pdelta"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 3) continue;
+        int n = atoi(f[0].c_str()), d = atoi(f[2].c_str());
+        const std::string& field = f[1];
+        if (n < 1 || n > 8 || n == K || IsHumanNation(n) || !d) continue;
+        if (field == "BaseResources")
+            d = std::max(-5000, std::min(5000, d));
+        else if (field == "Prestige")
+            d = std::max(-20, std::min(20, d));
+        else if (field == "BudgetModifier" && !game::AtWarWithAnyone(n))
+            d = std::max(-10, std::min(10, d));
+        else
+            continue;
+        if (!game::AdjustNationField(n, field, d, true)) continue;
+        if (field == "Prestige" && game::NationIntField(n, "Prestige") < 0) game::AdjustNationField(n, "Prestige", 0, false);
+        changed.insert(n);
+        applied += " " + std::to_string(n) + ":" + field + (d > 0 ? "+" : "") + std::to_string(d);
+    }
+    for (auto& e : Split(KVStr(kv, "plost"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2) continue;
+        int n = atoi(f[0].c_str());
+        if (n < 1 || n > 8 || n == K || IsHumanNation(n)) continue;
+        if (game::SetNationFlag(n, "HasLostWar", atoi(f[1].c_str()) != 0)) {
+            changed.insert(n);
+            applied += " " + std::to_string(n) + ":HasLostWar=" + f[1];
+        }
+    }
+    nations = (int)changed.size();
+    std::vector<int> ended;  // the enemies K is at peace with now
+    for (int j : enemies)
+        if (!game::AtWar(K, j)) ended.push_back(j);
+    if (accepted && !ended.empty()) {
+        bool kWar = game::AtWarWithAnyone(K);
+        if (!kWar) {
+            game::SetNationFlag(K, "Blockaded", false);
+            if (game::NationVP(K) != 0) applied += " VP " + std::to_string(game::NationVP(K)) + "->0";
+            game::SetNationVP(K, 0);
+        }
+        for (int j : ended) {
+            if (!game::AtWarWithAnyone(j)) game::SetNationFlag(j, "Blockaded", false);
+            g_warVP.erase(PairKey(K, j));
+        }
+    }
+    std::string ens;
+    for (int j : enemies) ens += (ens.empty() ? "" : ", ") + Nm(j);
+    if (accepted && !ended.empty()) {
+        std::string outcome = winner == 1   ? Nm(K) + " wins"
+                              : winner == 2 ? ens + (enemies.size() > 1 ? " win" : " wins")
+                                            : "a compromise peace";
+        chat.push_back("Peace treaty between " + Nm(K) + " and " + ens + ": " + outcome + ".");
+        for (auto& l : Split(KVStr(kv, "ptreaty"), kSepRec))
+            if (!l.empty() && l != " ") chat.push_back(l);
+    } else if (KVStr(kv, "pargs").size() > 0 && !accepted) {
+        chat.push_back(Nm(K) + "'s peace negotiations with " + ens + " came to nothing.");
+    }
+    g_lastHostPeace = "nation=" + std::to_string(K) + " kind=" + KVStr(kv, "kind", "turn") + " code=" + KVStr(kv, "pcode") +
+                      " event=" + KVStr(kv, "pevent") + " args=" + KVStr(kv, "pargs") + " accepted=" + (accepted ? "1" : "0") +
+                      " winner=" + std::to_string(winner) + " enemies=" + KVStr(kv, "penemies") + " lands=" +
+                      std::to_string(lands) + " ships=" + std::to_string(ships) + " states=" + std::to_string(states) +
+                      " nations=" + std::to_string(nations) + " skipped=" + std::to_string(skipped) + " blockade=" +
+                      std::to_string(game::NationFlag(K, "Blockaded")) + " vp=" + std::to_string(game::NationVP(K));
+    for (int j : enemies)
+        g_lastHostPeace += " " + std::to_string(j) + ":" + (game::AtWar(K, j) ? "war" : "peace") + ",blockade=" +
+                           std::to_string(game::NationFlag(j, "Blockaded"));
+    Log("relations v2: peace of nation %d with %s (%s, code %s, NegotiatePeace(%s)): %s, winner %d; %d possession(s), %d "
+        "ship(s), %d war state(s), %d nation(s) changed, %d skipped, %d treaty line(s)",
+        K, ens.c_str(), KVStr(kv, "kind", "turn").c_str(), KVStr(kv, "pcode").c_str(), KVStr(kv, "pargs").c_str(),
+        accepted ? "peace" : "no peace", winner, lands, ships, states, nations, skipped,
+        (int)Split(KVStr(kv, "ptreaty"), kSepRec).size() - 1);
+}
+
+// Relations v2, B4: the end of a peace's wars in nation K's history, with the winner (KHistUpdate has dated them).
+static void KHistPeace(int K, const KV& kv, int month) {
+    if (KVInt(kv, "peace") != 1 || KVInt(kv, "paccepted") != 1) return;
+    int w = KVInt(kv, "pwinner");
+    for (auto& e : Split(KVStr(kv, "penemies"), ',')) {
+        int j = atoi(e.c_str());
+        if (e.empty() || j < 1 || j > 8 || j == K || game::AtWar(K, j)) continue;
+        auto& h = g_kHist[K];
+        auto it = std::find_if(h.begin(), h.end(), [&](const KPastWar& p) { return p.opp == j && p.end == month; });
+        if (it == h.end()) {
+            h.push_back({j, month, w});
+            g_kEnemies[K].erase(j);
+        } else {
+            it->winner = w;
+        }
+    }
+}
+
+// Relations v2, B3 (host): what the player's relation routines changed for the player's nation K at the start of its
+// month (on its PC, in K's view), applied before the month runs, as events are. K's relations with the computer's
+// nations take the routines' changes (a war one of them declared on K starts here); between players only the tension
+// moves (wars and alliances between players come from their diplomacy); a war a computer nation joined on K's side
+// against the host is the host's war. K's per-relation state is kept for its next month; the other nations' budget
+// changes (a war's) are applied; K's own fields come with K's turn, its VP (kept by the host) here. B4: the turn's peace
+// with the computer's nations (or a proposal's, `kind=peace`: one a month, a test's any time) comes with it: K's wars
+// with them and their wars with the computer's nations end at the tension the game's peace left (HostApplyPeace: the
+// rest).
+// Relations v2: a joined nation's relation turn and peace change the host's campaign in the middle of the month (its
+// planning phase). They are saved at once, as a join saves (the month's own save would come only when the month runs),
+// so a host whose game stops in the month and is started again finds them in its campaign; the month's guard (krelm,
+// kpeacem) is in the session file before the save. While a dialog of the host's game is open the save waits for it
+// (Tick); the month's own save (RunHostTurn) covers a save still waiting.
+static bool g_relSavePending = false;
+static int g_relSaves = 0;
+static void SaveAfterRelations(const char* what, int K) {
+    if (g_role != Role::Host) return;
+    std::string of = K > 0 ? " of nation " + std::to_string(K) : "";
+    if (g_phase != Phase::Planning || g_turnRunning || game::IsBusy() || game::BattleActive() || game::EventActive()) {
+        if (!g_relSavePending) {
+            Log("relations v2: the campaign is saved after %s%s once the host's game is free", what, of.c_str());
+            g_lastHostRelations += " saved=pending";
+        }
+        g_relSavePending = true;
+        return;
+    }
+    g_relSavePending = false;
+    bool ok = game::SaveGame();
+    if (ok) g_relSaves++;
+    Log("relations v2: campaign saved after %s%s (%s; %d save(s) of this kind)", what, of.c_str(), ok ? "ok" : "FAILED",
+        g_relSaves);
+    g_lastHostRelations += ok ? " saved=1" : " saved=failed";
+}
+
+static void HostApplyRelations(Player& p, const KV& kv) {
+    int K = KVInt(kv, "nation", -1);
+    if (K != p.nation || K < 1 || K > 8 || KVInt(kv, "seq", -1) != g_seq || g_phase != Phase::Planning ||
+        !game::DiplomacyAvailable() || !hookcb::PlayerRulesNation(K)) {
+        Log("relations from %s ignored (nation %d, seq %d, current seq %d)", p.name.c_str(), K, KVInt(kv, "seq", -1),
+            g_seq);
+        return;
+    }
+    int month = HostMonth();
+    bool proposal = KVStr(kv, "kind") == "peace", test = KVInt(kv, "test") == 1;
+    if (proposal) {
+        if (month > 0 && !test && g_kPeaceMonth.count(K) && g_kPeaceMonth[K] == month) {
+            Log("second peace of %s with the computer's nations this month ignored", p.name.c_str());
+            return;
+        }
+        if (!test) g_kPeaceMonth[K] = month;
+    } else {
+        if (month > 0 && g_kRelMonth[K] == month) {  // once per nation and month (reconnects, hosting again)
+            Log("second relation turn of %s this month ignored", p.name.c_str());
+            return;
+        }
+        g_kRelMonth[K] = month;
+        if (KVInt(kv, "pevent") == 1) g_kPeaceMonth[K] = month;  // a peace event was answered: no proposal this month
+    }
+    bool peaceRan = KVInt(kv, "peace") == 1, accepted = peaceRan && KVInt(kv, "paccepted") == 1;
+    std::set<int> exEnemies;
+    for (auto& e : Split(KVStr(kv, "penemies"), ','))
+        if (!e.empty()) exEnemies.insert(atoi(e.c_str()));
+    auto Nm = [](int n) { return CampaignNationName(n); };
+    std::string applied;
+    std::vector<std::string> wars;
+    for (auto& e : Split(KVStr(kv, "tension"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 4) continue;
+        int a = atoi(f[0].c_str()), b = atoi(f[1].c_str()), t0 = atoi(f[2].c_str()), t1 = atoi(f[3].c_str());
+        if (a < 0 || b <= a || b > 8 || b >= game::NationCount()) continue;
+        bool war = t0 <= 40 && t1 > 40, peace = t0 > 40 && t1 <= 40;
+        bool players = IsHumanNation(a) && IsHumanNation(b);
+        std::string pr = std::to_string(a) + "-" + std::to_string(b);
+        if (a != K && b != K) {  // another pair: only a war (a computer nation joining K's war on K's side)
+            // B4: a war of one of K's enemies that K's peace ended (the game's DoPeace ends every war of the player's
+            // enemies); between the computer's nations only (the people's wars are their own)
+            if (peace && accepted && !IsHumanNation(a) && !IsHumanNation(b) && (exEnemies.count(a) || exEnemies.count(b)) &&
+                game::AtWar(a, b)) {
+                game::MakePeace(a, b);
+                game::SetTensionRaw(a, b, std::max(0, std::min(40, t1)));
+                applied += " peace " + pr;
+                wars.push_back("Peace: " + Nm(a) + " and " + Nm(b) + " have made peace (" + Nm(K) + "'s peace).");
+                continue;
+            }
+            if (!war || players || game::AtWar(a, b)) {
+                if (t1 != t0) applied += " " + pr + " " + std::to_string(t0) + "->" + std::to_string(t1) + " skipped";
+                continue;
+            }
+            game::StartWar(a, b);
+            applied += " war " + pr;
+            int other = a == 0 ? b : b == 0 ? a : -1;
+            std::string line = "War: " + Nm(a) + " and " + Nm(b) + " are now at war (" + Nm(K) + "'s war).";
+            wars.push_back(line);
+            if (other >= 0) Notice(Nm(other) + " has entered the war against you on " + Nm(K) + "'s side!");
+            continue;
+        }
+        int o = a == K ? b : a;
+        int cur = game::Tension(K, o);
+        if (war) {
+            if (players || cur > 40) {
+                applied += " war " + pr + " skipped (" + (players ? "players" : "already") + ")";
+                continue;
+            }
+            game::StartWar(K, o);
+            applied += " war " + pr;
+            wars.push_back("War: " + Nm(o) + " and " + Nm(K) + " are now at war.");
+        } else if (peace) {
+            if (players || cur <= 40) {
+                applied += " peace " + pr + " skipped";
+                continue;
+            }
+            game::MakePeace(K, o);
+            game::SetTensionRaw(K, o, std::max(0, std::min(40, t1)));  // the game's tension after its peace (DoPeace)
+            applied += " peace " + pr;
+            if (!accepted) wars.push_back("Peace: " + Nm(o) + " and " + Nm(K) + " have made peace.");
+        } else if (proposal && players) {  // a peace leaves the people's nations alone (their cells were put back)
+            if (t1 != t0) applied += " " + pr + " " + std::to_string(t0) + "->" + std::to_string(t1) + " skipped";
+        } else if (cur <= 40 && t1 <= 40) {
+            int now = std::max(0, std::min(40, cur + (t1 - t0)));
+            if (now != cur) game::SetTensionRaw(K, o, now);
+            applied += " " + pr + " " + std::to_string(cur) + "->" + std::to_string(now);
+        }
+    }
+    for (auto& e : Split(KVStr(kv, "alliance"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 4) continue;
+        int a = atoi(f[0].c_str()), b = atoi(f[1].c_str()), m1 = std::max(0, std::min(120, atoi(f[3].c_str())));
+        if (a < 0 || b <= a || b > 8 || b >= game::NationCount()) continue;
+        std::string pr = std::to_string(a) + "-" + std::to_string(b);
+        if ((IsHumanNation(a) && IsHumanNation(b)) || game::AtWar(a, b)) {
+            applied += " alliance " + pr + " skipped";
+            continue;
+        }
+        game::SetAlliance(a, b, m1);
+        applied += " alliance " + pr + "=" + std::to_string(m1);
+    }
+    std::vector<int> will = DecodeArr9(KVStr(kv, "will")), ts = DecodeArr9(KVStr(kv, "ts"));
+    will[K] = ts[K] = 0;
+    if (!proposal || accepted) g_kWill[K] = will;  // a proposal's view started from this PC's state: only DoPeace's reset
+    if (!proposal) g_kTs[K] = ts;
+    for (auto& e : Split(KVStr(kv, "budget"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2) continue;
+        int j = atoi(f[0].c_str()), d = std::max(-5, std::min(5, atoi(f[1].c_str())));
+        if (j < 1 || j > 8 || j == K || IsHumanNation(j) || !d) continue;
+        if (game::AdjustNationField(j, "BudgetModifier", d, true))
+            applied += " budget " + std::to_string(j) + (d > 0 ? "+" : "") + std::to_string(d);
+    }
+    int dvp = KVInt(kv, "vp", 0);
+    if (dvp) {
+        game::SetNationVP(K, game::NationVP(K) + dvp);
+        applied += " VP " + std::to_string(dvp);
+    }
+    std::vector<std::string> peaceChat;
+    if (peaceRan) HostApplyPeace(K, kv, applied, peaceChat);
+    // The nation's own fields the routines changed on its PC (they reach the host with its turn too, which then replaces
+    // them with the same values): taken here as well, so the campaign saved below holds them.
+    for (auto& e : Split(KVStr(kv, "self"), ';')) {
+        auto f = Split(e, ':');
+        if (f.size() != 2) continue;
+        const std::string& field = f[0];
+        int d = atoi(f[1].c_str()), lim = field == "BudgetModifier" || field == "UnrestLevel" ? 10
+                                          : field == "Prestige"                              ? 50
+                                          : field == "BaseResources"                         ? 20000
+                                                                                             : 0;
+        if (!lim || !d) continue;
+        d = std::max(-lim, std::min(lim, d));
+        if (!game::AdjustNationField(K, field, d, true)) continue;
+        if (game::NationIntField(K, field) < 0) game::AdjustNationField(K, field, 0, false);
+        applied += " own " + field + (d > 0 ? "+" : "") + std::to_string(d);
+    }
+    KWarFollow(K, peaceRan ? "the player's peace" : "the player's routines");
+    KHistUpdate(month);
+    KHistPeace(K, kv, month);
+    g_lastHostRelations = "nation=" + std::to_string(K) + (proposal ? " kind=peace" : "") + applied;
+    Log("relations of %s (nation %d; %s; %s message(s)):%s", p.name.c_str(), K,
+        proposal ? "peace proposal" : KVStr(kv, "ran").c_str(), KVStr(kv, "msgs", "0").c_str(),
+        applied.empty() ? " no changes" : applied.c_str());
+    for (auto& w : peaceChat) AddChat("* " + w);
+    for (auto& w : wars) AddChat("* " + w);
+    if (!applied.empty() && !game::EventActive()) game::RefreshUI();  // the host's screen: its relations, lands, ships
+    SaveReservations();  // the month's guard first: a crash before the save below loses the changes, never doubles them
+    SaveAfterRelations(proposal ? "a peace proposal" : "a relation turn", K);
+    BroadcastLobby();
+}
+
 static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     Bundle b;
     std::string err;
@@ -1280,7 +1923,60 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     h["year"] = std::to_string(y);
     h["month"] = std::to_string(m);
     h["remaining"] = std::to_string(RemainingSec());
+    h["kwar"] = std::to_string(KWar(p.nation));  // the nation's own war counter (0.4.1 clients ignore it)
+    if (hookcb::PlayerRulesNation(p.nation) && g_kRelMonth[p.nation] != HostMonth()) {
+        // Relations v2, B3 (not again in a month whose turn was applied, e.g. after a reconnect): the player's relation routines run on the player's PC this month, with the nation's own
+        // per-relation state and past wars and the nations people play (the host's and the joined ones).
+        int K = p.nation, now = HostMonth();
+        std::vector<int> none(9, 0);
+        auto arr = [&](const std::map<int, std::vector<int>>& m) {
+            auto it = m.find(K);
+            const std::vector<int>& v = it == m.end() ? none : it->second;
+            std::string o;
+            for (size_t i = 0; i < 9 && i < v.size(); i++) o += (i ? "." : "") + std::to_string(v[i]);
+            return o;
+        };
+        std::string hist, humans;
+        auto hi = g_kHist.find(K);
+        if (hi != g_kHist.end())
+            for (auto& w : hi->second)
+                hist += std::to_string(w.opp) + "." + std::to_string(std::max(0, now - w.end)) + "." +
+                        std::to_string(w.winner) + "|";
+        for (int j = 0; j <= 8 && j < game::NationCount(); j++)
+            if (IsHumanNation(j)) humans += std::to_string(j) + ",";
+        h["rel"] = "1";
+        h["kwill"] = arr(g_kWill);
+        h["kts"] = arr(g_kTs);
+        h["khist"] = hist;
+        h["humans"] = humans;
+    }
+    if (hookcb::PlayerRulesNation(p.nation) && game::PeaceAvailable()) {
+        // Relations v2, B4 (0.4.x and B3 clients ignore them; also in a month whose turn was applied: proposals): K's war
+        // score with its computer enemies (the player's VP and EnemyVP of its peace decision), per enemy, whether its
+        // peace was settled this month already, and the nations people play (they stay out of K's peace).
+        int K = p.nation, now = HostMonth(), kvp = 0, kevp = 0;
+        std::string pairs, humans;
+        KLedger(K, kvp, kevp, &pairs);
+        for (int j = 0; j <= 8 && j < game::NationCount(); j++)
+            if (IsHumanNation(j)) humans += std::to_string(j) + ",";
+        h["kvp"] = std::to_string(kvp);
+        h["kevp"] = std::to_string(kevp);
+        h["kpairs"] = pairs;
+        h["kpeace"] = g_kPeaceMonth.count(K) && g_kPeaceMonth[K] == now ? "1" : "0";
+        h["humans"] = humans;
+    }
     h["intel"] = "1";  // per-player intelligence: the player's turn carries its own (0.4.0 peers ignore the key)
+    {
+        // The player's economy rules the host ran for this nation (economy.cpp; older clients ignore the keys): their
+        // messages since the last state (sent once) and the nation's army offensive months (its budget's x 0.9).
+        std::vector<std::wstring> econ = economy::TakeNews(p.nation);
+        std::string news;
+        for (auto& l : econ) news += SafeText(W2U(l)) + kSepRec;
+        if (!news.empty()) h["econnews"] = news;
+        h["kao"] = std::to_string(economy::ArmyOffensiveOf(p.nation));
+        if (!econ.empty())
+            Log("economy: %d message(s) of nation %d's rules go with state seq %d", (int)econ.size(), p.nation, g_seq);
+    }
     std::string payload = PackHB(KVEncode(h), b.Pack());
     if (payload.size() > net::MaxMessageBytes()) {
         Notice("The month is too large to send to " + p.name + " (" + std::to_string(payload.size() >> 20) +
@@ -1301,6 +1997,8 @@ static void BroadcastState() {
     std::wstring dir = game::SaveDir(g_hostSlot);
     int y = 0, m = 0;
     saveio::ReadDate(dir, g_hostSlot, y, m);
+    NoteRelRules();
+    KHistUpdate(y * 12 + m);  // relations v2: the wars that ended are dated with the new month
     SaveReservations();  // stamps the open diplomacy items with the new month
     g_seq++;
     g_submissions.clear();
@@ -1624,9 +2322,10 @@ static bool FinishBattlePhase() {
 // A fought battle's result is merged into the save file at once, so the player's next battle is built from it.
 // A battle fought on a player's PC: its result is in the save file but not yet in the campaign in memory. The host's
 // battle hooks never saw it, so its points are counted here for the war score of a war between two players (the
-// peace terms). Battles against AI nations don't count there.
+// peace terms), and (relations v2, B4) of a war of a nation under the player's rules with a computer nation.
 static void CreditWarScore(int a, int b, int vpA, int vpB) {
-    if (!IsHumanNation(a) || !IsHumanNation(b) || !game::AtWar(a, b) || (vpA <= 0 && vpB <= 0)) return;
+    bool players = IsHumanNation(a) && IsHumanNation(b);
+    if ((!players && !LedgerPair(a, b)) || !game::AtWar(a, b) || (vpA <= 0 && vpB <= 0)) return;
     auto& vp = WarVP(a, b);  // a new score starts from the nations' points before this battle
     if (a < b) {
         vp.first += vpA;
@@ -1717,6 +2416,7 @@ static void RunHostTurn() {
         g_turnRunning = false;
         return;
     }
+    g_relSavePending = false;  // this save holds the month's relation changes too
     std::wstring dir = game::SaveDir(g_hostSlot);
     nplay::HostAttach(dir, CampaignKey());
     int merged = 0;
@@ -2113,8 +2813,9 @@ static void HostOnMessage(net::Msg& m) {
             p->lsLevel = std::max(0, KVInt(kv, "ls"));  // 0.3.x: "1"
             p->lockstep = p->lsLevel > 0;
             p->mod = KVStr(kv, "mod").substr(0, 24);
-            Log("%s: mod %s, live-battle engine %d (this host: %d)", name.c_str(), p->mod.c_str(), p->lsLevel,
-                MP_LS_LEVEL);
+            p->relLevel = std::max(0, KVInt(kv, "rel"));  // relations v2 (older clients: none)
+            Log("%s: mod %s, live-battle engine %d (this host: %d), player's relation rules %d", name.c_str(),
+                p->mod.c_str(), p->lsLevel, MP_LS_LEVEL, p->relLevel);
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -2256,6 +2957,9 @@ static void HostOnMessage(net::Msg& m) {
         case net::MSG_EVENT:
             if (p && p->welcomed) HostApplyEvent(*p, KVDecode(m.data));
             break;
+        case net::MSG_RELATIONS:
+            if (p && p->welcomed) HostApplyRelations(*p, KVDecode(m.data));
+            break;
         case net::MSG_BATTLE_RESULT:
             if (p && p->welcomed) HostOnBattleResult(*p, m.data);
             break;
@@ -2302,6 +3006,47 @@ static void ClientApplyPendingState() {
         WriteFileBytes(dir + L"rtw3mp_player.ini", KVEncode(mk));
     }
     g_clientIdStart = saveio::ReadIdNo(dir, g_clientSlot);
+    // The nation's own war counter (relations v2); a 0.4.1 host sends none and the host's stays in place.
+    game::SetOwnWarCounter(KVInt(h, "kwar", INT_MIN));
+    // Relations v2, B3: the host runs the player's rules for this nation; its relation routines run here this month.
+    g_relTurnSeq = KVInt(h, "rel", 0) >= 1 && game::PlayerTurnAvailable() ? seq : -1;
+    if (g_relTurnSeq >= 0) {
+        game::PlayerTurnSetup s;
+        std::vector<int> will = DecodeArr9(KVStr(h, "kwill")), ts = DecodeArr9(KVStr(h, "kts"));
+        for (int j = 0; j < 9; j++) {
+            s.will[j] = will[j];
+            s.techSharing[j] = ts[j];
+        }
+        for (auto& e : Split(KVStr(h, "humans"), ',')) {
+            int j = atoi(e.c_str());
+            if (!e.empty() && j >= 0 && j <= 8) s.human[j] = true;
+        }
+        for (auto& w : Split(KVStr(h, "khist"), '|')) {
+            auto x = Split(w, '.');
+            if (x.size() == 3) s.history.push_back({atoi(x[0].c_str()), atoi(x[1].c_str()), atoi(x[2].c_str())});
+        }
+        g_relSetup = s;
+    }
+    // Relations v2, B4: a B4 host sends this nation's war score with its computer enemies and applies its peace with
+    // them (also in a month whose relation turn was applied: proposals); the nations people play stay out of it.
+    g_peaceHost = h.find("kvp") != h.end() && game::PeaceAvailable();
+    g_peaceStateMonth = KVInt(h, "year") * 12 + KVInt(h, "month");
+    g_peacePairs.clear();
+    g_peaceProposal = -1;
+    if (g_peaceHost) {
+        g_relSetup.peace.vp = KVInt(h, "kvp");
+        g_relSetup.peace.enemyVP = KVInt(h, "kevp");
+        for (auto& e : Split(KVStr(h, "kpairs"), ',')) {
+            auto f = Split(e, ':');
+            if (f.size() == 3) g_peacePairs[atoi(f[0].c_str())] = {atoi(f[1].c_str()), atoi(f[2].c_str())};
+        }
+        for (int j = 0; j < 9; j++) g_relSetup.human[j] = false;
+        for (auto& e : Split(KVStr(h, "humans"), ',')) {
+            int j = atoi(e.c_str());
+            if (!e.empty() && j >= 0 && j <= 8) g_relSetup.human[j] = true;
+        }
+        if (KVInt(h, "kpeace") == 1) g_peaceMonth = g_peaceStateMonth;
+    }
     if (!game::LoadCampaign(g_clientSlot, nation)) {
         Notice("Loading the received game failed.");
         return;
@@ -2313,6 +3058,18 @@ static void ClientApplyPendingState() {
         if (j != nation && game::AtWar(nation, j)) enemyVP += std::max(0, game::NationVP(j));
     game::ShowEnemyVP(enemyVP);
     Log("victory points shown: own %d, enemy %d", game::NationVP(nation), enemyVP);
+    // The player's economy rules the host ran for this nation (economy.cpp): its army offensive months in this PC's
+    // budget figures (the game's ArmyOffensive while the host's is 0; this copy's General section is not merged back), and
+    // their messages, shown in the turn report before the month's event roll.
+    if (int kao = KVInt(h, "kao")) {
+        std::string what = economy::ClientArmyOffensive(kao);
+        Log("economy: army offensive of nation %d: %d month(s) (ArmyOffensive %s)", nation, kao, what.c_str());
+        if (what.rfind("set", 0) == 0) game::RefreshUI();
+    }
+    g_econNews.clear();
+    for (auto& l : Split(KVStr(h, "econnews"), kSepRec))
+        if (!l.empty()) g_econNews.push_back(U2W(l));
+    g_econNewsSeq = g_econNews.empty() ? -1 : seq;
     g_myNation = nation;
     g_clientSeq = seq;
     g_haveState = true;
@@ -2397,7 +3154,7 @@ static void ClientStartBattle() {
     std::wstring dir = game::SaveDir(g_battleSlot);
     std::string err, summary;
     if (dir.empty() || !saveio::ApplyStateBundle(b, dir, g_battleSlot, err) ||
-        !saveio::MakeNationPlayer(dir, g_battleSlot, K, {}, summary, err) ||
+        !saveio::MakeNationPlayer(dir, g_battleSlot, K, {}, summary, err, game::OwnWarCounter()) ||
         !ReadFileBytes(dir + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", g_cb.before)) {
         SendBattleResult(id, "failed", "cannot prepare the battle slot: " + err, nullptr, "");
         return;
@@ -2644,6 +3401,7 @@ static void ClientRunEvent(int forcedIdx) {
         Log("event: no event this month");
         return;
     }
+    g_evShownSeq = seq;  // relations v2: no random tension changes in a month with an event (the game's own chain)
     KV kv;
     kv["seq"] = std::to_string(seq);
     kv["nation"] = std::to_string(g_myNation);
@@ -2669,6 +3427,210 @@ static void ClientRunEvent(int forcedIdx) {
                   " set=" + set;
     Log("event %d for nation %d: %s | %s", r.eventIdx, g_myNation, cap.substr(0, 60).c_str(), g_lastEvent.c_str());
     game::RefreshUI();
+}
+
+// The relation changes of RunPlayerTurn for the host (MSG_RELATIONS); `summary` gets the log's text.
+static KV RelationsKV(const game::PlayerTurnResult& r, int seq, std::string& summary) {
+    KV kv;
+    kv["seq"] = std::to_string(seq);
+    kv["nation"] = std::to_string(g_myNation);
+    std::string ten, ally, will, ts, budget;
+    for (auto& c : r.tension)
+        ten += std::to_string(c.a) + ":" + std::to_string(c.b) + ":" + std::to_string(c.before) + ":" +
+               std::to_string(c.after) + ";";
+    for (auto& c : r.alliance)
+        ally += std::to_string(c.a) + ":" + std::to_string(c.b) + ":" + std::to_string(c.before) + ":" +
+                std::to_string(c.after) + ";";
+    for (int j = 0; j < 9; j++) {
+        will += (j ? "." : "") + std::to_string(r.will[j]);
+        ts += (j ? "." : "") + std::to_string(r.techSharing[j]);
+    }
+    for (auto& b : r.budget) budget += std::to_string(b.first) + ":" + std::to_string(b.second) + ";";
+    kv["tension"] = ten;
+    kv["alliance"] = ally;
+    kv["will"] = will;
+    kv["ts"] = ts;
+    kv["budget"] = budget;
+    kv["vp"] = std::to_string(r.vpDelta);
+    kv["kwar"] = std::to_string(r.warCounter);
+    {
+        std::string own;  // the nation's own fields the routines changed (the host's campaign takes them at once)
+        for (auto& d : r.self) own += d.first + ":" + std::to_string(d.second) + ";";
+        kv["self"] = own;
+    }
+    kv["ran"] = std::string(r.ranTension ? "tension," : "") + (r.ranPreviousWars ? "previous wars," : "") +
+                (r.ranWar ? "war" : "");
+    kv["msgs"] = std::to_string(r.messages.size());
+    summary = "tension=" + ten + " alliance=" + ally + " will=" + will + " budget=" + budget + " vp=" +
+              std::to_string(r.vpDelta) + " kwar=" + std::to_string(r.warCounter) + " ran=" + kv["ran"] + " msgs=" +
+              kv["msgs"];
+    // Relations v2, B4: the peace part (B3 hosts ignore these keys).
+    const game::PeaceResult& p = r.peace;
+    if (!p.ran) return kv;
+    auto T = [](const std::wstring& w) { return SafeText(W2U(w)); };
+    auto F = [](const std::string& x) { return x + kSepField; };
+    std::string en, lands, ships, taken, delta, lost, treaty;
+    for (int j : p.enemies) en += std::to_string(j) + ",";
+    for (auto& l : p.lands)
+        lands += F(T(l.name)) + F(std::to_string(l.from)) + F(std::to_string(l.to)) + (l.removeCA ? "1" : "0") + kSepRec;
+    for (auto& s : p.ships)
+        ships += F(std::to_string(s.id)) + F(std::to_string(s.from)) + F(std::to_string(s.to)) + F(T(s.name)) +
+                 F(T(s.reason)) + T(s.renamed) + kSepRec;
+    for (auto& t : p.taken)
+        taken += F(T(t.name)) + F(std::to_string(t.owner)) + F(std::to_string(t.takenFrom)) +
+                 F(std::to_string(t.invaded)) + F(std::to_string(t.support)) + std::to_string(t.rebellion) + kSepRec;
+    for (auto& n : p.delta)
+        for (auto& d : n.second) delta += std::to_string(n.first) + ":" + d.first + ":" + std::to_string(d.second) + ";";
+    for (auto& n : p.lostWar) lost += std::to_string(n.first) + ":" + std::to_string(n.second) + ";";
+    for (auto& l : p.treaty) treaty += T(l) + kSepRec;
+    kv["peace"] = "1";
+    kv["pcode"] = std::to_string(p.code);
+    kv["pevent"] = p.eventShown ? "1" : "0";
+    if (p.negotiated)
+        kv["pargs"] = std::to_string(p.chance) + ":" + std::to_string(p.lossGain) + ":" + (p.force ? "1" : "0");
+    kv["paccepted"] = p.accepted ? "1" : "0";
+    kv["pwinner"] = std::to_string(p.winner);
+    kv["penemies"] = en;
+    kv["pland"] = lands;
+    kv["pships"] = ships;
+    kv["ptaken"] = taken;
+    kv["pdelta"] = delta;
+    kv["plost"] = lost;
+    kv["ptreaty"] = treaty;
+    std::string shipIds;
+    for (auto& s : p.ships) shipIds += std::to_string(s.id) + ":" + std::to_string(s.from) + ">" + std::to_string(s.to) + ",";
+    std::string landNames;  // the last key of the summary (names may hold spaces)
+    for (auto& l : p.lands)
+        landNames += T(l.name) + "~" + std::to_string(l.from) + ">" + std::to_string(l.to) + "|";
+    g_lastPeace = "ran=1 code=" + kv["pcode"] + " event=" + kv["pevent"] + " args=" + KVStr(kv, "pargs") + " accepted=" +
+                  kv["paccepted"] + " winner=" + kv["pwinner"] + " enemies=" + en + " lands=" +
+                  std::to_string(p.lands.size()) + " ships=" + std::to_string(p.ships.size()) + " taken=" +
+                  std::to_string(p.taken.size()) + " delta=" + delta + " lost=" + lost + " treaty=" +
+                  std::to_string(p.treaty.size()) + " kwar=" + std::to_string(r.warCounter) + " shipids=" + shipIds +
+                  " landnames=" + landNames;
+    summary += " peace=" + std::string(p.accepted ? "made" : "none") + " code=" + kv["pcode"] + " event=" + kv["pevent"];
+    return kv;
+}
+
+// After a turn or a proposal: this PC's nation's own state follows (its war counter, its per-relation state for a later
+// proposal, its event cooldowns), the screen, the turn messages.
+static void ClientAfterRelations(const game::PlayerTurnResult& r) {
+    game::SetOwnWarCounter(r.warCounter);
+    for (int j = 0; j < 9; j++) {
+        g_relSetup.will[j] = r.will[j];
+        g_relSetup.techSharing[j] = r.techSharing[j];
+    }
+    if (r.peace.eventShown) g_peaceMonth = g_peaceStateMonth;
+    if (r.peace.ran && !g_evUsedKey.empty()) SaveEventCooldowns();
+    game::RefreshUI();
+    Changed();
+    if (!r.messages.empty()) game::ShowTurnMessagesOf(r.messages);
+}
+
+// Relations v2 (client): the nations people play, as the month's state named them and as the host's lobby names them
+// now (a nation claimed or reserved after the state was sent is a player's nation too: kept out of the view's routines
+// and the peace).
+static void MarkLobbyHumans(bool (&human)[9]) {
+    for (auto& h : g_cSnap.humans)
+        if (h.idx >= 0 && h.idx <= 8) human[h.idx] = true;
+}
+
+// Relations v2, B3 (client): the player's relation routines for this PC's nation at the start of its month (after the
+// event roll): RandomTensionChanges (in a month without an event), TensionEffectOfPreviousWars, CheckForWar, in the
+// nation's own view, with their dialogs here. What they changed goes to the host at once (MSG_RELATIONS, applied before
+// the month runs) and into this PC's campaign; the turn messages they wrote follow in the game's turn report. B4: then,
+// at war with a computer nation, the player's peace decision and its peace event (not in a month with another event: one
+// event a month), from a B4 host only.
+static void ClientRunRelations(bool force = false) {
+    if (g_role != Role::Client || g_myNation <= 0 || !g_haveState || game::EventActive()) return;
+    static int s_relMonth = 0;  // once per calendar month (a resent month has a new seq)
+    int month = ClientMonth();
+    if (!force && month > 0 && month == s_relMonth) {
+        Log("relations: this month's turn was already run");
+        return;
+    }
+    s_relMonth = month;
+    game::PlayerTurnSetup s = g_relSetup;
+    MarkLobbyHumans(s.human);
+    s.K = g_myNation;
+    int seq = g_clientSeq;
+    s.tensionChanges = g_evShownSeq != seq;
+    s.peace.run = g_peaceHost && game::PeaceAvailable();
+    s.peace.decision = g_evShownSeq != seq && g_peaceMonth != g_peaceStateMonth;
+    s.peace.forcedCode = g_forcedPeaceCode;
+    s.peace.forcedChance = g_forcedPeaceChance;
+    g_forcedPeaceCode = g_forcedPeaceChance = 0;
+    if (s.peace.run && month > 0) {
+        UpdateEventCooldowns(month);
+        s.peace.used = g_evUsed;
+    }
+    game::PlayerTurnResult r = game::RunPlayerTurn(s);
+    if (!r.error.empty()) {
+        g_lastRelations = "error " + r.error;
+        Log("relations: %s", r.error.c_str());
+        return;
+    }
+    std::string summary;
+    KV kv = RelationsKV(r, seq, summary);
+    net::Send(0, net::MSG_RELATIONS, KVEncode(kv));
+    g_lastRelations = summary;
+    Log("relations for nation %d sent: %s", g_myNation, g_lastRelations.c_str());
+    if (r.peace.ran) Log("peace for nation %d (its turn): %s", g_myNation, g_lastPeace.c_str());
+    ClientAfterRelations(r);
+}
+
+// Relations v2, B4 (client): a peace proposal to the computer's nations this PC's nation is at war with (the Diplomacy
+// list's "Propose peace", or `peacetest`): the game's NegotiatePeace(chance, lossGain, force) at once in the nation's
+// view (the proposal: the game's compromise offer 40, 0), with its dialogs here; the result goes to the host like the
+// turn's (MSG_RELATIONS, kind=peace: one a month, a test's any time).
+static void ClientRunPeace(int chance, int lossGain, bool force, bool test) {
+    if (g_role != Role::Client || g_myNation <= 0 || !g_haveState || game::EventActive()) return;
+    if (!g_peaceHost || !game::PeaceAvailable()) {
+        g_lastPeace = "error the host does not apply peace with the computer's nations for this nation";
+        Log("peace: %s", g_lastPeace.c_str());
+        return;
+    }
+    if (!test && g_peaceMonth == g_peaceStateMonth) {  // e.g. the month's peace event came first (its relation turn)
+        g_lastPeace = "none (the proposal was dropped: a peace was negotiated this month)";
+        Log("peace: the proposal was dropped (this month's peace was negotiated already)");
+        AddLocalChat("* No peace talks: your nation has negotiated with the computer's nations this month already.");
+        return;
+    }
+    int month = ClientMonth();
+    if (month > 0) UpdateEventCooldowns(month);
+    game::PlayerTurnSetup s = g_relSetup;
+    MarkLobbyHumans(s.human);
+    s.K = g_myNation;
+    s.relations = false;
+    s.tensionChanges = false;
+    s.peace.run = true;
+    s.peace.negotiate = true;
+    s.peace.chance = chance;
+    s.peace.lossGain = lossGain;
+    s.peace.force = force;
+    s.peace.forcedCode = 0;
+    s.peace.used = month > 0 ? g_evUsed : nullptr;
+    int seq = g_clientSeq;
+    game::PlayerTurnResult r = game::RunPlayerTurn(s);
+    if (!r.error.empty()) {
+        g_lastPeace = "error " + r.error;
+        Log("peace: %s", r.error.c_str());
+        return;
+    }
+    if (!r.peace.ran) {
+        g_lastPeace = "none (not at war with a computer nation)";
+        Log("peace: %s", g_lastPeace.c_str());
+        return;
+    }
+    std::string summary;
+    KV kv = RelationsKV(r, seq, summary);
+    kv["kind"] = "peace";
+    if (test) kv["test"] = "1";
+    net::Send(0, net::MSG_RELATIONS, KVEncode(kv));
+    if (!test) g_peaceMonth = g_peaceStateMonth;
+    Log("peace for nation %d sent (%s): %s | %s", g_myNation, test ? "test" : "proposal", g_lastPeace.c_str(),
+        summary.c_str());
+    ClientAfterRelations(r);
 }
 
 static void ParseLobby(const KV& kv) {
@@ -2740,6 +3702,7 @@ static void ClientOnMessage(net::Msg& m) {
             kv["pw"] = g_password;
             kv["battles"] = g_fightBattles ? "1" : "0";
             kv["ls"] = g_lsEnabled && lockstep::Available() ? std::to_string(AnnouncedLsLevel()) : "0";  // engine level
+            kv["rel"] = game::PlayerTurnAvailable() ? "1" : "0";  // relations v2: the player's relation routines run here
             kv["cpu"] = x87::CpuVendor();  // (logged by both sides: a live battle's diagnostics name differing vendors)
             if (datafiles::Ready()) kv["dh"] = datafiles::Combined();  // the game data files (logged; checked at a start)
             net::Send(0, net::MSG_HELLO, KVEncode(kv));
@@ -3068,6 +4031,27 @@ void Leave() {
     g_pendingTreaty.clear();
     g_warVP.clear();
     g_treaties.clear();
+    g_kWar.clear();
+    g_kWarSteppedSeq = -1;
+    economy::ClearState();
+    g_econNews.clear();
+    g_econNewsSeq = -1;
+    g_relNations.clear();
+    g_relForced.clear();
+    g_kWill.clear();
+    g_kTs.clear();
+    g_kHist.clear();
+    g_kEnemies.clear();
+    g_kRelMonth.clear();
+    g_relTurnSeq = -1;
+    g_kPeaceMonth.clear();  // relations v2, B4
+    g_lastHostPeace.clear();
+    g_peaceHost = false;
+    g_peacePairs.clear();
+    g_peaceStateMonth = g_peaceMonth = 0;
+    g_peaceProposal = -1;
+    g_forcedPeaceCode = g_forcedPeaceChance = 0;
+    g_peaceRows.clear();
     g_enemyVPSeen = -1;
     g_eventRollSeq = -1;
     g_submissions.clear();
@@ -3230,6 +4214,8 @@ static void SyncHostCampaign() {
 void ReleaseNation(int idx) {
     if (g_role != Role::Host) return;
     g_reserved.erase(idx);
+    g_relNations.erase(idx);
+    g_relForced.erase(idx);
     for (auto& p : g_players)
         if (p.second.nation == idx) {
             p.second.nation = -1;
@@ -3334,11 +4320,65 @@ void SubmitTurn() {
     Notice("Turn submitted. You can still change orders and press Submit again until the host processes the turn.");
 }
 
+// Relations v2, B4 (client): the Diplomacy list's rows of the computer's nations this PC's nation is at war with, while
+// the host applies its peace with them: only "Propose peace" (a peace with all of them at once, the game's negotiation,
+// at once; one a month, after the month's relation turn and not in a month whose peace event was answered, before the
+// turn is submitted). Kept from the last look while the nation list is in a joined player's view (an event or the
+// relation turn runs).
+static std::vector<DiploRow> ComputerPeaceRows() {
+    if (game::EventActive()) return g_peaceRows;
+    std::vector<DiploRow> rows;
+    int K = g_myNation;
+    if (g_role == Role::Client && g_peaceHost && g_haveState && K >= 1 && K <= 8 && game::DiplomacyAvailable() &&
+        game::CurrentSlot() == g_clientSlot && game::PlayerNation() == game::Nation(K)) {
+        bool done = g_peaceMonth == g_peaceStateMonth, busy = g_peaceProposal >= 0;
+        bool turnFirst = g_relTurnSeq >= 0 && g_relTurnSeq == g_clientSeq;  // the month's relation turn comes first
+        bool human[9];
+        for (int j = 0; j < 9; j++) human[j] = g_relSetup.human[j];
+        MarkLobbyHumans(human);
+        for (int j = 1; j <= 8 && j < game::NationCount(); j++) {
+            if (j == K || human[j] || !game::AtWar(K, j)) continue;
+            DiploRow r;
+            r.nation = j;
+            r.nationName = CampaignNationName(j);
+            r.player = "computer";
+            r.relation = "At war";
+            r.tension = game::Tension(K, j);
+            r.atWar = true;
+            r.computer = true;
+            auto it = g_peacePairs.find(j);
+            if (it != g_peacePairs.end()) {
+                r.vpMine = it->second.first;
+                r.vpTheirs = it->second.second;
+            }
+            r.canPeace = !done && !busy && !turnFirst && !g_submitted;
+            r.pending = busy ? "peace talks under way" : done ? "peace negotiated this month" : turnFirst ? "the month's relations come first" : g_submitted ? "turn submitted" : "";
+            r.outlook = "a peace with the computer's nations is negotiated at once, with all of them";
+            rows.push_back(r);
+        }
+    }
+    g_peaceRows = rows;
+    return rows;
+}
+
 std::string Diplomacy(const std::string& action, int target, const std::string& extra) {
     if (g_role == Role::Host) return HostDiplo(0, action, target, extra);
     if (g_role != Role::Client) return "Not connected.";
     if (g_phase != Phase::Planning) return "Diplomacy is possible while the players plan a month.";
     if (g_myNation <= 0) return "Claim a nation first.";
+    for (auto& c : ComputerPeaceRows()) {  // relations v2, B4: a computer nation at war with this nation
+        if (c.nation != target) continue;
+        if (action != "peace") return "With " + c.nationName + " only peace can be proposed.";
+        if (g_submitted) return "Propose peace before you submit your turn.";
+        if (g_peaceProposal >= 0) return "Peace talks are under way.";
+        if (g_relTurnSeq >= 0 && g_relTurnSeq == g_clientSeq)
+            return "Your nation's relations of this month come first; propose peace when they are done.";
+        if (!c.canPeace) return "Your nation has negotiated with the computer's nations this month already.";
+        g_peaceProposal = target;
+        AddLocalChat("* Peace talks with the computer's nations at war with you begin (all of them at once).");
+        Changed();
+        return "";
+    }
     // Quick check against the host's last relations snapshot; the host validates again.
     const DiploRow* r = nullptr;
     auto rows = DiploRows(g_myNation, g_cSnap);
@@ -3408,6 +4448,118 @@ std::string DebugVPInfo() {
     for (int i = 0; i <= 8 && i < game::NationCount(); i++)
         s += std::to_string(i) + ":" + std::to_string(game::NationVP(i)) + ",";
     return s;
+}
+
+std::string DebugKWar(const std::vector<std::string>& args) {
+    if (g_role == Role::Client) {
+        int own = game::OwnWarCounter();
+        return "ok own=" + (own == INT_MIN ? std::string("unknown") : std::to_string(own)) +
+               " game=" + std::to_string(game::WarCounter()) + " nation=" + std::to_string(g_myNation);
+    }
+    if (g_role != Role::Host) return "error not in a session";
+    if (args.size() >= 3) {
+        int K = atoi(args[1].c_str());
+        if (K < 1 || K > 8) return "error nation 1-8";
+        KWar(K) = atoi(args[2].c_str());
+        SaveReservations();
+    }
+    std::string s = "ok stepped=" + std::to_string(g_kWarSteppedSeq) + " host=" + std::to_string(game::WarCounter()) +
+                    " kwar=";
+    for (int K = 1; K <= 8 && K < game::NationCount(); K++)
+        if (hookcb::IsHumanRemoteNation(K)) s += std::to_string(K) + ":" + std::to_string(KWar(K)) + ",";
+    return s;
+}
+
+std::string DebugRelRules(const std::vector<std::string>& args) {
+    if (g_role != Role::Host) return "error host only";
+    if (args.size() >= 3) {
+        int K = atoi(args[1].c_str());
+        if (K < 1 || K > 8) return "error nation 1-8";
+        if (atoi(args[2].c_str()) != 0)
+            g_relForced.insert(K);
+        else
+            g_relForced.erase(K);
+        Log("relations v2: nation %d forced to the %s rules by a test", K, g_relForced.count(K) ? "player's" : "usual");
+    }
+    auto list = [](const std::set<int>& s) {
+        std::string o;
+        for (int n : s) o += std::to_string(n) + ",";
+        return o;
+    };
+    std::string now;
+    for (int K = 1; K <= 8 && K < game::NationCount(); K++)
+        if (hookcb::PlayerRulesNation(K)) now += std::to_string(K) + ",";
+    return "ok rules=" + now + " forced=" + list(g_relForced) + " saved=" + list(g_relNations);
+}
+
+void DebugRelTurn() {  // client: the player's relation routines now (tests; normally once a month after the event roll)
+    if (g_role != Role::Client) return;
+    g_relTurnSeq = -1;
+    ClientRunRelations(true);
+}
+
+std::string DebugRelLast() {
+    if (g_role == Role::Host) return "ok " + (g_lastHostRelations.empty() ? std::string("none") : g_lastHostRelations);
+    if (g_role == Role::Client) {
+        std::string state = g_relTurnSeq >= 0 ? " pending" : "";
+        return "ok " + g_lastRelations + state;
+    }
+    return "error not in a session";
+}
+
+void DebugPeaceTest(int chance, int lossGain, bool force) {  // client: the peace part now, through the proposal path
+    if (g_role != Role::Client) return;
+    Log("peacetest %d %d %d", chance, lossGain, force ? 1 : 0);
+    ClientRunPeace(chance, lossGain, force, true);
+}
+
+std::string DebugPeaceEvent(int code, int chance) {
+    if (g_role != Role::Client) return "error client only";
+    if (code != 0 && (code < 33 || code > 36)) return "error code 33-36 (0: none)";
+    if (chance < 0 || chance > 200) return "error chance 0-200 (0: the answer's)";
+    g_forcedPeaceCode = code;
+    g_forcedPeaceChance = code ? chance : 0;
+    return "ok the next relation turn shows peace event code " + std::to_string(code) +
+           (g_forcedPeaceChance ? ", its NegotiatePeace with the chance " + std::to_string(g_forcedPeaceChance) : "");
+}
+
+std::string DebugPeaceLast() {
+    if (g_role == Role::Host) return "ok " + (g_lastHostPeace.empty() ? std::string("none") : g_lastHostPeace);
+    if (g_role == Role::Client)
+        return "ok " + g_lastPeace + " host=" + (g_peaceHost ? "1" : "0") +
+               " month=" + (g_peaceMonth == g_peaceStateMonth ? "used" : "open") +
+               (g_peaceProposal >= 0 ? " proposal=" + std::to_string(g_peaceProposal) : "") +
+               " forced=" + std::to_string(g_forcedPeaceCode) +
+               (g_forcedPeaceChance ? ":" + std::to_string(g_forcedPeaceChance) : "");
+    return "error not in a session";
+}
+
+std::string DebugKWarVP(const std::vector<std::string>& args) {
+    if (g_role != Role::Host) return "error host only";
+    int K = args.size() > 1 ? atoi(args[1].c_str()) : -1;
+    if (K < 1 || K > 8) return "error nation 1-8";
+    if (args.size() >= 5) {
+        int j = atoi(args[2].c_str()), a = atoi(args[3].c_str()), b = atoi(args[4].c_str());
+        if (j < 1 || j > 8 || j == K || !LedgerPair(K, j))
+            return "error not a war of the ledger (K under the player's rules, J a computer nation)";
+        auto& w = WarVP(K, j);
+        w = K < j ? std::make_pair(a, b) : std::make_pair(b, a);
+        SaveReservations();
+    }
+    int vp = 0, evp = 0;
+    std::string pairs;
+    KLedger(K, vp, evp, &pairs);
+    std::string kept;  // every war score of K the host keeps (also one whose war already ended)
+    for (auto& w : g_warVP)
+        if (w.first.first == K || w.first.second == K) {
+            int j = w.first.first == K ? w.first.second : w.first.first;
+            kept += std::to_string(j) + ":" + std::to_string(w.first.first == K ? w.second.first : w.second.second) +
+                    ":" + std::to_string(w.first.first == K ? w.second.second : w.second.first) + ",";
+        }
+    int now = HostMonth();
+    return "ok nation=" + std::to_string(K) + " rules=" + (hookcb::PlayerRulesNation(K) ? "1" : "0") + " vp=" +
+           std::to_string(vp) + " evp=" + std::to_string(evp) + " pairs=" + pairs + " kept=" + kept + " peace=" +
+           (g_kPeaceMonth.count(K) && g_kPeaceMonth[K] == now ? "used" : "open") + " kwar=" + std::to_string(KWar(K));
 }
 
 std::string DebugTerms(int a, int b) {
@@ -3561,6 +4713,8 @@ void Tick() {
             (AllSubmitted(nullptr) || now - g_forceTick > 30000) && !game::IsBusy())
             RunHostTurn();
         if (g_runTurnWhenIdle && g_phase == Phase::Planning && !game::IsBusy()) RunHostTurn();
+        if (g_relSavePending && g_phase == Phase::Planning && !g_turnRunning)
+            SaveAfterRelations("the relation changes applied while the game was busy", 0);
         if (g_turnRunning) {
             if (g_afterTurnPending) {
                 // During the battle phase the strategic screen is locked (IsBusy), so only a modal dialog waits it.
@@ -3573,6 +4727,7 @@ void Tick() {
                         g_afterTurnPending = false;
                         g_turnRunning = false;
                         ApplyDiplomacy();
+                        KWarMonthStep();
                         BroadcastState();
                     } else {
                         g_afterTurnPending = false;
@@ -3625,11 +4780,38 @@ void Tick() {
         if (g_lsClientA.pending && now - g_lsClientA.lastTry > 500) ClientTryStartLockstep();
         if (!g_pendingState.empty()) ClientApplyPendingState();
         if (g_forceSubmitPending && !g_submitted && g_haveState && !game::IsBusy()) SubmitTurn();
+        // The messages of the player's economy rules the host ran for this nation, in the game's turn report, first.
+        if (g_econNewsSeq >= 0 && g_econNewsSeq == g_clientSeq && g_haveState && g_pendingState.empty() &&
+            !game::IsBusy() && !game::BattleActive() && !game::EventActive()) {
+            std::vector<std::wstring> lines;
+            lines.swap(g_econNews);
+            g_econNewsSeq = -1;
+            Log("economy: showing %d message(s) of this nation's money rules", (int)lines.size());
+            game::ShowTurnMessagesOf(lines);
+        }
         // This month's event roll (once per calendar month, see ClientRunEvent).
         if (g_eventRollSeq >= 0 && g_eventRollSeq == g_clientSeq && g_haveState && g_phase == Phase::Planning &&
             !g_submitted && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive()) {
             g_eventRollSeq = -1;
             ClientRunEvent(-1);
+        }
+        // Then the player's relation routines (relations v2, B3), once the roll and its dialog are done.
+        if (g_relTurnSeq >= 0 && g_relTurnSeq == g_clientSeq && g_eventRollSeq < 0 && g_haveState &&
+            g_phase == Phase::Planning && !g_submitted && g_pendingState.empty() && !game::IsBusy() &&
+            !game::BattleActive() && !game::EventActive()) {
+            g_relTurnSeq = -1;
+            ClientRunRelations();
+        }
+        // A "Propose peace" to the computer's nations (relations v2, B4), once the month's turn is done.
+        if (g_peaceProposal >= 0 && (g_relTurnSeq < 0 || g_relTurnSeq != g_clientSeq) &&
+            (g_eventRollSeq < 0 || g_eventRollSeq != g_clientSeq) && g_haveState &&
+            g_phase == Phase::Planning && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive() &&
+            !game::EventActive()) {
+            g_peaceProposal = -1;
+            if (g_submitted)
+                Log("peace: the proposal was dropped (the turn is submitted)");
+            else
+                ClientRunPeace(40, 0, false, false);
         }
         if (!g_pendingTreaty.empty() && g_haveState && g_pendingState.empty() && !game::IsBusy() &&
             !game::BattleActive() && !game::EventActive()) {
@@ -3720,6 +4902,11 @@ View GetView() {
         } else {
             v.diplo = DiploRows(g_myNation, g_cSnap);
         }
+        size_t humanRows = v.diplo.size();
+        if (g_role == Role::Client) {  // relations v2, B4: the computer's nations at war with this nation
+            auto rows = ComputerPeaceRows();
+            v.diplo.insert(v.diplo.end(), rows.begin(), rows.end());
+        }
         bool available = g_role == Role::Host ? game::DiplomacyAvailable() : g_cSnap.on || g_phase == Phase::Lobby;
         v.diploOpen = g_phase == Phase::Planning && available && (g_role == Role::Host || g_myNation > 0);
         if (g_phase == Phase::Lobby)
@@ -3730,6 +4917,8 @@ View GetView() {
             v.diploNote = "the month is being processed.";
         else if (v.diplo.empty())
             v.diploNote = "no other player commands a nation yet.";
+        else if (humanRows == 0)
+            v.diploNote = "peace with the computer's nations is negotiated at once.";
         else
             v.diploNote = "decisions take effect at the end of this month.";
     }
@@ -3786,6 +4975,7 @@ bool InSession() { return mp::g_role != mp::Role::None; }
 
 void OnAfterEndOfTurn(void* self) {
     ResetPeaceMask();
+    game::ResetRelationMasks();
     if (mp::g_role == mp::Role::Host && mp::g_turnRunning) {
         mp::g_afterTurnPending = true;
         Log("DoEndOfTurn finished");
@@ -3799,6 +4989,20 @@ bool IsHumanRemoteNation(int idx) {
     for (auto& p : g_players)
         if (p.second.nation == idx) return true;
     return false;
+}
+
+bool PlayerRulesNation(int idx) {
+    using namespace mp;
+    if (g_role != Role::Host || g_phase == Phase::Lobby || idx < 1 || idx > 8 || !IsHumanRemoteNation(idx)) return false;
+    if (g_relForced.count(idx)) return true;
+    for (auto& p : g_players)
+        if (p.second.connected && p.second.welcomed && p.second.nation == idx) return p.second.relLevel >= 1;
+    return g_relNations.count(idx) > 0;
+}
+
+int KWarCounter(int idx) {
+    if (idx < 1 || idx > 8 || !IsHumanRemoteNation(idx)) return game::WarCounter();
+    return mp::KWar(idx);
 }
 
 void OnBeforeAIMoves(void* self) {
@@ -3864,7 +5068,8 @@ void OnAfterCopyGame(int from, int to) {
     std::wstring mine = game::NationName(K), host = game::NationName(0);
     std::string summary, err;
     HWND owner = GetActiveWindow();
-    if (saveio::MakeNationPlayer(dst, to, K, eut, summary, err)) {
+    if (saveio::MakeNationPlayer(dst, to, K, eut, summary, err,
+                                 g_role == Role::Client ? game::OwnWarCounter() : INT_MIN)) {
         MessageBoxW(owner,
                     (L"Slot " + std::to_wstring(to) + L" is your own copy of the campaign: you play " + mine + L".\n\n" +
                      host + L", the host's nation, is run by the computer in this copy. The multiplayer session is "
@@ -3908,7 +5113,8 @@ void OnBattleVP(int a, int b, int vpA, int vpB) {
             g_enemyVPSeen = g_enemyVPSeen >= 0 ? g_enemyVPSeen + gain : game::EnemyVP();
         }
     }
-    if (!IsHumanNation(a) || !IsHumanNation(b) || !game::AtWar(a, b)) return;
+    bool players = IsHumanNation(a) && IsHumanNation(b);
+    if ((!players && !LedgerPair(a, b)) || !game::AtWar(a, b)) return;  // B4: also a joined nation's computer wars
     bool seeded = false;
     auto& vp = WarVP(a, b, &seeded);
     if (seeded) {  // the nations' points already include this battle

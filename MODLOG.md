@@ -158,6 +158,23 @@ commits titled "WIP 0.4.0", "WIP 0.5.0" and "WIP 0.6.0" are development commits 
     [the 0.4.1 release candidate 2 dist_rc041_2](#testing-2026-10-22-the-041-release-candidate-2-dist_rc041_2-v041)
   - Docs:
     [0.4.1 release candidate](#docs-2026-10-21-041-release-candidate-v041)
+- **0.5.0** (built on the branch `relations-v2` after 0.4.1: each joined nation under the player's own rules; its
+  entries carry "(relations v2)" or "(0.5.0-dev)" from before the release number was decided)
+  - Feature:
+    [B1: a war counter for each joined nation](#feature-2026-10-20-relations-v2-b1-a-war-counter-for-each-joined-nation-relations-v2);
+    [B2: the computer's rules leave a joined nation's pairs alone](#feature-2026-10-20-relations-v2-b2-the-computers-rules-leave-a-joined-nations-pairs-alone-relations-v2);
+    [B3: the player's relation routines on the joined player's PC](#feature-2026-10-20-relations-v2-b3-the-players-relation-routines-on-the-joined-players-pc-relations-v2);
+    [B4: peace with computer nations](#feature-2026-10-21-relations-v2-b4-peace-with-computer-nations-relations-v2);
+    [B5 money: the player's economy rules for a joined nation](#feature-2026-10-22-relations-v2-b5-the-players-economy-rules-for-a-joined-nation-relations-v2);
+    [B5 money, part 2: the player's remaining economy rules, and the computer's last decisions for a joined nation](#feature-2026-10-22-relations-v2-b5-money-part-2-the-players-remaining-economy-rules-and-the-computers-last-decisions-for-a-joined-nation-050-dev)
+  - Merge:
+    [0.4.1 into relations v2](#merge-2026-10-22-041-into-relations-v2-050-dev)
+  - Fix:
+    [a host restart in the month keeps the month's relation turn and peace](#fix-2026-10-22-a-host-restart-in-the-month-keeps-the-months-relation-turn-and-peace-050-dev);
+    [the game's AI peace and the relations mask: VP kept, no access violation](#fix-2026-10-22-the-games-ai-peace-and-the-relations-mask-vp-kept-no-access-violation-v050)
+  - Testing:
+    [the 0.5.0 release candidate dist_rc050_1](#testing-2026-10-22-the-050-release-candidate-dist_rc050_1-v050);
+    [the 0.5.0 release candidate 2 dist_rc050_2](#testing-2026-10-23-the-050-release-candidate-2-dist_rc050_2-v050)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -4385,3 +4402,599 @@ and the Preferences identical to the pre-run copies after every run (MD5); no co
 - **Verdict: GO** for 0.4.1 with dist_rc041_2: the RC 1 blocker is gone, every other fail was the suite's and passed on
   re-run, mixed versions work; the AdjustForcesForBattle box is rare, caught by the game and harmless in the run, to be
   investigated after the release. Not pushed.
+
+## Feature 2026-10-20: relations v2, B1: a war counter for each joined nation (relations v2)
+The user's decision on the design of the [investigation](#investigation-2026-10-20-each-players-own-relations-tension-wars-and-battles-of-a-joined-players-nation-v041)
+was option 2 plus B6: each joined nation's relations under the player's own rules, built in steps on the branch
+`relations-v2` (from 0.4.1's fix-strat 2e1a042), each proven live and committed on its own. B1 is the first.
+- **Why.** The game counts nation 0's months at war or at peace in `[General] War` (0xf52ff4) and many routines read it
+  (the war machinery, budgets, training costs, fuel, research, events, the screen's war state; GAME-INTERNALS). A joined
+  nation K had none: its PC showed and used the host's counter, the events guessed one, the battle slot too.
+- **Host (`session.cpp`).** `g_kWar` holds a counter per joined nation (reserved nations included). `KWarMonthStep`
+  runs once per month after `ApplyDiplomacy` and before `BroadcastState`: +1 at war, -1 at peace, then `KWarFollow`
+  (1 when a war started, 0 when the last war ended), the game's rule for nation 0 (DoStrategicTurn 0xce1f69, then
+  WarStartsWithNation and DoPeace). The step is marked with the processed month (`kwarStepped`; the save on disk still
+  holds that month at this point), so a resent month doesn't step again. A nation the computer plays drops its counter;
+  a nation without one (an existing campaign, a new player) starts from its wars with the host's counter as the guess
+  (at war: the host's if the host is at war, else 1; at peace: the host's if at peace, else -12). Saved in
+  `rtw3mp_session.ini` (`kwar=1:1,2:-69,`, `kwarStepped=Aug 1900`) with the month's other date-bound state; sent in the
+  `MSG_STATE` header (`kwar`). Log `war counter of nation 1: -68 -> 1 (the month)`.
+- **Client (`game.cpp`, `session.cpp`).** `ClientApplyPendingState` stores the header's counter
+  (`game::SetOwnWarCounter`, INT_MIN when absent); `game::LoadCampaign` with a player nation writes it over the save's
+  counter before `SetPlayerNation` draws the screen (log `war counter: -68 (the host's nation) -> 1 (nation 1's own)`),
+  also after a battle slot. The game's own lines then show K's war: "At war for N months." with the War results box,
+  at peace the hint "At peace for N months."; the relations view's `KViewWarState` keeps its "At war with Spain." line
+  only for a host without counters. `RunClientEvent` uses the counter when it agrees with K's wars;
+  `MakeNationPlayer`/`TransformNationPlayer` take it (`kWar`) for the battle slot and Copy game. The client never
+  sends `[General]` (its turn holds its own nation's sections), so the host's counter is untouched.
+- **UpdateUIValues at peace** empties `lbWar` but never hides it once a war was shown (single player too); the runner's
+  war-state check accepts that.
+- **Bridge** `kwar` (host: the counters, `kwar <K> <n>` sets one; client: own and game). **Runner:** `own_war_counter`,
+  `kwar_counters`, `kwar_step`; `month_checks` asserts the step after every processed month (9 checks a month now);
+  `relview_check` expects the game's own war lines when the client knows its counter.
+- **Older peers.** A 0.4.1 client ignores `kwar` (its screen keeps "At war with Spain."); a 0.4.1 host sends none and a
+  relations-v2 client keeps the host's counter and the 0.4.1 lines. Protocol 3.
+- **Live proof** (dist_rv_1, RTW3MP 0E80BFE4C9B64DEF: this commit's source but two comments; driver
+  `rv_live.py b1` in the session folder, 1900 fixture, host and client on one PC, Germany = nation 1, France reserved
+  for "Bot"): 32/32 in 55 s of game
+  time. Session start Aug 1900: host counter -68, `kwar=1:-68,2:-68` (both at peace: the host's), the client's game -68,
+  "At peace for 5 years and 8 months.". Germany at war with Spain (`settension 1 7 50`), Aug -> Sep: Germany 1, France
+  -69, the host -69 (its own step), the client "At war for 1 months." with the War results box, the session file
+  `kwar=1:1,2:-69,`, `kwarStepped=Aug 1900`, `diplomacyDate=Sep 1900`; Sep -> Oct: 2, "At war for 2 months."; peace
+  (`settension 1 7 5`), Oct -> Nov: 0, "At peace for 0 months.", France -71. The host's screen unchanged throughout.
+  (A first run, 55 s, had 4 failing checks of the driver: it expected `kwarStepped` = the new month and a hidden war
+  line at peace.)
+
+## Feature 2026-10-20: relations v2, B2: the computer's rules leave a joined nation's pairs alone (relations v2)
+- **Why.** The game runs every nation but nation 0 by its AI rules, so a joined nation K's relations with the
+  computer's nations (and K's decisions about the host) came from the computer: AI wars and AI peace (frozen while the
+  host is at war), alliances, the drift, reactions to the host, and in the host's own CheckForWar K could plan and
+  declare war on the host. Under the player's rules (option 2) those relations are K's player's: they follow the
+  player's routines on K's PC (B3), the players' diplomacy and the events.
+- **Which routines** (static, the callers of `ChangeAITension`, `SetAITension`, `SetAIAlliance`, `HandleAIPeace`; the
+  dumps of `CheckAITensionEvents`, `CheckForWar`, `RandomTensionChanges`, `ReduceTimeLimits`; GAME-INTERNALS):
+  the computer's relation rules are `CheckAITensionEvents`, `DoAITensionChanges`, `CheckStopPlayerAgression`,
+  `CheckAllyTrouble`, `CheckBlitzkrieg`, `CheckChineseConcessions`, `CheckForceOnForeignStations`,
+  `CreateArmsControlTreaty`, `CheckForRevolutionInEnemyNation`, `ReduceTimeLimits` (an ally's "separate peace") and
+  `HandleAIPeace`, plus `ChangeAITension` from anywhere. In the host's own routines K appears as a computer nation in
+  `CheckForWar` (war plans, declarations, surprise landings, volunteering, alliance quarrels) and `RandomTensionChanges`
+  (alliance offers "X suggests an axis of steel ...").
+- **Who.** `hookcb::PlayerRulesNation(K)` (host): K is a joined nation and its connected player announced `rel` >= 1
+  in the hello; while the player is away, what its last player announced (`relRules` in `rtw3mp_session.ini`,
+  updated with every month); Give to AI ends it; bridge `relrules <K> 1` forces it for tests. Clients announce `rel`
+  from B3 on, so this commit changes nothing in a real session; the proof forces it.
+- **How (`game.cpp`).** The routines run through generated thunks (`EmitMaskThunk`: push edx, eax, idx; call
+  `MaskedCall`, which calls the original with `dl::Call` inside `__try`/`__finally`); `ReduceTimeLimits` and
+  `HandleAIPeace` in their existing detours. Kind 0 (`AIMaskEnter`/`AIMaskLeave`, depth-counted): every cell of a pair
+  (K, j), j in 1..8, both directions, reads tension 5 and alliance 0 during the call (5: no war, no outbreak needing
+  10 < t < 40, no common-enemy or most-tense logic needing > 7, no alliance attempt needing 0) and gets its value back
+  afterwards; changes the routine made to a masked cell are dropped and logged. Kind 1, the host's `CheckForWar`: K's
+  tension with the host reads 5 while they are at peace, its `WillGoToWar` 0 and its own alliance cells 0; afterwards
+  the tension gets the routine's change on top of its real value, the war plan back, and K's alliance cells the other
+  nations' side of each pair (their decisions about K stay). Kind 2, the host's `RandomTensionChanges`: K's tension
+  with the host reads at least 6 (no alliance offer in K's name), the routine's change kept. `ChangeAITension` (naked
+  detour, `ret 4`) skips a pair with K. `ResetRelationMasks` (month end) undoes a mask an exception left and logs the
+  month's count of skipped ChangeAITension calls. All hooks or none (`Player's rules for joined nations: ok`).
+- **Kept:** the players' diplomacy (the mod's `StartWar`/`MakePeace`/`SetAlliance` run outside these routines), the
+  events, the host's coalition (a computer nation that joins the host's war, also against K), the battles
+  (`CheckAIvsAIBattles` sees K's real wars), the host's drift of its tension with K (`RandomTensionChanges`,
+  `TensionEffectOfPreviousWars`).
+- **Facts found:** `RandomTensionChanges` doesn't run every month: `CheckTurnEvents` gives the player one thing a month
+  (the peace event at war, officer stuff, a technology offer, a random event 1 in 3, an intelligence report), and the
+  random tension changes only when none of these came (or 1 in 8/10 after an intelligence report). `CheckForWar` runs
+  from `DoTurn` and from `DoEndOfTurn`. `0xa07124` is `ShowMessagePos` (modal).
+- **Live proof** (dist_rv_2 = this commit's code, RTW3MP AF2FF5059D2E8462; `rv_live.py b2`; `relrules 1 1`; baits:
+  Germany-Russia 35 (an AI outbreak), Germany-Japan 0 (an AI alliance attempt), Germany's tension with the host 15
+  (a declaration of war on the host: certain under the computer's rules, 13 + 0 nations at war <= 15), France-Russia 35
+  (France = the stand-in, computer's rules) and USA-Italy 35): 26/26 in 46 s (a first run, 24/26 in 50 s, required the
+  RandomTensionChanges log line, but the routine didn't run in those months). Both months: Germany's pairs with the
+  nations 1-8 unchanged (tension and alliances), other pairs changed ("War has broken out between USA and Italy!"; in
+  the first run also "between Russia and France!"), no box about Germany on the host, Germany not at war with the host
+  at tension 15; the host log `relations v2: CheckAITensionEvents runs without the pairs of nation(s) 1 (player's
+  rules)`, the same for DoAITensionChanges, CheckForceOnForeignStations, ReduceTimeLimits, CheckChineseConcessions,
+  `CheckForWar sees nation(s) 1 as players`, `2 tension change(s) of the computer's rules left out (ChangeAITension)`.
+  The client's `diplo war 2` (against the stand-in) applied at the month's end: Germany at war with France, Germany's
+  war counter 1, the client's screen "At war for 1 months.", the host's screen unchanged.
+- **Runner:** `relrules`, `computer_pairs`; `month_checks` + `relrules_month_check` (while nation 1 follows the player's
+  rules: the host's month left nation 1's relations with the computer's nations alone; allowed: a computer nation that
+  joined the host's war against it); `session`: nation 1 follows the player's rules exactly when its client announced
+  them, the stand-in never (12 checks).
+- **Older peers.** A 0.4.x client announces no `rel`: its nation keeps the computer's rules (the 0.4.x behaviour). A
+  0.4.x host runs the computer's rules for every joined nation.
+
+## Feature 2026-10-20: relations v2, B3: the player's relation routines on the joined player's PC (relations v2)
+- **What.** A joined nation K under the player's rules gets the player's own relation routines, as nation 0 does in
+  single player: `RandomTensionChanges` (with its explanations, speeches and questions), `TensionEffectOfPreviousWars`
+  and `CheckForWar` (war plans, spy warnings and rumours, declarations, allies and volunteers), at the start of K's
+  month on K's PC, with the dialogs answered by K's player; the host applies what they changed before the month runs.
+  Clients announce it (`rel=1` in the hello, `game::PlayerTurnAvailable`), so from this commit B2 is on for them.
+- **The view (`game.cpp`, `RunPlayerTurn`).** The routines read relations from nation 0's point of view; in K's full
+  view K is at index 0 and the host's nation at index K in the nation list, and every record's 9 relation cells and 9
+  alliance cells are rewritten with the permuted relations (record of view index v, cell w = the real relation of
+  P(v) and P(w), P swapping 0 and K), K's per-relation state goes into the other records (`WillGoToWar`: their war
+  plans against K, `TechSharing`: K's deals; 0 for the nations people play), and `CheckWarsWithNation` answers from
+  K's past wars (hook). The other nations people play are masked as players in CheckForWar and RandomTensionChanges
+  (the B2 masks, by view index: no war plan, declaration or alliance offer between players). Surprise landings and
+  attacks return nothing in the view (`GetRandomPossessionInArea`, `GetRandomPossession`, `DoSurpriseAttack`,
+  `CheckForPlayerSurpriseInvasion`; they move possessions and ships the host would have to replay: B5). Afterwards
+  the cells and per-relation fields are put back (also on a game exception, `__finally`), the changes come back in
+  real indices (every pair whose tension or alliance changed, K's per-relation state, the other nations' budget
+  changes, K's VP change, K's war counter) and are written into K's campaign for its screen. The turn messages the
+  routines wrote are shown in the game's own turn report (`ShowTurnMessages` with the form's `TurnMessages` swapped).
+  The game gives the player one of its events or the random tension changes a month (`CheckTurnEvents`' chain): in a
+  month with an event, `RandomTensionChanges` is left out.
+- **Client (`session.cpp`).** The month's header `rel=1` (with `kwill`, `kts`, `khist`, `humans`) arms the turn; it
+  runs after the event roll when the game is idle (`ClientRunRelations`, once per calendar month), sends
+  `MSG_RELATIONS` (40, a number of its own away from the sequence other branches extend) and shows the turn report.
+  Log `relations for nation 1 sent: tension=1:3:14:50;1:4:3:2; alliance= will=0.0.0.0.0.0.0.0.0 budget=0:1;2:1;3:3;...
+  vp=0 kwar=1 ran=tension,previous wars,war msgs=3`.
+- **Host (`HostApplyRelations`).** Once per nation and month (also across reconnects; the header leaves `rel` out
+  for a month already done), in planning, for a nation under the player's rules: K's pairs with the computer's
+  nations take the changes (a war: `StartWar`; tension deltas on the current values, at most 40); between players only
+  the tension (a delta, at most 40); another pair only a war (a computer nation that joined K's war; against the host
+  it is the host's war and a Notice); alliances unless between players or at war; K's `kwill`/`kts` kept with the
+  month; the computer nations' BudgetModifier changes; K's VP change; `KWarFollow`; chat "* War: Russia and Germany are
+  now at war.". Log `relations of Captain (nation 1; tension,previous wars,war; 3 message(s)): war 1-3 1-4 3->2 ...
+  budget 3+3 budget 4+1 ...`. K's wars that end go into its history (`khist`, dated with the new month), read by
+  `TensionEffectOfPreviousWars`.
+- **Fix of B1's step marker.** B1 marked the month's step with the save's date (`kwarStepped`), but after a live
+  battle the host's save already holds the new month at that point: the next month's step was skipped (the suite's
+  `lockstep_month` after `lockstep_pvp`: counters 1 -> 1). The step is marked with the session's month sequence now
+  (`g_seq`, in memory; the session file keeps no marker); the bridge's `stepped=` shows it.
+- **Peace events** are left for B4: the game's peace offers are events (`GetPeaceEvent`: an event slot whose
+  condition is the code 30-40 the inline decision in `CheckTurnEvents` picks) whose answers run `NegotiatePeace` and
+  `DoPeace`, the terms. Until B4 a war between K and a computer nation does not end (no computer peace under B2, no
+  player's peace yet).
+- **Live proofs** (driver `rv_live.py b3`, 1900 fixture, host and client on one PC; bait: Russia's tension with Germany
+  14): dist_rv_3 (BE8F532126D33C03) 23/23 in 54 s: the first month's turn on the client ("Tension with Spain is reduced
+  as they do not want to raise tensions with a strong nation." in its turn report; host `1-7 4->3`); after Aug 1900
+  the client showed "War has broken out between Germany and Russia" (the game's dialog, on the client only), the host
+  logged `war 1-3`, Germany's counter 1 then 2, the client's screen "At war for 1 months.", the host's screen unchanged;
+  the war generated a battle request for the client ("battle request 1: nation 1 vs 3 in Northeast Asia, fought by
+  Captain"). dist_rv_4 (FB6A16910D20A22F = this commit's code): run 1 failed 5 of 23 in 54 s (the driver expected the
+  war in the first month; the player's rule skips a declaration 8 % of the months: Random(180) < 15 and at peace for
+  4 years; it came a month later: "Germany and Russia are now at a state of war!"; and the host's own event "Talks
+  with Germany fails due to the high tension between the nations!" counted as Germany's dialog), run 2 with up to 3
+  months 23/23 in 47 s.
+- **Suite** `--only session,lockstep_month,lockstep_pvp`: dist_rv_3 16/18 (lockstep_pvp's second client, the stand-in
+  "Bot" on v2, was held by its relation turn's turn report: the runner now waits for it, `wait_relations_turn` with
+  port/pid/nation), then 87/89 (the per-month check counted the new month's relation turn as the month's change; and
+  B1's step marker), dist_rv_4 100/100 (session 14, lockstep_pvp 39, lockstep_month 47) in 211 s.
+- **Runner:** `wait_relations_turn` (after the event roll in `run_month` and `ls_month`, for the client and for K2, and
+  at the session start), `relturn_lines`; `relrules_month_check` allows the new month's relation turn's own changes
+  when the turn started from the value before the month. **Bridge:** `relturn`, `rellast`.
+- **Windows Defender** flagged one development build of this source as `Trojan:Win32/Phonzy.A!ml` (machine-learning
+  heuristic, 23:25:09) and removed it; the next build of the same source (FB6A16910D20A22F) was not flagged. A false
+  positive, but released builds may meet it too.
+- **Older peers.** A 0.4.x host ignores `rel` and `MSG_RELATIONS` (the computer's rules for K, as before); a 0.4.x
+  client announces no `rel` (the computer's rules for its nation). Protocol 3.
+
+## Feature 2026-10-21: relations v2, B4: peace with computer nations (relations v2)
+- **What.** A joined nation K under the player's rules ends its wars with the computer's nations by the player's own
+  rules, as nation 0 does in single player: at the start of K's month, after B3's routines, the player's peace decision
+  picks a peace event whose answers negotiate (the game's `TdlgEventAnswer`, answered by K's player), and the
+  Multiplayer window's Diplomacy list has a row for each computer nation at war with K with "Propose peace" (the
+  negotiation at once). The game's own `NegotiatePeace` and `DoPeace` run in K's view on K's PC with their dialogs
+  (the hawks, the enemy's refusal, "Select possessions as part of peace agreement", the "Peace treaty", the AMC and
+  submarine questions); the host applies the result right away, as B3's wars.
+- **Facts (static, 1.01.44).** The decision is inline in `CheckTurnEvents` (0xce32c7..0xce37d6): at war, if
+  `Random(4) + 2 < War`: the war loans at `War mod 3 = 1` (the player's budget: B5), then if `War > 4` and the player's
+  VP or `EnemyVP` exceed 250 G (G = FleetSize, the scale of `EventLikelihoodCheck`) and (`Random(30000) < VP + EnemyVP`
+  or `Random(100) < War`): code 36 (enemy far ahead), 34 (we are far ahead, or ahead by 1.5 with an enemy in unrest),
+  33 (no shared areas, or VP near parity in a long war), 34 -> 33 below a force ratio of 95, 36 -> 35 above 110; with
+  `TotalWar` a Fascist/Communist player drops all but 34 (`Random(200) > War`) and `CheckTotalDefeat` may negotiate
+  itself; then `GetPeaceEvent(code)` (an unused event slot whose condition is the code, +0x54 := 6,
+  `TdlgEventAnswer.Execute(event, 99)`), whose answers call `NegotiatePeace(chance, lossGain, ForceBadPeace)`. Peace is
+  always with every enemy (`Tension > 40`) at once; `DoPeace` ends every war of the enemies
+  (`IsAtWarWithPlayerOrPlayerOpponent` 0xd4a830 is only `BNation(i).Tension > 40`: its loop over the opponents is dead
+  code), sets each enemy's tension 1..4, relaxes every other relation, resets `WillGoToWar`, `Blockaded` and
+  `SubmarinePolicy` of all, budgets and unrest by the war's length, Prestige of nations 1..8 := 0, `War := 0`.
+  `TransferShipAsReparation` moves the ship object (its `CShipId` stays), copies its design into the receiver's list
+  (new design id), clears its air units, crew -20, puts it in the receiver's build area and logs "<date>
+  <reason><nation>" and, renamed, "<date> Renamed <name>" in `myLogEntries`, then always an empty line (0xcce0d3).
+  `ReturnTakenPossessionsAfterWar` uses `ChangePossessionOwner` and `GetBNation(TakenFrom)`: `TakenFrom` (and
+  `Invaded`) hold nation indices. The game's loops over nations 0..8 read nation 0's own `Tension`/`Allied` (0 for the
+  player): `CountNationsAtWarWithPlayer` (in `CheckForWar`), `RandomTensionChanges`' count of nations at peace,
+  `NegotiatePeace`'s enemies' and allies' gains and `TerminateAlliances`.
+- **The peace part (`game.cpp`, `PeacePart` in `RunPlayerTurn`, the same view as B3).** Runs when K is at war with a
+  computer nation: the decision mirrored in C++ (`PeaceDecision`, the game's own `Random` 0x837834 found from the
+  decision's first instructions, the same order of tests and Random calls; skipped in a month with another event: one
+  event a month) -> `GetPeaceEvent`; or a proposal / test: `NegotiatePeace(chance, lossGain, force)` at once (the
+  proposal is the game's compromise offer 40, 0). The view (`PvEnter`, B3's too) has the own cells of K's and the
+  host's records at 0 (K's record's cell 0 held its real relation with the host: K at war with or allied to the host
+  was its own enemy or ally there). Masks (`PeaceMaskEnter`/`Leave`, also on a game exception): the
+  nations people play read tension 40 and no alliance with K, and all their cells are put back afterwards (their wars
+  are their own; `DoPeace` would end them); K's VP and `EnemyVP` = its war score with its computer enemies (the host's
+  ledger); `TotalWar` 0 (the host's), `HasBeenBattle` from the war score, `AutoBuildSubs` 0 (the host's setting), the
+  save's war record of the month cleared (NegotiatePeace writes K's outcome there: the winner) and put back; the
+  possessions' `TakenFrom`/`Invaded` in view indices; K's own event cooldowns. Hooks record only while it runs:
+  `ChangePossessionOwner` (name, real owners, RemoveAllCoastalArtillery), `TransferShipAsReparation` (id, nations, the
+  new name, the reason, the log's "Renamed" line), `NegotiatePeace` (the arguments), `ShowPeaceTreaty` (the lines);
+  `DoPeace` in the view keeps every other nation's Prestige. B3's view-skip of `GetRandomPossession*` is limited to
+  B3's routines (the possession choice after a war uses it). Afterwards: the other nations' BaseResources, Prestige,
+  BudgetModifier and HasLostWar changes (the people's nations put back), the war state of the possessions of K's war
+  (K, its enemies, the computer nations whose war with them ended; DoPeace's clearing of the others is put back), K's
+  war counter (DoPeace's 0; while a war with a people's nation goes on, the old one, and K's BudgetModifier,
+  SubmarinePolicy, UnrestLevel, Corruption and Blockaded from before DoPeace: no demobilization), the relation changes in B3's
+  diff (K's pairs, its enemies' wars, alliances ended, `WillGoToWar`), the winner (the war record: 1 K, 2 enemy, 3
+  compromise). Log `relations v2: nation 1's peace proposal: 1-7 50->3 ...; peace part: code 0, event 0, NegotiatePeace
+  (100, 2, 1), peace, winner 1, 1 possession(s), 0 ship(s), ...`.
+- **Client (`session.cpp`).** The turn's `MSG_RELATIONS` carries the peace part (`peace`, `pcode`, `pevent`, `pargs`,
+  `paccepted`, `pwinner`, `penemies`, `pland`, `pships`, `ptaken`, `pdelta`, `plost`, `ptreaty`); a proposal or test
+  sends its own (`kind=peace`, `test=1`). "Propose peace" (`ComputerPeaceRows`: player "computer", At war, only Propose
+  peace, a confirmation) is offered after the month's relation turn (its peace event comes first) and waits for an
+  idle moment; once a month, not in a month whose peace event was answered (a queued proposal that meets one is
+  dropped: log `peace: the proposal was dropped ...`, a chat line), before the turn is submitted. Log `peace for
+  nation 1 sent (proposal): ran=1 code=0 ...`.
+- **Host (`HostApplyRelations`, `HostApplyPeace`).** K's ended wars at the game's new tension (`MakePeace`, then the
+  reported tension; no host `DoPeace`), the computer-only wars of K's ex-enemies that its peace ended (the people's
+  are skipped), alliances, then the possessions by name (`ChangePossessionOwner` if the owner is still the reported
+  one), the ships by `CShipId` in the giver's list (`TransferShipAsReparation` without the game's second rename, then
+  the player's name and log line, before the entry's closing empty line), the possessions' war state, the other
+  nations' changes (BudgetModifier only of a
+  nation left without a war: the game's peace demobilizes), K's history with the winner (`KHistPeace`), `Blockaded`
+  := 0 and VP := 0 for K without a war, `Blockaded` := 0 for an ex-enemy without a war, the war scores erased,
+  `KWarFollow`. Chat "* Peace treaty between Germany and Spain: Germany wins." and the treaty's lines (or "... peace
+  negotiations with ... came to nothing."). Log `relations v2: peace of nation 1 with Spain (peace, code 0,
+  NegotiatePeace(100:2:1)): peace, winner 1; 1 possession(s), 0 ship(s), ... 0 skipped, 5 treaty line(s)`. A
+  proposal is once a month per nation (`g_kPeaceMonth`, also after a peace event of its turn; tests exempt).
+- **War score ledger.** A war of K (player's rules) with a computer nation is scored in `g_warVP` like a war between
+  players (`LedgerPair`, from 0:0): `OnBattleVP` (battles the host resolves) and `CreditWarScore` (battles fought on
+  K's PC) count it, the month-end cleanup keeps it while the war lasts, a peace erases it. The header sends K's sums
+  `kvp`/`kevp` (the decision's VP and EnemyVP), the pairs `kpairs`, `kpeace` and `humans` (also in a month whose turn
+  was applied: proposals).
+- **Merge safety (`saveio::MergeSubmission`, `DropForeignShips`).** A ship of the player's submitted `[Nation<K>Ships]`
+  that another nation's ships section on the host holds too (the same id: two players received the same ship, or the
+  host handed it over after the player's turn was built) is dropped from K's section, `ShipCount` follows, logged
+  ("merge nation 1: ship 101 (New B) dropped: nation 7 holds it on the host"). Offline harness (saveio + util): 14/14.
+- **Bridge:** `peacetest <chance> <lossGain> <force>` (client, async), `peaceevent <code> [chance]` (client: the next
+  turn's peace event past the decision; with a chance its answer's `NegotiatePeace` runs with it: 100 takes the
+  computer's offer), `peacelast` (client/host), `kwarvp <K> [J vpK vpJ]` (host), `findship <id>`,
+  `nflag <n> <field> [0|1]`. **Suite:** `relations_peace` (group `relations`). **Live driver:** `b4_live.py` (outside
+  the repo).
+- **Not the game's:** the war loans before the decision are left to B5; `TotalWar` is the host's state, so K's
+  decision never takes the total-war branch (K has no total-war state yet); DoPeace's relaxation of the computer's
+  other relations (`ChangeAITension -1`, at most 7) and its unrest and submarine resets of other nations stay on K's
+  PC (the host keeps its computer rules for them).
+- **The war counter of the decision.** The game decides in `CheckTurnEvents`, before `DoStrategicTurn` steps `War`
+  (0xce1f69), so the decision, `CheckTotalDefeat`, the event's `NegotiatePeace` and `DoPeace` read the value from before
+  the step; K's month starts with its counter already stepped by the host (B1, `KWarMonthStep`). `PeaceRunGuarded`
+  puts K's counter less one in place while at war (> 1) for the turn's decision and its peace event (also a forced
+  one, `peaceevent`), the counter as shown for a proposal or `peacetest` (while planning; single player has none), and
+  the shown value back afterwards on every path, a game exception included (DoPeace's 0 stays; the shown value again
+  while a war with a people's nation goes on). Log `relations v2: peace: the turn's decision sees the war counter 4
+  (the game's, before the month's step; shown 5)`.
+- **Once a month also across a host restart (risk 6).** The months whose relation turn and peace were applied
+  (`g_kRelMonth`, `g_kPeaceMonth`, memory only before) are saved in `rtw3mp_session.ini` (`krelm`, `kpeacem`:
+  `K:Year*12+Month,`; `HostApplyRelations` saves the file after every apply) and read back only for the month they
+  were saved with (`diplomacyDate`, like `kwar`); a host that stops and hosts again in the same month sends no second
+  `rel=1` and takes no second peace. Files without the keys load as before. A restart from a save older than the
+  apply skips that month's turn instead of applying it twice. Suite: `relations_peace` c) `kpeacem`, d) `krelm`.
+- **Status: proven live** (2026-10-22, B4 without the B5 money rules; host and client on one PC, the 1900 fixture,
+  Germany = nation 1 against Russia; 50/50 checks, the game open 91 s): a gain (`peacetest 100 2 1`: Sakhalin ceded
+  to Germany on both copies, Russia's BaseResources -500 as reported, the ledger pair erased, war counter and
+  blockades 0, the chat's treaty), a loss (`-6`: two ships handed over, held by Russia only on both copies, also after
+  the month's merge), "Propose peace" (the game's compromise offer refused, applied as `kind=peace`, a second one
+  refused), the computer's offer taken through the game's own peace event in K's turn (`peaceevent 34 100`: applied
+  with the turn, `kind=turn accepted=1`, no proposal afterwards) and a host killed and started again in the same
+  month (`krelm`/`kpeacem` read back: no second relation turn sent, a forced one ignored, the proposal still
+  refused). Suite `relations_peace` 45/45 (with `session`).
+- **Fixes from the live proof.** (1) The host's screen showed its old tension with K after K's turn changed it (B3's
+  apply never redrew it; the suite's `relview` check, one run in three): `HostApplyRelations` ends with `RefreshUI`
+  when it changed something. (2) A nation reserved after the month's state (the suite's "Bot") was not in the
+  client's `humans`: K's DoPeace relaxed K's tension with it (7 -> 1) and the host applied it as a players' pair. The
+  client adds the lobby's people's nations (`MarkLobbyHumans`, the lobby's `dipHumans`) to the turn's, the proposal's
+  and the Diplomacy rows' list; the host skips a proposal's changes of K's relations with people's nations
+  (`... skipped`). (3) The runner's possessions answer: the lowest value, and the game's own messages over the dialog
+  first (see GAME-INTERNALS, `bnOKClick`).
+- **Restart trade-off (seen live).** The apply lives in the host's memory until the host saves its campaign (the
+  month's processing): a host that is killed and started again from the month's save has neither the turn's changes
+  nor the peace, and `krelm`/`kpeacem` keep it from taking them again this month (in the proof Russia's war with
+  Germany was back for the rest of the month; the next month decides again). **Older peers.** A 0.4.x or
+  B3 host sends no `kvp`: no peace part, no computer rows (the computer's rules, as before); a 0.4.x or B3 client
+  ignores the new keys.
+
+## Feature 2026-10-22: relations v2, B5: the player's economy rules for a joined nation (relations v2)
+- **What.** The host runs the month of each joined nation K and the game treats K as one of its computer nations, so K got
+  the money and budget bonuses the game gives the nations it plays (e.g. Germany +18,460 in one month: CheckBBNumbers'
+  6000 x FleetSize). The new `src/mod/economy.cpp` takes them away on the host and gives K the player's rule where the
+  player has one. Nation 0 and the computer's nations are unchanged; a joined player's PC is unchanged; existing
+  campaigns keep the money they have (nothing retroactive).
+- **Facts (static, 1.01.44; addresses in the 0x830000 image).** `ComputeExpenses` 0xca049c: the player gets
+  `Funds += GetMonthlyBalance`; each nation 1..8 (loop body 0xca0511..0xca05b6, nation in ebx) gets a BaseResources floor
+  of Round(1.5 x FleetSize), BaseResources x 0.9 every month at a BudgetModifier below 5, the balance, and two subsidies of
+  25 x FleetSize (one only when its modified budget is below the player's and its tension with the player is above 6).
+  `CheckBBNumbers` 0xccb6d8 (only caller: CheckTurnEvents' loop 1..8, so its player branch is dead code): a capital-ship
+  race gives the computer +6000 x FleetSize and BudgetModifier +1. `ReduceTimeLimits`' funding loop (0..8): keep-up
+  (`cmp edi,[ebx+PlayerNation]; je` 0xc7ba85, +1 toward the player's BudgetModifier, 30 %), preeminence (0xc7b9f5; the
+  player's branch needs unrest below 3, Random(100) < 10 - unrest and two below the highest BudgetModifier, the
+  computer's unrest below 6 and 20 - unrest), January cuts 1..8 (0xc7b303, 0xc7b33e). `CheckForCoups`: a computer coup
+  always succeeds with +1 (0xd12edc); the player answers a dialog. `CheckAITensionEvents`: its only BudgetModifier writes
+  are +1 at war with a computer nation (0xd2ddb3), arms race (0xd2e592) and both sides of a war declared between computer
+  nations (0xd2e662, 0xd2e689). `CheckForWar`: when the player's nation went to war, every nation 1..8 with tension below
+  40 gets +1 (0xc85a47). `WarStartsWithNation` 0xd333bc: the enemy +2 up to 30 (IncMax) and +1 below 22; the player +1
+  below 30 and +1 below 25 when Random(30) > BudgetModifier. `SpySuccess` (spying nation 0 only): a target with tension
+  above 7 gets the report "secretly spending an additional 10%" and Funds += ModBudget / 5 (0xc9d5f6). The computer's
+  loop runs `DeHaltAllShips` (every ship's Halted := 0) and up to four `HaltMostExpensiveShip` while the balance is
+  negative. Maintenance: `GetNavalAcademyCost` (the computer pays 0, 0xc77b09), `ApplyAirMaintenanceModifiers` (x 0.8,
+  0xc658d1), `GetShipMaintenanceCost` (a light carrier with aircraft x 0.6, 0xc59eda). `GetMonthlyBalance`'s tree calls no
+  Random and writes only idempotent values (BudgetModifier >= 3, raider status at peace). The date advances in
+  `DoStrategicTurn` after `CheckUnrestChanges` and before `ReduceTimeLimits`.
+- **Now for K (B2's masks in mind).** Under the player's rules (B2) K's pairs read 5 during `CheckAITensionEvents`, so
+  none of its +1s reach K; a joined nation of an older client (no `rel`) gets them. During `CheckForWar` K at peace reads
+  5 (< 40): K gets the +1. Everything else above reaches K (no test for people's nations).
+- **How (`economy.cpp`, installed from `main.cpp` after `game::InstallHooks`).** Each rule is found by its routine's RTTI
+  name and a byte pattern unique in the routine (field offsets from RTTI; call targets checked) and hooked with MinHook
+  at the instruction (generated thunks: leave the instruction out, answer `cmp nation,[form+PlayerNation]` as "the
+  player", or return at once), only when `hookcb::IsHumanRemoteNation`: `ComputeExpenses` skips the computer's part for K
+  and adds `GetMonthlyBalance(K)` (at the player's prices); `CheckBBNumbers`, `DeHaltAllShips`, `HaltMostExpensiveShip`
+  return at once; keep-up skipped, preeminence by the player's branch; the January cuts, the coup's +1,
+  `CheckAITensionEvents`' four +1s and `CheckForWar`'s +1 left out; `WarStartsWithNation` restores K's BudgetModifier and
+  applies the player's increments with the game's Random; `SpySuccess`'s tension test reads "not tense" for K (no report,
+  no money); the three maintenance tests answer "the player". A rule that doesn't match stays the game's; the start
+  logs `economy: the player's economy rules for joined nations: ok (20 of 20; ...)`.
+- **Left as they are.** The computer's unrest cuts in `CheckUnrestChanges` (BudgetModifier -1, twice with unrest -1: the
+  player's unrest rules show the host's dialogs and follow the host's war counter; dropping them would leave K's unrest
+  without relief); the treaty cut R1 (the computer -1, the player -2) and the isolationism cut R4 (the player's needs the
+  host's ParliamentDelay); the shared rules (HandleEconomicGrowth's +1 at the host's war, AdvanceShipConstruction's
+  hoarding reclaim, DoPeace's caps, the nationalist and fascist +1s); the global-economy event's BaseResources changes of
+  nations 1..8; a coup itself (the government changes); `LayDownShip`'s 5 % first-of-class fee. The intel part of the
+  balance (`ComputeAINationIntelCost`) is the player's own spending since 0.4.1 (`nationplay.cpp`, merged with 0.4.1).
+- **Record and log.** Each joined nation's month is logged after the month's `CheckForWar` (MinHook on DoEndOfTurn's
+  call): `economy: nation K (<name>) YYYY-MM: funds a -> b (balance +c at the player's prices, maintenance +m); withheld:
+  subsidy s, BB check n, spy n (funds f), BM +n (AI war, arms race, AI war start, host's war, coup), January -n, keep-up n,
+  BR floor, BR x0.9, auto-halt n, resume n; the player's rules: preeminence n (+n), war start +p (computer's +g)`.
+- **Bridge:** `econ <K>` (host): Funds, BudgetModifier, BaseResources, the balance at the player's and the computer's
+  prices, fs, and the last month's record (`rec`, `before`, `after`, `applied`, `subsidy`, the counts; see TESTING).
+- **Not yet (B5 follow-ups; done in part 2, below):** the player's own rules for K: war loans every third month at war (needs K's war counter,
+  B1's ledger in session.cpp), `CheckPlayerFunds`' debt penalties and corruption, the hoarding cuts (K-local, never the
+  global ArmyOffensive), `SmallFleetCheck`'s +1/-1. Without them K's BudgetModifier only moves by the shared rules, the
+  player's routines on K's PC (B3's RandomTensionChanges) and the player's preeminence and war-start rules.
+- **The record of the rules every nation shares.** `AdvanceShipConstruction` (in `ReduceTimeLimits`, after the date's
+  step, before `ComputeExpenses`) is hooked at its entry for the record only: how much it changed each joined nation's
+  Funds (`CheckForConstructionDelays`, called for every nation 0..8 in its loop, pays a delayed ship's month back, e.g.
+  "Technical problems have delayed the construction of ... by one month."; the hoarding reclaim takes 5 or 10 %). The
+  month's line ends with `shared construction rules +n`, `econ` has `shared=n`.
+- **Status: proven live** (2026-10-22, B4 + money, host and client on one PC, the 1900 fixture, Germany = nation 1,
+  three processed months with its BudgetModifier 4 below the host's, then the host's war with Germany; 76/76 checks, the
+  game open 79 s): every month one line per joined nation; `after - before == applied` (the balance only); nothing
+  after ComputeExpenses (no +6000 x FleetSize, no spy money); 75 = 25 x FleetSize withheld each month; the funds before
+  ComputeExpenses == the client's submitted funds + the shared construction rules (the first run found +282 in one
+  month: a construction delay's refund, the record's reason); the client shows the host's funds; the stand-in nation
+  2 (reserved, no client) has its own record (+2033 and +1733 of shared construction refunds); the computer nation 3
+  and the host's nation 0 have no record (the game's economy); the computer's four automatic halts of Germany's ships
+  in deficit left out (`auto-halt 4`); the host's war: BudgetModifier 15 -> 16 by the player's rule (the computer's
+  would have given +2 and +1). Existing campaigns keep their money: nothing is taken back, the first month starts
+  from the submitted funds.
+
+## Merge 2026-10-22: 0.4.1 into relations v2 (0.5.0-dev)
+- **What.** `main` (21c69c6, the 0.4.1 release: live battles between two PCs with the software maths and the game data
+  files, engine level 17; each player's own intelligence and trade protection warnings, `nationplay.cpp`; the twopc
+  suite group) merged into `relations-v2` (B1-B5 on fix-strat 2e1a042). `MP_MOD_VERSION` "0.5.0-dev", protocol 3.
+- **How.** 0.4.1 is one commit on 0.4.0 that also holds fix-strat, which `relations-v2` has as its own commits: a
+  plain merge (base 0.4.0) saw fix-strat added twice and gave 49 conflicts. Resolved against fix-strat instead (a
+  temporary commit with main's tree on 2e1a042, merged without commit; the merge commit's parents are relations-v2 and
+  main): 22 conflicts in 8 files, every one both sides': `build.bat` (both sides' sources), the bridge (`relturn`,
+  `peacetest` and `submit`, `intelcheck`), the month's header (`rel`, `kwill`, `kts`, `khist`, `humans`, `kvp`,
+  `kevp`, `kpairs`, `kpeace` and `intel=1`), the hello (`rel` and `cpu`, `dh`; one log line with both), `game.cpp`'s
+  resolve and install (B2-B4 and `nplay::Resolve`/`InstallHooks`), `EventActive()` = the event view, the player's view
+  (B3/B4) or nationplay's; the runner's session checks, groups and estimates; MODLOG, ARCHITECTURE and TESTING. No game
+  routine is hooked twice: nationplay hooks the intelligence cost and labels, `ChangeIntel`, the patrol requirement and
+  `CheckShipsOnForeignStations`; economy.cpp's sites are elsewhere (installed after `game::InstallHooks`, MinHook
+  already initialized).
+- **Runner.** `build_version` reads a version with a suffix ("mod 0.5.0-dev"); `events`' random path waits for a month
+  in which nation 1 is at war with nobody (a run whose `battles` needed retry months put its planned month on
+  `lockstep_pvp`'s war month: no event qualifies at war); `relations_peace` a)'s chat check names nation 1's other
+  computer enemies too ("Germany and Russia, Spain": `battles` leaves a war with Spain).
+- **Tests.** Build without warnings (dist_rv_10). Suite `--only session,lockstep_month,lockstep_pvp,events,battles
+  --group relations`: run 1 233/237 (the two runner issues above), run 2 217/217 in 370 s of game time.
+
+## Fix 2026-10-22: a host restart in the month keeps the month's relation turn and peace (0.5.0-dev)
+- **Problem.** A joined player's relation turn (B3) and peace (B4) are applied on the host in the month's planning phase
+  (`HostApplyRelations`) and lived only in the host's memory until the month's own save (`RunHostTurn`). The risk-6 guard
+  (`krelm`/`kpeacem` in `rtw3mp_session.ini`) prevents a second turn after a restart, so a host whose game stopped in the
+  month lost them: in the B4 live run the war 1-3 the joined nation had just ended was back after the restart.
+- **Options.** (a) Save the host's campaign right after the apply; (b) record the identity of the save with the guard and
+  apply the turn again from a stored copy when an older save is loaded. (b) has to replay `HostApplyPeace` (possessions,
+  ships, other nations' fields) on a reloaded campaign while keeping the session-side effects (ledger, war counter,
+  history, chat) single, and K's own fields still live only on K's PC; (a) uses the game's own save at a moment the mod
+  already saves at (a join, a claim and a rematch save in the planning phase to send the month), so the newest save
+  always holds what was applied. Chosen: (a).
+- **How.** `HostApplyRelations` writes the guard first (`SaveReservations`) and then saves (`SaveAfterRelations`:
+  `game::SaveGame` in the planning phase when no turn runs, no battle, no event view and the host's game is free
+  (`IsBusy`: no modal dialog); otherwise pending, retried from `Tick`; `RunHostTurn`'s own save clears it). A crash
+  between the guard and the save loses the changes and never doubles them. Log `relations v2: campaign saved after a
+  relation turn|a peace proposal of nation K (ok; n save(s) of this kind)`; the host's `rellast` reply ends in
+  `saved=1` (`saved=pending` while it waits). The saved month is the month the clients get when they join again
+  (`SendStateTo` packs the save), so a client that reloads the month after the restart sees the same.
+- **K's own fields.** The routines on K's PC also change K's own fields, which reached the host only with K's turn
+  (MergeSubmission replaces K's sections): a restart lost them with K's plans. `RunPlayerTurn` now sends their changes
+  (`self` = BudgetModifier, Prestige, BaseResources, UnrestLevel; clamped on the host) and the host applies them with the
+  rest, so the saved campaign holds them; the month's merge then puts the same values in place. Funds are left out: a
+  peace's `ScrapShipsAfterPeace`/`ScrapShipsAccordingToTreaty` on K's PC pays refunds for ships the host never scraps.
+- **Wording.** Different mod versions can share a live-battle engine (0.4.1 and 0.5.0 are both level 17): `LevelWhy`
+  says "live battles need the same live-battle engine on both PCs: the host has 0.5.0 (engine 17), you have 0.4.0
+  (engine 14)"; `LevelMismatchText` drops "the same mod version" (the `lockstep_resume` check follows).
+- **Status: proven live** (B4 driver `--event --restart`, dist_rv_12, 102 s open): five saves after applies; the host
+  killed after the turn's accepted peace event and started again: the peace 1-3 still in the host's campaign and in the
+  client's reloaded month (war 0, tension 2), nation 1's own fields equal on both, ledger pair erased, `peace=used`, no
+  second turn (`second relation turn of Captain this month ignored`), the next month processed (Sep -> Oct 1900), ships
+  handed over held once. (The run's two failures were the driver's: it compared with its own in-memory re-declaration
+  of the war; fixed.) Limit: a crash in the second between the guard and the save loses that apply.
+
+## Feature 2026-10-22: relations v2, B5 money, part 2: the player's remaining economy rules, and the computer's last decisions for a joined nation (0.5.0-dev)
+- **What.** B5 money left K without the player's own rules and still let the computer decide some things for K. Now, on
+  the host, each joined nation K also gets the player's war loans, debt penalties (and the money of corruption),
+  hoarding cuts and SmallFleetCheck's budget rules, and the computer no longer spends K's money or decides for K in the
+  month. Nation 0, the computer's nations and a joined player's PC run the game's rules as before.
+- **Facts (static, 1.01.44; RE note re_econ.md in the developers' files).** `CheckPlayerFunds` 0xcb4b44 (after
+  `ComputeExpenses`, player only): (a) debt: Funds < 0 gives a message (OK box, not logged) and by the escalation
+  (Funds > -50 or Random(100) < 10: "in the red"; > -1000: finance ministry 40 %, then "losing confidence" 40 % with
+  War < -2 and ProportionalPrestigeLoss(10); else unless Balance >= 100 and Random(100) >= 20: "outraged" 50 % with
+  War < -4 and PPL(10), else MoraleLoss (FleetMorale -1, every ship's crew and every air unit's pilots -1/-2) and
+  Prestige -1); (b) corruption (Random(300 - C) < 10 and (War <= 0 or Random(100) < War + 70)): Funds > 4000 and
+  Random(300) < C: Funds -1000 and a question (answer 2: Corruption -10, PPL(10)); else a question only; (c) the Air Force
+  event (1950-1975, 1/1000, a question; BM -1 on answer 2); (d) hoarding 1 (Funds > 0.6 x ModBudget + 20000, the most
+  tense nation below 6, Balance > -100, ArmyOffensive 0, 10 %): at war ArmyOffensive := 4..6 only; Bombastic or
+  government 2: Funds -2000 x FS, BM -1, ArmyOffensive := 12; else BM -1, ArmyOffensive := 12; (e) hoarding 2 (Funds >
+  40000 x FS, ArmyOffensive 0, 28 %): Funds -= Funds div 10, BM -1, ArmyOffensive := 8. ArmyOffensive (form +0x4a6f) is
+  one value: `GetModifiedBudget` 0xc4f103 makes every nation's budget x 0.9 while it is above 0 (`ResolveArmyOffensive`
+  counts it down monthly; its reset in `WarStartsWithNation` 0xd334c0 is unreachable, only `DoPeace` ends it).
+  `CheckTurnEvents` 0xce30f0 (exits in month 2 of the start years and at War 0/-1): Random(4)+2 < War: the war loan
+  (War mod 3 == 1, Unrest < 8, BM < 22, Random(16)+10 > BM: BM +1 with the leader's/parliament's message), then at War > 4
+  the peace decision (B4, K's PC); at peace `SmallFleetCheck` 0xc87dd4: A/B (the host player's dialog and early events),
+  C complaints (prestige -1), D budget rules (D1 the most tense nation's threat: War > -36 lowers that tension, else BM +1
+  and ParliamentDelay 10..13; D2 government 0; D3 a disarmament treaty BM -1; D4 after 1950 BM -1), E the notice of the
+  smaller share after 1920. `BuyTechnology` (the host player's choice) can take K as the partner.
+- **How (economy.cpp; host only, `hookcb::IsHumanRemoteNation(K)`).** After the game's `CheckPlayerFunds` and
+  `CheckTurnEvents` each joined K runs the player's version with K's fields, K's own war counter (`hookcb::KWarCounter`,
+  the pre-step value the game's War has there) and K's own ParliamentDelay and army-offensive months (the game's global
+  ArmyOffensive is never written for K); K's budget is x 0.9 while K's months last (`GetModifiedBudget`'s ArmyOffensive
+  test answers for K); the months count down where `ReduceTimeLimits` counts the game's and end at K's peace. The
+  corruption question takes its first answer (the money goes, no further effect); the Air Force event and
+  SmallFleetCheck's A/B parts are not run for K. The texts (the game's, with K's parliament and leader) go to K's player
+  with the new month (header `econnews`) and are shown in the game's turn report there; header `kao` sets the client's
+  own ArmyOffensive (its budget figures show the x 0.9; that copy's General section is never merged back). Per-K state:
+  `rtw3mp_session.ini` key `kecon=K:pd:ao:notice,...` (with the month, as `kwar`).
+- **The computer's last decisions for K (audit, static).** Kept away from K now: `CheckNewResearchEffectsForAI` (K's
+  doctrine set by the computer), `SetAmmoLoadoutAndUsage` (January), `MaybeSendHomeShipInColonies`, `PutShipOnASWPatrol`,
+  `CheckOneShipsOrBaseHasAircraft` (g_skips); `CheckSubmarineActivity`'s escorts built and paid for K and its ASW research
+  priority (K answers as the player), `BuyTechnology` with K as the partner, the scrap sell-on with K as the buyer (twice
+  the scrap value), `ScrapShipsAfterPeace`'s automatic scrapping of K's armed merchant cruisers (the player's "No" path),
+  the treaty cut R1 (K gets the player's second -1, no tension message), `CheckChineseConcessions` for K = China. Already
+  away: `AINationAdjustBudget` (the only source of "... is said to have increased the naval budget"), `AIMonthlyBuild`,
+  `CheckAIRebuilds` (refits), `PutAIShipsInStatus` (reserve, scrapping), `DetermineAINationResearch`, `SetAITraining`,
+  `CheckAISpying` and the B5 money sites. Repairs cost nothing for anyone; `ScrapShipsAccordingToTreaty` and
+  `CreateArmsControlTreaty` scrap for the player too. Left: aircraft development (the computer develops prototypes and
+  licences for K; K's requests live on its PC), `CheckForRevolutionInEnemyNation` and `WarHelpFromAllies` (war effects,
+  B5 later), the global-economy event, `ReduceTimeLimits` R2/R4, GetModifiedBudget's x 0.97 (the host's War).
+- **Record.** The month's line gains `; the player's money rules (war counter W): debt ..., corruption ..., hoarding ...,
+  war loan n, complaint ..., budget rule ..., notice n; funds +f, BM +g, prestige +h, N message(s); treaty cut t; army
+  offensive A month(s) (budget -x), ParliamentDelay P; month's end funds E (other changes +o); left out for the player:
+  ...`; `econ K` adds `ran kwar debt ... ruleFunds ruleBM rulePrestige news kao kpd aoCut ended fundsEnd otherFunds asw
+  techPartner shipBuyer amcKept china aoNow pdNow ...` (old keys unchanged). TEST knob `econrand <v>` (K's rules draw
+  min(v, n - 1)); bridge `ffield <Field>` reads a campaign field.
+- **Status: proven live** (econ driver, dist_rv_13, the 1900 fixture, Germany = nation 1, five processed months, 121/121,
+  116 s open): M1 debt (-50000, war counter -10): "outraged", prestige -2, ComputeExpenses' balance only (+123); M2 at war
+  with nation 4 (counter 4): the war loan, BM 10 -> 11; M3 SmallFleetCheck D1 (counter -40, tension 25 with Britain): the
+  hawk party's bill, BM +1, K's ParliamentDelay 13 (the host's untouched), the client's turn report showing the text; M4
+  hoarding rule 2: 176630 -> 158967 (a tenth), BM -1, K's army offensive 8 (client ArmyOffensive 8); M5: 7 months, K's
+  budget x 0.9 (aoCut 5540). Every month: the month's end funds == ComputeExpenses' + the rules' funds (other 0), the
+  funds before == the client's submitted funds, the stand-in its own record, nation 3 and nation 0 no record and no
+  suppression, the global ArmyOffensive 0; `AI suppressed` for nation 1: AIMonthlyBuild, AINationAdjustBudget,
+  CheckAIRebuilds, CheckAISpying, CheckNewResearchEffectsForAI, DetermineAINationResearch, MaybeSendHomeShipInColonies,
+  PutAIShipsInStatus, SetAITraining. Review fixes before the run: K's army offensive no longer ends at a war's start.
+## Testing 2026-10-22: the 0.5.0 release candidate dist_rc050_1 (v0.5.0)
+The release candidate dist_rc050_1 (rel-050 dc2cbfc: 0.5.0, live-battle engine 17, protocol 3) on the reg-050 runner,
+installed from its frozen snapshot (`--dist`), 0.4.1 (dist_rc041_2) put back after every run; slots 1 and 9 and the
+Preferences identical to their backup after every run (hash), no copy left running, the game folder copies deleted.
+- **Runs.** The default run 814/822 (1723 s with the game open); `--stress` (28 scenarios with the missile fixture)
+  1158/1163 (5287 s); `--stress --only diplomacy,battles,victory_points,lockstep_month` (the re-run and `lockstep_month
+  --stress`) 291/295 (489 s). `relations_peace` 33/33 in both full runs (B4: offers, "Propose peace", terms, the save
+  after the apply) and the money checks of every month (`econ_month_check`, B5) ran in all three. Every long live-battle
+  case passed: `lockstep_month` 79/79 twice (an agreed end at 514 minutes, the game's end inside a minute), `twopc` full
+  83/83, `lockstep_rejoin` 41/41, `lockstep_resume` 43/43, `lockstep_torpedo` 20/20, `lockstep_stress` 119/119,
+  `lockstep_strike` 21/21, `lockstep_missiles` 23/23, `lockstep_air` 41/41.
+- **Product: the AI peace under the relations v2 mask (regressions against 0.4.1).** `CB_BeforeAIPeace` (game.cpp) enters
+  the B2 mask (`relations v2: HandleAIPeace runs without the pairs of nation(s) 1`: every pair of nation 1 with 1..8
+  reads tension 5) before the mod's own AI-peace guards run, and `CB_AfterAIPeace` leaves it only after them:
+  - `victory_points` h) failed in all three runs: `aipeace 2 0` (the AI war 2-3 ends, the players' war 1-2 goes on) left
+    no `AI peace: VP of player nation K kept at P (the game set 0)` line and the VP of nations 1 and 2 at 0 (319/135,
+    327/153, 315/129 -> 0). `AIPeaceRestoreVP` asks `AtWarWithAnyone(i)` while nation 1's pairs read peace, so neither 1
+    (at war with 2 only) nor 2 (its war with 1 masked) gets its VP back. dist_rc041_2 passed h) in both its runs.
+  - In two of the three runs the host showed the game's box "Error in HandleAIPeace procedure! Access violation at
+    address 01058F0B in module 'RTW3.exe'. Read of address 000001A5" at `diplomacy`'s forced AI peace (`aipeace 2 1`:
+    nation 2's only war is the players' war with nation 1). `OnBeforeAIPeace` (session.cpp) skips the game's routine for
+    a nation whose wars the players declared, but under the mask `AtWar(1, 2)` reads peace: no `AI peace (badLoss=1)
+    skipped for nation 2: its wars were declared by the players` line, the game's routine runs for a nation without a
+    visible war. In a campaign the same can come from any HandleAIPeace call for a computer nation whose only war is
+    with a joined nation under the player's rules.
+  - The fix to try: run `AIPeaceKeepVP` and `OnBeforeAIPeace` before `MaskEnterSafe(0, "HandleAIPeace")` (and enter the
+    mask only when the routine runs), and leave the mask before `OnAfterAIPeace` and `AIPeaceRestoreVP`; then run
+    `diplomacy` and `victory_points` again (and the default run).
+- **Product note (no effect on the money).** A war of the host's nation with nation 1 declared at the month's end
+  (`diplomacy` B) opens an economy record of its own with the month's date after the month's record was logged: `econ 1`
+  then shows `pending=1 expenses=0 warStarts=1`, and the next month logs a second line for that date ("1901-01: no
+  ComputeExpenses; ... war start +1 (computer's +2)").
+- **Suite fixes (reg-050).** bb91257 `relrules_month_check`: the joined player's own event of the new month (its
+  intelligence result `#-1 'Intelligence'`: 1-4 3->4; a random event #34: 1-3 3->4, 1-4 4->5) changes nation 1's pairs
+  after the host's month like its relation turn; the first change by the player's side must start from the value before
+  the month (`event_tension_changes`). f64beb4 `econ_month_check`: with a record opened after the month's end it reads
+  the month's own line (`ECON_LINE_RE`, "month's end funds F (other changes +0)"). 4893861 `player_copy` a) and g): the
+  copy's [General] War is the player's own war counter since 0.5.0 (saveio `MakeNationPlayer`, `own_kwar`: 0 after the
+  last war ended that month; the host's guess -1 before). 01565b0 `lockstep_air` g) says why its wait for a ready
+  formation ended. Self-test 121/121.
+- **Flaky (passed when run again).** `battles` b) in the `--stress` run: seven attempts avoided or declined by the
+  enemy (the game's choice; 71/71 in the re-run). `lockstep_air` g) in the default run: "a formation B readied became
+  ready (status 2) within 27 minutes (for Stand down)" (41/41 in the `--stress` run).
+- **Mixed versions** (TESTING.md, Mixed versions; driver `mixed_050.py`): a) a 0.5.0 host with a 0.4.1 player: the join,
+  two months, the computer's relation rules for its nation and the player's money rules without their messages (4
+  message lines sent with `--debt`, none shown), the host's battle fought live (415 and 424 minutes equal, no DESYNC):
+  66/66, 67/67. b) a 0.4.1 host with a 0.5.0 player: the computer's rules for its nation (no relation turn, the host's
+  war counter, no money messages), the host's battle fought live (416 minutes equal, no DESYNC): 39/39. c) a 0.5.0 host
+  with a 0.4.0 player: the battle refused live with the new notice ("live battles need the same live-battle engine on
+  both PCs: this host has 0.5.0 (engine 17), Captain has 0.4.0 (engine 14)."; the player's: "the host has 0.5.0
+  (engine 17), you have 0.4.0 (engine 14)."), nothing stuck: 52/52 (50/51 before a driver fix: the debt's messages come
+  in the months after it).
+- **Verdict: NO-GO** for publishing this build: the AI-peace regressions above (a game error box on the host, the
+  players' VP lost) sit in the path the 0.5.0 relations rules add. Everything else, the mixed versions included, passed.
+  Game open: 8562 s in all (the three runs 7499 s, the mixed runs 1063 s).
+
+## Fix 2026-10-22: the game's AI peace and the relations mask: VP kept, no access violation (v0.5.0)
+Main session, on `rel-050` after the NO-GO of the 0.5.0 release candidate dist_rc050_1 (the testing entry above).
+- **Seen:** `victory_points` h) failed in 3 of 3 runs: a game AI peace set the VP of the players at war to 0 (319/135 ->
+  0/0; 0.4.1 passed it). The `diplomacy` scenario's forced AI peace (`aipeace 2 1`) gave the host the game's box "Error
+  in HandleAIPeace procedure! Access violation at address 01058F0B ... Read of address 000001A5" in 2 of 3 runs.
+- **Cause:** `CB_BeforeAIPeace` (`game.cpp`) entered the relations-v2 mask (`AIMaskEnter`: every pair of a nation
+  under the player's rules at tension 5, no alliance) before the older protections ran, and `CB_AfterAIPeace` left it
+  only after them. `AIPeaceRestoreVP` checks `AtWarWithAnyone` before it puts a player nation's VP back, and saw a
+  nation whose wars were hidden as at peace, so the game's VP reset stood. A computer nation whose only war was with a
+  nation under the player's rules entered the game's `HandleAIPeace` with no visible enemy: the skip in
+  `OnBeforeAIPeace` covers only wars the players declared on each other (`g_pactWars`), and the game's routine read
+  through the enemy it couldn't find.
+- **Fix:** the nation's war state and the players' VP are recorded before the mask. After the masks, a nation that was
+  at war and has no visible war left is skipped: the game's routine doesn't run, since those wars end only by the
+  players' own peace (B4). Log `AI peace (badLoss=N) skipped for nation N: its wars are with players' nations`. The
+  masks are left before `AIPeaceRestoreVP`, which now sees every war. The strategic layer only: `MP_LS_LEVEL` stays 17,
+  protocol 3. Verified by the regression of the next release candidate (`diplomacy`, `victory_points`, the default
+  suite).
+
+## Testing 2026-10-23: the 0.5.0 release candidate 2 dist_rc050_2 (v0.5.0)
+The release candidate dist_rc050_2 (rel-050 b5b0da7: 0.5.0, live-battle engine 17, protocol 3; the AI peace fix of the
+entry above) on the reg-050b runner, installed from its frozen snapshot (`--dist`; RTW3MP.dll SHA-256 55806E24...8702,
+version.dll A5098282...F670), 0.4.1 (dist_rc041_2) put back after every run; slots 1 and 9 and the Preferences identical
+to their backup after every run (hash; the backup itself equal to the one taken before the first candidate's runs), no
+copy or delay proxy left running, the game folder copy deleted.
+- **Runs.** `--stress --only diplomacy,victory_points` three times: 144/144 each (161, 163 and 160 s with the game open;
+  `session` 17/17, `diplomacy` 74/74, `victory_points` 53/53). The default run: 835/836 (1779 s): `diplomacy` 75/75 with
+  the new check, `victory_points` 53/53, `relations_peace` 33/33, every live-battle scenario passed (`lockstep` 33/33,
+  `lockstep_ui` 41/41, `lockstep_limits` 52/52, `lockstep_pvp` 29/29, `lockstep_month` 49/49, `twopc` 60/60, `air_units`
+  10/10, `lockstep_air` 41/41); its one fail is `battles` b) (flaky, below). `--stress --only session,events,battles,
+  lockstep_month,lockstep_pvp,relations_peace`: 261/261 (898 s): `battles` 71/71 (b) fought at its first attempt),
+  `lockstep_pvp` long 30/30 (the players' live battle ended by agreement at 424 minutes), `lockstep_month` long 79/79 (an
+  agreed end at 457 minutes, the game's end inside a minute), `relations_peace` 33/33, `events` 31/31.
+- **The AI peace fix works** (b5b0da7), in all four runs with `diplomacy` and `victory_points`:
+  - `diplomacy`'s forced AI peace (`aipeace 2 1`, nation 2's only war the players' war with nation 1): the host logs `AI
+    peace (badLoss=1) skipped for nation 2: its wars are with players' nations` (01:15:06, 01:18:16, 01:21:04, 01:26:40),
+    the players' war goes on, no game box.
+  - `victory_points` h) (`aipeace 2 0` ends the AI war 2-3 while the players' war 1-2 goes on): `AI peace: VP of player
+    nation 1 kept at 315 (the game set 0)` and `AI peace: VP of player nation 2 kept at 129 (the game set 0)` (327 and 129
+    in the default run); the AI nations get the game's 0.
+  - "No game error box on either copy in the whole run" passed in every run; no log of any copy has an access violation.
+- **Suite (reg-050b).** 8896b72 `diplomacy`: the host log's skip line after the forced AI peace is a check (the older
+  guard's `... its wars were declared by the players` counts too; a SKIP-note when nation 2 has another war), so the
+  path no longer depends on the box, which came in 2 of 3 runs: dist_rc050_1's runs had no skip line at all. Self-test
+  121/121.
+- **Flaky (passed when run again).** `battles` b) in the default run: six attempts in three months, five "The Spanish
+  navy declines battle! You gain 360 VP!" (`StartPlayerBattle 0 attacks 7 in Northern Europe -> none`, outcome
+  `avoided`, its VP merged) and one declined by the client's side (`battle 5: resolved by the game (Captain declined
+  it)`); the next run fought at its first attempt (`-> battle`, `battle 1: fought`). Spain was blockaded by nation 1 in
+  both runs (`blockaded: 7` at every battle load), so the blockade doesn't decide it: the game's choice, as in the first
+  candidate's `--stress` run.
+- **Mixed versions** (`mixed_050.py` and its helper with the reg-050b runner): a) a 0.5.0 host with a 0.4.1 player
+  (`--debt -30000`), run again since the host's AI-peace path changed: the join (`Captain: mod 0.4.1, live-battle engine
+  17 (this host: 17), player's relation rules 0`), two months, the host's battle fought live (424 minutes equal, no
+  DESYNC, ended by agreement), the money rules' 4 message lines not shown on the 0.4.1 PC, peace and a normal month, no
+  game error box: 67/67 (148 s).
+- **Verdict: GO** for publishing 0.5.0 with exactly this build (dist_rc050_2). Game open: 3309 s in all (the five suite
+  runs 3161 s, the mixed run 148 s).

@@ -169,6 +169,11 @@ bool AtWar(int a, int b);
 bool AtWarWithAnyAI(int idx);                 // any war of `idx` with nations 1..8
 int AllianceMonths(int a, int b);
 int WarCounter();                             // months the host's nation has been at war (<= 0: peace)
+// A joined player's PC: its own nation's war counter as the host keeps it (months at war > 0, at peace <= 0), set
+// before the month is loaded; LoadCampaign with a player nation puts it in place of the save's (the host's). INT_MIN:
+// unknown (an older host).
+void SetOwnWarCounter(int months);
+int OwnWarCounter();
 int CountAtWarWithHost();
 void StartWar(int a, int b);                  // what the game does when a war breaks out
 void MakePeace(int a, int b, int hostOutcome = 3);  // ends only the war between a and b; hostOutcome 1 won, 2 lost, 3 compromise
@@ -178,6 +183,100 @@ void SetAlliance(int a, int b, int months);   // 0 ends it
 // war and alliance marks, flags, map strength bars and war state show nation K's relations (game.cpp, KViewBegin).
 int ShownNationIndex();     // K when PlayerNation is BuilderNations[K] with K in 1..8, else 0
 std::string DebugRelView();  // tests: what the strategic screen's tension panel and war state show now
+// Relations v2, B2: the computer's relation rules leave the pairs of the nations under the player's rules alone
+// (hookcb::PlayerRulesNation; game.cpp, PlayerRules). A mask a game exception left in place is undone here (month end).
+void ResetRelationMasks();
+
+// Relations v2, B3: the player's relation routines for a joined player's nation K, run on K's own PC in K's full view
+// (game.cpp, RunPlayerTurn). Real nation indices throughout; the dialogs are the player's.
+struct PastWar {
+    int opp = -1;        // the other nation
+    int monthsAgo = 0;   // since the war ended
+    int winner = 0;      // 1 K won, 2 K lost, 0 compromise or unknown
+};
+// Relations v2, B4: K's peace with the computer's nations, after the relation routines in the same view (game.cpp,
+// PeacePart): the player's peace decision (CheckTurnEvents' block) -> the game's peace event (answered by K's player) ->
+// NegotiatePeace -> DoPeace, or a proposal / test: NegotiatePeace(chance, lossGain, force) at once. The people's nations
+// stay out of it (their wars with K are their own). K's own effects stay in this PC's campaign (they reach the host with
+// K's turn); the rest is returned in real indices for the host.
+struct PeaceSetup {
+    bool run = false;           // run the peace part (K at war with a computer nation)
+    bool decision = true;       // the turn's decision (false in a month with another event: one event a month)
+    int forcedCode = 0;         // tests: this peace event code (33..36) past the decision
+    int forcedChance = 0;       // tests: the forced event's NegotiatePeace chance (0: its answer's)
+    bool negotiate = false;     // a proposal or test: NegotiatePeace(chance, lossGain, force) without the decision
+    int chance = 40, lossGain = 0;
+    bool force = false;
+    int vp = 0, enemyVP = 0;    // K's war score in its wars with the computer's nations (the host's ledger)
+    int* used = nullptr;        // K's own event cooldowns (100 values, in/out); nullptr: the save's
+};
+struct PeaceLand {  // ChangePossessionOwner
+    std::wstring name;
+    int from = -1, to = -1;  // to -1: independent
+    bool removeCA = false;
+};
+struct PeaceShip {  // TransferShipAsReparation
+    int id = 0, from = -1, to = -1;
+    std::wstring name, reason, renamed;  // the name afterwards, the reason, the ship log's "Renamed" line (or empty)
+};
+struct PeaceTaken {  // a possession's war state afterwards (the possessions of K's war)
+    std::wstring name;
+    int owner = -1, takenFrom = -1, invaded = -1, support = 0, rebellion = 0;
+};
+struct PeaceResult {
+    bool ran = false;           // K was at war with a computer nation: the peace part ran
+    int code = 0;               // the decision's peace event code (33..36), 0 none, -1 CheckTotalDefeat decided
+    bool eventShown = false;    // a peace event was shown (K's player answered it)
+    bool negotiated = false;    // NegotiatePeace ran (the first call's arguments below)
+    int chance = 0, lossGain = 0;
+    bool force = false;
+    bool accepted = false;      // the game's DoPeace ran: K's wars with the computer's nations ended
+    int winner = 0;             // 1 K won, 2 K lost, 0 compromise (the game's war record)
+    std::vector<int> enemies;   // K's computer enemies before
+    std::vector<PeaceLand> lands;
+    std::vector<PeaceShip> ships;
+    std::vector<PeaceTaken> taken;
+    std::map<int, std::map<std::string, int>> delta;  // other nations: BaseResources, Prestige, BudgetModifier changes
+    std::map<int, int> lostWar;                       // other nations: HasLostWar afterwards (changed ones)
+    std::vector<std::wstring> treaty;                 // the "Peace treaty" lines
+};
+struct PlayerTurnSetup {
+    int K = -1;
+    bool relations = true;       // the relation routines (false: the peace part alone, a proposal)
+    bool tensionChanges = true;  // RandomTensionChanges (the game runs it in a month without another player event)
+    int will[9] = {};            // K's own per-relation state: nation j's war plan against K (WillGoToWar)
+    int techSharing[9] = {};     // K's tech-sharing deal with nation j
+    bool human[9] = {};          // nations played by people (the host's nation 0 and the joined ones)
+    std::vector<PastWar> history;  // K's past wars (TensionEffectOfPreviousWars)
+    PeaceSetup peace;
+};
+struct PairChange {
+    int a, b, before, after;  // a < b
+};
+struct PlayerTurnResult {
+    std::string error;
+    bool ranTension = false, ranPreviousWars = false, ranWar = false;
+    std::vector<PairChange> tension, alliance;  // every pair that changed (real indices)
+    int will[9] = {}, techSharing[9] = {};      // K's per-relation state afterwards
+    std::map<int, int> budget;                  // BudgetModifier changes of the other nations (relation routines)
+    int vpDelta = 0;                            // K's victory points (kept by the host)
+    int warCounter = 0;                         // K's war counter afterwards
+    std::map<std::string, int> self;            // K's own fields the turn or proposal changed (field -> delta)
+    std::vector<std::wstring> messages;         // the turn messages the routines wrote
+    PeaceResult peace;
+};
+bool PlayerTurnAvailable();
+bool PeaceAvailable();  // B4: the peace part's routines and hooks
+PlayerTurnResult RunPlayerTurn(const PlayerTurnSetup& setup);
+// Relations v2, B4 (host): a joined nation's peace, applied with the game's own routines. "" or why not.
+std::string MovePossession(const std::wstring& name, int from, int to, bool removeCA);  // `from` must own it
+std::string HandOverShip(int id, int from, int to, const std::wstring& name, const std::wstring& reason,
+                         const std::wstring& renamedLine);  // by CShipId in `from`'s list
+std::string SetPossessionWarState(const PeaceTaken& t);  // by name; `t.owner` must own it
+bool SetNationFlag(int idx, const std::string& field, bool value);  // a Boolean field (HasLostWar, Blockaded)
+int NationFlag(int idx, const std::string& field);                  // -1 if unknown
+// The turn messages of RunPlayerTurn in the game's own turn report dialog (modal), on this PC.
+void ShowTurnMessagesOf(const std::vector<std::wstring>& lines);
 
 }  // namespace game
 
@@ -187,6 +286,12 @@ bool OnTurnClick(void* self, void* sender);  // true => swallow the click
 bool OnResignClick(void* self);              // true => swallow
 void OnAfterEndOfTurn(void* self);
 bool IsHumanRemoteNation(int idx);  // host: AI must not act for this nation
+// Host (relations v2): this joined nation's relations follow the player's rules (its player's PC runs the player's
+// relation routines), so the computer's relation rules leave its pairs alone.
+bool PlayerRulesNation(int idx);
+// Host (relations v2): a joined nation's own war counter, as the game's War for the host's nation (months at war > 0,
+// at peace < 0; stepped after the month). The player's economy rules for that nation read it (economy.cpp).
+int KWarCounter(int idx);
 void OnBeforeAIMoves(void* self);
 void OnAfterAIMoves(void* self);
 bool OnBeforeAIPeace(int nationIdx, bool badLoss);  // true => skip the game's AI peace for this nation

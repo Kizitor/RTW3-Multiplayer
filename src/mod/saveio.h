@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include <climits>
 
 // Line-preserving INI document (the .bcs/.dat save files are UTF-8 INI with CRLF).
 struct IniSection {
@@ -50,14 +51,15 @@ long long ReadIdNo(const std::wstring& slotDir, int slot);
 
 // A joined player's own copy of the campaign (the game's "Copy game" of slot 77): nation K becomes the player nation
 // (index 0) and the host's nation an AI nation at index K. eventCooldowns: K's own [EUT] values (100), or empty.
+// kWar: K's own war counter (months at war > 0, at peace <= 0) when the host sent it, else INT_MIN (approximated).
 struct PlayerCopyFiles {
     std::string bcs, map, off;
     bool hasMap = false, hasOff = false;
 };
 bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& eventCooldowns, std::string& summary,
-                           std::string& err);
+                           std::string& err, int kWar = INT_MIN);
 bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::vector<int>& eventCooldowns,
-                      std::string& summary, std::string& err);
+                      std::string& summary, std::string& err, int kWar = INT_MIN);
 
 // Joined players' battles. The battle is fought in a battle slot made with MakeNationPlayer(K): K is nation 0 there and
 // the opponent J keeps its index (an AI nation, J != 0 and != K). ExtractBattleResult reads the battle slot before and

@@ -40,6 +40,7 @@ struct DiploRow {
     std::string pending;   // proposals and decisions waiting for the end of the month
     bool canWar = false, canAlly = false, allyAccept = false, canPeace = false, peaceAccept = false;
     bool canLeave = false, canCancel = false, cancelIsDecline = false;
+    bool computer = false;  // relations v2, B4: a computer nation at war with mine (only "Propose peace": at once)
     // war score and peace terms
     int vpMine = 0, vpTheirs = 0;  // victory points of this war
     std::string outlook;           // what a peace would bring right now
@@ -107,6 +108,24 @@ std::string DebugLastEvent();    // tests: last event sent (client) or applied (
 std::string DebugWarVP(int a, int b, int va, int vb, bool set);  // tests (host): read or set a war's victory points
 std::string DebugTerms(int a, int b);                            // tests (host): the peace terms right now
 std::string DebugVPInfo();  // tests: EnemyVP, what the host already gave the enemies of it, every nation's VP
+// Tests (relations v2): the joined nations' war counters (host: `kwar` lists them, `kwar <K> <n>` sets one; client: its
+// own as received and the game's counter in memory).
+std::string DebugKWar(const std::vector<std::string>& args);
+// Tests (host, relations v2): which joined nations follow the player's rules (`relrules`), `relrules <K> <0|1>` forces one.
+std::string DebugRelRules(const std::vector<std::string>& args);
+// Tests (relations v2, B3): `relturn` (client, async: the player's relation routines now, with their dialogs);
+// `rellast`: the last relation turn sent (client) or applied (host).
+void DebugRelTurn();
+std::string DebugRelLast();
+// Tests (relations v2, B4): `peacetest <chance> <lossGain> <force>` (client, async: the peace with the computer's nations
+// now, through the proposal path: NegotiatePeace(chance, lossGain, force) in the nation's view with the game's dialogs;
+// any time, no month limit); `peaceevent <code>` (client: the next relation turn shows this peace event, 33..36, past the
+// decision); `peacelast` (the last peace sent (client) or applied (host)); `kwarvp <K> [J vpK vpJ]` (host: nation K's
+// war scores with the computer's nations; with J and two values, sets that war's score).
+void DebugPeaceTest(int chance, int lossGain, bool force);
+std::string DebugPeaceEvent(int code, int chance);
+std::string DebugPeaceLast();
+std::string DebugKWarVP(const std::vector<std::string>& args);
 // Joined players fight their battles against AI nations (sent with the hello; set before joining).
 void SetFightBattles(bool on);
 bool FightBattles();

@@ -14,7 +14,7 @@
 #include <deque>
 #include <functional>
 
-#define MP_MOD_VERSION "0.4.1"
+#define MP_MOD_VERSION "0.5.0"
 #define MP_PROTOCOL 3
 // The live-battle engine level (lockstep.cpp): a live battle is fought only between two PCs with the same level, while
 // the rest of the session stays compatible within MP_PROTOCOL. A client announces it in its hello (`ls=<level>`;

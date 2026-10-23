@@ -36,7 +36,7 @@ struct Api {
     void* mAdvanceDesignStudies = nullptr;
     // intel reports (TStringList the game appends to on every load and never clears)
     int fIntelReports = -1, fSLList = -1, fSLCount = -1;
-    void *mSLClear = nullptr, *mSLAdd = nullptr;
+    void *mSLClear = nullptr, *mSLAdd = nullptr, *mSLInsert = nullptr;
     // air units (TList of TAirUnit the game appends to on every load and never clears): the cell of its unit variable
     uint32_t airUnitsCell = 0;
     void* mObjFree = nullptr;
@@ -75,6 +75,23 @@ struct Api {
     int fHint = -1, fText = -1, fPicture = -1, fGbWar = -1, fLbWar = -1, fLbPlayer = -1;
     int fFlag[9] = {}, fShape[9] = {}, fSlotWar[9] = {}, fSlotAlly[9] = {}, fSlotBlock[9] = {};
     bool relView = false;
+    // Relations v2 (B2): the computer's relation routines leave the pairs of nations under the player's rules alone
+    void *mChangeAITension = nullptr, *mCheckForWar = nullptr, *mRandomTension = nullptr;
+    int fWillGoToWar = -1;
+    bool playerRules = false;
+    // Relations v2 (B3): the player's relation routines in K's view on K's PC
+    void *mPreviousWars = nullptr, *mShowTurnMessages = nullptr, *mWarsWithNation = nullptr, *mRandPossArea = nullptr,
+         *mRandPoss = nullptr, *mSurpriseAttack = nullptr, *mSurpriseInvasion = nullptr;
+    int fBudget = -1, fTurnMessages = -1;
+    bool playerTurn = false;
+    // Relations v2 (B4): K's peace with the computer's nations in K's view on K's PC; System.Random (unnamed)
+    void *mNegotiatePeace = nullptr, *mGetPeaceEvent = nullptr, *mCheckTotalDefeat = nullptr, *mForceRatio = nullptr,
+         *mRandomEnemy = nullptr, *mSameAreas = nullptr, *mCountTakenFrom = nullptr, *mEcoRating = nullptr,
+         *mTransferShip = nullptr, *mRandom = nullptr;
+    int fTotalWar = -1, fHasBeenBattle = -1, fAutoSubs = -1, fTFW = -1, fHasLostWar = -1, fGovernment = -1,
+        fUnrest = -1, fShipId = -1, fCShipName = -1, fShipLog = -1, fTakenFrom = -1, fInvaded = -1, fInvSupport = -1,
+        fRebellion = -1, fSubPolicy = -1, fCorruption = -1;
+    bool peace = false;
 } A;
 
 static void* g_buildCamp = nullptr;
@@ -83,6 +100,7 @@ static bool g_inTurn = false;
 static bool g_noDefer = false;         // ResolveAIBattle: the game's own resolution runs
 static bool g_battleSlotMode = false;  // this PC fights a joined player's battle in its battle slot
 static bool g_battleAftermath = false; // HandleBattleAftermath ran in battle slot mode
+static int g_ownWar = INT_MIN;          // a joined player's PC: its own nation's war counter from the host (or unknown)
 extern "C" int __stdcall CB_SkipCampaignStep(int which);
 
 #define REQ_FIELD(dst, cls, name)                              \
@@ -320,6 +338,60 @@ static void ResolveRelationsView() {
         A.mSetVisible, A.mSetText, A.mUStrAsg, A.mStrengthBars, A.mNationData);
 }
 
+// Relations v2, B4: the player's peace (CheckTurnEvents' peace decision, GetPeaceEvent, NegotiatePeace, DoPeace) for a
+// joined nation in its view, and the fields the peace part masks or reports. System.Random has no RTTI name: it is the
+// call of the decision's first instructions in CheckTurnEvents, `mov eax, 4; call Random; add eax, 2; cmp eax, [War]`
+// (Random = `push eax; call [RandomProc]; ...`); the decision's `imul edi, [G], 250` must name the scale value G that
+// EventLikelihoodCheck's thresholds use (A.scaleVar, the game's FleetSize setting).
+static void ResolvePeace() {
+    A.mNegotiatePeace = dl::Method("TfrmBuildCamp", "NegotiatePeace");
+    A.mGetPeaceEvent = dl::Method("TfrmBuildCamp", "GetPeaceEvent");
+    A.mCheckTotalDefeat = dl::Method("TfrmBuildCamp", "CheckTotalDefeat");
+    A.mForceRatio = dl::Method("TfrmBuildCamp", "GetTotalForceRatio");
+    A.mRandomEnemy = dl::Method("TfrmBuildCamp", "GetRandomEnemy");
+    A.mSameAreas = dl::Method("TfrmBuildCamp", "HasPossessionsInTheSameAreas");
+    A.mCountTakenFrom = dl::Method("TfrmBuildCamp", "CountTakenFrom");
+    A.mEcoRating = dl::Method("TfrmBuildCamp", "GetNationEconomicRating");
+    A.mTransferShip = dl::Method("TfrmBuildCamp", "TransferShipAsReparation");
+    A.fTotalWar = dl::Field("TfrmBuildCamp", "TotalWar");
+    A.fHasBeenBattle = dl::Field("TfrmBuildCamp", "HasBeenBattle");
+    A.fAutoSubs = dl::Field("TfrmBuildCamp", "AutoBuildSubs");
+    A.fTFW = dl::Field("TfrmBuildCamp", "TFW");
+    A.fHasLostWar = dl::Field("TBuilderNation", "HasLostWar");
+    A.fGovernment = dl::Field("TBuilderNation", "GovernmentType");
+    A.fUnrest = dl::Field("TBuilderNation", "UnrestLevel");
+    A.fShipId = dl::Field("TCampaignShip", "CShipId");
+    A.fCShipName = dl::Field("TCampaignShip", "ShipName");
+    A.fShipLog = dl::Field("TCampaignShip", "myLogEntries");
+    A.fTakenFrom = dl::Field("TPossession", "TakenFrom");
+    A.fInvaded = dl::Field("TPossession", "Invaded");
+    A.fInvSupport = dl::Field("TPossession", "InvasionSupport");
+    A.fRebellion = dl::Field("TPossession", "Rebellion");
+    A.fSubPolicy = dl::Field("TBuilderNation", "SubmarinePolicy");
+    A.fCorruption = dl::Field("TBuilderNation", "Corruption");
+    void* cte = dl::Method("TfrmBuildCamp", "CheckTurnEvents");
+    bool scaleOk = false;
+    if (cte && A.warVar) {
+        uint8_t* hit = FindSite((uint8_t*)cte, 0x1000,
+                                {0xB8, 0x04, 0x00, 0x00, 0x00, 0xE8, -1, -1, -1, -1, 0x83, 0xC0, 0x02, 0x3B, 0x05, -1, -1, -1, -1},
+                                [](uint8_t* h) { return *(uint32_t*)(h + 15) == (uint32_t)(uintptr_t)A.warVar; });
+        uint8_t* r = hit ? (uint8_t*)CallTarget(hit + 5) : nullptr;
+        if (r && InImage((uintptr_t)r) && r[0] == 0x50 && r[1] == 0xFF && r[2] == 0x15) A.mRandom = r;
+        uint8_t* g = dl::FindPattern((uint8_t*)cte, 0x1000, {0x69, 0x3D, -1, -1, -1, -1, 0xFA, 0x00, 0x00, 0x00});
+        scaleOk = g && A.scaleVar && *(uint32_t*)(g + 2) == (uint32_t)(uintptr_t)A.scaleVar;
+    }
+    A.peace = A.treaties && A.events && A.mRandom && scaleOk && A.mNegotiatePeace && A.mGetPeaceEvent &&
+              A.mCheckTotalDefeat && A.mForceRatio && A.mRandomEnemy && A.mSameAreas && A.mCountTakenFrom &&
+              A.mEcoRating && A.mTransferShip && A.mDoPeace && A.recYearCell && A.recMonthCell && A.fTotalWar >= 0 &&
+              A.fHasBeenBattle >= 0 && A.fAutoSubs >= 0 && A.fTFW >= 0 && A.fHasLostWar >= 0 && A.fGovernment >= 0 &&
+              A.fUnrest >= 0 && A.fShipId >= 0 && A.fCShipName >= 0 && A.fShipLog >= 0 && A.fTakenFrom >= 0 &&
+              A.fInvaded >= 0 && A.fInvSupport >= 0 && A.fRebellion >= 0 && A.fBlockaded >= 0 && A.fPlayerNation >= 0 &&
+              A.fSubPolicy >= 0 && A.fCorruption >= 0;
+    Log("Peace with the computer's nations for a joined nation (routines): %s (random=%p scale=%d negotiate=%p "
+        "transfer=%p)",
+        A.peace ? "ok" : "UNAVAILABLE", A.mRandom, scaleOk ? 1 : 0, A.mNegotiatePeace, A.mTransferShip);
+}
+
 bool Resolve() {
     bool ok = true;
     REQ_FIELD(A.fBuilderNations, "TfrmBuildCamp", "BuilderNations");
@@ -397,6 +469,7 @@ bool Resolve() {
     A.fSLCount = dl::Field("TStringList", "FCount");
     A.mSLClear = dl::Method("TStringList", "Clear");
     A.mSLAdd = dl::Method("TStringList", "Add");
+    A.mSLInsert = dl::Method("TStringList", "Insert");
     if (A.fIntelReports < 0 || A.fSLList < 0 || A.fSLCount < 0 || !A.mSLClear || !A.mSLAdd)
         Log("WARNING: intel report list not found; reloading a campaign will duplicate its intel reports");
     // The air units' list: LoadAircraftData (mov eax, [cell]; mov eax, [eax]; mov edx, ebx; call TList.Add) and the
@@ -438,6 +511,21 @@ bool Resolve() {
     ResolveTreaties();
     ResolveLoadBlockade();
     ResolveRelationsView();
+    A.mChangeAITension = dl::Method("TBuilderNation", "ChangeAITension");
+    A.mCheckForWar = dl::Method("TfrmBuildCamp", "CheckForWar");
+    A.mRandomTension = dl::Method("TfrmBuildCamp", "RandomTensionChanges");
+    A.fWillGoToWar = dl::Field("TBuilderNation", "WillGoToWar");
+    A.playerRules = A.diplomacy && A.mChangeAITension && A.mCheckForWar && A.mRandomTension && A.fWillGoToWar >= 0;
+    A.mPreviousWars = dl::Method("TfrmBuildCamp", "TensionEffectOfPreviousWars");
+    A.mShowTurnMessages = dl::Method("TfrmBuildCamp", "ShowTurnMessages");
+    A.mWarsWithNation = dl::Method("TfrmBuildCamp", "CheckWarsWithNation");
+    A.mRandPossArea = dl::Method("TBuilderNation", "GetRandomPossessionInArea");
+    A.mRandPoss = dl::Method("TfrmBuildCamp", "GetRandomPossession");
+    A.mSurpriseAttack = dl::Method("TfrmBuildCamp", "DoSurpriseAttack");
+    A.mSurpriseInvasion = dl::Method("TfrmBuildCamp", "CheckForPlayerSurpriseInvasion");
+    A.fBudget = dl::Field("TBuilderNation", "BudgetModifier");
+    A.fTurnMessages = dl::Field("TfrmBuildCamp", "TurnMessages");
+    ResolvePeace();
     nplay::Resolve();
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
@@ -953,8 +1041,11 @@ struct EvState {
     bool swapped;
 };
 static EvState g_ev;
+static bool g_pvOn = false;  // relations v2, B3: the player's routines run in K's view (RunPlayerTurn)
+static bool g_pvSkip = false;  // ... and the relation routines run (surprise landings and attacks are left out)
+static bool g_pvHuman[9];    // ... and the view indices of the other nations people play (the host's nation at K)
 
-bool EventActive() { return g_ev.swapped || nplay::ViewActive(); }
+bool EventActive() { return g_ev.swapped || g_pvOn || nplay::ViewActive(); }
 
 static void EvRestore() {
     if (!g_ev.swapped) return;
@@ -997,7 +1088,7 @@ ClientEventResult RunClientEvent(int K, int forcedIdx, int used[100]) {
     ClientEventResult res;
     void* f = BuildCamp();
     void* list = NationList();
-    if (!EventsAvailable() || !f || !list || K < 1 || K > 8 || PlayerNation() != Nation(K) || g_ev.swapped) {
+    if (!EventsAvailable() || !f || !list || K < 1 || K > 8 || PlayerNation() != Nation(K) || EventActive()) {
         res.error = "events unavailable";
         return res;
     }
@@ -1041,7 +1132,9 @@ ClientEventResult RunClientEvent(int K, int forcedIdx, int used[100]) {
         dl::At<int>(g_ev.obj[i], A.fAllied) = tmpA[i];
         dl::At<int>(g_ev.obj[i], A.fTechSharing) = 0;
     }
-    *A.warVar = kAtWar ? (g_ev.war > 0 ? g_ev.war : 1) : (g_ev.war > 0 ? -12 : g_ev.war);
+    // K's own war counter when the host sent it (it is in place already, see LoadCampaign), else a guess from the host's.
+    bool ownKnown = g_ownWar != INT_MIN && (g_ownWar > 0) == kAtWar;
+    *A.warVar = ownKnown ? g_ownWar : kAtWar ? (g_ev.war > 0 ? g_ev.war : 1) : (g_ev.war > 0 ? -12 : g_ev.war);
     for (int j = 0; j < kEventSlots; j++) *(int*)(EventRec(f, j) + kEvUsed) = used[j];
     g_ev.swapped = true;
     g_ev.arr[0] = g_ev.obj[K];
@@ -1588,6 +1681,9 @@ int AllianceMonths(int a, int b) {
 
 int WarCounter() { return A.warVar ? *A.warVar : 0; }
 
+void SetOwnWarCounter(int months) { g_ownWar = months; }
+int OwnWarCounter() { return g_ownWar; }
+
 int CountAtWarWithHost() {
     void* f = BuildCamp();
     return f && A.mCountAtWar ? (int)dl::Call(A.mCountAtWar, (uint32_t)(uintptr_t)f) : 0;
@@ -1669,7 +1765,7 @@ static int g_kvDepth = 0;
 // Puts the view in place unless it is already there (nested display routines) or not wanted: the PC shows nation 0 as
 // the player (the host, single player, a battle slot), or an event dialog has its own view. Pair with KViewEnd.
 static bool KViewBegin() {
-    if (g_kvDepth++ > 0 || !A.relView || g_ev.swapped) return false;
+    if (g_kvDepth++ > 0 || !A.relView || EventActive()) return false;
     int K = ShownNationIndex();
     void* l = NationList();
     if (K < 1 || !l) return false;
@@ -1757,7 +1853,7 @@ static void StrengthBarsInView(void* f, void* area, void* orig) {
 
 // After SetValues (the flags): slot K shows the host's flag (the player's own flag already shows PlayerNation).
 static void KViewFlagPicture(void* f) {
-    int K = A.relView && !g_ev.swapped ? ShownNationIndex() : 0;
+    int K = A.relView && !EventActive() ? ShownNationIndex() : 0;
     void* img = K > 0 ? FormCtl(f, A.fFlag[K]) : nullptr;
     void* host = Nation(0);
     if (!img || !host) return;
@@ -1768,13 +1864,14 @@ static void KViewFlagPicture(void* f) {
     if (!path.empty() && pic && FileExists(path)) dl::Call(A.mPictureLoad, (uint32_t)(uintptr_t)pic, (uint32_t)(uintptr_t)file);
 }
 
-// After UpdateUIValues: the war state the game shows from the host's war counter (the "War results" box, the "At war
-// for N months." line under the player's name, the name's "At peace for ..." hint) follows the player's own wars. The
-// months are not known for a joined player's nation (the war counter is the host's), so the line names the enemy.
+// After UpdateUIValues: the war state the game shows from the war counter (the "War results" box, the "At war for N
+// months." line under the player's name, the name's "At peace for ..." hint) follows the player's own wars. Since the
+// host sends the player's own war counter with the month (LoadCampaign puts it in place) the game's own lines are
+// right; from an older host only the host's counter is known, so the line names the enemy instead.
 static std::string g_kvLogged;
 
 static void KViewWarState(void* f) {
-    int K = A.relView && !g_ev.swapped ? ShownNationIndex() : 0;
+    int K = A.relView && !EventActive() ? ShownNationIndex() : 0;
     if (K < 1) return;
     std::vector<int> enemies;
     std::string sig = "nation " + std::to_string(K) + " sees its own relations:";
@@ -1785,15 +1882,20 @@ static void KViewWarState(void* f) {
         sig += " " + W2U(NationName(j)) + " " + std::to_string(t) + (AllianceMonths(K, j) > 0 ? " (ally)" : "");
     }
     bool war = !enemies.empty();
-    std::wstring line;
-    if (war)
-        line = enemies.size() == 1 ? L"At war with " + NationName(enemies[0]) + L"."
-                                   : L"At war with " + std::to_wstring(enemies.size()) + L" nations.";
-    SetCtlVisible(FormCtl(f, A.fGbWar), war);
-    SetCtlVisible(FormCtl(f, A.fLbWar), war);
-    if (war) SetCtlText(FormCtl(f, A.fLbWar), line);
-    SetCtlHint(FormCtl(f, A.fLbPlayer), war ? L"" : L"At peace.");
-    sig += war ? "; " + W2U(line) : "; at peace";
+    bool counted = g_ownWar != INT_MIN && A.warVar && (*A.warVar > 0) == war;
+    if (counted) {
+        sig += "; war counter " + std::to_string(*A.warVar);
+    } else {
+        std::wstring line;
+        if (war)
+            line = enemies.size() == 1 ? L"At war with " + NationName(enemies[0]) + L"."
+                                       : L"At war with " + std::to_wstring(enemies.size()) + L" nations.";
+        SetCtlVisible(FormCtl(f, A.fGbWar), war);
+        SetCtlVisible(FormCtl(f, A.fLbWar), war);
+        if (war) SetCtlText(FormCtl(f, A.fLbWar), line);
+        SetCtlHint(FormCtl(f, A.fLbPlayer), war ? L"" : L"At peace.");
+        sig += war ? "; " + W2U(line) : "; at peace";
+    }
     if (sig != g_kvLogged) {
         g_kvLogged = sig;
         Log("relations view: %s", sig.c_str());
@@ -1821,6 +1923,1086 @@ std::string DebugRelView() {
 int StartBuildPhase() {
     void* f = BuildCamp();
     return f ? dl::At<uint8_t>(f, A.fStartBuild) : -1;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Relations v2, B2: the pairs of a joined nation K under the player's rules are left alone by the computer's rules.
+//
+// The game runs the relations between nations 1..8 by its AI rules (GAME-INTERNALS): CheckAITensionEvents (AI wars and
+// peace, alliances, offers to the player), DoAITensionChanges, ChangeAITension, and the AI side of CheckStopPlayerAgression,
+// CheckAllyTrouble, CheckBlitzkrieg, CheckChineseConcessions, CheckForceOnForeignStations, CreateArmsControlTreaty,
+// CheckForRevolutionInEnemyNation, ReduceTimeLimits ("has negotiated a separate peace") and HandleAIPeace. While one of
+// them runs on the host, every pair (K, j) looks neutral (tension 5: no war, no outbreak, no common-enemy or most-tense
+// logic; no alliance) and is put back afterwards, so these routines neither change K's relations nor show messages or
+// questions about them; ChangeAITension skips K's pairs at any time. The host's own player routines treat K as a
+// player, not as a computer nation: during CheckForWar K's tension with the host reads 5 when they are at peace, K
+// plans no war and has no alliances of its own (no declaration, surprise landing, volunteering, war plan or alliance
+// quarrel in K's name; the other nations' decisions about K stay), and during RandomTensionChanges at least 6 (no
+// alliance offer in K's name), the routine's own changes kept. K's relations then follow the player's routines on K's
+// PC (B3), the players' diplomacy and the events.
+
+static const int kMaskTension = 5;
+
+static bool PlayerRules(int i) { return A.playerRules && i >= 1 && i <= 8 && hookcb::PlayerRulesNation(i); }
+
+static int& AllianceCell(int from, int to) {  // from's alliance months with `to`, both in 1..8
+    return dl::At<int>(Nation(from), A.fAIAlliance + 4 * (to - 1));
+}
+
+static std::set<std::string> g_maskLogged;  // routines already logged this month
+
+static int g_aiMaskDepth = 0;
+static struct {
+    bool on;
+    bool k[9];
+    int t[9][9], al[9][9];
+} g_aiMask;
+
+static void AIMaskEnter(const char* routine) {
+    if (g_aiMaskDepth++ > 0 || NationCount() < 9) return;
+    g_aiMask.on = false;
+    std::string ks;
+    for (int k = 1; k <= 8; k++) {
+        g_aiMask.k[k] = PlayerRules(k);
+        if (g_aiMask.k[k]) ks += " " + std::to_string(k);
+    }
+    if (ks.empty()) return;
+    for (int a = 1; a <= 8; a++)
+        for (int b = 1; b <= 8; b++) {
+            if (a == b || !(g_aiMask.k[a] || g_aiMask.k[b])) continue;
+            g_aiMask.t[a][b] = TensionCell(a, b);
+            g_aiMask.al[a][b] = AllianceCell(a, b);
+            TensionCell(a, b) = kMaskTension;
+            AllianceCell(a, b) = 0;
+        }
+    g_aiMask.on = true;
+    if (g_maskLogged.insert(routine).second)
+        Log("relations v2: %s runs without the pairs of nation(s)%s (player's rules)", routine, ks.c_str());
+}
+
+static void AIMaskLeave() {
+    if (g_aiMaskDepth <= 0 || --g_aiMaskDepth > 0 || !g_aiMask.on) return;
+    int dropped = 0;
+    for (int a = 1; a <= 8; a++)
+        for (int b = 1; b <= 8; b++) {
+            if (a == b || !(g_aiMask.k[a] || g_aiMask.k[b])) continue;
+            if (TensionCell(a, b) != kMaskTension || AllianceCell(a, b) != 0) dropped++;
+            TensionCell(a, b) = g_aiMask.t[a][b];
+            AllianceCell(a, b) = g_aiMask.al[a][b];
+        }
+    g_aiMask.on = false;
+    if (dropped) Log("relations v2: %d change(s) of the computer's rules to the masked pairs dropped", dropped);
+}
+
+// The host's CheckForWar (kind 1) and RandomTensionChanges (kind 2) with K seen as a player; on a joined player's PC
+// (B3, the routines in K's view) the same for the other nations people play: the host's nation and the other joined
+// ones, so no war or alliance between players comes from these routines.
+static struct {
+    bool on;
+    bool k[9];
+    int T[9], W[9], al[9][9];
+} g_pw;
+static int g_pwKind = 0;
+
+static bool MaskAsPlayer(int k) { return g_pvOn ? g_pvHuman[k] : PlayerRules(k); }
+
+static void PlayerMaskEnter(int kind, const char* routine) {
+    g_pw.on = false;
+    g_pwKind = kind;
+    if (NationCount() < 9) return;
+    std::string ks;
+    for (int k = 1; k <= 8; k++) {
+        g_pw.k[k] = MaskAsPlayer(k);
+        if (!g_pw.k[k]) continue;
+        ks += " " + std::to_string(k);
+        int& T = TensionCell(k, 0);
+        int& W = dl::At<int>(Nation(k), A.fWillGoToWar);
+        g_pw.T[k] = T;
+        g_pw.W[k] = W;
+        if (kind == 1) {
+            if (T <= 40) T = kMaskTension;
+            W = 0;
+            for (int j = 1; j <= 8; j++)
+                if (j != k) {
+                    g_pw.al[k][j] = AllianceCell(k, j);
+                    AllianceCell(k, j) = 0;
+                }
+        } else if (T <= 40 && T < 6) {
+            T = 6;
+        }
+    }
+    g_pw.on = !ks.empty();
+    if (g_pw.on && g_maskLogged.insert(routine).second)
+        Log("relations v2: %s sees nation(s)%s as players (player's rules)", routine, ks.c_str());
+}
+
+static void PlayerMaskLeave() {
+    if (!g_pw.on) return;
+    g_pw.on = false;
+    for (int k = 1; k <= 8; k++) {
+        if (!g_pw.k[k]) continue;
+        int& T = TensionCell(k, 0);
+        int base = g_pwKind == 1 ? kMaskTension : std::max(g_pw.T[k], 6);
+        if (g_pw.T[k] <= 40 && T <= 40) {
+            int now = std::max(0, std::min(40, g_pw.T[k] + (T - base)));  // the routine's own changes kept
+            if (now != g_pw.T[k]) Log("relations v2: tension 0-%d %d -> %d (the host's routine)", k, g_pw.T[k], now);
+            T = now;
+        } else if (g_pw.T[k] <= 40) {
+            Log("relations v2: WARNING: war 0-%d started inside the host's routine despite the mask", k);
+        }
+        if (g_pwKind == 1) {
+            dl::At<int>(Nation(k), A.fWillGoToWar) = g_pw.W[k];
+            for (int j = 1; j <= 8; j++)
+                if (j != k) AllianceCell(k, j) = AllianceCell(j, k);  // the other nations' decisions about K stay
+        }
+    }
+}
+
+// A game exception that unwound through a masked routine would leave the mask in place: undone at the month's end.
+static int g_aiChangesSkipped = 0;  // ChangeAITension calls left out this month
+
+void ResetRelationMasks() {
+    if (g_aiMaskDepth > 0 || g_aiMask.on) {
+        Log("relations v2: mask reset (depth %d)", g_aiMaskDepth);
+        g_aiMaskDepth = 1;
+        AIMaskLeave();
+        g_aiMaskDepth = 0;
+    }
+    if (g_pw.on) {
+        Log("relations v2: player mask reset");
+        PlayerMaskLeave();
+    }
+    if (g_aiChangesSkipped)
+        Log("relations v2: %d tension change(s) of the computer's rules left out (ChangeAITension)", g_aiChangesSkipped);
+    g_aiChangesSkipped = 0;
+    g_maskLogged.clear();
+}
+
+static void MaskEnterSafe(int kind, const char* routine) {
+    try {
+        if (kind == 0)
+            AIMaskEnter(routine);
+        else
+            PlayerMaskEnter(kind, routine);
+    } catch (...) {
+        Log("exception entering the relations mask (%s)", routine);
+    }
+}
+
+static void MaskLeaveSafe(int kind) {
+    try {
+        if (kind == 0)
+            AIMaskLeave();
+        else
+            PlayerMaskLeave();
+    } catch (...) {
+        Log("exception leaving the relations mask");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Relations v2, B3: the player's relation routines for a joined player's nation K, on K's own PC.
+//
+// The game runs RandomTensionChanges, TensionEffectOfPreviousWars and CheckForWar for nation 0, reading relations from
+// nation 0's point of view. On K's PC, at the start of K's month, they run in K's full view: K at index 0 and the host's
+// nation at index K in the nation list (PlayerNation is K already), every record's relation cells permuted the same way
+// (its `Tension` = its relation with K, `AITension[w]` = its relation with the view's nation w; alliances alike; K's own
+// `Tension` and `Allied` read 0), K's own per-relation state in the other records (`WillGoToWar`: their war plans
+// against K, `TechSharing`: K's deals, both kept by the host for K), K's war counter (B1, in place since the load), K's
+// past wars for `CheckWarsWithNation`.
+// The routines' dialogs (questions, declarations, spy reports) and turn messages are K's player's; the other nations
+// people play are masked as players (MaskAsPlayer: no war or alliance between players from these routines).
+// Afterwards the relation cells and the per-relation fields are put back, the changes are returned in real indices
+// (the host applies them, MSG_RELATIONS) and written into this PC's campaign for K's screen; other fields keep what the
+// routines did (K's own budget, prestige, corruption go to the host with K's turn; the host applies the others').
+// Surprise landings and attacks are left out (`GetRandomPossession*`, `DoSurpriseAttack`,
+// `CheckForPlayerSurpriseInvasion` return nothing in the view): they move possessions and ships (B5).
+
+static struct PvState {
+    int K;
+    void** arr;
+    void* obj[9];
+    int cells[9][9], acells[9][9];  // raw relation and alliance cells of every record (cell 0 = Tension / Allied)
+    int will[9], ts[9];             // raw WillGoToWar, TechSharing
+    int budget[9], vp;              // BudgetModifier of every record, K's VP
+    int rel[9][9], ally[9][9];      // real relations before
+    int histMonths[9], histWinner[9], histCount[9];  // K's past wars by real opponent (months 0x7fffffff: none)
+    int warCounter;
+} g_pv;
+
+static int PvReal(int v) { return v == 0 ? g_pv.K : v == g_pv.K ? 0 : v; }  // view index -> real (and back)
+
+static int& AllyCellAt(void* rec, int w) {  // alliance cell w of a record: 0 = Allied, else AIAlliance[w]
+    return dl::At<int>(rec, w == 0 ? A.fAllied : A.fAIAlliance + 4 * (w - 1));
+}
+static int& RelCellAt(void* rec, int w) { return dl::At<int>(rec, A.fTension + 4 * w); }
+
+bool PlayerTurnAvailable() { return A.playerTurn; }
+
+static void PvEnter() {
+    int K = g_pv.K;
+    for (int v = 0; v < 9; v++) {
+        void* rec = g_pv.obj[PvReal(v)];
+        int r = PvReal(v);
+        for (int w = 0; w < 9; w++) {
+            if (w == v) continue;
+            int o = PvReal(w);
+            if (v == 0 && w == 0) continue;
+            RelCellAt(rec, w) = g_pv.rel[r][o];
+            AllyCellAt(rec, w) = g_pv.ally[r][o];
+        }
+    }
+    // The swapped records' own cells read 0 like nation 0's own Tension and Allied (as in the event view): K's record's
+    // cell 0 holds its real relation with the host, which the game's loops over nations 0..8 would take for a war or an
+    // alliance of K with itself (CheckForWar's CountNationsAtWarWithPlayer, RandomTensionChanges' count of nations at
+    // peace, NegotiatePeace's gains of enemies and allies, TerminateAlliances); the host's record's cell K (nation 0's
+    // AITension[K] and AIAlliance[K]) likewise. PvLeave puts the raw cells back.
+    RelCellAt(g_pv.obj[K], 0) = 0;
+    AllyCellAt(g_pv.obj[K], 0) = 0;
+    RelCellAt(g_pv.obj[0], K) = 0;
+    AllyCellAt(g_pv.obj[0], K) = 0;
+    g_pv.arr[0] = g_pv.obj[g_pv.K];
+    g_pv.arr[g_pv.K] = g_pv.obj[0];
+    g_pvOn = true;
+}
+
+static void PvLeave() {
+    if (!g_pvOn) return;
+    g_pv.arr[0] = g_pv.obj[0];
+    g_pv.arr[g_pv.K] = g_pv.obj[g_pv.K];
+    for (int r = 0; r < 9; r++) {
+        void* rec = g_pv.obj[r];
+        for (int w = 0; w < 9; w++) {
+            RelCellAt(rec, w) = g_pv.cells[r][w];
+            AllyCellAt(rec, w) = g_pv.acells[r][w];
+        }
+        dl::At<int>(rec, A.fWillGoToWar) = g_pv.will[r];
+        dl::At<int>(rec, A.fTechSharing) = g_pv.ts[r];
+    }
+    g_pvOn = false;
+}
+
+// Runs the routines; a game exception that unwinds through here puts the view back first. Returns the routines run.
+static int PvRunGuarded(void* form, bool tension) {
+    int ran = 0;
+    g_pvSkip = true;
+    __try {
+        if (tension) {
+            dl::Call(A.mRandomTension, (uint32_t)(uintptr_t)form);
+            ran |= 1;
+        }
+        dl::Call(A.mPreviousWars, (uint32_t)(uintptr_t)form);
+        ran |= 2;
+        dl::Call(A.mCheckForWar, (uint32_t)(uintptr_t)form);
+        ran |= 4;
+    } __finally {
+        g_pvSkip = false;
+        if (AbnormalTermination()) PvLeave();
+    }
+    return ran;
+}
+
+static std::vector<std::wstring> ReadStringList(void* sl) {
+    std::vector<std::wstring> out;
+    int n = sl ? dl::At<int>(sl, A.fSLCount) : 0;
+    void** items = sl ? dl::At<void**>(sl, A.fSLList) : nullptr;
+    for (int i = 0; items && i < n; i++) out.push_back(dl::ReadUStr(items[i * 2]));
+    return out;
+}
+
+static void WriteStringList(void* sl, const std::vector<std::wstring>& lines) {
+    dl::Call(A.mSLClear, (uint32_t)(uintptr_t)sl);
+    for (auto& s : lines) StringListAdd(sl, s);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Relations v2, B4: K's peace with the computer's nations, on K's own PC, in K's full view (right after the relation
+// routines of B3, or alone for a proposal).
+//
+// The game ends the player's (nation 0's) wars in CheckTurnEvents: at war, when Random(4) + 2 < War (months at war), its
+// peace decision weighs the war score (the player's VP and EnemyVP), FleetSize, the enemies' unrest, economies and
+// colonies, and picks a peace event (condition 33..36) that GetPeaceEvent shows (TdlgEventAnswer). Its answers call
+// NegotiatePeace(chance, lossGain, ForceBadPeace), which makes peace with every enemy at once: hawks, the enemies' refusals,
+// the terms (prestige, resources, possessions chosen in TdlgPossessions or by the game, ships handed over, alliances
+// ended, a build limit), the "Peace treaty" report, then DoPeace (each enemy's tension 1..4, every war of the enemies
+// ends, everyone's WillGoToWar/Blockaded reset, budgets and unrest by the war's length, Prestige of nations 1..8 := 0,
+// War := 0). PeaceDecision mirrors the decision (the war loans before it belong to B5); the rest is the game's own code in
+// K's view, with K's player answering its dialogs:
+// - the people's nations stay out of it: their relations and alliances with K read 40 and 0 while it runs, and all their
+//   cells are put back afterwards (DoPeace would end their wars with K's enemies too); their wars with K are their own;
+// - K's war score with its computer enemies is in place (VP, EnemyVP: the host's ledger); the save's TotalWar (the host's),
+//   HasBeenBattle (K's: its war score has points) and AutoBuildSubs (0) are put aside; the month's war record of the save
+//   is cleared (NegotiatePeace writes K's outcome there: the winner) and put back;
+// - the possessions' TakenFrom and Invaded hold nation indices: the view's while the part runs;
+// - K's own event cooldowns are in place (GetPeaceEvent picks an unused event and marks it);
+// - hooks record what goes to the host: possession owner changes (ChangePossessionOwner), ships handed over
+//   (TransferShipAsReparation: id, nations, the new name and the ship log's "Renamed" line), NegotiatePeace's arguments,
+//   the treaty's lines (ShowPeaceTreaty), DoPeace (its zeroing of the other nations' Prestige is undone).
+// Afterwards the other nations' BaseResources, Prestige, BudgetModifier and HasLostWar changes and the war state of the
+// possessions of K's war are returned with the relation changes (B3's diff); DoPeace's clearing of the other possessions'
+// war state is put back. K's own effects stay in this PC's campaign and reach the host with K's turn (the merge).
+
+static bool g_peaceOn = false;          // the peace part runs: the hooks below record into g_peaceRec
+static PeaceResult* g_peaceRec = nullptr;
+static bool g_peaceDoPeace = false;     // DoPeace ran in the part
+static int g_pvPrestige[9];             // every record's Prestige before DoPeace (real indices)
+// K's own fields before DoPeace that its end of every war resets (demobilization); put back while K's war with a
+// people's nation goes on (DoPeace ends all of the player's wars; K's peace ends only those with the computer's nations).
+static struct {
+    int budget, sub, unrest, corruption;
+    uint8_t blockaded;
+} g_pvKeep;
+
+static struct {
+    bool on;
+    int cells[9][9], acells[9][9];  // the view's relation and alliance cells before the part (view indices)
+    int vp, enemyVP, autoSubs, war;
+    uint8_t totalWar, hasBeenBattle, tfw;
+    int* rec;                       // this month's war record (the cell) of the save
+    int recSave[3];                 // its enemy slots and the cell
+    int* used;                      // K's event cooldowns (nullptr: the save's)
+    int hostUsed[kEventSlots];
+    int base[9], prestige[9], budget[9];  // real indices
+    uint8_t lost[9];
+} g_pm;
+
+struct PossSnap {
+    void* ps;
+    void* owner;
+    int taken, invaded, support, rebellion;
+};
+static std::vector<PossSnap> g_pmPoss;
+
+bool PeaceAvailable() { return A.peace && A.playerTurn; }
+
+static int PvRealOf(void* nation) {  // a record's real index (also while the view is in place)
+    for (int r = 0; r < 9; r++)
+        if (g_pv.obj[r] == nation) return r;
+    return -1;
+}
+
+static void* PvRec(int v) { return g_pv.obj[PvReal(v)]; }  // the record at view index v
+
+static int& EvUsedAt(void* f, int j) { return *(int*)(EventRec(f, j) + kEvUsed); }
+
+static void PeaceMaskEnter(void* f, const PeaceSetup& s) {
+    int K = g_pv.K;
+    for (int v = 0; v < 9; v++)
+        for (int w = 0; w < 9; w++) {
+            g_pm.cells[v][w] = RelCellAt(PvRec(v), w);
+            g_pm.acells[v][w] = AllyCellAt(PvRec(v), w);
+        }
+    for (int v = 1; v <= 8; v++) {
+        if (!g_pvHuman[v]) continue;
+        RelCellAt(PvRec(v), 0) = 40;
+        RelCellAt(PvRec(0), v) = 40;
+        AllyCellAt(PvRec(v), 0) = 0;
+        AllyCellAt(PvRec(0), v) = 0;
+    }
+    void* k = g_pv.obj[K];
+    g_pm.vp = dl::At<int>(k, A.fVP);
+    dl::At<int>(k, A.fVP) = s.vp;
+    g_pm.enemyVP = dl::At<int>(f, A.fEnemyVP);
+    dl::At<int>(f, A.fEnemyVP) = s.enemyVP;
+    g_pm.totalWar = dl::At<uint8_t>(f, A.fTotalWar);
+    dl::At<uint8_t>(f, A.fTotalWar) = 0;
+    g_pm.hasBeenBattle = dl::At<uint8_t>(f, A.fHasBeenBattle);
+    dl::At<uint8_t>(f, A.fHasBeenBattle) = s.vp + s.enemyVP > 0 ? 1 : 0;
+    g_pm.tfw = dl::At<uint8_t>(f, A.fTFW);
+    g_pm.autoSubs = dl::At<int>(f, A.fAutoSubs);
+    dl::At<int>(f, A.fAutoSubs) = 0;
+    g_pm.war = *A.warVar;
+    g_pm.rec = (int*)((uint8_t*)f + **A.recYearCell * 0x4B0 + **A.recMonthCell * 100 + A.recDisp);
+    for (int i = 0; i < 3; i++) {
+        g_pm.recSave[i] = g_pm.rec[i - 2];
+        g_pm.rec[i - 2] = 0;
+    }
+    for (int r = 0; r < 9; r++) {
+        void* n = g_pv.obj[r];
+        g_pm.base[r] = dl::At<int>(n, A.fBaseResources);
+        g_pm.prestige[r] = dl::At<int>(n, A.fPrestige);
+        g_pm.budget[r] = dl::At<int>(n, A.fBudget);
+        g_pm.lost[r] = dl::At<uint8_t>(n, A.fHasLostWar);
+    }
+    g_pmPoss.clear();
+    ForEachPossession([](void*, void* ps) {
+        PossSnap p{ps, dl::At<void*>(ps, A.fPossOwner), dl::At<int>(ps, A.fTakenFrom), dl::At<int>(ps, A.fInvaded),
+                   dl::At<int>(ps, A.fInvSupport), dl::At<int>(ps, A.fRebellion)};
+        g_pmPoss.push_back(p);
+        dl::At<int>(ps, A.fTakenFrom) = PvReal(p.taken);
+        dl::At<int>(ps, A.fInvaded) = PvReal(p.invaded);
+    });
+    g_pm.used = s.used;
+    if (s.used)
+        for (int j = 0; j < kEventSlots; j++) {
+            g_pm.hostUsed[j] = EvUsedAt(f, j);
+            EvUsedAt(f, j) = s.used[j];
+        }
+    g_pm.on = true;
+}
+
+// Puts back what the part masked (also when a game exception unwinds through it): the people's nations' cells and
+// fields, K's VP, the form's fields, the war record, the cooldowns, the possessions' nation indices.
+static void PeaceMaskLeave() {
+    if (!g_pm.on) return;
+    g_pm.on = false;
+    void* f = BuildCamp();
+    for (int v = 1; v <= 8; v++) {
+        if (!g_pvHuman[v]) continue;
+        for (int w = 0; w < 9; w++) {
+            if (w == v) continue;
+            RelCellAt(PvRec(v), w) = g_pm.cells[v][w];
+            AllyCellAt(PvRec(v), w) = g_pm.acells[v][w];
+            RelCellAt(PvRec(w), v) = g_pm.cells[w][v];
+            AllyCellAt(PvRec(w), v) = g_pm.acells[w][v];
+        }
+        int r = PvReal(v);
+        void* n = g_pv.obj[r];
+        dl::At<int>(n, A.fBaseResources) = g_pm.base[r];
+        dl::At<int>(n, A.fPrestige) = g_pm.prestige[r];
+        dl::At<int>(n, A.fBudget) = g_pm.budget[r];
+        dl::At<uint8_t>(n, A.fHasLostWar) = g_pm.lost[r];
+    }
+    dl::At<int>(g_pv.obj[g_pv.K], A.fVP) = g_pm.vp;
+    if (f) {
+        dl::At<int>(f, A.fEnemyVP) = g_pm.enemyVP;
+        dl::At<uint8_t>(f, A.fTotalWar) = g_pm.totalWar;
+        dl::At<uint8_t>(f, A.fHasBeenBattle) = g_pm.hasBeenBattle;
+        dl::At<uint8_t>(f, A.fTFW) = g_pm.tfw;
+        dl::At<int>(f, A.fAutoSubs) = g_pm.autoSubs;
+        if (g_pm.used)
+            for (int j = 0; j < kEventSlots; j++) {
+                g_pm.used[j] = EvUsedAt(f, j);
+                EvUsedAt(f, j) = g_pm.hostUsed[j];
+            }
+    }
+    if (g_pm.rec)
+        for (int i = 0; i < 3; i++) g_pm.rec[i - 2] = g_pm.recSave[i];
+    for (auto& p : g_pmPoss) {
+        dl::At<int>(p.ps, A.fTakenFrom) = PvReal(dl::At<int>(p.ps, A.fTakenFrom));
+        dl::At<int>(p.ps, A.fInvaded) = PvReal(dl::At<int>(p.ps, A.fInvaded));
+    }
+}
+
+// The hooks' records (only while the part runs; elsewhere the routines run as they are).
+static void RecordLand(void* ps, void* owner, bool removeCA) {
+    void* cur = dl::At<void*>(ps, A.fPossOwner);
+    if (cur == owner) return;
+    PeaceLand l;
+    l.name = dl::ReadUStr(dl::At<void*>(ps, A.fPossName));
+    l.from = cur ? PvRealOf(cur) : -1;
+    l.to = owner ? PvRealOf(owner) : -1;
+    l.removeCA = removeCA;
+    g_peaceRec->lands.push_back(l);
+    Log("relations v2: peace: possession %s from nation %d to %d", W2U(l.name).c_str(), l.from, l.to);
+}
+
+static void RecordShip(void* ship, int id, int from, int to, bool rename, void* reason) {
+    PeaceShip s;
+    s.id = id;
+    s.from = from;
+    s.to = to;
+    s.name = dl::ReadUStr(dl::At<void*>(ship, A.fCShipName));
+    s.reason = dl::ReadUStr(reason);
+    if (rename) {  // the game's log entry ends "<date> Renamed <name>", then an empty line
+        std::vector<std::wstring> log = ReadStringList(dl::At<void*>(ship, A.fShipLog));
+        for (size_t i = log.size(), n = 0; i > 0 && n < 3; i--, n++)
+            if (log[i - 1].find(L"Renamed ") != std::wstring::npos) {
+                s.renamed = log[i - 1];
+                break;
+            }
+    }
+    g_peaceRec->ships.push_back(s);
+    Log("relations v2: peace: ship %d (%s) from nation %d to %d", id, W2U(s.name).c_str(), from, to);
+}
+
+static void RecordTreaty(void* report) {
+    std::vector<std::wstring> lines = ReadStringList(report);
+    if (!g_peaceRec->treaty.empty() && !lines.empty()) g_peaceRec->treaty.push_back(L" ");
+    g_peaceRec->treaty.insert(g_peaceRec->treaty.end(), lines.begin(), lines.end());
+}
+
+extern "C" void* o_NegotiatePeace = nullptr;
+extern "C" void* o_ChangeOwner = nullptr;
+extern "C" void* o_TransferShip = nullptr;
+extern "C" void* o_ShowPeaceTreaty = nullptr;
+
+static int g_peaceChance = 0;  // tests (`peaceevent <code> <chance>`): the forced event's NegotiatePeace chance
+
+// Returns the chance NegotiatePeace runs with (the caller's, or a test's for the forced peace event's answer).
+extern "C" int __stdcall CB_NegotiatePeace(int chance, int lossGain, uint32_t force) {
+    if (!g_peaceOn || !g_peaceRec) return chance;
+    if (g_peaceChance > 0 && !g_peaceRec->negotiated) {
+        Log("relations v2: peace: test: the event's NegotiatePeace runs with the chance %d (its answer's %d)",
+            g_peaceChance, chance);
+        chance = g_peaceChance;
+    }
+    Log("relations v2: peace: NegotiatePeace(%d, %d, %d)", chance, lossGain, (int)(force & 0xFF));
+    if (g_peaceRec->negotiated) return chance;
+    g_peaceRec->negotiated = true;
+    g_peaceRec->chance = chance;
+    g_peaceRec->lossGain = lossGain;
+    g_peaceRec->force = (force & 0xFF) != 0;
+    return chance;
+}
+
+extern "C" __declspec(naked) void d_NegotiatePeace() {  // (Self, aChance, aLossGain; ForceBadPeace on the stack)
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push dword ptr [esp + 16]
+        push ecx
+        push edx
+        call CB_NegotiatePeace
+        pop edx
+        mov edx, eax
+        pop ecx
+        pop eax
+        jmp dword ptr [o_NegotiatePeace]
+    }
+}
+
+extern "C" void __stdcall CB_ChangeOwner(void* ps, void* owner, uint32_t removeCA) {
+    if (!g_peaceOn || !g_peaceRec || !ps) return;
+    __try {
+        RecordLand(ps, owner, (removeCA & 0xFF) != 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+extern "C" __declspec(naked) void d_ChangeOwner() {  // (Self, aPossession, aNewOwner; RemoveAllCoastalArtillery on the stack)
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push dword ptr [esp + 16]
+        push ecx
+        push edx
+        call CB_ChangeOwner
+        pop edx
+        pop ecx
+        pop eax
+        jmp dword ptr [o_ChangeOwner]
+    }
+}
+
+extern "C" void __stdcall CB_TransferShip(void* self, void* from, void* to, void* ship, uint32_t rename, void* reason) {
+    bool rec = g_peaceOn && g_peaceRec && ship;
+    int id = rec ? dl::At<int>(ship, A.fShipId) : 0;
+    int rf = rec ? PvRealOf(from) : -1, rt = rec ? PvRealOf(to) : -1;
+    uint32_t st[3] = {(uint32_t)(uintptr_t)ship, rename, (uint32_t)(uintptr_t)reason};
+    dl::Call(o_TransferShip, (uint32_t)(uintptr_t)self, (uint32_t)(uintptr_t)from, (uint32_t)(uintptr_t)to, 3, st);
+    if (!rec) return;
+    __try {
+        RecordShip(ship, id, rf, rt, (rename & 0xFF) != 0, reason);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+extern "C" __declspec(naked) void d_TransferShip() {  // (Self, aFromNation, aToNation; aShip, Rename, aReason on the stack)
+    __asm {
+        push dword ptr [esp + 4]
+        push dword ptr [esp + 12]
+        push dword ptr [esp + 20]
+        push ecx
+        push edx
+        push eax
+        call CB_TransferShip
+        ret 12
+    }
+}
+
+extern "C" void __stdcall CB_ShowPeaceTreaty(void* report) {
+    if (!g_peaceOn || !g_peaceRec || !report) return;
+    __try {
+        RecordTreaty(report);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+extern "C" __declspec(naked) void d_ShowPeaceTreaty() {  // (Self, aPeaceReport)
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push edx
+        call CB_ShowPeaceTreaty
+        pop edx
+        pop ecx
+        pop eax
+        jmp dword ptr [o_ShowPeaceTreaty]
+    }
+}
+
+static int Rnd(int n) { return (int)dl::Call(A.mRandom, (uint32_t)n); }  // the game's System.Random: 0..n-1
+
+// CheckTurnEvents' peace decision (1.01.44, 0xce32c7..0xce37d6), in the same order of tests and Random calls; the war
+// loans at War mod 3 == 1 before it are left out (the player's budget: B5). War is the game's value there (see
+// PeaceRunGuarded). Returns the peace event's condition code (33..36), 0 (none) or -1 (CheckTotalDefeat decided: it
+// negotiated itself).
+static int PeaceDecision(void* f) {
+    const int War = *A.warVar;
+    void* P = dl::At<void*>(f, A.fPlayerNation);
+    uint32_t F = (uint32_t)(uintptr_t)f;
+    auto PVP = [&] { return dl::At<int>(P, A.fVP); };
+    auto EVP = [&] { return dl::At<int>(f, A.fEnemyVP); };
+    auto enemy = [&] { return (void*)(uintptr_t)dl::Call(A.mRandomEnemy, F); };
+    auto sameAreas = [&](void* e) {
+        return (dl::Call(A.mSameAreas, F, (uint32_t)(uintptr_t)P, (uint32_t)(uintptr_t)e) & 0xFF) != 0;
+    };
+    auto eco = [&](void* n) { return (int)dl::Call(A.mEcoRating, F, (uint32_t)(uintptr_t)n); };
+    if (Rnd(4) + 2 >= War) return 0;  // (the game: no event this month at war)
+    int code = 0;
+    if (War > 4) {
+        int t = *A.scaleVar * 250;
+        if ((PVP() > t || EVP() > t) && (Rnd(30000) < PVP() + EVP() || Rnd(100) < War)) {
+            if (Rnd(5) == 1 && EVP() > 300 && EVP() > 2 * PVP()) {
+                code = 36;
+            } else if (Rnd(5) == 1 && PVP() > 300 && PVP() > 2 * EVP()) {
+                code = 34;
+            } else if (Rnd(4) == 1 && PVP() > 300 && PVP() > 3 * EVP()) {
+                code = 34;
+            } else {
+                if (Rnd(30) < War && Rnd(3) == 1) {
+                    void* e = enemy();
+                    if (e && !sameAreas(e) && ((int)dl::Call(A.mCountTakenFrom, F) == 0 || Rnd(100) < 30)) code = 33;
+                }
+                if (!code && Rnd(3) == 1) {
+                    void* e = enemy();
+                    if (e && !sameAreas(e) && 2 * PVP() > EVP()) code = 33;
+                }
+                if (!code && Rnd(10) == 1 && PVP() > 300 && (double)PVP() > EVP() * 1.5) {
+                    void* e = enemy();
+                    if (e && dl::At<int>(e, A.fUnrest) > 6) {
+                        int mine = eco(P);
+                        void* e2 = enemy();
+                        int theirs = e2 ? eco(e2) : 0;
+                        if (mine >= theirs || Rnd(100) > 50) code = 34;
+                    }
+                }
+                if (!code && Rnd(15) == 1) {
+                    int mine = eco(P);
+                    void* e2 = enemy();
+                    int theirs = e2 ? eco(e2) : 0;
+                    if (mine >= theirs || Rnd(100) > 50) {
+                        int p = PVP(), q = EVP();
+                        if (p > 200 && q > 200 && (p > q ? p - q : q - p) < 100 && War > 6)
+                            code = 33;
+                        else if (p > 300 && (double)p < q * 1.5 && q > 300 && (double)q < p * 1.5 && War > 12)
+                            code = 33;
+                    }
+                }
+            }
+            if (code) {
+                int ratio = (int)dl::Call(A.mForceRatio, F);
+                if (code == 34 && ratio < 95) code = 33;
+                if (code == 36 && ratio > 110) code = 35;
+            }
+        }
+    }
+    if (dl::At<uint8_t>(f, A.fTotalWar)) {
+        int gov = dl::At<uint8_t>(P, A.fGovernment);
+        if ((gov == 4 || gov == 5) && code != 34 && Rnd(200) > War) code = 0;
+        if (dl::Call(A.mCheckTotalDefeat, F) & 0xFF) return -1;
+    }
+    return code;
+}
+
+// The decision and its peace event, or NegotiatePeace at once; a game exception that unwinds through here puts the
+// masks and the view back first. Returns the decision's code.
+// The war counter: the game decides in CheckTurnEvents, before DoStrategicTurn steps the counter (0xce1f69), and its
+// peace code there (the decision, CheckTotalDefeat, the event's NegotiatePeace, DoPeace) reads the value from before the
+// step; on K's PC the month starts with the counter the host has stepped already (B1, KWarMonthStep). So the turn's
+// decision and its peace event (also a test's forced one) see one month less while at war (> 1). A proposal (the
+// Diplomacy list's "Propose peace" or a test, while planning; single player has none) sees the counter as shown. The
+// shown value goes back afterwards on every path, unless DoPeace ended the war (its 0 stays; PeacePart puts the shown
+// value back while a war with a people's nation goes on).
+static int PeaceRunGuarded(void* f, const PeaceSetup* s) {
+    int code = 0;
+    const int shown = *A.warVar;
+    const bool turn = !s->negotiate && (s->forcedCode > 0 || s->decision);
+    const int war = turn && shown > 1 ? shown - 1 : shown;
+    if (war != shown)
+        Log("relations v2: peace: the turn's decision sees the war counter %d (the game's, before the month's step; "
+            "shown %d)", war, shown);
+    *A.warVar = war;
+    g_peaceOn = true;
+    g_peaceChance = !s->negotiate && s->forcedCode > 0 ? std::max(0, s->forcedChance) : 0;
+    __try {
+        if (s->negotiate) {
+            uint32_t st[1] = {s->force ? 1u : 0u};
+            dl::Call(A.mNegotiatePeace, (uint32_t)(uintptr_t)f, (uint32_t)s->chance, (uint32_t)s->lossGain, 1, st);
+        } else {
+            code = s->forcedCode > 0 ? s->forcedCode : s->decision ? PeaceDecision(f) : 0;
+            if (code > 0) dl::Call(A.mGetPeaceEvent, (uint32_t)(uintptr_t)f, (uint32_t)code);
+        }
+    } __finally {
+        g_peaceOn = false;
+        g_peaceChance = 0;
+        if (AbnormalTermination() || !g_peaceDoPeace) *A.warVar = shown;
+        if (AbnormalTermination()) {
+            g_peaceRec = nullptr;
+            PeaceMaskLeave();
+            PvLeave();
+        }
+    }
+    return code;
+}
+
+// In the view (PvEnter done), after the relation routines: the peace part when K is at war with a computer nation.
+static void PeacePart(void* f, const PlayerTurnSetup& s, PeaceResult& out) {
+    int K = g_pv.K;
+    for (int v = 1; v <= 8; v++)
+        if (!g_pvHuman[v] && RelCellAt(PvRec(v), 0) > 40) out.enemies.push_back(PvReal(v));
+    if (out.enemies.empty()) return;
+    out.ran = true;
+    PeaceMaskEnter(f, s.peace);
+    int usedBefore[kEventSlots];
+    for (int j = 0; j < kEventSlots; j++) usedBefore[j] = EvUsedAt(f, j);
+    g_peaceRec = &out;
+    g_peaceDoPeace = false;
+    out.code = PeaceRunGuarded(f, &s.peace);
+    g_peaceRec = nullptr;
+    out.accepted = g_peaceDoPeace;
+    for (int j = 0; j < kEventSlots; j++)
+        if (usedBefore[j] == 0 && EvUsedAt(f, j) != 0) out.eventShown = true;
+    int cell = g_pm.rec ? *g_pm.rec : 0;
+    out.winner = !out.accepted ? 0 : cell == 1 ? 1 : cell == 2 ? 2 : 0;
+    // The nations of K's war: K, its enemies, and the computer's nations whose war with one of them ended.
+    bool inWar[9] = {};
+    inWar[K] = true;
+    for (int e : out.enemies) inWar[e] = true;
+    for (int e : out.enemies) {
+        int ve = PvReal(e);
+        for (int v = 1; v <= 8; v++)
+            if (v != ve && !g_pvHuman[v] && g_pm.cells[v][ve] > 40 && RelCellAt(PvRec(v), ve) <= 40) inWar[PvReal(v)] = true;
+    }
+    for (int r = 0; r < 9; r++) {
+        if (r == K || s.human[r]) continue;
+        void* n = g_pv.obj[r];
+        int d = dl::At<int>(n, A.fBaseResources) - g_pm.base[r];
+        if (d) out.delta[r]["BaseResources"] = d;
+        d = dl::At<int>(n, A.fPrestige) - g_pm.prestige[r];
+        if (d) out.delta[r]["Prestige"] = d;
+        d = dl::At<int>(n, A.fBudget) - g_pm.budget[r];
+        if (d) out.delta[r]["BudgetModifier"] = d;
+        uint8_t lost = dl::At<uint8_t>(n, A.fHasLostWar);
+        if (lost != g_pm.lost[r]) out.lostWar[r] = lost;
+    }
+    PeaceMaskLeave();
+    // The war state of the possessions of K's war; DoPeace cleared every possession's: the others get theirs back.
+    auto inWarOf = [&](int n) { return n >= 0 && n <= 8 && inWar[n]; };
+    for (auto& p : g_pmPoss) {
+        void* owner = dl::At<void*>(p.ps, A.fPossOwner);
+        int& tk = dl::At<int>(p.ps, A.fTakenFrom);
+        int& inv = dl::At<int>(p.ps, A.fInvaded);
+        int& sup = dl::At<int>(p.ps, A.fInvSupport);
+        int& reb = dl::At<int>(p.ps, A.fRebellion);
+        bool moved = owner != p.owner;
+        int o0 = p.owner ? PvRealOf(p.owner) : -1;
+        if (!moved && !(inWarOf(o0) && (inWarOf(p.taken) || p.taken == 99 || inWarOf(p.invaded)))) {
+            tk = p.taken;
+            inv = p.invaded;
+            sup = p.support;
+            reb = p.rebellion;
+            continue;
+        }
+        if (moved || tk != p.taken || inv != p.invaded || sup != p.support || reb != p.rebellion) {
+            PeaceTaken x;
+            x.name = dl::ReadUStr(dl::At<void*>(p.ps, A.fPossName));
+            x.owner = owner ? PvRealOf(owner) : -1;
+            x.takenFrom = tk;
+            x.invaded = inv;
+            x.support = sup;
+            x.rebellion = reb;
+            out.taken.push_back(x);
+        }
+    }
+    g_pmPoss.clear();
+    if (out.accepted) {  // DoPeace set War := 0; a war with a people's nation goes on (its months count on)
+        bool still = false;
+        for (int v = 1; v <= 8; v++) still |= RelCellAt(PvRec(v), 0) > 40;
+        if (still) {
+            void* k = g_pv.obj[K];
+            *A.warVar = g_pm.war;
+            dl::At<int>(k, A.fBudget) = g_pvKeep.budget;
+            dl::At<int>(k, A.fSubPolicy) = g_pvKeep.sub;
+            dl::At<int>(k, A.fUnrest) = g_pvKeep.unrest;
+            dl::At<int>(k, A.fCorruption) = g_pvKeep.corruption;
+            dl::At<uint8_t>(k, A.fBlockaded) = g_pvKeep.blockaded;
+            Log("relations v2: peace: nation %d's war with a people's nation goes on: its war counter, budget, submarine "
+                "policy, unrest, corruption and blockade stay", K);
+        }
+    }
+}
+
+PlayerTurnResult RunPlayerTurn(const PlayerTurnSetup& s) {
+    PlayerTurnResult res;
+    void* f = BuildCamp();
+    void* list = NationList();
+    int K = s.K;
+    if (!PlayerTurnAvailable() || !f || !list || NationCount() < 9 || K < 1 || K > 8 || PlayerNation() != Nation(K) ||
+        EventActive() || !A.warVar) {
+        res.error = "the player's routines are not available here";
+        return res;
+    }
+    void* msgs = dl::At<void*>(f, A.fTurnMessages);
+    if (!msgs) {
+        res.error = "no turn message list";
+        return res;
+    }
+    g_pv.K = K;
+    g_pv.arr = dl::At<void**>(list, 4);
+    for (int r = 0; r < 9; r++) {
+        g_pv.obj[r] = g_pv.arr[r];
+        for (int w = 0; w < 9; w++) {
+            g_pv.cells[r][w] = RelCellAt(g_pv.obj[r], w);
+            g_pv.acells[r][w] = AllyCellAt(g_pv.obj[r], w);
+        }
+        g_pv.will[r] = dl::At<int>(g_pv.obj[r], A.fWillGoToWar);
+        g_pv.ts[r] = dl::At<int>(g_pv.obj[r], A.fTechSharing);
+        g_pv.budget[r] = dl::At<int>(g_pv.obj[r], A.fBudget);
+        g_pvHuman[r] = false;
+    }
+    for (int a = 0; a < 9; a++)
+        for (int b = 0; b < 9; b++) {
+            g_pv.rel[a][b] = a == b ? 0 : Tension(a, b);
+            g_pv.ally[a][b] = a == b ? 0 : AllianceMonths(a, b);
+        }
+    g_pv.vp = dl::At<int>(g_pv.obj[K], A.fVP);
+    for (int o = 0; o < 9; o++) {
+        g_pv.histMonths[o] = 0x7fffffff;
+        g_pv.histWinner[o] = 0;
+        g_pv.histCount[o] = 0;
+    }
+    for (auto& h : s.history) {
+        if (h.opp < 0 || h.opp > 8 || h.opp == K) continue;
+        g_pv.histCount[h.opp]++;
+        if (h.monthsAgo < g_pv.histMonths[h.opp]) {
+            g_pv.histMonths[h.opp] = std::max(0, h.monthsAgo);
+            g_pv.histWinner[h.opp] = h.winner;
+        }
+    }
+    for (int v = 1; v <= 8; v++) g_pvHuman[v] = s.human[PvReal(v)];
+    // K's own per-relation state in the other records (the host's nation plans no war: a player).
+    for (int r = 0; r < 9; r++) {
+        if (r == K) continue;
+        dl::At<int>(g_pv.obj[r], A.fWillGoToWar) = s.human[r] ? 0 : std::max(0, s.will[r]);
+        dl::At<int>(g_pv.obj[r], A.fTechSharing) = s.human[r] ? 0 : std::max(0, s.techSharing[r]);
+    }
+    // K's own fields: what the turn or the proposal changes in them goes to the host too, so the host's campaign (saved
+    // right after it applies them) holds them when the host's game is started again in the month.
+    struct SelfField {
+        const char* name;
+        int off;
+        int before;
+    } self[] = {{"BudgetModifier", A.fBudget, 0},
+                {"Prestige", A.fPrestige, 0},
+                {"BaseResources", A.fBaseResources, 0},
+                {"UnrestLevel", A.fUnrest, 0}};  // not Funds: a peace's scraps on this PC pay refunds the host never scraps
+    for (auto& sf : self)
+        if (sf.off >= 0) sf.before = dl::At<int>(g_pv.obj[K], sf.off);
+    std::vector<std::wstring> oldMsgs = ReadStringList(msgs);
+    dl::Call(A.mSLClear, (uint32_t)(uintptr_t)msgs);
+
+    PvEnter();
+    int ran = s.relations ? PvRunGuarded(f, s.tensionChanges) : 0;
+    int budgetPre[9];  // after the relation routines: the peace part's budget changes are its own (res.peace.delta)
+    for (int r = 0; r < 9; r++) budgetPre[r] = dl::At<int>(g_pv.obj[r], A.fBudget);
+    if (s.peace.run && PeaceAvailable()) PeacePart(f, s, res.peace);
+    // Read the view: K's relation with the view's nation v is v's cell 0; other pairs from both records' cells.
+    int now[9][9], nowAlly[9][9];
+    for (int a = 0; a < 9; a++)
+        for (int b = 0; b < 9; b++) now[a][b] = nowAlly[a][b] = 0;
+    for (int v = 1; v <= 8; v++) {
+        int o = PvReal(v);
+        void* rec = g_pv.obj[o];
+        now[K][o] = now[o][K] = RelCellAt(rec, 0);
+        nowAlly[K][o] = nowAlly[o][K] = AllyCellAt(rec, 0);
+        for (int w = 1; w <= 8; w++) {
+            if (w == v) continue;
+            int p = PvReal(w);
+            if (p == K) continue;
+            int mine = RelCellAt(rec, w), theirs = RelCellAt(g_pv.obj[p], v);
+            int before = g_pv.rel[o][p];
+            now[o][p] = mine != before ? mine : theirs;  // a one-sided write (the game writes both) wins
+            int am = AllyCellAt(rec, w), at = AllyCellAt(g_pv.obj[p], v);
+            nowAlly[o][p] = am != g_pv.ally[o][p] ? am : at;
+        }
+    }
+    for (int r = 0; r < 9; r++) {
+        if (r == K) continue;
+        res.will[r] = dl::At<int>(g_pv.obj[r], A.fWillGoToWar);
+        res.techSharing[r] = dl::At<int>(g_pv.obj[r], A.fTechSharing);
+        int d = budgetPre[r] - g_pv.budget[r];
+        if (d) res.budget[r] = d;
+    }
+    res.vpDelta = dl::At<int>(g_pv.obj[K], A.fVP) - g_pv.vp;
+    res.warCounter = *A.warVar;
+    PvLeave();
+    for (auto& sf : self)
+        if (sf.off >= 0 && dl::At<int>(g_pv.obj[K], sf.off) != sf.before)
+            res.self[sf.name] = dl::At<int>(g_pv.obj[K], sf.off) - sf.before;
+    res.ranTension = (ran & 1) != 0;
+    res.ranPreviousWars = (ran & 2) != 0;
+    res.ranWar = (ran & 4) != 0;
+    res.messages = ReadStringList(msgs);
+    WriteStringList(msgs, oldMsgs);
+
+    // The changes, written into this PC's campaign too (K's screen until the next month comes).
+    for (int a = 0; a < 9; a++)
+        for (int b = a + 1; b < 9; b++) {
+            int t0 = g_pv.rel[a][b], t1 = now[a][b], a0 = g_pv.ally[a][b], a1 = nowAlly[a][b];
+            if (t1 != t0) {
+                res.tension.push_back({a, b, t0, t1});
+                SetTensionRaw(a, b, t1);
+            }
+            if (a1 != a0) {
+                res.alliance.push_back({a, b, a0, a1});
+                if (a == 0)
+                    dl::At<int>(Nation(b), A.fAllied) = a1;
+                else {
+                    AllianceCell(a, b) = a1;
+                    AllianceCell(b, a) = a1;
+                }
+            }
+        }
+    // K's peace: its screen follows (K's VP is the host's, 0 without a war; "Enemy VP" = its enemies' points).
+    if (res.peace.accepted) {
+        if (!AtWarWithAnyone(K)) SetNationVP(K, 0);
+        int e = 0;
+        for (int j = 0; j < 9; j++)
+            if (j != K && AtWar(K, j)) e += std::max(0, NationVP(j));
+        ShowEnemyVP(e);
+    }
+    std::string sum = "relations v2: nation " + std::to_string(K) +
+                      (s.relations ? std::string("'s turn (") + (res.ranTension ? "tension, " : "") + "previous wars, war):"
+                                   : std::string("'s peace proposal:"));
+    for (auto& c : res.tension)
+        sum += " " + std::to_string(c.a) + "-" + std::to_string(c.b) + " " + std::to_string(c.before) + "->" +
+               std::to_string(c.after);
+    for (auto& c : res.alliance)
+        sum += " ally " + std::to_string(c.a) + "-" + std::to_string(c.b) + " " + std::to_string(c.before) + "->" +
+               std::to_string(c.after);
+    if (res.vpDelta) sum += " VP " + std::to_string(res.vpDelta);
+    for (auto& d : res.self) sum += std::string(" own ") + d.first + (d.second > 0 ? "+" : "") + std::to_string(d.second);
+    sum += "; war counter " + std::to_string(res.warCounter) + "; " + std::to_string(res.messages.size()) + " message(s)";
+    if (res.peace.ran) {
+        const PeaceResult& p = res.peace;
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+                 "; peace part: code %d, event %d, NegotiatePeace %s(%d, %d, %d), %s, winner %d, %d possession(s), %d "
+                 "ship(s), %d war state(s), %d nation(s) changed, %d treaty line(s)",
+                 p.code, p.eventShown ? 1 : 0, p.negotiated ? "" : "not run ", p.chance, p.lossGain, p.force ? 1 : 0,
+                 p.accepted ? "peace" : "no peace", p.winner, (int)p.lands.size(), (int)p.ships.size(),
+                 (int)p.taken.size(), (int)(p.delta.size() + p.lostWar.size()), (int)p.treaty.size());
+        sum += buf;
+    }
+    Log("%s", sum.c_str());
+    return res;
+}
+
+void ShowTurnMessagesOf(const std::vector<std::wstring>& lines) {
+    void* f = BuildCamp();
+    void* msgs = f && A.fTurnMessages >= 0 ? dl::At<void*>(f, A.fTurnMessages) : nullptr;
+    if (!msgs || lines.empty() || !A.mShowTurnMessages || EventActive()) return;
+    std::vector<std::wstring> old = ReadStringList(msgs);
+    WriteStringList(msgs, lines);
+    dl::Call(A.mShowTurnMessages, (uint32_t)(uintptr_t)f);  // the game's turn report dialog (modal)
+    WriteStringList(msgs, old);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Relations v2, B4 (host): a joined nation's peace with the computer's nations, applied with the game's own routines.
+
+static void* FindPossessionOf(const std::wstring& name, void* owner, bool* other) {
+    void* found = nullptr;
+    *other = false;
+    ForEachPossession([&](void*, void* ps) {
+        if (found || dl::ReadUStr(dl::At<void*>(ps, A.fPossName)) != name) return;
+        if (dl::At<void*>(ps, A.fPossOwner) == owner)
+            found = ps;
+        else
+            *other = true;
+    });
+    return found;
+}
+
+std::string MovePossession(const std::wstring& name, int from, int to, bool removeCA) {
+    void* f = BuildCamp();
+    if (!PeaceAvailable() || !f || from == to) return "unavailable";
+    void* owner = from >= 0 ? Nation(from) : nullptr;
+    void* newOwner = to >= 0 ? Nation(to) : nullptr;
+    if ((from >= 0 && !owner) || (to >= 0 && !newOwner)) return "no such nation";
+    bool other = false;
+    void* ps = FindPossessionOf(name, owner, &other);
+    if (!ps) return other ? "it has another owner now" : "no such possession";
+    uint32_t st[1] = {removeCA ? 1u : 0u};
+    dl::Call(A.mChangeOwner, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)ps, (uint32_t)(uintptr_t)newOwner, 1, st);
+    return "";
+}
+
+// The game's hand-over (without its own rename: a second name suggestion would differ from the player's), then the name
+// and the ship log's "Renamed" line from the player's PC.
+std::string HandOverShip(int id, int from, int to, const std::wstring& name, const std::wstring& reason,
+                         const std::wstring& renamedLine) {
+    void* f = BuildCamp();
+    void* nf = Nation(from);
+    void* nt = Nation(to);
+    if (!PeaceAvailable() || !f || !nf || !nt || from == to) return "unavailable";
+    void* ship = nullptr;
+    for (int i = 0; i < ShipCount(nf) && !ship; i++) {
+        void* s = Ship(nf, i);
+        if (s && dl::At<int>(s, A.fShipId) == id) ship = s;
+    }
+    if (!ship) return "not among nation " + std::to_string(from) + "'s ships";
+    dl::ConstUStr why(reason);
+    uint32_t st[3] = {(uint32_t)(uintptr_t)ship, 0, why.ptr()};
+    dl::Call(A.mTransferShip, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)nf, (uint32_t)(uintptr_t)nt, 3, st);
+    if (!name.empty() && A.mUStrAsg && dl::ReadUStr(dl::At<void*>(ship, A.fCShipName)) != name) {
+        dl::ConstUStr n(name);
+        dl::Call(A.mUStrAsg, (uint32_t)(uintptr_t)((uint8_t*)ship + A.fCShipName), n.ptr());
+    }
+    void* log = dl::At<void*>(ship, A.fShipLog);
+    if (!renamedLine.empty() && log) {  // before the empty line that closes the game's log entry, as on the player's PC
+        std::vector<std::wstring> lines = ReadStringList(log);
+        if (A.mSLInsert && !lines.empty() && lines.back().empty()) {
+            dl::ConstUStr u(renamedLine);
+            dl::Call(A.mSLInsert, (uint32_t)(uintptr_t)log, (uint32_t)(lines.size() - 1), u.ptr());
+        } else {
+            StringListAdd(log, renamedLine);
+        }
+    }
+    return "";
+}
+
+std::string SetPossessionWarState(const PeaceTaken& t) {
+    if (!PeaceAvailable()) return "unavailable";
+    void* owner = t.owner >= 0 ? Nation(t.owner) : nullptr;
+    if (t.owner >= 0 && !owner) return "no such nation";
+    bool other = false;
+    void* ps = FindPossessionOf(t.name, owner, &other);
+    if (!ps) return other ? "it has another owner now" : "no such possession";
+    dl::At<int>(ps, A.fTakenFrom) = t.takenFrom;
+    dl::At<int>(ps, A.fInvaded) = t.invaded;
+    dl::At<int>(ps, A.fInvSupport) = t.support;
+    dl::At<int>(ps, A.fRebellion) = t.rebellion;
+    return "";
+}
+
+bool SetNationFlag(int idx, const std::string& field, bool value) {
+    void* n = Nation(idx);
+    int off = dl::Field("TBuilderNation", field.c_str());
+    if (!n || off < 0) return false;
+    dl::At<uint8_t>(n, off) = value ? 1 : 0;
+    return true;
+}
+
+int NationFlag(int idx, const std::string& field) {
+    void* n = Nation(idx);
+    int off = dl::Field("TBuilderNation", field.c_str());
+    return n && off >= 0 ? dl::At<uint8_t>(n, off) : -1;
 }
 
 int CampaignStartYear() {
@@ -1913,6 +3095,13 @@ bool LoadCampaign(int slot, int playerIdx, bool modReload) {
         bool use1920 = dl::At<int>(f, A.fCampaignStartYear) >= 1920;
         for (int i = 0; i < 9 && i < NationCount(); i++)
             dl::Call(A.mLoadWarData, (uint32_t)(uintptr_t)Nation(i), use1920 ? 1 : 0);
+        // A joined player's month: the save's war counter is the host nation's. The player's own one (sent by the host
+        // with the month) replaces it before the screen is drawn: the war state, budgets and the player's own routines
+        // read it. A client never sends [General] back (its turn holds its own nation's sections only).
+        if (playerIdx > 0 && g_ownWar != INT_MIN && A.warVar) {
+            Log("war counter: %d (the host's nation) -> %d (nation %d's own)", *A.warVar, g_ownWar, playerIdx);
+            *A.warVar = g_ownWar;
+        }
         if (playerIdx > 0) SetPlayerNation(playerIdx);
     }
     Log("LoadCampaign slot %d player %d -> %s", slot, playerIdx, ok ? "ok" : "FAILED");
@@ -2085,19 +3274,48 @@ static void AIPeaceRestoreVP() {
     }
 }
 
+// The order matters: the protections below read wars (the skip of a nation whose wars are all hidden, and the VP of
+// player nations still at war), so they run with every relation visible, outside the relations-v2 mask.
 extern "C" BOOL __stdcall CB_BeforeAIPeace(void* self, void* nation, uint32_t badLoss) {
     BOOL skip = FALSE;
+    int idx = -1;
+    bool wasAtWar = false;
     try {
+        idx = NationIndex(nation);
+        wasAtWar = idx >= 1 && idx <= 8 && AtWarWithAnyone(idx);
         AIPeaceKeepVP();
-        skip = hookcb::OnBeforeAIPeace(NationIndex(nation), (badLoss & 0xFF) != 0) ? TRUE : FALSE;
-        if (skip) AIPeaceRestoreVP();  // the game's routine doesn't run
     } catch (...) {
+    }
+    MaskEnterSafe(0, "HandleAIPeace");  // relations v2: the wars of nations under the player's rules stay out of it
+    try {
+        skip = hookcb::OnBeforeAIPeace(idx, (badLoss & 0xFF) != 0) ? TRUE : FALSE;
+        if (!skip && wasAtWar && !AtWarWithAnyone(idx)) {
+            // Every war of this nation is hidden (with nations under the player's rules, or between players): the
+            // game's routine would look for an enemy it can't see (an access violation in 1.01.44), and these wars
+            // end only by the players' own peace.
+            Log("AI peace (badLoss=%d) skipped for nation %d: its wars are with players' nations", (badLoss & 0xFF) != 0,
+                idx);
+            hookcb::OnAfterAIPeace();
+            skip = TRUE;
+        }
+    } catch (...) {
+    }
+    if (skip) {  // the game's routine doesn't run
+        MaskLeaveSafe(0);
+        try {
+            AIPeaceRestoreVP();
+        } catch (...) {
+        }
     }
     return skip;
 }
 extern "C" void __stdcall CB_AfterAIPeace() {
     try {
         hookcb::OnAfterAIPeace();
+    } catch (...) {
+    }
+    MaskLeaveSafe(0);
+    try {
         AIPeaceRestoreVP();
     } catch (...) {
     }
@@ -2135,12 +3353,22 @@ extern "C" void __stdcall CB_AfterReduceTimeLimits(void* self) {
     }
 }
 
-// ReduceTimeLimits(Self=EAX): run the game's routine, then the callback with Self.
+// ReduceTimeLimits(Self=EAX): the game's routine with the pairs of nations under the player's rules masked (relations
+// v2: its "separate peace" of a computer nation), then the callback with Self.
+extern "C" void __stdcall CB_ReduceTimeLimits(void* self) {
+    __try {
+        MaskEnterSafe(0, "ReduceTimeLimits");
+        dl::Call(o_ReduceTimeLimits, (uint32_t)(uintptr_t)self);
+    } __finally {
+        MaskLeaveSafe(0);
+    }
+    CB_AfterReduceTimeLimits(self);
+}
+
 extern "C" __declspec(naked) void d_ReduceTimeLimits() {
     __asm {
         push eax
-        call dword ptr [o_ReduceTimeLimits]
-        call CB_AfterReduceTimeLimits
+        call CB_ReduceTimeLimits
         ret
     }
 }
@@ -2269,6 +3497,18 @@ static int g_peacePrestige[9];
 static bool g_peaceKeep[9];
 
 extern "C" void __stdcall CB_BeforeDoPeace() {
+    if (g_peaceOn) {  // relations v2, B4: K's peace in K's view (see PeacePart): only the other nations' Prestige is kept
+        for (int r = 0; r < 9; r++) g_pvPrestige[r] = g_pv.obj[r] ? dl::At<int>(g_pv.obj[r], A.fPrestige) : 0;
+        void* k = g_pv.obj[g_pv.K];
+        g_pvKeep.budget = dl::At<int>(k, A.fBudget);
+        g_pvKeep.sub = dl::At<int>(k, A.fSubPolicy);
+        g_pvKeep.unrest = dl::At<int>(k, A.fUnrest);
+        g_pvKeep.corruption = dl::At<int>(k, A.fCorruption);
+        g_pvKeep.blockaded = dl::At<uint8_t>(k, A.fBlockaded);
+        g_peaceDoPeace = true;
+        Log("relations v2: peace: DoPeace (nation %d's wars with the computer's nations end)", g_pv.K);
+        return;
+    }
     for (int i = 1; i < 9; i++) {
         g_peaceKeep[i] = false;
         void* n = i < NationCount() && hookcb::IsHumanRemoteNation(i) ? Nation(i) : nullptr;
@@ -2284,6 +3524,11 @@ extern "C" void __stdcall CB_BeforeDoPeace() {
 }
 
 extern "C" void __stdcall CB_AfterDoPeace() {
+    if (g_peaceOn) {
+        for (int r = 0; r < 9; r++)
+            if (r != g_pv.K && g_pv.obj[r]) dl::At<int>(g_pv.obj[r], A.fPrestige) = g_pvPrestige[r];
+        return;
+    }
     for (int i = 1; i < 9; i++) {
         if (!g_peaceKeep[i]) continue;
         g_peaceKeep[i] = false;
@@ -2381,7 +3626,7 @@ extern "C" void __stdcall CB_StrengthBars(void* self, void* area) { StrengthBars
 // K shows the host's nation and the player's flag nation K.
 extern "C" int __stdcall CB_NationDataIdx(int idx) {
     __try {
-        int K = A.relView && !g_ev.swapped ? ShownNationIndex() : 0;
+        int K = A.relView && !EventActive() ? ShownNationIndex() : 0;
         int to = K > 0 && idx == 0 ? K : K > 0 && idx == K ? 0 : idx;
         if (K > 0) Log("relations view: nation data of slot %d opens nation %d", idx, to);
         return to;
@@ -2757,6 +4002,152 @@ extern "C" __declspec(naked) void d_AIMoves() {
     }
 }
 
+// Relations v2, B2 (see PlayerRules): the routines that run with the pairs of nations under the player's rules masked.
+// All are register-only (Self and at most one more argument); MaskedCall runs them through dl::Call inside __try, so a
+// game exception unwinding through one still puts the mask back. kind 0: the computer's rules (AIMaskEnter); 1: the
+// host's CheckForWar, 2: the host's RandomTensionChanges (PlayerMaskEnter).
+struct MaskSpec {
+    const char* cls;
+    const char* method;
+    int kind;
+    void* orig;
+};
+static MaskSpec g_maskSpecs[] = {
+    {"TfrmBuildCamp", "CheckAITensionEvents", 0, nullptr},
+    {"TBuilderNation", "DoAITensionChanges", 0, nullptr},
+    {"TfrmBuildCamp", "CheckStopPlayerAgression", 0, nullptr},
+    {"TfrmBuildCamp", "CheckAllyTrouble", 0, nullptr},
+    {"TfrmBuildCamp", "CheckBlitzkrieg", 0, nullptr},
+    {"TfrmBuildCamp", "CheckChineseConcessions", 0, nullptr},
+    {"TfrmBuildCamp", "CheckForceOnForeignStations", 0, nullptr},
+    {"TfrmBuildCamp", "CreateArmsControlTreaty", 0, nullptr},
+    {"TfrmBuildCamp", "CheckForRevolutionInEnemyNation", 0, nullptr},
+    {"TfrmBuildCamp", "CheckForWar", 1, nullptr},
+    {"TfrmBuildCamp", "RandomTensionChanges", 2, nullptr},
+};
+
+extern "C" uint32_t __stdcall MaskedCall(int idx, uint32_t eax, uint32_t edx) {
+    const MaskSpec& s = g_maskSpecs[idx];
+    uint32_t r = 0;
+    __try {
+        MaskEnterSafe(s.kind, s.method);
+        r = dl::Call(s.orig, eax, edx);
+    } __finally {
+        MaskLeaveSafe(s.kind);
+    }
+    return r;
+}
+
+static void* EmitMaskThunk(int idx) {  // push edx; push eax; push idx; mov eax, MaskedCall; call eax; ret
+    uint8_t* mem = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return nullptr;
+    uint8_t* p = mem;
+    *p++ = 0x52;
+    *p++ = 0x50;
+    *p++ = 0x68;
+    *(int32_t*)p = idx;
+    p += 4;
+    *p++ = 0xB8;
+    *(uint32_t*)p = (uint32_t)(uintptr_t)&MaskedCall;
+    p += 4;
+    *p++ = 0xFF;
+    *p++ = 0xD0;
+    *p++ = 0xC3;
+    FlushInstructionCache(GetCurrentProcess(), mem, p - mem);
+    return mem;
+}
+
+// ChangeAITension(Self=EAX, Idx=EDX, anAmount=ECX, aCause on the stack): a pair with a nation under the player's rules
+// is left alone (the change and its turn message).
+extern "C" void* o_ChangeAITension = nullptr;
+
+extern "C" BOOL __stdcall CB_SkipChangeAITension(void* self, int idx) {
+    __try {
+        if (A.playerRules && (PlayerRules(NationIndex(self)) || PlayerRules(idx))) {
+            g_aiChangesSkipped++;
+            return TRUE;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return FALSE;
+}
+
+extern "C" __declspec(naked) void d_ChangeAITension() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push edx
+        push eax
+        call CB_SkipChangeAITension
+        test eax, eax
+        pop edx
+        pop ecx
+        pop eax
+        jnz skip
+        jmp dword ptr [o_ChangeAITension]
+    skip:
+        ret 4
+    }
+}
+
+// Relations v2, B3, in K's view (RunPlayerTurn): CheckWarsWithNation(Self=EAX, anOpponentIdx=EDX, var LastWinner=ECX,
+// var NumberOfWars on the stack): months since the last war with that nation (MaxInt: none) from K's own past wars,
+// not from the month records (nation 0's).
+extern "C" void* o_WarsWithNation = nullptr;
+extern "C" int __stdcall CB_WarsWithNation(void* self, int idx, int* lastWinner, int* number) {
+    if (g_pvOn && idx >= 0 && idx <= 8) {
+        int o = PvReal(idx);
+        if (lastWinner) *lastWinner = g_pv.histWinner[o];
+        if (number) *number = g_pv.histCount[o];
+        return g_pv.histMonths[o];
+    }
+    uint32_t st = (uint32_t)(uintptr_t)number;
+    return (int)dl::Call(o_WarsWithNation, (uint32_t)(uintptr_t)self, (uint32_t)idx, (uint32_t)(uintptr_t)lastWinner, 1,
+                         &st);
+}
+
+extern "C" __declspec(naked) void d_WarsWithNation() {
+    __asm {
+        push dword ptr [esp + 4]
+        push ecx
+        push edx
+        push eax
+        call CB_WarsWithNation
+        ret 4
+    }
+}
+
+// While the relation routines run in K's view these return nothing (nil / False) without running: GetRandomPossessionInArea,
+// GetRandomPossession, DoSurpriseAttack, CheckForPlayerSurpriseInvasion (all register-only). Elsewhere (also in the peace
+// part of B4, where the game's possession choice after a war uses GetRandomPossession) the original runs.
+extern "C" void* o_RandPossArea = nullptr;
+extern "C" void* o_RandPoss = nullptr;
+extern "C" void* o_SurpriseAttack = nullptr;
+extern "C" void* o_SurpriseInvasion = nullptr;
+
+static void* EmitViewSkipThunk(void** origCell) {  // cmp byte [g_pvSkip],0; je +3; xor eax,eax; ret; jmp [orig]
+    uint8_t* mem = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return nullptr;
+    uint8_t* p = mem;
+    *p++ = 0x80;
+    *p++ = 0x3D;
+    *(uint32_t*)p = (uint32_t)(uintptr_t)&g_pvSkip;
+    p += 4;
+    *p++ = 0x00;
+    *p++ = 0x74;
+    *p++ = 0x03;
+    *p++ = 0x31;
+    *p++ = 0xC0;
+    *p++ = 0xC3;
+    *p++ = 0xFF;
+    *p++ = 0x25;
+    *(uint32_t*)p = (uint32_t)(uintptr_t)origCell;
+    p += 4;
+    FlushInstructionCache(GetCurrentProcess(), mem, p - mem);
+    return mem;
+}
+
 // Generated thunks: skip an AI routine when its nation argument belongs to a remote human player.
 struct SkipSpec {
     const char* cls;
@@ -2780,6 +4171,15 @@ static SkipSpec g_skips[] = {
     // The AI's spying (SpySuccess for an AI spy: gun qualities copied silently); a joined player's nation spies as the
     // player does, on the player's PC (nationplay.cpp).
     {"TfrmBuildCamp", "CheckAISpying", 1, true, 0, nullptr},
+    // The computer's decisions about a joined nation that its player makes on the player's PC (all register-only, no
+    // result): the doctrine a finished research item brings (oxygen torpedoes, AP shell priority, diving missiles), the
+    // January ammunition loadout, ships sent home from the colonies, ships put on ASW patrol (CheckPatrols,
+    // CheckSubmarineActivity), air groups for carriers and bases (and the 6-monthly adds and deletes).
+    {"TfrmBuildCamp", "CheckNewResearchEffectsForAI", 1, false, 0, nullptr},
+    {"TBuilderNation", "SetAmmoLoadoutAndUsage", 0, false, 0, nullptr},
+    {"TBuilderNation", "MaybeSendHomeShipInColonies", 0, false, 0, nullptr},
+    {"TBuilderNation", "PutShipOnASWPatrol", 0, false, 0, nullptr},
+    {"TfrmBuildCamp", "CheckOneShipsOrBaseHasAircraft", 2, true, 0, nullptr},
 };
 
 extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
@@ -2901,7 +4301,8 @@ bool InstallHooks() {
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
         Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
     if (A.loadBlockadeRet) Hook(A.mCheckBlockade, (void*)&d_CheckBlockade, &o_CheckBlockade, "CheckBlockadeStatus");
-    if (A.doctrine) Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");
+    if (A.doctrine || A.playerRules)
+        Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");
     if (A.events) Hook(A.mLikelihood, (void*)&d_Likelihood, &o_Likelihood, "EventLikelihoodCheck");
     bool aftermathHook = false, aiBattleHook = false;
     if (A.treaties) {
@@ -2935,6 +4336,77 @@ bool InstallHooks() {
         }
         Hook(target, thunk, &g_skips[i].orig, g_skips[i].method);
     }
+    // Relations v2, B2: the computer's relation rules leave the pairs of nations under the player's rules alone. All or
+    // nothing: without one of the routines a nation under the player's rules would get half of the computer's rules.
+    if (A.playerRules) {
+        bool all = A.mReduceTimeLimits && A.mHandleAIPeace;
+        void* thunks[sizeof(g_maskSpecs) / sizeof(g_maskSpecs[0])] = {};
+        for (int i = 0; all && i < (int)(sizeof(g_maskSpecs) / sizeof(g_maskSpecs[0])); i++)
+            all = dl::Method(g_maskSpecs[i].cls, g_maskSpecs[i].method) && (thunks[i] = EmitMaskThunk(i)) != nullptr;
+        all = all && Hook(A.mChangeAITension, (void*)&d_ChangeAITension, &o_ChangeAITension, "ChangeAITension");
+        for (int i = 0; all && i < (int)(sizeof(g_maskSpecs) / sizeof(g_maskSpecs[0])); i++)
+            all = Hook(dl::Method(g_maskSpecs[i].cls, g_maskSpecs[i].method), thunks[i], &g_maskSpecs[i].orig,
+                       g_maskSpecs[i].method);
+        if (!all) {
+            A.playerRules = false;
+            MH_RemoveHook(A.mChangeAITension);
+            for (auto& s : g_maskSpecs)
+                if (s.orig) MH_RemoveHook(dl::Method(s.cls, s.method));
+        }
+        Log("Player's rules for joined nations: %s", A.playerRules ? "ok" : "UNAVAILABLE (hooks)");
+    } else {
+        Log("Player's rules for joined nations: UNAVAILABLE (routines or fields)");
+    }
+    // Relations v2, B3: the player's relation routines in a joined nation's view (on its player's PC).
+    if (A.playerRules) {
+        bool pt = A.events && A.fVP >= 0 && A.fBudget >= 0 && A.mPreviousWars && A.mShowTurnMessages &&
+                  A.fTurnMessages >= 0 && A.mSLClear && A.mSLAdd && A.fSLList >= 0 && A.fSLCount >= 0 &&
+                  A.mWarsWithNation && A.mRandPossArea && A.mRandPoss && A.mSurpriseAttack && A.mSurpriseInvasion;
+        struct ViewSkip {
+            void* target;
+            void** orig;
+            const char* name;
+        } skips[] = {{A.mRandPossArea, &o_RandPossArea, "GetRandomPossessionInArea"},
+                     {A.mRandPoss, &o_RandPoss, "GetRandomPossession"},
+                     {A.mSurpriseAttack, &o_SurpriseAttack, "DoSurpriseAttack"},
+                     {A.mSurpriseInvasion, &o_SurpriseInvasion, "CheckForPlayerSurpriseInvasion"}};
+        pt = pt && Hook(A.mWarsWithNation, (void*)&d_WarsWithNation, &o_WarsWithNation, "CheckWarsWithNation");
+        for (auto& v : skips) {
+            void* thunk = pt ? EmitViewSkipThunk(v.orig) : nullptr;
+            pt = pt && thunk && Hook(v.target, thunk, v.orig, v.name);
+        }
+        if (!pt) {
+            if (o_WarsWithNation) MH_RemoveHook(A.mWarsWithNation);
+            for (auto& v : skips)
+                if (*v.orig) MH_RemoveHook(v.target);
+        }
+        A.playerTurn = pt;
+        Log("Player's relation routines for a joined nation: %s", pt ? "ok" : "UNAVAILABLE");
+    }
+    // Relations v2, B4: the records of a joined nation's peace in its view (elsewhere these routines run as they are).
+    if (A.playerTurn && A.peace && o_DoPeace) {
+        struct PeaceHook {
+            void* target;
+            void* detour;
+            void** orig;
+            const char* name;
+        } hooks[] = {{A.mNegotiatePeace, (void*)&d_NegotiatePeace, &o_NegotiatePeace, "NegotiatePeace"},
+                     {A.mChangeOwner, (void*)&d_ChangeOwner, &o_ChangeOwner, "ChangePossessionOwner"},
+                     {A.mTransferShip, (void*)&d_TransferShip, &o_TransferShip, "TransferShipAsReparation"},
+                     {A.mShowTreaty, (void*)&d_ShowPeaceTreaty, &o_ShowPeaceTreaty, "ShowPeaceTreaty"}};
+        bool all = true;
+        for (auto& h : hooks) all = all && Hook(h.target, h.detour, h.orig, h.name);
+        if (!all)
+            for (auto& h : hooks)
+                if (*h.orig) {
+                    MH_RemoveHook(h.target);
+                    *h.orig = nullptr;
+                }
+        A.peace = all;
+    } else {
+        A.peace = false;
+    }
+    Log("Peace with the computer's nations for a joined nation: %s", PeaceAvailable() ? "ok" : "UNAVAILABLE");
     nplay::InstallHooks();
     if (lockstep::TestPrefsWanted()) {  // TEST ONLY
         Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");

@@ -325,6 +325,8 @@ static bool IsHostOwnedKey(const std::string& line) {
     return false;
 }
 
+static int DropForeignShips(IniDoc& host, int nationIdx);
+
 bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const Bundle& sub, std::string& err) {
     std::wstring s = SlotStr(slot);
     std::wstring bcsPath = slotDir + L"RTWGame" + s + L".bcs";
@@ -369,6 +371,7 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
             replaced++;
         }
     }
+    int dropped = DropForeignShips(host, nationIdx);
     long long hostId = atoll(host.Get("General", "IDNo", "0").c_str());
     long long cliId = atoll(cli.Get("General", "IDNo", "0").c_str());
     long long cliStart = atoll(cli.Get("General", "IDNoStart", "0").c_str());
@@ -414,7 +417,8 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
         Log("merge nation %d rejected: %s", nationIdx, err.c_str());
         return false;
     }
-    Log("merge nation %d: %d sections, %d possession fields, IDNo %lld/%lld", nationIdx, replaced, poss, hostId, cliId);
+    Log("merge nation %d: %d sections, %d possession fields, IDNo %lld/%lld%s", nationIdx, replaced, poss, hostId, cliId,
+        dropped ? (", " + std::to_string(dropped) + " ship(s) of other nations dropped").c_str() : "");
     return replaced > 0;
 }
 
@@ -498,7 +502,7 @@ static bool SetExisting(IniDoc& d, const std::string& sec, const std::string& ke
 }
 
 bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& eventCooldowns, std::string& summary,
-                           std::string& err) {
+                           std::string& err, int kWar) {
     if (K < 1 || K > 8) {
         err = "not a joined player's nation";
         return false;
@@ -589,7 +593,10 @@ bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& ev
         }
     int war = geti("General", "War");
     bool hostAtWar = war > 0;
-    SetExisting(d, "General", "War", std::to_string(kAtWar ? (war > 0 ? war : 1) : (war > 0 ? -12 : war)));
+    // K's own counter when known (it agrees with K's wars: > 0 exactly while at war), else the host's as a guess.
+    bool known = kWar != INT_MIN && (kWar > 0) == kAtWar;
+    SetExisting(d, "General", "War",
+                std::to_string(known ? kWar : kAtWar ? (war > 0 ? war : 1) : (war > 0 ? -12 : war)));
     SetExisting(d, "General", "EnemyVP", std::to_string(enemyVP));
     SetExisting(d, "General", "ScenarioInProgress", "-1");  // a battle in progress was the host's
     for (const char* key : {"BattleAlliedNationIdx", "BattleEnemyAlliedNationIdx"}) {
@@ -700,7 +707,7 @@ bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& ev
 }
 
 bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::vector<int>& eventCooldowns,
-                      std::string& summary, std::string& err) {
+                      std::string& summary, std::string& err, int kWar) {
     std::wstring s = SlotStr(slot);
     std::wstring bcsPath = slotDir + L"RTWGame" + s + L".bcs", mapPath = slotDir + L"MapData" + s + L".dat",
                  offPath = slotDir + L"RTWGame" + s + L".off";
@@ -711,7 +718,7 @@ bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::v
     }
     f.hasMap = ReadFileBytes(mapPath, f.map);
     f.hasOff = ReadFileBytes(offPath, f.off);
-    if (!TransformNationPlayer(f, K, eventCooldowns, summary, err)) return false;
+    if (!TransformNationPlayer(f, K, eventCooldowns, summary, err, kWar)) return false;
     // The ship designs are stored per nation number too.
     std::wstring des0 = slotDir + L"DesignFiles0.des", desK = slotDir + L"DesignFiles" + std::to_wstring(K) + L".des",
                  tmp = slotDir + L"DesignFiles_swap.tmp";
@@ -781,6 +788,55 @@ static std::vector<std::string> ShipLines(const std::vector<ShipBlock>& ships, c
     for (size_t i = 0; i < ships.size(); i++)
         for (auto& f : ships[i].fields) out.push_back("Ship" + std::to_string(i) + f);
     return out;
+}
+
+// "Nation<j>Ships" -> j.
+static bool ShipsSectionNation(const std::string& name, int& j) {
+    if (name.size() < 12 || name.compare(0, 6, "Nation") != 0 || name.compare(name.size() - 5, 5, "Ships") != 0)
+        return false;
+    std::string num = name.substr(6, name.size() - 11);
+    if (num.empty() || num.size() > 2 || !AllDigits(num, 0, num.size())) return false;
+    j = atoi(num.c_str());
+    return true;
+}
+
+// Relations v2, B4 (MergeSubmission, after a joined player's sections replaced the host's): a ship of the player's
+// section that another nation's ships section on the host holds as well (the same CShipId: two players received the same
+// ship, or the host handed it over after the player's turn was built) is dropped from the player's section, logged. The
+// nation's ShipCount follows. Returns the ships dropped.
+static int DropForeignShips(IniDoc& host, int nationIdx) {
+    IniSection* ks = host.Find("Nation" + std::to_string(nationIdx) + "Ships");
+    if (!ks) return 0;
+    std::map<std::string, int> elsewhere;  // ship id -> the nation holding it on the host
+    for (auto& s : host.sections) {
+        int j;
+        if (!ShipsSectionNation(s.name, j) || j == nationIdx) continue;
+        std::vector<ShipBlock> ships;
+        std::vector<std::string> other;
+        ParseShips(s, ships, other);
+        for (auto& b : ships)
+            if (!b.id.empty()) elsewhere[b.id] = j;
+    }
+    std::vector<ShipBlock> ships, keep;
+    std::vector<std::string> other;
+    ParseShips(*ks, ships, other);
+    for (auto& b : ships) {
+        auto it = b.id.empty() ? elsewhere.end() : elsewhere.find(b.id);
+        if (it == elsewhere.end()) {
+            keep.push_back(b);
+            continue;
+        }
+        std::string name;
+        for (auto& f : b.fields)
+            if (f.compare(0, 5, "Name=") == 0) name = f.substr(5);
+        Log("merge nation %d: ship %s (%s) dropped: nation %d holds it on the host", nationIdx, b.id.c_str(), name.c_str(),
+            it->second);
+    }
+    int dropped = (int)(ships.size() - keep.size());
+    if (!dropped) return 0;
+    ks->lines = ShipLines(keep, other);
+    host.Set("Nation" + std::to_string(nationIdx), "ShipCount", std::to_string(keep.size()));
+    return dropped;
 }
 
 static const char* kBattleSections[] = {"Ships", "Losses", "CoastalArtillery"};

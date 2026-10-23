@@ -184,7 +184,15 @@ The game is written for one player, nation 0; it runs every other nation, a join
   K > 0 shows K's relations (the relations view, ARCHITECTURE).
 - **The war counter** `[General] War` (global 0xf52ff4; `0xccd5fc` = War > 0) is nation 0's: months at war (> 0) or
   at peace (<= 0); `WarStartsWithNation` 0xd333bc sets 1 when it was <= 0, DoStrategicTurn (0xce1f69) adds 1 at war and
-  subtracts 1 at peace (at -2 a clean-up 0xd26fc8 runs), `DoPeace` ends the war. K has none.
+  subtracts 1 at peace (at -2 a clean-up 0xd26fc8 runs), `DoPeace` ends the war (War := 0, every nation's
+  `WillGoToWar` and `Blockaded` cleared). K has none; since relations v2 the host keeps one per joined nation and the
+  joined player's PC uses it in place of the host's (ARCHITECTURE, [each joined nation's relations](ARCHITECTURE.md#each-joined-nations-relations-relations-v2)).
+  Readers besides the war machinery: `GetModifiedBudget`, `GetTotalMonthlyTrainingCost`, `CheckFuelShortage`,
+  `DoResearch`, `ReduceTimeLimits`, `EventLikelihoodCheck`, `CheckUnrestChanges`, `CheckPlayerFunds`, `SmallFleetCheck`,
+  `AIMonthlyBuild`, `UpdateUIValues`. The screen (`UpdateUIValues`): at war the War results box `gbWar` and `lbWar`
+  "At war for N months." are shown and the player name's hint is emptied; at peace `lbWar`'s text is emptied (or a
+  treaty's "Peace treaty displacement limit applies for N months.") but the label is never hidden again, and the hint
+  reads "At peace for N months." (under 12 months) or "At peace for Y years[ and M months.]".
 - **Nation 0's machinery.** Tension: `RandomTensionChanges` 0xc81100 (from `CheckTurnEvents`; about 50
   `TensionChangeWithMessage` 0xd46a3c calls with explanations, which add "Tension with X increases <why>" to the turn
   messages when a setting allows it, [0xf278b4]+0x361; speeches, questions to the player) and
@@ -204,7 +212,8 @@ The game is written for one player, nation 0; it runs every other nation, a join
   screen, `SetAITension` 50 and the allies (`AllyWithAINationsFightingTheSameEnemy`, `CheckIfAlliedAINationsJoinWar`).
   AI peace: `HandleAIPeace` 0xd32f98 (war weariness, while nation 0 is not at war and the nation not at war with it, or
   forced by unrest; "The war between ... has ended", VP of nations 1-8 zeroed). So a joined nation's wars with AI
-  nations follow these rules and freeze while the host is at war; nothing of it reaches K's PC.
+  nations follow these rules and freeze while the host is at war; nothing of it reaches K's PC. (Relations v2: not for
+  a joined nation under the player's rules, whose pairs these routines don't see, ARCHITECTURE.)
 - **Battles between nations the game runs.** `CheckAIvsAIBattles` 0xd32a50: for pairs i, j in 1..8 with AITension > 40
   (nations walked in order, 50 % each) the areas are tried with `CheckAivsAIBattleInArea` 0xd32c2c (50 %, ships of
   both in the area, Random(10) < the counts, then a size-based chance) -> `DoBattleBetweenAINations` (resolved without
@@ -214,6 +223,138 @@ The game is written for one player, nation 0; it runs every other nation, a join
   battle! You gain N VP!" and PlayerNation's VP += N (`add [eax+0x175], edx`), before any preview (the battle setup
   `DoBattle` is not entered). The player's own decline in the preview gives the enemy VP ("Decline will give the enemy
   ..."; `DoPlayerDecline`).
+- **Nation 0's per-relation state lives in the other nations' records** (static, 2026-10-20): `Tension` +0x256 and
+  `Allied` +0x29a (the relation), `WillGoToWar` +0x1bd (the nation's war plan against nation 0, counted down by
+  CheckForWar; DoPeace clears it), `TechSharing` +0x29e (nation 0's tech-sharing deal), `IntelEffort` +0x1ac (nation 0's
+  intelligence on it: the chance of CheckForWar's spy warnings), `IntelligenceSpending` +0x171 (nation 0's spending on
+  it: RandomTensionChanges' "annoyed by our extensive intelligence activities" when the nations at peace add up high).
+  A joined nation K has its own values of all of them (relations v2 keeps the first four for K, ARCHITECTURE; the
+  intelligence ones are the per-player intelligence's).
+- **Every routine that changes relations between nations 1..8** (callers of `ChangeAITension` 0xc67904,
+  `SetAITension` 0xc6871c, `SetAIAlliance` 0xc686a4, `HandleAIPeace` 0xd32f98; static, 2026-10-20): the AI's own
+  (`CheckAITensionEvents`, `DoAITensionChanges`, `CheckIfAlliedAINationsJoinWar`, `AllyWithAINationsFightingTheSameEnemy`,
+  `CheckPossibleAIAlliance`, `CheckAivsAIBattleInArea`), reactions to nation 0 (`CheckStopPlayerAgression`,
+  `CheckAllyTrouble`, `CheckForceOnForeignStations`, `CheckChineseConcessions`, `CreateArmsControlTreaty`,
+  `CheckBlitzkrieg`, `CheckForRevolutionInEnemyNation`, `CheckBuildingShipForFC`), `ReduceTimeLimits` (an ally of nation
+  0 at war "has negotiated a separate peace with our enemies!": its tension with everyone set to 2-4, its alliances
+  ended), nation 0's own `CheckForWar` (volunteers: "X has entered the war against Y on our side!" = SetAITension 50
+  against every enemy of nation 0) and `DoPeace`, `SetInitialAITensions` (campaign start), the relations window's debug
+  click. `0xa07124` is `ShowMessagePos(text, -1, -1)`: a modal box ("War has broken out between X and Y!", "X and Y have
+  let their treaty lapse due to rising tensions.", "The alliance between X and Y has expired.").
+- **`CheckAITensionEvents` in detail** (per nation i 1..8): AI alliances run down while the world is at peace;
+  `AIWarLength` (0xf52ff8) counts months with an AI war; a nation at AI war raises its BudgetModifier and makes peace by
+  war weariness (`HandleAIPeace(i)`, chance from AIWarLength and unrest; only while nation 0 is at peace and i not at
+  war with it) or by unrest ("Racked by unrest X is forced to seek peace with its enemies!", alliances ended); per pair:
+  the alliance desync fix, common enemy -> -1; "X is seeking improved relations with us due to ... What do you
+  recommend?" (a question to nation 0 for the pair (0, i)); the treaty lapse (alliance > 3, tension > 5), renewal or
+  expiry (alliance = 1), an alliance attempt at tension 0 (`CheckPossibleAIAlliance`); a nation tense with nation 0
+  (> 7) drifts by government type and nation 0's alliances; the outbreak (above); `CheckIfAlliedAINationsJoinWar`.
+- **The player's event chain** (`CheckTurnEvents` 0xce30f0): one of these per month, in order: at war the peace event
+  (`GetPeaceEvent` 0xcc2a24: a random event slot whose condition is the code 30-40 the inline decision picks from VP,
+  EnemyVP, war months, force ratio and `CheckTotalDefeat`, shown by `TdlgEventAnswer.Execute`); officer stuff,
+  `BuyTechnology`, at peace `SmallFleetCheck`, `CheckForPossessionEvent`; a random event (`GetRandomEvent`, 1 in 3);
+  `CheckIntelligence`; else `RandomTensionChanges` (also after an intelligence report, 1 in 10 at war, 1 in 8 at peace);
+  then at peace `TensionEffectOfPreviousWars` (War < -6: per nation, months since the last war with it from the month
+  records, form+0x795f.. per year 0x4B0 / month 100: opponents and outcome, via `CheckWarsWithNation` 0xd4ddc4; -1 with
+  "because of previous war." and similar). `CheckForWar` runs from `DoTurn` and from `DoEndOfTurn` (after
+  `ShowTurnMessages`). `ShowTurnMessages` 0xc8e3c8 shows the form's `TurnMessages` (+0x3208, a TStringList) in
+  `dlgCampTurnRep` ("Turn messages", modal) when it is not empty, and leaves the list as it is.
+- **`CheckForWar` in detail** (per nation i with tension < 40): `CheckIfAlliedNationIsAtWar(i)` (i allied with both
+  sides of a war of nation 0 picks one: "X cancels their alliance with us ..."), common enemy -1; at peace a surprise
+  landing before a war (SurpriseAttack trait or government 4/5; `WillGoToWar` = 1 or Random(300) < t >= 10; tension set
+  to 14; "... troops have made a surprise landing in our possession ..." or ChangePossessionOwner "In a surprise move,
+  ... have taken control of ...!"); the war plan countdown `WillGoToWar` (+0x1bd) with tension rising and "rumours in X
+  about war with us" (chance from the nation's `IntelEffort` +0x1ac); a declaration when tension >= 13 + the nations
+  at war with nation 0 (or 12 with chances, or >= 8 at the plan's end): tension 13, "X has declared war on us!" (or
+  "has joined the war against", "... are now at a state of war!", "War has broken out between"), `WarStartsWithNation`,
+  the alliance checks for every nation, nation 0's BudgetModifier, VP reduced when War > 6, War := 1; else at War <
+  -48 a new war plan (3-8 months) at tension >= 11 with the spy reports "Our spy in X reports that they plan to declare
+  war on us in N months!"; else the plan dropped ("no longer considering war with us a risk"); then the volunteers
+  (tension 0, not allied, nation 0 at war, 10 %); after the loop BudgetModifier +1 for everyone not at war when a war
+  started, and `DoSurpriseAttack`.
+- **The player's peace** (static, 2026-10-21; relations v2 B4 runs it for a joined nation, [MODLOG](../MODLOG.md#feature-2026-10-21-relations-v2-b4-peace-with-computer-nations-relations-v2)).
+  The decision is inline in `CheckTurnEvents` (0xce32c7..0xce37d6): at war, when `Random(4) + 2 < War` (else at war no
+  event at all that month): the war loans at `War mod 3 = 1`, then when `War > 4`, VP or EnemyVP above 250 G (G =
+  FleetSize [0xf4c914], the `EventLikelihoodCheck` scale) and (`Random(30000) < VP + EnemyVP` or `Random(100) < War`):
+  code 36 (EnemyVP > 300 and > 2 VP, 1 in 5), 34 (VP > 300 and > 2 EnemyVP 1 in 5, > 3 EnemyVP 1 in 4, or > 1.5
+  EnemyVP with an enemy's unrest > 6 and no weaker economy, 1 in 10), 33 (an enemy without shared areas, or VP near
+  parity in a long war); 34 -> 33 at a force ratio (`GetTotalForceRatio`) below 95, 36 -> 35 above 110. With `TotalWar`
+  a Fascist/Communist player keeps only 34 (unless `Random(200) <= War`) and `CheckTotalDefeat` (War > 12, VP > 500)
+  may call `NegotiatePeace(100, +-5..6)` itself. `GetPeaceEvent(code)` 0xcc2a24 shows an unused event slot whose
+  condition is the code (Used +0x54 := 6, `TdlgEventAnswer.Execute(event, 99)`); answers with effect codes 50-56 call
+  `NegotiatePeace` (40,0) (25,0) (30,2) (70,-2) (20,-1) (50,1) (10,1). `System.Random` is 0x837834 (`push eax; call
+  [RandomProc]; pop edx; mul edx; mov eax, edx`).
+- **`NegotiatePeace(aChance, aLossGain, ForceBadPeace)`** 0xcbab88 makes peace with every enemy (Tension > 40) at once:
+  hawks (Officers.jpg) and, with TotalWar, the enemy's or the player's refusal speech; modifiers of lossGain and the
+  chance from the force ratio, unrest, economies, VP and war months (ForceBadPeace with -5: -2..-5 without them, and
+  acceptance forced); acceptance `Random(100) < chance`, else "No common ground ..." (Negotiation.jpg). Outcomes: <= -6
+  utterly defeated (BaseResources -10 % or -1000, prestige, HasLostWar, 2-3 ships handed over, a build limit of 5-12
+  years, the enemies' possessions choice, alliances may end), -5..-2 considerable, -1 minor loss, 0 compromise, 1 minor
+  gain (+200, Prestige +1), 2..10 large gain (+1000, the enemies HasLostWar); the war record cell of the month
+  (`MonthRecords[Year, Month]` +0xC: 1 won, 2 lost, 3 compromise; enemy slots +4/+8); for gains
+  `SelectPossessionsAfterWar` 0xcf4514 ("Select possessions as part of peace agreement", `TdlgPossessions`: the
+  enemies' possessions next to the player's, worth < 11, budget 2 x lossGain, the unused budget as BaseResources; its
+  `bnOKClick` 0xc188d8 keeps the dialog open after "Total value of selected possessions is higher than permitted total
+  value!" (0xc1863c, a ShowMessage) and asks "You have not selected any possessions. If you leave points unused ..."
+  (Yes/No, No keeps it open) when nothing is selected), the
+  allies' and enemies' choices (`AINationSelectPossessionsAfterWar` 0xcf4b64: never nation 0's own possessions),
+  `ReturnTakenPossessionsAfterWar` 0xd259bc (`ChangePossessionOwner`, `GetBNation(TakenFrom)`: TakenFrom and Invaded
+  are nation indices), `ScrapShipsAccordingToTreaty`, the "Peace treaty" (`ShowPeaceTreaty` 0xd3d9a4,
+  `TdlgTotalLog`, only with lines), then `DoPeace`.
+- **`DoPeace`** 0xcbc6f8: every enemy's tension 1..4 and every war of an enemy (`IsAtWarWithPlayerOrPlayerOpponent`
+  0xd4a830 = `BNation(i).Tension > 40`; its loop over the opponents is dead code) at 1..5, the other relations down
+  (80 %: 1..3), `WillGoToWar`, `Blockaded` 0 and `SubmarinePolicy` 1 for all, BudgetModifier by the war's length
+  and unrest down for all, Prestige of nations 1..8 := 0, VP, EnemyVP, TotalWar, invasions, every possession's
+  TakenFrom/Invaded cleared, interned ships back, the AMC and auto-built submarine questions, `War := 0`; it leaves
+  DisplacementLimit, HasLostWar, BaseResources and alliances. `TransferShipAsReparation` 0xccdef8 (Self, from, to;
+  ship, Rename, reason) moves the ship object (CShipId kept), copies its design for the receiver (a new design id),
+  clears its air units, crew -20, puts it in the receiver's build area and logs the hand-over in `myLogEntries`
+  ("<date> <reason><nation>", renamed "<date> Renamed <name>" with a name from `GetNameSuggestion`, then always an
+  empty line, 0xcce0d3).
+- **Loops over nations 0..8 read nation 0's own `Tension`/`Allied`** (0 for the player): `CountNationsAtWarWithPlayer`
+  0xcc402c (Tension > 40, used by `CheckForWar`), `RandomTensionChanges`' count of nations at peace 0xc81293 (Tension
+  < 40), `NegotiatePeace`'s enemies' gains (0xcbb34e, 0xcbbc79: Tension > 40), allies' gains (0xcbbc3b: Allied > 0) and
+  `TerminateAlliances` 0xcbaa84 ("The alliance with <name> is terminated."). `TensionChangeWithMessage` skips the
+  PlayerNation; `SetAITension` ignores Idx < 1.
+- **The computer's money (relations v2, B5 money).** `ComputeExpenses` 0xca049c gives the player `Funds +=
+  GetMonthlyBalance`; each nation 1..8 (loop body 0xca0511..0xca05b6, no test for people's nations) also gets a
+  BaseResources floor of Round(1.5 x FleetSize), BaseResources x 0.9 at a BudgetModifier below 5 and subsidies of 25 x
+  FleetSize (twice when poorer than the player and tense with it). `CheckBBNumbers` 0xccb6d8 (only from
+  `CheckTurnEvents`' loop 1..8) gives +6000 x FleetSize and BudgetModifier +1. `ReduceTimeLimits`' keep-up (+1 toward the
+  player's BudgetModifier, 0xc7ba85), its computer preeminence branch (0xc7b9f5) and January cuts (0xc7b303,
+  0xc7b33e), a computer coup's +1 (0xd12edc), `CheckAITensionEvents`' four +1s, `CheckForWar`'s +1 for the nations at
+  peace when the player went to war (0xc85a47), `WarStartsWithNation`'s +2/+1 (0xd333bc; the player's: +1 below 30, +1
+  below 25 with Random(30) > BudgetModifier), `SpySuccess`' "secretly spending an additional 10%" (Funds +=
+  ModBudget / 5, 0xc9d5f6), `DeHaltAllShips`/`HaltMostExpensiveShip`, and the maintenance discounts (naval academy 0,
+  aircraft x 0.8, light carriers x 0.6) are the computer's alone. Shared by every nation: `AdvanceShipConstruction`
+  (from `ReduceTimeLimits`, before `ComputeExpenses`) with `CheckForConstructionDelays` 0xc86314 (called for nations
+  0..8: a delayed ship's month is paid back, "Technical problems have delayed the construction of ... by one month.")
+  and the hoarding reclaim, and rules such as `HandleEconomicGrowth`. `GetMonthlyBalance` calls no Random and writes
+  only idempotent values.
+- **The player's own money rules (0.5.0, economy.cpp gives them to a joined nation K on the host).**
+  - `CheckPlayerFunds` 0xcb4b44 (after `ComputeExpenses`; reads and writes only the player): debt messages with
+    `ProportionalPrestigeLoss` (0xd276f8: Prestige div f when Prestige >= 2f, else 1) and `MoraleLoss` 0xd29040 (any
+    nation: FleetMorale -1, each ship's CrewQuality and each air unit's PilotExperience -Random(2)-1); corruption
+    (Funds -1000 and a question); the Air Force event (1950-1975, a question); hoarding 1 (Funds > 0.6 x ModBudget +
+    20000, calm, 10 %: BM -1, the opera's -2000 x FleetSize for Bombastic or government 2, ArmyOffensive 12; at war only
+    ArmyOffensive 4..6) and hoarding 2 (Funds > 40000 x FleetSize, 28 %: a tenth of the funds, BM -1, ArmyOffensive 8).
+  - ArmyOffensive (form +0x4a6f) is one value: `GetModifiedBudget` makes every nation's budget x 0.9 while it is above 0
+    (test at 0xc4f103); `ResolveArmyOffensive` (in `ReduceTimeLimits`) counts it down and at war resolves an offensive
+    with victory points; `DoPeace` ends it (the reset in `WarStartsWithNation` 0xd334c0 is unreachable).
+  - `CheckTurnEvents` 0xce30f0: exits in month 2 of 1890/1900/1920 and at War 0/-1; Random(4)+2 < War: the war loan in war
+    months 4, 7, 10... (Unrest < 8, BM < 22, Random(16)+10 > BM: BM +1); War > 4: the peace decision; at peace
+    `SmallFleetCheck` 0xc87dd4 (only caller): the host player's dialog and early events (A/B), complaints (prestige -1),
+    budget rules D1-D4 under the form's ParliamentDelay +0x4a83 (D1: a threatening most tense nation: BM +1 after 36
+    months of peace, before that its tension -1), the notice of the smaller share after 1920; then `BuyTechnology`
+    (the host player's choice; any computer nation, K too, can be the partner).
+  - The computer's remaining decisions in the month (they act on any nation 1..8 unless the mod keeps them away): K's
+    doctrine on new research (`CheckNewResearchEffectsForAI`), ammunition each January (`SetAmmoLoadoutAndUsage`), ships
+    sent home from colonies, ASW patrols and escorts with their cost in `CheckSubmarineActivity` (only nations at war
+    with nation 0), air groups on carriers and bases (`CheckOneShipsOrBaseHasAircraft`), aircraft prototypes and
+    licences (`AIDevelopAircraftType`; the player's own development is a request resolved for nation 0 only), the
+    automatic scrapping of armed merchant cruisers after a peace (`ScrapShipsAfterPeace`; the player is asked), the
+    purchase of another nation's scrapped ship. `AINationAdjustBudget` is the only source of "... is said to have
+    increased the naval budget".
 
 ## Research speed and the missile era
 What is known as of 2026-10-17 (static reading of 1.01.44, and a single-player test campaign played by a driver from

@@ -94,7 +94,8 @@ restriction (`WHERE id = 'rg-...'` or `WHERE id LIKE 'rg-%'`).
 ## The installed build and mixed versions
 - Test a build from its frozen snapshot (`--dist <snapshot>`: the runner compares the installed DLLs with it). At the
   end of every run of yours put the released version's DLLs back into the game folder   (the caller names it: on
-  2026-10-21 v0.4.0, `dist_vp_2`; compare the hashes), restore the slots and the Preferences, and leave no `RTW3.exe`.
+  2026-10-21 v0.4.0, `dist_vp_2`; on 2026-10-22 v0.4.1, `dist_rc041_2`; compare the hashes), restore the slots and the
+  Preferences, and leave no `RTW3.exe`.
 - Mixed versions (a release candidate against the released version): copy the game folder outside the Steam library,
   put the released DLLs into the copy and the candidate into the Steam folder, and start each copy from its folder
   (TESTING.md, "Mixed versions"; the 0.4.0 driver `mixed_040.py` is kept with the developers' session files). Delete
@@ -193,6 +194,22 @@ restriction (`WHERE id = 'rg-...'` or `WHERE id LIKE 'rg-%'`).
   ... Read of address 02EBC02F" on the third copy (k2, its player copy in slot 86) at a relayed battle's start
   (`lockstep_rejoin` e), once on 2026-10-22); the battle goes on; keep the k2 log. The mixed-version driver
   `mixed_041.py` takes the candidate's level (17).
+- 0.5.0 release candidate 1 (dist_rc050_1, rel-050 dc2cbfc, engine level 17; MODLOG, Testing 2026-10-22, the 0.5.0
+  release candidate): the relations v2 month checks excuse the joined player's own event of the new month (its random
+  event, its intelligence result: `event_tension_changes`) and read the month's own economy line when a war of the host
+  with nation 1 began after the month's end (`ECON_LINE_RE`); `player_copy` expects the copy's [General] War from the
+  player's own war counter (`own_kwar`). Its product issues, fixed in b5b0da7 (a recurrence is a regression): the host's
+  box "Error in HandleAIPeace procedure! Access violation at address 01058F0B ... Read of address 000001A5" at
+  `diplomacy`'s forced AI peace, and `victory_points` h) (no `AI peace: VP of player nation K kept` line, the players'
+  VP zeroed): the relations v2 mask was entered around the mod's own AI-peace guards. Mixed versions: `mixed_050.py`
+  (`--case a|b|c`, `--debt`) and `mixed_run.ps1` (copy, lock, run, 0.4.1 back, copy deleted) in the developers' session
+  files (`r50`; `r52` holds copies for the reg-050b runner): 0.4.1 and 0.5.0 fight live under a host on either version
+  (engine 17); a 0.4.0 player under a 0.5.0 host gets the "same live-battle engine" notice. Never pipe a cleanup script
+  into `Select-Object -First n`: it stops the script early (before the game lock is released).
+- 0.5.0 release candidate 2 (dist_rc050_2, rel-050 b5b0da7; MODLOG, Testing 2026-10-23): `diplomacy` checks the host
+  log's `AI peace (badLoss=1) skipped for nation 2: its wars are with players' nations` after its forced AI peace
+  (8896b72). `battles` b) without a fought battle in all its attempts is the game's choice (the enemy declines battle):
+  re-run it (TESTING.md, Known traps).
 - Battle screen controls are tested with posted messages only (`click_tool`, `click_arrow`, `post_click`, tree views
   and list views read cross-process) and the bridge probes `ls ctl`, `ls airwin`, `pocstate fastest=`; the battle's
   modeless tool windows must be closed (`close_modeless`) before anything answers dialogs with `answer_dialogs`.

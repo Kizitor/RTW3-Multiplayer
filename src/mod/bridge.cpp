@@ -3,6 +3,7 @@
 // Lets automated tests drive the mod without touching the user's mouse or keyboard.
 #include "common.h"
 #include "delphi.h"
+#include "economy.h"
 #include "game.h"
 #include "lockstep.h"
 #include "nationplay.h"
@@ -110,6 +111,18 @@ static std::string Execute(const std::string& line) {
         RunOnMainThread([idx] { mp::DebugEvent(idx); });
         return "ok";
     }
+    if (cmd == "relturn") {  // relturn: client runs the player's relation routines now (their dialogs: async)
+        if (game::EventActive()) return "error an event dialog is open";
+        RunOnMainThread([] { mp::DebugRelTurn(); });
+        return "ok";
+    }
+    if (cmd == "peacetest") {  // peacetest <chance> <lossGain> <force>: client, peace with the computer's nations now (async)
+        if (game::EventActive()) return "error an event dialog is open";
+        int chance = atoi(arg(1, "40").c_str()), lossGain = atoi(arg(2, "0").c_str());
+        bool force = arg(3, "0") != "0";
+        RunOnMainThread([chance, lossGain, force] { mp::DebugPeaceTest(chance, lossGain, force); });
+        return "ok";
+    }
     // submit: the client's Submit, which may ask the game's Turn questions (trade protection, foreign stations) first.
     if (cmd == "submit") {
         g_submitting++;
@@ -146,7 +159,8 @@ static std::string ExecuteOnMain(const std::string& line) {
     const std::string& cmd = args[0];
     auto arg = [&](size_t i, const std::string& def = "") { return i < args.size() ? args[i] : def; };
     // While a joined player's event dialog is open the nation list is reordered: only read-only commands.
-    static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview", "relview"};
+    static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview", "relview",
+                                                    "rellast", "peacelast", "kwarvp"};
     if (game::EventActive() && !kReadOnly.count(cmd)) return "error an event dialog is open";
     if (cmd.compare(0, 3, "poc") == 0) return poc::Command(args);  // research POC (battles), see poc_battle.cpp
     {
@@ -238,6 +252,26 @@ static std::string ExecuteOnMain(const std::string& line) {
         }
         if (cmd == "terms") return mp::DebugTerms(atoi(arg(1).c_str()), atoi(arg(2).c_str()));  // host: terms <a> <b>
         if (cmd == "vpinfo") return mp::DebugVPInfo();
+        if (cmd == "kwar") return mp::DebugKWar(args);  // relations v2: the joined nations' war counters
+        if (cmd == "relrules") return mp::DebugRelRules(args);  // relations v2: nations under the player's rules
+        if (cmd == "rellast") return mp::DebugRelLast();        // relations v2: the last relation turn
+        if (cmd == "peaceevent")  // B4: the next turn's peace event [the chance of its NegotiatePeace]
+            return mp::DebugPeaceEvent(atoi(arg(1, "0").c_str()), atoi(arg(2, "0").c_str()));
+        if (cmd == "peacelast") return mp::DebugPeaceLast();    // B4: the last peace with the computer's nations
+        if (cmd == "kwarvp") return mp::DebugKWarVP(args);      // B4 (host): a joined nation's computer war scores
+        if (cmd == "findship") {  // findship <ship id>: the nations whose ship list holds this ship (CShipId)
+            int id = atoi(arg(1, "0").c_str()), fid = dl::Field("TCampaignShip", "CShipId"),
+                fname = dl::Field("TCampaignShip", "ShipName");
+            if (fid < 0 || fname < 0) return "error unavailable";
+            std::string s;
+            for (int n = 0; n < game::NationCount(); n++)
+                for (int i = 0; i < game::ShipCount(game::Nation(n)); i++) {
+                    void* ship = game::Ship(game::Nation(n), i);
+                    if (ship && dl::At<int>(ship, fid) == id)
+                        s += std::to_string(n) + ":" + std::to_string(i) + ":" + W2U(dl::ReadUStr(dl::At<void*>(ship, fname))) + "; ";
+                }
+            return "ok " + s;
+        }
         if (cmd == "research") return game::DebugResearch(atoi(arg(1, "0").c_str()));  // research <nation>: pct and priorities
         if (cmd == "battles") return mp::DebugBattles(args);  // joined players' battles (see session.cpp)
         if (cmd == "ls") return mp::DebugLockstep(args);      // live player-vs-player battles (see lockstep.cpp)
@@ -357,6 +391,12 @@ static std::string ExecuteOnMain(const std::string& line) {
             return "ok " + s;
         }
         // --- dev helpers for automated tests ---
+        if (cmd == "nflag") {  // nflag <nation> <BooleanField> [0|1]: a Boolean nation field (HasLostWar, Blockaded)
+            int n = atoi(arg(1).c_str());
+            if (args.size() > 3) game::SetNationFlag(n, arg(2), arg(3) != "0");
+            int v = game::NationFlag(n, arg(2));
+            return v < 0 ? "error no such nation/field" : "ok " + std::to_string(v);
+        }
         if (cmd == "nfield") {  // nfield <nation> <IntegerField> [value]
             void* n = game::Nation(atoi(arg(1).c_str()));
             int off = dl::Field("TBuilderNation", arg(2).c_str());
@@ -389,6 +429,15 @@ static std::string ExecuteOnMain(const std::string& line) {
             return "ok " + W2U(dl::ReadUStr(dl::At<void*>(ship, dl::Field("TCampaignShip", "ShipName")))) +
                    " loc=" + an(dl::At<void*>(ship, locOff)) + " ordered=" + an(dl::At<void*>(ship, ordOff)) +
                    " status=" + std::to_string(dl::At<uint8_t>(ship, dl::Field("TCampaignShip", "Status")));
+        }
+        if (cmd == "econ") return economy::BridgeCommand(args);  // econ <K>: the player's economy rules (economy.cpp)
+        // TEST ONLY: econrand <v>: the player's economy rules for joined nations draw min(v, n - 1) for Random(n); -1 off
+        if (cmd == "econrand") return economy::TestRandom(args);
+        if (cmd == "ffield") {  // ffield <IntegerField>: a campaign field (e.g. ArmyOffensive, ParliamentDelay), read only
+            void* f = game::BuildCamp();
+            int off = dl::Field("TfrmBuildCamp", arg(1).c_str());
+            if (!f || off < 0) return "error no campaign/field";
+            return "ok " + std::to_string(dl::At<int>(f, off));
         }
         return "error unknown command";
     }

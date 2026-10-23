@@ -8730,7 +8730,7 @@ static void TryLoadQueued() {
 // Two PCs whose live-battle engines differ, in player language (the session's notices add the mod versions).
 static std::string LevelMismatchText(const std::string& who, int theirs) {
     return who + "'s mod plays live battles at level " + std::to_string(theirs) + ", this PC's at level " +
-           std::to_string(MP_LS_LEVEL) + " (a live battle needs the same level on both PCs: the same mod version)";
+           std::to_string(MP_LS_LEVEL) + " (a live battle needs the same level on both PCs)";
 }
 
 static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {

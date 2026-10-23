@@ -307,6 +307,14 @@ static void OnDiplomacy(int id) {
         return;
     }
     std::wstring who = U2W(row->nationName + (row->player.empty() ? "" : " (" + row->player + ")"));
+    if (id == IDC_DPEACE && row->computer &&  // relations v2, B4: the game's peace negotiation, at once
+        MessageBoxW(g_wnd,
+                    (L"Propose peace to " + U2W(row->nationName) +
+                     L"?\n\nThe negotiation starts at once, with all the computer's nations at war with you (the game's "
+                     L"own peace talks, its dialogs on your screen). Once a month, before you submit your turn.")
+                        .c_str(),
+                    L"Propose peace", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        return;
     std::string action;
     switch (id) {
         case IDC_DWAR:

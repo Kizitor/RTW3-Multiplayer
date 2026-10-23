@@ -1,6 +1,7 @@
 #include "common.h"
 #include "datafiles.h"
 #include "delphi.h"
+#include "economy.h"
 #include "game.h"
 #include "lockstep.h"
 #include "net.h"
@@ -188,6 +189,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
     if (!game::InstallHooks()) Log("some hooks failed; multiplayer may not work");
+    economy::Install();
     g_msgHook = SetWindowsHookExW(WH_GETMESSAGE, GetMsgProc, g_inst, g_mainTid);
     PostThreadMessageW(g_mainTid, WM_NULL, 0, 0);
     Log("init done: build %s, main thread %lu, msg hook %p", game::BuildFingerprint().c_str(), g_mainTid, g_msgHook);
