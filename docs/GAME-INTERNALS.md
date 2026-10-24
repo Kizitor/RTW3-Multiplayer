@@ -102,6 +102,24 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   creates new ones: part of the memory growth per reload), so an old unit's `HomeBase` still points to the old ship
   object: base-matched code (the air group dialog's base views, `CheckAirGroupNumbers`, the battle setup) sees the
   old copies only after a save and a reload resolve their base ids, which are right.
+- **The last battle's area and possession outlive a load** (static reading and live runs, 2026-10-23;
+  [MODLOG](../MODLOG.md#fix-2026-10-23-the-joined-players-savebuildcampaign-access-violation-060)).
+  `TfrmBuildCamp.BattleArea` (+0x4a3b, a `TMapArea`) and `BattlePossession` (+0x4a36, a `TPossession`) are set by
+  `DoBattle` (0xcb3b9a/0xcb3bb9). The battle screen's close (`TfrmMain.FormClose`, 0xdcd9e4) clears the possession;
+  nothing clears the area (`DoStrategicTurn` 0xce19fb reads it for "You may retire the CO <area>, ... due to his
+  unconvincing command of operations during the recent battle." while `RetireAdmiral` +0x9ed is set, and on Yes writes
+  `BattleArea.AreaCommander` +0x178 := nil). `LoadBuildCampaign` frees every map area with its possessions
+  (`LoadMapData` 0xce7248 -> `ClearMapData`, then a new `TMapArea` per area; possessions live in `TMapArea.Possessions`
+  +0x84) but sets the two fields from `[BATTLE INFO]` only when the save has a battle in progress (0xc9ad91:
+  ScenarioInProgress or `BattleIndex` > -1); otherwise they keep pointing at the freed objects. `SaveBuildCampaign`
+  then writes `BattleAreaName`/`BattlePossessionName` from them (0xc8ee80/0xc8eeb9: `[ptr+0x54]` passed straight to
+  its "Ident=Value" writer 0xab6bc8, whose prologue `_UStrAddRef`s it, 0x83b9d0). A `TPossession` (3420 bytes) is a
+  medium block of the memory manager, reused for anything: a later load put another possession there (live: one
+  pointer read "East Prussia", then "Liaotung Peninsula", "Sakhalin", "Annam" after three loads) or something else,
+  and the save failed with "Access violation at address <RVA 0xB9D4> ... Read of address 00000029" (a "pointer" 0x31:
+  the characters of a string "1") or "Integer overflow" (the line's concatenation, `_UStrCatN`, met a garbage length;
+  the game itself is compiled without overflow checks). `InvasionTarget` and `EnemyInvasionTarget` are set from the
+  save on every load. Since 0.6.0 the mod clears both fields before every load (the state `FormCreate` leaves).
 - **Duplicated air units: which copy the game changes** (static reading, 2026-10-17). A doubled list is [the copies of
   the game's first load] + [the copies of each later load], in that order, in the save too (`SaveAircraftData` writes
   the list in order, `LoadAircraftData` appends in file order).
@@ -180,7 +198,8 @@ The game is written for one player, nation 0; it runs every other nation, a join
   pair. Helpers: `IsEnemy` 0xc66410 (the player's coalition only), `NationIsAtWar` 0xc634f8 (PlayerNation: War > 0),
   `IsAtAIWar` 0xc68ecc (false for PlayerNation), `GetRandomEnemy` 0xccd5cc (Tension > 40), `GetRandomEnemyForAI`
   0xc77500 (AITension[1..8]). Side effects: while War > 0 `UpdateUIValues` calls `CancelTreaty` (a box when a
-  disarmament treaty ends) and zeroes every nation's DisplacementLimit. Since 0.4.1 a PC whose PlayerNation is nation
+  disarmament treaty ends; [the treaty](#the-disarmament-treaty-and-the-submarine-ban)) and zeroes every nation's
+  DisplacementLimit and BuildConstraint. Since 0.4.1 a PC whose PlayerNation is nation
   K > 0 shows K's relations (the relations view, ARCHITECTURE).
 - **The war counter** `[General] War` (global 0xf52ff4; `0xccd5fc` = War > 0) is nation 0's: months at war (> 0) or
   at peace (<= 0); `WarStartsWithNation` 0xd333bc sets 1 when it was <= 0, DoStrategicTurn (0xce1f69) adds 1 at war and
@@ -214,6 +233,49 @@ The game is written for one player, nation 0; it runs every other nation, a join
   forced by unrest; "The war between ... has ended", VP of nations 1-8 zeroed). So a joined nation's wars with AI
   nations follow these rules and freeze while the host is at war; nothing of it reaches K's PC. (Relations v2: not for
   a joined nation under the player's rules, whose pairs these routines don't see, ARCHITECTURE.)
+
+### The disarmament treaty and the submarine ban
+Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix-2026-10-23-the-disarmament-treaty-and-a-joined-nations-war-no-box-every-month-the-host-ends-it-once-v060-dev)).
+- **Campaign-wide.** The arms control treaty lives in `TfrmBuildCamp` fields saved in `[General]`: `TreatyTimeRemaining`
+  +0x4a5b (months; > 0 = in force), `TreatyDisplacementLimit` +0x4a53 and `TreatyCalibreLimit` +0x4a57 (MaxInt =
+  none), `TreatyTonnageBasePercentage` +0x4a5f, `HasBeenTreaty` +0x4a4c; per nation `TreatyTonnageLimit` +0x20e and
+  `TreatyTonnageFactor` +0x20a (`DoTonnageLimitsForAllNations` 0xd3d56c). The submarine ban is `SubBanTime` +0xa63
+  (months). No limit has a per-nation exemption for a nation at war: a war ends the whole treaty instead.
+- **Its effects** (every nation, as long as the months last): `GetTreatyLimit` 0xd023fc (displacement; MaxInt without
+  a treaty, scaled by GovernmentType +0x1cc) and `GetCalibreLimit` 0xd254a0 (MaxInt for a nation under a peace
+  treaty's DisplacementLimit) in the design and build checks ("Due to treaty restrictions you cannot build ships larger
+  than ..."); `CheckAllowableTreatyBuild` 0xc76e58 and `GetTreatyMaxBuildTonnage` 0xc77254 (only while
+  TreatyTimeRemaining > 0; TreatyTonnageLimit MaxInt = no limit): the tonnage building ("Due to treaty build
+  restrictions, we can have a maximum of N tons of warships building", the host's pre-turn check: the Turn is refused);
+  `CheckTreatyTonnageLimit` 0xc76800 (PlayerChecksBeforeTurn: "You must scrap ..."). `ReduceTimeLimits` counts both
+  down ("The current arms limitation treaty has expired!", "The treaty outlawing submarines has expired!") and cuts
+  the player's naval funding "With naval armaments restricted by treaty, ..." (the player's economy rules for a joined
+  nation mirror it, economy.cpp).
+- **Made** by `CreateArmsControlTreaty(aChance)` 0xcb6bf0 (from the submarine-ban routine 0xd0f578 while War < 0, an
+  event answer, `CheckAllyTrouble`, two calls in `TfrmSelectNation2`'s code): its first test, `AnyNationIsAtAIWar`
+  0xd30b58 (two of nations
+  1..8 at war; a war with nation 0 doesn't count), ends it with "With a war already in progress, the conference ends
+  in solemn declarations and no action." (a picture message). Otherwise a draft (limits by year, the player's
+  question "Can we accept this treaty?"), or "The conference fails due to high tensions ...".
+- **Ended** by `CancelTreaty` 0xd30b88: while months remain the box (`ShowMessagePos` 0xa07124) "The outbreak of war
+  cancels the disarmament treaty!", then TreatyTimeRemaining 0, both limits MaxInt, the treaty label "-", SubBanTime
+  0 (the ban ends silently). Its only string work is the label's (`stTreatyTime` +0x59c, a `TStaticText`): its caption
+  (`TControl.SetText` 0x981ca0) and its hint (`FHint` +0x90 cleared by `_UStrClr` 0x83b8dc); the treaty goes into
+  `[General]` as integers (`SaveBuildCampaign` 0xc8e781-0xc8e820: `Treaties` byte +0x4a52, `TreatyCalibreLimit`,
+  `TreatyDisplacementLimit`, `TreatyTimeRemaining`, `TreatyTonnageBasePercentage`, `SubBanPoss` byte +0xa62,
+  `SubBanTime`), so ending it on a joined player's PC leaves no string behind (checked for the 0.6.0 release
+  candidate's save box, which came from the last battle's possession instead, above). Callers: `UpdateUIValues`
+  (0xc80828: every screen refresh while War > 0, so the box once and later calls change nothing) and
+  `CheckAITensionEvents` (0xd2e691: two computer nations go to war). So any war's outbreak ends the treaty for
+  everyone.
+- **A joined player's PC** puts its nation's own war counter in `War` (relations v2, B1): the first screen refresh at
+  war calls CancelTreaty on the host's copy. The client never sends `[General]` back, so before 0.6.0 the box came
+  back with every month while the host kept the treaty; the B2 mask also hid K's wars from the conference's first
+  test. Since 0.6.0 the host ends the treaty for a joined nation's war, a joined PC ends it on its copy (without
+  the box) only when its host does so too, and the conference sees the joined nations' wars
+  ([the arms-control conference](#the-other-relation-and-war-routines), below; ARCHITECTURE).
+
+### The other relation and war routines
 - **Battles between nations the game runs.** `CheckAIvsAIBattles` 0xd32a50: for pairs i, j in 1..8 with AITension > 40
   (nations walked in order, 50 % each) the areas are tried with `CheckAivsAIBattleInArea` 0xd32c2c (50 %, ships of
   both in the area, Random(10) < the counts, then a size-based chance) -> `DoBattleBetweenAINations` (resolved without
@@ -223,6 +285,56 @@ The game is written for one player, nation 0; it runs every other nation, a join
   battle! You gain N VP!" and PlayerNation's VP += N (`add [eax+0x175], edx`), before any preview (the battle setup
   `DoBattle` is not entered). The player's own decline in the preview gives the enemy VP ("Decline will give the enemy
   ..."; `DoPlayerDecline`).
+- **The player's battle generator in detail** (static, 2026-10-23, for B6): `CheckForBattles2` reads only `War`
+  (0xccd5fc: [0xf52ff4] > 0), `PlayerNation` (+0x3204) and `GetBNation(i).Tension` (+0x256 > 40) besides pointer-based
+  helpers (IsHomeArea, GetStrengthInArea, GetRandomHomeArea, the strongest-area helper 0xceca88), so a view that puts
+  another record at index 0 and as PlayerNation, with that nation's relation cells and war counter, runs it for that
+  nation. Every candidate goes through `CheckAttackLocation(attacker, defender, area)` 0xced17c (ret 4; area nil at
+  0xcecddf: it picks one), and the search stops at the first True: at most one battle a month; a False goes on.
+  `CheckForInvasionBattles` 0xd10228 reads the form's invasion state (+0x4a8c..+0x4a98, nation 0's);
+  `CheckRaiderVsPatrols` 0xcce6bc the pending raider battle (+0x4a1b). `DoPlayerDecline` 0xd4927c (callers: the map
+  question's No in `DoPossessionBattle` 0xcedfcb, and TfrmQuickBattle) adds to EnemyVP (+0x4a63), counts declines
+  (+0x32ec; "High command demands action", Prestige -1 +0x198, FleetMorale -1 +0x19c) and may let the enemy invade the
+  possession (+0x75 := the enemy, +0x7d InvadedThisTurn := 1, form +0x4a94/+0x4a98). A decline in the battle preview
+  returns from `DoBattle` without it; its consequences there showed as the enemy's VP (live run: "VP 0/63").
+- **The generator's own error box** (static, 2026-10-23; live with the mod's test fault): `CheckForBattles2` has its own
+  try/except; the handler (0xced047) calls `ShowMessage('Error in CheckForBattles procedure!'#13 + E.Message)` (the
+  literal at 0xced04f, the concatenation at 0xced054, `ShowMessage` 0xab7970 called at 0xced05c) and returns normally.
+  A game exception inside the generator therefore never reaches a caller's SEH frame (`__try`): only the box tells.
+  ShowMessage is found from that call site (`mov edx, <literal>; call; mov eax, [ebp-0x14]; call ShowMessage`).
+- **The player's decline counts are form fields** (static and live, 2026-10-23): `DeclineCount` (TfrmBuildCamp
+  +0x32ec) and `EnemyDeclineCount` (+0x32f0) are written by `SaveBuildCampaign` ([General], 0xc8eacb/0xc8eae4), but
+  `LoadBuildCampaign` reads only DeclineCount (0xc99f35..0xc99f4a): EnemyDeclineCount is saved and never loaded, so it
+  lives in memory for the game session and survives loading another save (live: a client's battle slot showed the
+  previous battle slot's value, "the save's were 0/3"). A slot made from a campaign (a battle slot) therefore holds
+  that campaign's player's DeclineCount and the PC's in-memory EnemyDeclineCount. `DoPlayerDecline`: below 0 (after a
+  warning) a 50 % roll "The <LeaderTitle> is extremely frustrated with the continuing inaction of the navy! ..."
+  (Prestige -1, DeclineCount := -1); else above 2 a roll
+  Random(40) < DeclineCount "Continued inaction affects fleet morale!" (FleetMorale -1); else when the war's points are
+  close or behind (|VP - EnemyVP| < VP/3 with EnemyVP > 100, or VP < EnemyVP < 2 VP) DeclineCount += 1, and above 2 a
+  further roll (50 %, then 15-30 %) "High command demands action from the navy! ..." DeclineCount := -10.
+  `CheckSurpriseAttack` sets it to 0 (0xcfdb6a, 0xcfe020). EnemyDeclineCount += 1 in `AIDeclinesBattle` (0xcd2eaa) and
+  an unnamed battle routine (0xbe7111), := 0 at 0xbe9f3d (live: three battles the AI declined 0 -> 1 -> 2 -> 3; the
+  player's Decline in the preview set it to 0, so 0xbe9f3d is on the preview's path - a guess). Readers:
+  DoPossessionBattle, DoHomeAreaBattle,
+  ArrangePossessionBattleDetails (the penalty scale), AdjustPlayerPenaltyPointsForArea, the month's invasion resolution
+  (EnemyDeclineCount in its modifier, below).
+- **`DoPlayerDecline`'s possession branches** (static, 2026-10-23): the enemy invades only when the declined battle's
+  possession is the form's `EnemyInvasionTarget` (+0x4a94) and `InvasionBattlePending` (+0x4a98) > 0, i.e. an enemy
+  invasion battle `CheckForInvasionBattles` set up: Prestige -1, Invaded (+0x75) := the invader, InvasionSupport (+0x79)
+  := -1, InvadedThisTurn (+0x7d) := 1, the box "<X> forces invade <p> without opposition from our navy! Your prestige
+  suffers!", EnemyInvasionTarget := nil, InvasionBattlePending := -1. Otherwise a possession with Invaded = 0 (the
+  player's own invasion) loses 2 InvasionSupport. No other decline touches a possession.
+- **The month's invasion resolution is the player's** (static, 2026-10-23): an unnamed TfrmBuildCamp routine
+  0xcf8824..0xcfa1d1 (from `DoStrategicTurn` 0xce1f54, after "Checking rebellions"; the nearest RTTI name,
+  CheckForceOnForeignStations, is not it) loops over all possessions of all nations without an owner test. At peace
+  (War <= 0) every invasion is cancelled (Invaded := -1, 0xcf9900). At war Invaded > 0 means "an enemy invades OUR
+  possession" (nation 0's strength in the area against a random enemy of nation 0, nation 0's prestige, TakenFrom := 0
+  on a capture, "our forces" boxes), Invaded = 0 "our invasion"; the modifier is the army offensive (+4/-2) + 10 x
+  InvasionSupport + EnemyDeclineCount; an AI invasion only starts against nation 0's possessions (0xcf9226). The game
+  never sets Invaded for an invasion between computer nations. So invasion state of a joined nation's possession set on
+  the host would be resolved as the host player's (or cancelled at peace): a joined nation's invasions need their
+  resolution in its own view.
 - **Nation 0's per-relation state lives in the other nations' records** (static, 2026-10-20): `Tension` +0x256 and
   `Allied` +0x29a (the relation), `WillGoToWar` +0x1bd (the nation's war plan against nation 0, counted down by
   CheckForWar; DoPeace clears it), `TechSharing` +0x29e (nation 0's tech-sharing deal), `IntelEffort` +0x1ac (nation 0's
@@ -241,6 +353,24 @@ The game is written for one player, nation 0; it runs every other nation, a join
   against every enemy of nation 0) and `DoPeace`, `SetInitialAITensions` (campaign start), the relations window's debug
   click. `0xa07124` is `ShowMessagePos(text, -1, -1)`: a modal box ("War has broken out between X and Y!", "X and Y have
   let their treaty lapse due to rising tensions.", "The alliance between X and Y has expired.").
+- **`CheckForRevolutionInEnemyNation` 0xcc5c90 in detail** (from `ReduceTimeLimits`, before `CheckTurnEvents`; each
+  nation i 1..8 with Tension > 40, i.e. at war with nation 0): UnrestLevel - 1 above 8 at War 1 and at War 2, above 6 for
+  governments 4/5 at Random(100) < 10; the first i with `CheckTotalWar(i)` ends the routine; UnrestLevel > 10 and
+  Random(10) < UnrestLevel - 10: a revolution: harsh (VP > EnemyVP, Random(100) < 60: player BaseResources +1000,
+  Prestige +1, i's UnrestLevel := 6, HasLostWar; possessions back `ReturnTakenPossessionsAfterWar(i, 90)`, at
+  Random(100) > 50 `PickShipAsReparation`, possessions worth Random(6) + 5 in TdlgPossessions 0xcf4514), territories
+  (EnemyVP < VP * 1.3: +500, Random(5) + 4) or compromise (only with `HardPeaceDeals`); Revolution.jpg; i's wars with
+  everyone end (`SetAITension` Random(5)), its alliances too; at Random(100) < 20 `RevolutionPending` (+0x4a73, saved,
+  `DoPeace` resets it; an index in `BuilderNations`) := i. `HasOtherEnemy(i)` 0xd0b4b0: 0 none, 1 another enemy, 2
+  one with more tonnage (`GetShipTonnage`) than i; 2 and VP < EnemyVP * 1.5, or EnemyVP > VP * 1.1 and Random(100) <
+  50 - War / 2: "The other members of the enemy coalition resolve to fight on." (`ShowMessagePos`), i's Tension :=
+  Random(3) + 2, its Prestige := 0, no `DoPeace` (a separate peace, no war record); else the general peace (record cell
+  1/3, `ShowPeaceTreaty`, `DoPeace`). After the loop, `RevolutionPending` > 0 and Random(100) < 20: "Revolutionary
+  ideas from X are infecting our workers and soldiers!" (governments 3/4 only at Random(100) < 50; never 5) and the
+  player's unrest up 1-3. Unrest > 7 without a revolution: Random(100) < 20 demonstrations (WarDemoB.jpg; War > 8).
+  On the host the loop's i include a joined nation at war with the host (its Tension cell with nation 0 is not one of the
+  cells B2's mask hides): since 0.6.0 the mod keeps such a nation out (its unrest reads at most 10 for the call), so the
+  rule never forces a peace between players.
 - **`CheckAITensionEvents` in detail** (per nation i 1..8): AI alliances run down while the world is at peace;
   `AIWarLength` (0xf52ff8) counts months with an AI war; a nation at AI war raises its BudgetModifier and makes peace by
   war weariness (`HandleAIPeace(i)`, chance from AIWarLength and unrest; only while nation 0 is at peace and i not at
@@ -272,6 +402,44 @@ The game is written for one player, nation 0; it runs every other nation, a join
   war on us in N months!"; else the plan dropped ("no longer considering war with us a risk"); then the volunteers
   (tension 0, not allied, nation 0 at war, 10 %); after the loop BudgetModifier +1 for everyone not at war when a war
   started, and `DoSurpriseAttack`.
+- **CheckForWar's surprise landing and takeover in detail** (static, 2026-10-23, 1.01.44; live with B6 piece 2): for B_i
+  with Tension < 40 (0xc84f9c) while War <= 0 (0xc84fa9) with the trait (+0x1f3) or GovernmentType 4, or 5 and
+  Random(100) < 30, and (`WillGoToWar` = 1 or Tension >= 10 and Random(300) < Tension): Tension := 14 (0xc85014), then
+  Random(100) < 50, or with the trait Random(100) < 90, else nothing more: `P.GetRandomPossessionInArea(B_i.BuildArea)`
+  (0xc85056; Self = nation 0); a possession worth < 200 (+0x58) and `B_i.GetStrengthInArea(area, False, True, False)` >
+  half of nation 0's there -> the landing ("... troops have made a surprise landing in our possession ...", Invaded
+  (+0x75) := i, InvadedThisTurn := 1, nothing else); otherwise up to three `GetRandomPossession(nil, @B_i.BuildArea)`
+  (0xc850f7/0xc85115/0xc85133) until one has Owner (+0x61) nil -> "In a surprise move, <B_i's adjective> troops have taken
+  control of <p>!" (Invasion.jpg, copied to the turn messages) and `ChangePossessionOwner(p, B_i, False)` (0xc85196),
+  the globe refreshed. Then the war-plan countdown (0xab7744 = Dec with a floor: `WillGoToWar` 1 -> 0) and, with
+  Tension 14, the declaration (CountNationsAtWarWithPlayer + 13 <= 14; not when War < -48 and Random(180) < 14: the
+  rumours instead). The war-start block (0xc8549b, only while War <= 0) keeps [ebp-0x24] := IndexOf(B_i) with B_i's
+  trait, else 0 with nation 0's; `DoSurpriseAttack` runs at the end (0xc85a64) when it is > -1. In the 1900 fixture
+  only Japan has the trait; neutral possessions (Owner nil) exist in most areas (Northern Korea, Southern Korea and
+  Shanghai in Northeast Asia, Japan's build area).
+- **`DoSurpriseAttack` / `CheckSurpriseAttack`** (static, 2026-10-23, 1.01.44; live with B6 piece 2): DoSurpriseAttack
+  0xd29e84 (EAX form, EDX index never read, ECX target): nation 0 with the trait -> CheckSurpriseAttack(nation 0, target
+  or `GetRandomEnemy`), its False -> `ShowMessagePos('No opportunity found for surprise attack!')`; else for i = 1..8
+  every nation with Tension > 40 and the trait -> CheckSurpriseAttack(it, nation 0) until one answers True.
+  CheckSurpriseAttack 0xcfd82c (EAX form, EDX attacker, ECX defender, Boolean; its own except handler shows "Error in
+  CheckSurpriseAttack procedure!"): SurpriseAttackPossession := nil, TmpPenaltyPoints := 100 G + 95, `LoadSurpriseWarInfo`
+  (Data\SurpriseWarInfo.dat, only the keys `Nation1Mission0..10`: Kiautschou Bay, Shanghai, Weihaiwei, Liaotung
+  Peninsula, Southern Korea, The Philippines, Formosa, Cam Ranh Bay, Kwang-Chou-Wan, Hong Kong, Northern Korea; the other
+  NationN sections are empty); the caption "Surprise attack!" (attacker = nation 0) or "Enemy surprise attack!"; before
+  1896 False; Random(100) < 20 -> False, then a war-history test 0xd0decc(idx, 1901|1935) and Random(100) < 60 -> False.
+  1896-1924: the first mission whose possession the defender owns (none -> False); an AI attacker's
+  `AIDeclinesBattle(attacker, area, mission, Implement True, 100 G, False, '')` declining -> False (the player gets the
+  points: live "The Japanese navy declines battle! You gain 200 VP!"); 1925-1934: `DoSubSurprise` (a submarine attack,
+  no battle) and False; from 1935 the carriers' mission pick 0xbf5798 (the AI attacker needs CV + CVL/2 >= 3). Then
+  `TdlgMapMessage.MapMessageDialog(text, point, NoChoice = the enemy attacks)`: its False (the player's Decline) ->
+  True without a battle; else the surprise-battle flag [0xf52ffc] := 1 ([General] BattleIsSurpriseAttack),
+  DeclineCount := 0, BattleIndex := 90 + k, nation 0 attacking: "Mobilize all ships for the surprise attack?" (Yes ->
+  `Mobilization(P, nil, True, True)`), the defender mobilized in the area, nation 0's destroyers (and cruisers) moved
+  there; the AI attacking: both mobilized; `DoBattle` called directly (opponent index of the other side), its result
+  returned. Nothing in it reads War, Tension or the traits: it runs standalone with any (attacker, defender) where one
+  is nation 0 (the game's own debug menu `Testsurpriseattack1Click` 0xd5cdf4 calls it so), but it re-rolls its gates.
+  `CheckForPlayerSurpriseInvasion` 0xd1a710 (its only call, 0xc85529, after WarStartsWithNation set War := 1) is
+  unreachable in 1.01.44.
 - **The player's peace** (static, 2026-10-21; relations v2 B4 runs it for a joined nation, [MODLOG](../MODLOG.md#feature-2026-10-21-relations-v2-b4-peace-with-computer-nations-relations-v2)).
   The decision is inline in `CheckTurnEvents` (0xce32c7..0xce37d6): at war, when `Random(4) + 2 < War` (else at war no
   event at all that month): the war loans at `War mod 3 = 1`, then when `War > 4`, VP or EnemyVP above 250 G (G =
@@ -342,7 +510,8 @@ The game is written for one player, nation 0; it runs every other nation, a join
     (test at 0xc4f103); `ResolveArmyOffensive` (in `ReduceTimeLimits`) counts it down and at war resolves an offensive
     with victory points; `DoPeace` ends it (the reset in `WarStartsWithNation` 0xd334c0 is unreachable).
   - `CheckTurnEvents` 0xce30f0: exits in month 2 of 1890/1900/1920 and at War 0/-1; Random(4)+2 < War: the war loan in war
-    months 4, 7, 10... (Unrest < 8, BM < 22, Random(16)+10 > BM: BM +1); War > 4: the peace decision; at peace
+    months 4, 7, 10... (Unrest < 8, BM < 22, Random(16)+10 > BM: BM +1; for each joined nation economy.cpp runs it with
+    the nation's own counter before the host's step, confirmed at war in 0.6.0); War > 4: the peace decision; at peace
     `SmallFleetCheck` 0xc87dd4 (only caller): the host player's dialog and early events (A/B), complaints (prestige -1),
     budget rules D1-D4 under the form's ParliamentDelay +0x4a83 (D1: a threatening most tense nation: BM +1 after 36
     months of peace, before that its tension -1), the notice of the smaller share after 1920; then `BuyTechnology`
@@ -355,6 +524,124 @@ The game is written for one player, nation 0; it runs every other nation, a join
     automatic scrapping of armed merchant cruisers after a peace (`ScrapShipsAfterPeace`; the player is asked), the
     purchase of another nation's scrapped ship. `AINationAdjustBudget` is the only source of "... is said to have
     increased the naval budget".
+- **The arms-control conference** (`CreateArmsControlTreaty(aChance)` 0xcb6bf0; from the conference event's answers,
+  `TdlgEventAnswer.Execute` 0xc0ed1e/0xc0ed34 (chance 30/60) in CheckTurnEvents after ComputeExpenses, and from
+  `CheckAllyTrouble` 0xcfe8e9 (40)). Its first test is `AnyNationIsAtAIWar` 0xd30b58 (0xcb6c26; `IsAtAIWar` 0xc68ecc:
+  a nation 1..8 other than PlayerNation with a tension above 40 towards one of 1..8): a war in progress ends it at once
+  ("With a war already in progress, the conference ends in solemn declarations and no action."). Then chance >
+  Random(100) (at least 60 when a nation has +0x17d > 0) and year < 1956; a treaty in force is prolonged; "The
+  conference fails due to high tensions" when the most tense nation's Tension (with PlayerNation) > 8, the average > 5
+  and their sum > Random(20); else the player's answers (`ExecuteGeneral`) and the treaty (TreatyTimeRemaining months,
+  TreatyDisplacementLimit, TreatyCalibreLimit, HasBeenTreaty). Per nation 0..8 (0xcb7962..): every ship under
+  construction over `GetTreatyLimit` 0xd023fc or the calibre limit (not Rebuild +0x58) goes by `ScrapShip(n, ship,
+  False)` 0xca0690 ("Broken up on slipway"), which pays Funds += a value by StartBuild (0: Cost, 1: Cost / 20, 2:
+  `GetScrapValue` 0xca0d8c = Round(Displacement / 25) x BuildProgress +0x9a / Cost +0x96 while not InPlay); the
+  messages "We have / X has scrapped the following ships under construction ..."; BudgetModifier -2 with floor 0
+  (0xcb7aa2, helper 0xab7744 = `x -= n; if x < min then x := min`), TensionChangeWithMessage -1 and Tension capped at 5,
+  random ChangeAITension -1s. `CancelTreaty` 0xd30b88 (from `UpdateUIValues` while War > 0): its box only while
+  TreatyTimeRemaining > 0, then TreatyTimeRemaining 0, both limits MaxInt. Under B2's mask a joined nation's war
+  read as peace here until 0.6.0 (B5 round 4: game.cpp shows the masked pairs' wars to this routine); a treaty in force
+  when a joined nation's war breaks out: [the disarmament treaty](#the-disarmament-treaty-and-the-submarine-ban).
+- **Blockades (0.6.0: warfx.cpp gives the player's version to a joined nation K on the host).**
+  - `TBuilderNation.IsBlockaded(aBlockadingNation)` 0xc618e8 ignores its argument: `CheckBlockade(BuildArea +0x70) or
+    CheckBlockade(BlockadeArea +0x78)`. `CheckBlockade` 0xc61920 loops e = 0..8 over the nation's enemies (nation 0:
+    `B_e.Tension > 40`; nation n > 0: its own cell e, cell 0 = with nation 0) and is True at the first enemy alone whose
+    `GetBlockadeStrength` 0xc76b74 in the area is above `GetMinimumBlockadeStrength` 0xc7864c and 1.1 x the nation's
+    own. `GetBlockadeStrength` adds allies by nation 0's relations (its enemies, its allies at an AI war). No Random.
+    In detail (E = the blockader): E's strength in the area x E+0x206 / a constant; then for each other nation x: if E
+    is at war with nation 0 (`Tension` > 40), every x > 0 at war with nation 0 (the coalition, " + Ally X: n"); else
+    every x with `Allied` > 0 (allied with nation 0) and `IsAtAIWar` (any cell 1..8 above 40; never the PlayerNation),
+    and nation 0 itself when E is allied with it and at an AI war (", X: n"). The account goes to its `var ExplString`.
+    The mod runs these tests for a joined nation K in K's view on the host (0.6.0), so K's alliances count, not the
+    host's.
+  - `CheckBlockadeStatus` 0xccc1c4 (callers: the load 0xc9abeb, `DoTurn`, `DoStrategicTurn` 0xce1bb9): every
+    `Blockaded` +0x1c5 := 0; War > 0: for each i = 1..8 at war with nation 0: nation 0 blockaded -> its flag, EnemyVP +=
+    20 x (Random(3) + FleetSize) (once per enemy); B_i blockaded -> its flag, nation 0's VP += the same. The flag is not
+    saved.
+  - `DoBlockadeEffects(N)` 0xd007d4, only from `CheckUnrestChanges` 0xcbdbeb (the first call of each nation's turn of
+    its loop i = 0..8): flagged: x = 20 x (Random(3) + FS) + 10 x (Random(2) + FS); N = nation 0: EnemyVP += x, "The
+    enemy gains x VP for blockading us"; else N.VP += x (the blockaded nation's own, though the text says "Gain x VP for
+    blockade of enemy"), both into RaiderSummary +0xa73; Random(100) < War / 2 + 1 and Random(40) < BudgetModifier ->
+    UnrestLevel + 1, above 5 and Random(100) < 50 a picture "The blockade is causing hardship and food shortages in
+    <nation>!". The loop's own rule for every flagged nation (0xcbe821): Random(100) < 5 or (Random(100) < War / 2 + 12
+    and UnrestLevel < 7) -> + 1; at 7 a picture "... food shortages and privations in <nation>!", else the turn message
+    "Shortages due to the blockade are causing hardship for our people!" (for any nation, into nation 0's report).
+  - The war-weariness rule of the same loop (0xcbe8c0..0xcbe93d, for every nation N): War > 0 (the helper 0xccd5fc),
+    N's GovernmentType +0x1cc = 2, EnemyVP > nation 0's VP and N's BudgetModifier > 18 -> (N blockaded: Random(100) < 5,
+    then) Random(100) < 5 -> N's UnrestLevel + 1 and the turn message "Our people is getting dissatisfied with the bad
+    war situation!" (nation 0's report): every nation of government 2 weighs the host's war and score. 0.6.0 hooks the
+    rule's `call` (MinHook at the instruction, EBX = the loop's cell of N) and runs it for K under the player's rules with
+    K's own war counter and war score (warfx.cpp).
+  - `StopBlockadedMoves` 0xd054d8 (`DoTurn2` 0xce17aa, before the month's check: the flags of the last check or the
+    load): only War > 0; every flagged nation's operational ships in its build area with a move out are stopped
+    (DestinationArea, OrderedArea := nil), 50 % escape in a home area ("coastal routes"); its message is never shown.
+  - The flag also stops productivity growth (`ProductivityGain`), and `CheckFuelShortage`, `GetMaximumShipyardCapacity`,
+    `AdvanceShipConstruction`, raiding (`CheckRaiderActivity`, `CheckRaiderProblem`), `CheckSubmarineActivity` and
+    `EventLikelihoodCheck` read it for any nation.
+- **Raiders, submarines and the trade war (0.6.0: warfx.cpp runs them for K in K's view on the host).**
+  `DoStrategicTurn` runs the submarine loop (`CheckSubmarineActivity(N)` for N = nation 0 and each nation at war with
+  it, Tension > 40) before `CheckAIvsAIBattles`, then only while War > 1 (0xce20b6) `CheckRaiderActivity` 0xcce50c,
+  the `TdlgSubmarineWarfareSummary` and `CheckResultOfSinkings` 0xd00ac4; right after that block both branches reach
+  `call <War > 0>` at 0xce21af (the mod's mid-hook), then `CheckBuildingShipsForWar` and `DoEndOfTurn`.
+  - `CheckRaiderActivity`: every map area's markers reset (`TMapArea.RaiderActivity` := 0, `PlayerRaiderType` :=
+    0x11), then two loops: nation 0's raiders against each nation at war with it that is not `Blockaded`, and each
+    enemy's raiders against nation 0 unless nation 0 is blockaded (a blockaded nation's merchants stay at home):
+    `CheckRaiderSinkings` 0xcce858(raiding, defending). A raider is a ship with Status 4, `IsOperational`, Used
+    (+0x37) 0; its chance 12/15/20 by type, x1.5 in the defender's home area, else by the defender's possessions in
+    the area (none: 2, one: half, at least 2); 5 x `Random(100) < chance` merchants; the VP per merchant 0xd46bb0 (by year) go to the form's
+    `PlayerTradeWarfareVPThisTurn` / `EnemyTradeWarfareVPThisTurn`; the raider's text into `RaiderSummary`
+    ("<nation> raider <ship> sinks n <nation> merchant ships in <area>"); then `CheckRaiderProblem` 0xcd06ac and Used
+    := 0. Losses: `MerchantsLostToRaidersThisTurn`, `MerchantsLostToSubsThisTurn`, `MoraleSinkingsThisTurn`,
+    `FriendlySubsLostThisTurn` (TBuilderNation, the month's).
+  - `CheckRaiderProblem` (fuel, mechanical problems, a commander's abilities): interned (Status := 7, "... has been
+    interned in a neutral port due to lack of fuel / mechanical problems."), scuttled (Status := 8, `SinkShip`,
+    `AddShipToTotalLosses`) or sent home (Status := 0, RepairTime := 2, LocationArea := `GetClosestHomeArea`). Its
+    boxes go through `ShowMessagePos` 0xa07124 directly (the VCL's `ShowMessage` 0xab7970 calls it too).
+    `InternShip` 0xcfce04 also only sets Status 7. TShipStatus: 0 Active, 1 Res, 2 MB, 3 TradeProtection, 4 Raider,
+    5 ToRaider, 6 Colonies, 7 Interned, 8 Sunk, 9 Museum, 10 WorkingUp, 11 Training.
+  - `CheckSubmarineActivity(N)`: the target is nation 0 when N is not, else `GetRandomEnemy`; a computer target builds
+    ASW; its War tests at 0xcc9fdf/0xcca022 (food scarcity, War > 4); neutral protests by
+    `TensionChangeWithMessage`. `CheckResultOfSinkings`: nation 0's VP += `PlayerTradeWarfareVPThisTurn`, EnemyVP +=
+    `EnemyTradeWarfareVPThisTurn`; per nation `CheckFuelShortage` and, after 1920, the sinkings' unrest and fuel.
+    `CheckAIvsAISubmarineSinking(A, B)` 0xd31e68 (from `CheckAIvsAIBattles` 0xd32aa1): one of A's submarines sunk by B
+    (15 %).
+  - `GetStrengthInArea` counts Status {0,1,3,4,6} with reserves, {0} active only, else {0,3,4,6} (never interned):
+    `CheckAttackLocation`'s presence test. The battle setup's `SelectForce` (0xbe7c18, unnamed, its except box "Error in
+    SelectForce procedure!") forms each side's forces from ships in the area (InPlay, operational, not Used); when a
+    side has none after 8 tries, its fallback 0xbe776c reads the main division [ebp-0x228] while it is nil ("Access
+    violation ... Read of address 0000000D" at 0xbe7a62): the battle does not start (DoBattle 0).
+- **War help from allies (0.6.0: game.cpp runs it for K in K's view on K's PC).** `WarHelpFromAllies` 0xcd4454
+  (`DoStrategicTurn` 0xce218f after the war step, War > 1): for each ally i (Allied > 0): enemy = `GetRandomEnemy`
+  0xccd5cc (201 tries of `Random(8) + 1` with Tension > 40, else nil); the ally at war with it: Random(100) < 60 (only
+  10 % when the player's tonnage is not below the enemy's): 10 x (Random(20) + FS) by its economic rating, "The
+  operations of our ally X adds nVP" (a picture), nation 0's VP += n. Not at war with it: Random(10) > the ally's
+  Tension: the ally quarrels with the player's other allies (their Tension + 1, turn messages); else at Tension < 4:
+  at an AI war, or its tension with the enemy above 5 and Random(20): 0xcd42e4 "Our ally X joins the war against Y!"
+  (a picture, nation 0's VP += 20 x (Random(22) + FS), `SetAITension(ally, enemy, 50)`); else Random(12) = 1 or War = 2:
+  "Our ally X sends a message that they are not ready to join the war ..." (`ExecuteGeneral`), its answers:
+  `TensionChangeWithMessage`, the alliance revoked (MessageDlg), `ProportionalPrestigeLoss`, lend-lease
+  (`DoLendLease` 0xc77628: ships by `TransferShipAsReparation`, once: the form's LendLeaseDone +0x4a8b, saved) or 2000
+  of the ally's funds to the player. A non-ally at war with the player's enemy: CoBelligerentDelay +0x2e9 - 1, then
+  Random(4) = 1, Random(7) > its Tension and the delay <= 0: "... we might as well formalize our relations in an
+  alliance" (Allied := 20, or its Tension + 1), the delay := 12. CoBelligerentDelay is not saved (0 at every load).
+- **Building for war (0.6.0: the seizures run for K in K's view on K's PC, the build rules' War tests answer K's own
+  counter on the host).** `CheckBuildingShipsForWar(NewWar)` 0xcd5ad8 (`DoStrategicTurn` 0xce21c5 after the war step,
+  War > 0, NewWar = War 1): for each nation n (`GetBNation`) each ship `IsBuilding` with `BuildingNationIdx` +0x61 (an
+  index) not n and `Rebuild` +0x58 = 0: n = 0 (the player's ship in yard b): b's Tension > 6 and Random(100) < 4, > 7 and
+  Random(100) < 10, or > 8 -> "Due to the current war situation, the authorities in b have decided to seize our ship X,
+  currently building there." (a picture) and `TransferShipAsReparation`(0 -> b, "Seized due to war needs by "); n > 0
+  in yard 0: n's Tension > 40 -> "We have seized the <n> ship X, currently building in one of our shipyards. ..." and
+  the transfer n -> 0; else (`GetRemainingBuildTime` = 2 or NewWar) `ExecuteGeneral` "We can seize ... We need that
+  ship more than they do!" / "No, we need to keep good relations with n." (1: n's Tension + Random(5) + 1, the
+  transfer). Computer nations order ships in other nations' yards (`CheckAIBuildingShipAbroad`), the player in foreign
+  yards (the design screen). The War > 0 tests (the helper 0xccd5fc) of the build rules every nation shares
+  (`ReduceTimeLimits` 0xce1dcf, before the war step): `AdvanceShipConstruction` 0xcd921e (the loop's nation at
+  [ebp-0x30]; a submarine with more than 3 months: Random(40) = 1 -> a month less), `CheckForConstructionDelays(NatIdx)`
+  0xc86314 (0xc86873 a month less 1/40, 0xc86abb the delay odds: war Random(40) = 1, peace Random(50) < min(x, 20),
+  0xc86da6 the peacetime "Government wrangling" delay 1/30), `HandleEconomicGrowth` 0xcdc41c (the loop's nation in EBX:
+  Unrest < 8 and BM < 16 and BM < Random(16) + 8, or the monthly building cost < 500 and BM < 19 and BM < Random(18) +
+  8 -> BM + 1; nation 0's picture by War's parity: even "War budget means increased allocations to the navy!", odd "War
+  emergency funding granted to the navy!"). Their texts are nation 0's only.
 
 ## Research speed and the missile era
 What is known as of 2026-10-17 (static reading of 1.01.44, and a single-player test campaign played by a driver from
@@ -1023,6 +1310,25 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     with the identification equal at its boundary. No display path wrote the identification (the display's only writer
     is `GetTypeAndNameForEnemy`, a hooked display routine whose writes go to the display set). The mod finds the three
     through `CheckShipTypesExist`'s prologue (`mov esi, eax`, then three `mov eax, [cell]; mov byte ptr [eax], 0`).
+  - *What only the month sets, and a joined player's battles (0.6.0, B6 round 3, static audit).* A joined player's
+    game processes no month and its battle slot is the host's month-end save. Read by the battle path and written only
+    by the month (or saved as the host player's): the ship-type flags above; `[0xf52ffc]` = `[General]
+    BattleIsSurpriseAttack` (DoTurn2 clears it, `CheckSurpriseAttack` sets it, saved and loaded; read by the battle
+    setup's objectives, the minute-10 step of `tmrMoveIntervalTimer` and `TfrmMain.FormClose`, which then runs
+    `AdvanceDesignStudies` instead of `DoStrategicTurn`); `[0xf4c5e9]`, the possession battle's flag (DoTurn2,
+    `DoPossessionBattle` and `DoHomeAreaBattle` clear it, `ArrangePossessionBattleDetails` sets it; the surprise
+    attack's `DoBattle` reads it as left); `HeroicVictory` (+0x3301), `tmpBattlePrestigeLoss` (+0x4ac6) and
+    `ImportantConvoy` (+0x4ad2): `DoStrategicTurn` resets them, the battle's end sets them, `DoBattlePrestigeLoss`
+    reads them (only `HeroicVictory` is reset there). `CheckShipTypesExist` is pure (it counts every nation's ships in
+    play; nation order does not matter), so the mod runs it on the joined player's PC. Harmless: `[0xfb591c]` (a
+    once-a-month aircraft message flag). The host player's invasion fields (+0x4a8c, +0x4a94, +0x4a98) are loaded from
+    the save too (`InvasionCount` +0x4a90 is not).
+  - *Raider vs patrol battles (static, 2026-10-23).* `CheckRaiderVsPatrols` 0xcce6bc -> `CheckRaiderInterceptions`
+    0xccee94 (records one interception in `PendingRaiderBattle` +0x4a1b: flag, +0x4a1c/+0x4a20 the ships, +0x4a24 the
+    enemy nation, +0x4a28 the area, +0x4a2d the caption, +0x4a31 the side; writes the "thwarts raider" lines) ->
+    `CheckPendingRaiderBattle` 0xcd1910 (`TdlgMapMessage.RaiderBattleDialog`: `QuickResolveRaiderBattle` 0xd0b534,
+    which calls `DoStrategicTurn`, or a tactical battle set up by 0xbdbf1c without `DoBattle`). DoTurn2 and
+    DoStrategicTurn clear the pending flag.
 - **Missiles (2026-10-17, static reading of 1.01.44, for engine level 9; `verify_p4.py` checks the patterns).** The
   weapons research of 2026-10-16 (`limits-weapons.md` §2, §3) with the details the build needed.
   - *Automatic fire.* `CheckMissileFiringForAllShips` (0xda91fc, EOTP after 1940), per division with ships and `Side` <

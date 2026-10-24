@@ -210,6 +210,24 @@ restriction (`WHERE id = 'rg-...'` or `WHERE id LIKE 'rg-%'`).
   log's `AI peace (badLoss=1) skipped for nation 2: its wars are with players' nations` after its forced AI peace
   (8896b72). `battles` b) without a fought battle in all its attempts is the game's choice (the enemy declines battle):
   re-run it (TESTING.md, Known traps).
+- 0.6.0 release candidate 1 (dist_rc060_1, int-060 20eb23a, engine 17; MODLOG, Testing 2026-10-23, the 0.6.0 release
+  candidate dist_rc060_1): NO-GO on the client's box "Error in SaveBuildCampaign procedure! Access violation at address
+  00C2B9D4 ... Read of address 00000029" (`@UStrAddRef`, a bad string pointer) at `arms_treaty`'s M2 submit in a `--group
+  relations` run (B5 round 4's run_g1 had boxes at the same submit; no 0.4.x or 0.5.0 run had one): a recurrence is a
+  product issue, keep both logs. The game's own repeated intel report (SpySuccess's gun-comparison loop) is allowed by
+  the month checks; `ls_start_test` ends at once on the game's "Enemy unable to challenge our forces in the area!"
+  (a chain of test battles, `--stress`); the mixed-version driver `mixed_060.py` (`--case a|b`, session files `r60`) is
+  ready but was not run on that candidate.
+- 0.6.0 release candidate 2 (dist_rc060_2, int-060 d0964a3; MODLOG, Testing 2026-10-23, the 0.6.0 release candidate 2):
+  no game error box anywhere, also in the old trigger (`other_campaign.py`, session files `r62`: the client on another
+  campaign in the same process, then a join and two submits). The month checks allow the client save's repeat of its
+  own monthly check of the month before (`saved_own_repeat`); `lockstep_pvp` f) and `treaty` k) count the host's
+  `CreditWarVP` lines (B5's blockade points between players' nations); `player_copy` f) ends a war the session left in
+  the copy before its month (a battle preview there stopped a whole `--stress` run). Battle and game conditions that
+  passed again: `battle_surprise` b) (the game's takeover step: a `SKIP-note`), `air_units` M2 (the 1935 treaty's "You
+  must scrap ... tons"), `lockstep_stress` f) (rng 3 draws apart in the minute after the game's own end) and S8 (a
+  `#32770` box at the drop), `lockstep_missiles` e) (held ships of side 0 lost SSM; also on RC1: watch it). The mixed
+  driver `mixed_060.py` (`r62`) matches `relations v2: surprise|surprise move`, not the battle-slot state lines.
 - Battle screen controls are tested with posted messages only (`click_tool`, `click_arrow`, `post_click`, tree views
   and list views read cross-process) and the bridge probes `ls ctl`, `ls airwin`, `pocstate fastest=`; the battle's
   modeless tool windows must be closed (`close_modeless`) before anything answers dialogs with `answer_dialogs`.

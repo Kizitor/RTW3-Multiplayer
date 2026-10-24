@@ -111,6 +111,8 @@ std::string DebugVPInfo();  // tests: EnemyVP, what the host already gave the en
 // Tests (relations v2): the joined nations' war counters (host: `kwar` lists them, `kwar <K> <n>` sets one; client: its
 // own as received and the game's counter in memory).
 std::string DebugKWar(const std::vector<std::string>& args);
+// Tests (0.6.0, host): the disarmament treaty's ends for joined nations' wars (`armstreaty`: " ends=<n> last=<...>").
+std::string DebugArmsTreatyEnds();
 // Tests (host, relations v2): which joined nations follow the player's rules (`relrules`), `relrules <K> <0|1>` forces one.
 std::string DebugRelRules(const std::vector<std::string>& args);
 // Tests (relations v2, B3): `relturn` (client, async: the player's relation routines now, with their dialogs);

@@ -23,6 +23,10 @@ and the entries tagged v0.4.0 are only part of it. The live-battle engine levels
 branch's development levels (0.4.0 plays at level 14), and docs/ARCHITECTURE.md names its features by them; its
 commits titled "WIP 0.4.0", "WIP 0.5.0" and "WIP 0.6.0" are development commits of 0.4.0.
 
+*Note 2026-10-23:* 0.5.0 and 0.6.0 later became versions of their own (each joined nation under the player's rules,
+then its war effects and battles; their groups below). The entries dated 2026-10-17 that carry v0.5.0 or v0.6.0 still
+belong to 0.4.0.
+
 - **0.1.0** (development version, never released)
   - Feature:
     [multiplayer design v1, historical](#feature-2026-10-04-multiplayer-design-v1-historical-v010);
@@ -175,6 +179,29 @@ commits titled "WIP 0.4.0", "WIP 0.5.0" and "WIP 0.6.0" are development commits 
   - Testing:
     [the 0.5.0 release candidate dist_rc050_1](#testing-2026-10-22-the-050-release-candidate-dist_rc050_1-v050);
     [the 0.5.0 release candidate 2 dist_rc050_2](#testing-2026-10-23-the-050-release-candidate-2-dist_rc050_2-v050)
+- **0.6.0** (built after 0.5.0: the player's war effects and battles for joined nations; its entries carry
+  "0.6.0-dev" or "0.6.0")
+  - Feature:
+    [B5 blockades for a joined nation](#feature-2026-10-23-b5-blockades-for-a-joined-nation-060-dev);
+    [B5 war help from allies for a joined nation](#feature-2026-10-23-b5-war-help-from-allies-for-a-joined-nation-060-dev);
+    [B5 war weariness for a joined nation](#feature-2026-10-23-b5-war-weariness-for-a-joined-nation-060-dev);
+    [B5 building for war for a joined nation](#feature-2026-10-23-b5-building-for-war-for-a-joined-nation-060-dev);
+    [B5 round 4, joined nations' war effects after the merge](#feature-2026-10-23-b5-round-4-joined-nations-war-effects-after-the-merge-060-dev);
+    [B6, the player's battle generator for a joined nation](#feature-2026-10-23-b6-the-players-battle-generator-for-a-joined-nation-060)
+  - Fix:
+    [risk 4, a joined player's declined battle is merged and the game's result box stays off the host](#fix-2026-10-23-risk-4-a-joined-players-declined-battle-is-merged-and-the-games-result-box-stays-off-the-host-060);
+    [B6 round 3: the month's own state in a joined player's battle slot, raider battles assessed](#fix-2026-10-23-b6-round-3-the-months-own-state-in-a-joined-players-battle-slot-raider-battles-assessed-v060-dev);
+    [the disarmament treaty and a joined nation's war: no box every month, the host ends it once](#fix-2026-10-23-the-disarmament-treaty-and-a-joined-nations-war-no-box-every-month-the-host-ends-it-once-v060-dev);
+    [the joined player's SaveBuildCampaign access violation](#fix-2026-10-23-the-joined-players-savebuildcampaign-access-violation-060)
+  - Testing:
+    [B5 war loans of a joined nation at war, confirmed live](#testing-2026-10-23-b5-war-loans-of-a-joined-nation-at-war-confirmed-live-060-dev);
+    [the 0.6.0 release candidate dist_rc060_1](#testing-2026-10-23-the-060-release-candidate-dist_rc060_1-v060);
+    [the 0.6.0 release candidate 2 dist_rc060_2](#testing-2026-10-23-the-060-release-candidate-2-dist_rc060_2-v060)
+  - Investigation:
+    [B5 round 2: the allies' war help outcomes (static) and the enemy-revolution rule (design)](#investigation-2026-10-23-b5-round-2-the-allies-war-help-outcomes-static-and-the-enemy-revolution-rule-design-060-dev);
+    [B5 round 3: the enemy-revolution rule for joined nations](#investigation-2026-10-23-b5-round-3-the-enemy-revolution-rule-for-joined-nations-060-dev);
+    [B6 decisions (attempts, decline counts, generator errors, wording)](#investigation-2026-10-23-b6-decisions-attempts-decline-counts-generator-errors-wording-v060-dev);
+    [surprise attacks and takeovers at war start for joined nations](#investigation-2026-10-23-surprise-attacks-and-takeovers-at-war-start-for-joined-nations-v060-dev)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -4998,3 +5025,1067 @@ copy or delay proxy left running, the game folder copy deleted.
   game error box: 67/67 (148 s).
 - **Verdict: GO** for publishing 0.5.0 with exactly this build (dist_rc050_2). Game open: 3309 s in all (the five suite
   runs 3161 s, the mixed run 148 s).
+
+## Feature 2026-10-23: B5 blockades for a joined nation (0.6.0-dev)
+- **What.** The game decides blockades for its player's wars only (nation 0, the host's): the points, the Blockaded
+  flags, their effects and messages. Now each joined nation K under the player's rules gets them in its own wars too:
+  K's blockades of its enemies and its enemies' blockades of K, with the points in K's war score (and the enemy's), the
+  effects on K's ship moves, trade and unrest, and the messages in K's turn report. The host's own nation and the
+  computer's wars among themselves are unchanged.
+- **Facts (static, 1.01.44; files\rv\b4\re_b5b6.md and files\b5\dis_*.txt in the developers' files; GAME-INTERNALS
+  "Blockades").** `IsBlockaded` 0xc618e8 ignores its argument; `CheckBlockade` 0xc61920 is True at the first single enemy
+  (by the nation's own relation cells) above the minimum and 1.1 x the nation's strength in its build or blockade area.
+  `CheckBlockadeStatus` 0xccc1c4 (the load, DoTurn, DoStrategicTurn 0xce1bb9) only flags nation 0 and its enemies and
+  only while War > 0: 20 x (Random(3) + FleetSize) to the other side per enemy. `DoBlockadeEffects` 0xd007d4 (first call of
+  each nation's turn of `CheckUnrestChanges`' loop, 0xcbdbeb): x = 20 x (R3 + FS) + 10 x (R2 + FS) (nation 0 blockaded:
+  EnemyVP; an enemy: the game adds x to that enemy's own VP, its text "Gain x VP for blockade of enemy"), unrest by War
+  and a hardship picture. The loop's own rule 0xcbe821 for any flagged nation: unrest by War, a picture at 7, else the
+  turn message "Shortages due to the blockade are causing hardship for our people!" (into the host's report).
+  `StopBlockadedMoves` 0xd054d8 (DoTurn2, before the month's check) stops moves out of a flagged nation's build area only
+  while War > 0 (its own message is never shown). The flag is not saved; ProductivityGain, CheckFuelShortage,
+  GetMaximumShipyardCapacity, AdvanceShipConstruction, the raiders and EventLikelihoodCheck read it for any nation.
+- **Before.** K's flag was set only in a war with the host (and cleared at every check); K's wars with computer nations
+  had no blockade at all; in a war with the host DoBlockadeEffects gave the blockaded K +x VP (the game's quirk) with the
+  host's War in its unrest roll and the texts in the host's report.
+- **How (`src/mod/warfx.cpp`, host; `hookcb::PlayerRulesNation(K)`, K's own war counter > 0).** game.cpp's
+  CheckBlockadeStatus hook (the 0.4.0 load VP guard) now tells warfx after every call (`SetBlockadeCheckedHook`; the
+  load's after its VP were put back). Each K's frame: K blockaded (the game's `IsBlockaded`) -> K's flag and 20 x (R3 +
+  FS) for each computer enemy at war with it; each enemy j (not the host) blockaded -> j's flag, 20 x (R3 + FS) for K.
+  An enemy under the player's rules credits its own gains (its own frame), so nothing counts twice; the host's wars keep
+  the game's check and points. The load's call: the flags only (no draw, no points). Points: `hookcb::CreditWarVP` (the
+  nation's VP field, as battles do, and the pair's war score: the B4 ledger or a war between players). Hooks:
+  `DoBlockadeEffects` (K: the player's version: x split over K's blockaders, each found by the game's test with K's
+  other wars' cells read as peace, the host's share to its VP; unrest by K's counter; K's texts. A computer enemy flagged
+  by the frames only: x to the K's at war with it, unrest by their counter, the hardship texts to them. An enemy the
+  host's check flagged too: the game's own, and each K its own x and text), with the loop's blockade rule for these
+  nations run there by the frame's counter (their flag reads 0 for the rest of that nation's turn of the loop; put back
+  at the next nation's call or when `CheckUnrestChanges`, hooked, returns); `StopBlockadedMoves` (War 1 for the call
+  while the host is at peace and a frame's flag is set). The texts go with K's `econnews` (0.5.0 clients show them too);
+  header `kblk` (the nations flagged now) sets the client's flags after its load (its own load's check sees the host's
+  wars). The rules reproduced in C++ are checked by pattern at startup (else UNAVAILABLE and the game's own).
+- **Compatibility.** Protocol 3; new header key `kblk` (older clients keep their own load's flags), war texts inside
+  `econnews`. Engine 17 unchanged. A 0.5.0 host gives nothing new (no frames, no `kblk`); 0.5.0 clients of a 0.6.0 host
+  get the texts in their turn report and the points in their VP and Enemy VP, without the flags on their screen.
+  Existing campaigns: the frames start from the campaign's wars and counters, nothing is saved.
+- **Status: proven live** (files\b5\b5_live.py --part a; the 1900 fixture: K = Germany, J = Russia, the host at peace).
+  dist_b5_3 (RTW3MP 02B7586DF013EACB), 100 s open: M1 the game's own test: Germany blockades Russia from the war's first
+  month (`1(war 1, enemies 3): not blockaded, blockading 3`): Germany +100 +100, VP and the ledger by the same, Russia's
+  flag on both copies, "Gain 100 VP for blockade of enemy" in Germany's turn report; M2 (TEST `warfxblk 3 1`, `warfxblk
+  1 0`, `warfxrand 0`): Germany +60 (20 x FS 3) +90 (30 x FS), Russia's unrest 3 -> 5; M3 (Germany forced blockaded):
+  Russia +60 +90 (its VP and its side of the ledger), Germany's unrest 1 -> 3 by its counter 3, its texts "The enemy
+  gains 90 VP for blockading us" and "Shortages due to the blockade ...", Germany's flag on both copies; M4
+  `StopBlockadedMoves` with War 1 (`1:0/0`), the host's War back to -72. The host's VP and EnemyVP 0 throughout, the other
+  nations' VP unchanged; a declined battle's war score (+1/+9) is the battle's. Suite `--group relations` (session,
+  relations_peace, war_effects) 94/94, 138 s open (dist_b5_4).
+- **Notes.** The war-weariness rule (0xcbe8fb) still weighs the host's war score and War for every nation; allied ships
+  in a blockade count by the host's alliances (GetBlockadeStrength's own rule); the score of a war between the host and K
+  gets no blockade points beyond the game's. A war between two joined nations gets them (each side's frame credits its
+  own gains, into the war score of the peace terms): the suite's `victory_points` g) counts them (Germany blockading
+  France there: +60 +90; a first 0.6.0 run failed on it).
+
+## Feature 2026-10-23: B5 war help from allies for a joined nation (0.6.0-dev)
+- **What.** The game runs `WarHelpFromAllies` for its player only: allies' operations add victory points, allies join
+  the war, quarrel, hesitate (with the player's answer: lend-lease ships, 2000 of the ally's money, a revoked alliance,
+  prestige), and nations at war with the player's enemy offer an alliance. Now each joined nation K under the player's
+  rules gets the same in its wars with computer nations, with its own dialogs on its PC, and the host applies the
+  results.
+- **Facts (static, 1.01.44; GAME-INTERNALS "War help from allies").** `WarHelpFromAllies` 0xcd4454 (DoStrategicTurn
+  0xce218f after the war step, War > 1); `GetRandomEnemy` 0xccd5cc (201 tries of `Random(8) + 1`); the joining helper
+  0xcd42e4 gives nation 0 20 x (Random(22) + FS) VP and `SetAITension(ally, enemy, 50)`; lend-lease `DoLendLease`
+  0xc77628 (TransferShipAsReparation, once per campaign: form `LendLeaseDone` +0x4a8b, saved); `CoBelligerentDelay`
+  +0x2e9 counts down per nation at war with the player's enemy and is not saved (0 at every load).
+- **How (game.cpp `AllyHelpPart`, K's PC; session.cpp `HostApplyAllyHelp`).** In K's relation turn (B3), right after
+  `PvEnter` and before the relation routines: when the host sends `khelp` (0.6.0, with `rel=1`), K's counter (the War
+  on K's PC) is above 1 and K fights a computer nation, the game's routine runs in K's view: the people's nations read
+  as neither at war nor allied with anyone (their help and their wars are their own; cells put back afterwards), K's own
+  LendLeaseDone (`klend`, kept by the host in `rtw3mp_session.ini` for any date: the game never resets it) and K's
+  CoBelligerentDelay values (this PC's memory, as the game keeps them) in place, the lend-lease ships recorded by the
+  peace part's `TransferShipAsReparation` hook. Its dialogs are K's player's; its relation and alliance changes go with
+  the turn's diff (another pair: a computer nation joining K's war), K's VP with `vp`; MSG_RELATIONS gains `ally=1`,
+  `allyvp` (the host adds it to K's war scores with its computer enemies, split evenly: the game adds it to the player's
+  VP), `afunds` (other nations' Funds: an ally's -2000, computer nations, +-5000), `aships` (from a computer ally to K by
+  ship id, as a peace's) and `lend`. TEST `allyrand 0` (client): the routine's draws 0, GetRandomEnemy's Random(8)
+  going round 0..7 (all 0 would never find an enemy).
+- **Compatibility.** Protocol 3; a 0.5.0 host sends no `khelp` (no ally help); a 0.5.0 client ignores it (no ally help,
+  as before). Engine 17 unchanged.
+- **Status: proven live** (files\b5\b5_live.py --part d, dist_b5_4 RTW3MP BDD131F4CD9E0661; Germany at war with
+  Russia, allied with the USA, the host at peace), 64 s open, 44/44: M1 (the USA at war with Russia, `allyrand 0`): "The
+  operations of our ally USA adds 13VP" (the picture on the client), the host's turn line `VP 13 allyvp 1-3+13`; M2 (the
+  USA at peace with Russia at tension 10): "Our ally USA joins the war against Russia!", the host `war 3-4 VP 60
+  allyvp 1-3+60` (the helper's 20 x FS), the war on both copies. The host's VP and EnemyVP unchanged. Natural months
+  (no allies) log `ally help` in the turn with nothing to do. Suite `war_effects` M1 checks it (94/94 with the group).
+- **Notes.** Not proven live: the hesitation question's answers (lend-lease, the ally's 2000, a revoked alliance) and the
+  co-belligerent alliance offer (their records and the host's apply are the peace part's proven paths). K's wars with
+  the host or another player get no allied help (the people's nations stay out).
+## Feature 2026-10-23: B5 war weariness for a joined nation (0.6.0-dev)
+- **What.** `CheckUnrestChanges`' war-weariness rule gives every nation of government type 2 unrest from the host's
+  war: the host's War, its EnemyVP against its VP. A joined nation K under the player's rules now gets it from its own
+  wars, by its own war counter and war score; the host's nation and the computer's nations keep the game's rule.
+- **Facts (static, 1.01.44; GAME-INTERNALS "Blockades").** The rule 0xcbe8c0..0xcbe93d of the loop i = 0..8 (EBX = the
+  loop's cell of the nation N): `call 0xccd5fc` (War > 0: `cmp dword ptr [War],0; setg al; ret`), N's GovernmentType
+  +0x1cc = 2, the form's EnemyVP +0x4a63 > nation 0's VP +0x175, N's BudgetModifier > 18, then (N blockaded:
+  Random(100) < 5 first) Random(100) < 5 -> N's UnrestLevel + 1 and TurnMessages.Add("Our people is getting
+  dissatisfied with the bad war situation!") (the host's report). Before: K's unrest followed the host's wars (5 % a
+  month while the host lost one, whatever K's own), the text went to the host, K's own wars gave none.
+- **How (`warfx.cpp`; session.cpp `hookcb::KWarScore`).** MinHook at the rule's `call` (found by a pattern of the whole
+  rule with the RTTI offsets; the War > 0 helper's code, the two Random calls and the text checked, else `war weariness
+  UNAVAILABLE` and the game's rule). The detour reads N from [EBX]: K under the player's rules -> the rule in C++ with
+  K's counter (`KWarCounter` > 0), its GovernmentType and BudgetModifier, its war score (`KWarScore`: K's points and its
+  enemies' over all its wars, the B4 ledger with the computer's nations and the score of each war with the host or
+  another joined nation), K's flag as the month's blockade check left it (the frames clear it for the rest of K's
+  turn), the game's Random (TEST `warfxrand`); the unrest on the host's month, the text with K's `econnews`; then AL = 0,
+  so the game's rule is skipped for K. Any other nation: the game's test and rule. A line per K and one per month (`the
+  player's rule for nations ..., the game's own for ...`). Independent of the blockade hooks.
+- **Compatibility.** Protocol 3, no new key (the text goes with `econnews`, which 0.5.0 clients show). A 0.5.0 host
+  keeps the game's rule for K (the host's war). Engine 17 unchanged.
+- **Status: proven live** (files\b5\b5_live.py --part w, dist_b5_7 RTW3MP 6F80FB741E8C5396; the 1900 fixture, K = Germany,
+  J = Russia, the host at peace; 57/57, 76 s open). Germany's GovernmentType 2 (its own is 1) and BudgetModifier 20
+  (`nfield` on both copies), `warfxrand 0`. W1 `kwarvp 1 3 100 0`: "war counter 1, war score 160:0 (its blockade of
+  Russia added 60), government 2, BM 20, blockaded 0 -> no (not losing)" and "the player's rule for nations 1, the game's
+  own for 0,2,3,4,5,6,7,8"; W2 `kwarvp 1 3 0 500`: "war counter 2, war score 60:500 ... -> unrest 2 -> 3", the message
+  "Our people is getting dissatisfied with the bad war situation!" for nation 1, shown in the client's turn report;
+  the host's VP and EnemyVP 0 throughout, its counter stepping at peace. Suite `war_effects` M1/M2 check both.
+- **Notes.** The same loop's rules for the nations at war with the host (intel reports, the computer's BudgetModifier
+  cuts above unrest 7/8) stay the game's, as 0.5.0 left the computer's unrest cuts.
+
+## Testing 2026-10-23: B5 war loans of a joined nation at war, confirmed live (0.6.0-dev)
+- **What.** 0.5.0's money part 2 gives each joined nation K the player's war loan (`economy.cpp` `TurnEventsK`, on the
+  host after the game's `CheckTurnEvents`) by K's own war counter. Confirmed now in a month at war, with 0.6.0's war
+  effects around it.
+- **The rule (static, 1.01.44, `CheckTurnEvents` 0xce32c7..0xce3409).** Random(4) + 2 < War, War mod 3 = 1, UnrestLevel
+  < 8, BudgetModifier < 22 and Random(16) + 10 > BudgetModifier -> the text (governments 4 and 5: 80 % "The <leader
+  title> pledges additional funding for the navy! ...", else "PX rubber stamps additional war loan! ..."; the others
+  "PX authorizes additional war loan! ...") and BudgetModifier + 1. For K: the same tests in the same Random order with
+  K's counter before the host steps it (as the game's War at that point), K's fields, leader and parliament (PX), the
+  text with K's `econnews` (the client's turn report), the BudgetModifier on the host's month (the client gets it with
+  the month).
+- **Evidence.** files\b5\b5_live.py --part w, month W3 (dist_b5_7): Germany's counter 4 (`kwar 1 4`), `econrand 1`
+  (Random(4) + 2 = 3 < 4, Random(16) + 10 = 11 > 10), BudgetModifier 10 on both copies: `econ 1` loan=1, BudgetModifier
+  10 -> 11 on the host and the client, "The Reichstag authorizes additional war loan! The naval budget increases." in
+  the client's "Turn messages"; the host's VP and EnemyVP unchanged. Suite `war_effects` M3 (new check) the same: group
+  `relations` 97/97, 119 s open (with the war weariness checks).
+- **Gaps: none in the rule.** Kept as they are: the game draws one Random(4) for the loan and the month's peace decision,
+  K has two (the host's for the loan, its own PC's for B4's peace decision); the text is a line of K's turn report,
+  not a picture (0.5.0's choice for all of K's money texts). Compatibility unchanged since 0.5.0.
+
+## Feature 2026-10-23: B5 building for war for a joined nation (0.6.0-dev)
+- **What.** The game runs `CheckBuildingShipsForWar` for its player only: at war, the player's ships building in a
+  foreign yard are seized by the yard's nation, and foreign ships in the player's yards are seized by the player (at
+  war at once, otherwise at the player's answer). The War > 0 tests of the build rules every nation shares read the
+  host's War. Now each joined nation K under the player's rules gets the seizures on its own PC (its pictures and
+  question), and the shared build rules answer each joined nation's own war counter on the host.
+- **Facts (static, 1.01.44; GAME-INTERNALS "Building for war").** `CheckBuildingShipsForWar(NewWar)` 0xcd5ad8
+  (`DoStrategicTurn` 0xce21c5, after the war step while War > 0): the ships `IsBuilding` whose `BuildingNationIdx` +0x61
+  (an index) is not their nation's and not `Rebuild` +0x58; nation 0's ship in yard b: b's Tension > 6 / 7 / 8 (4 %,
+  10 %, always) -> b takes it; a nation's ship in yard 0: Tension > 40 -> taken, else (2 months left or NewWar)
+  `ExecuteGeneral` (yes: Tension + Random(5) + 1, taken); `TransferShipAsReparation` and `UpdateUIValues`. Computer
+  nations order ships in other nations' yards (`CheckAIBuildingShipAbroad`). The shared rules' tests (`ReduceTimeLimits`,
+  before the war step): `AdvanceShipConstruction` 0xcd921e (submarines, nation at [ebp-0x30]), the three of
+  `CheckForConstructionDelays(NatIdx)` 0xc86314, `HandleEconomicGrowth` 0xcdc41c (the war budget's BudgetModifier + 1,
+  nation in EBX; nation 0's picture by War's parity at 0xcdc4c0).
+- **How.** Host (`warfx.cpp`): MinHook at the two `call`s of the War > 0 helper (the loop's nation from [ebp-0x30] / EBX:
+  a joined nation answers its own `KWarCounter` > 0), at the grant (0xcdc50b: the joined nation's text, "War budget
+  means increased allocations to the navy!" at an even counter, "War emergency funding granted to the navy!" at an odd
+  one, with `econnews`) and at `CheckForConstructionDelays`' entry (the game's War holds the nation's counter for the
+  call, put back in `__finally`); each checked by pattern (the helper's code, Random, GetBNation, the texts, the loop's
+  index; else `building for war UNAVAILABLE` and the game's). K's PC (game.cpp `BuildWarPart`, after the allies' war
+  help in the relation turn's view, while the host sends `kbuild` and K's counter is above 0): the game's routine with
+  NewWar = counter 1; the ships between K and a computer nation get their `BuildingNationIdx` in view terms, every other
+  ship reads as built at home (put back afterwards); the hand-overs are recorded by the peace part's
+  `TransferShipAsReparation` hook and go to the host as `bwar`/`bships` (by ship id, name, reason, the log's renamed
+  line); `HostApplyBuildWar` hands them over with `HandOverShip` (only between K and a computer nation); the tension of a
+  seizure from a nation at peace goes with the turn's diff. TEST bridge `shipbuilder`.
+- **Compatibility.** Protocol 3, engine 17. New keys: `kbuild` (header, with `rel=1`), `bwar`/`bships` (the relation
+  turn). A 0.5.0 client ignores `kbuild` (no seizures for its nation, as before); a 0.6.0 client of a 0.5.0 host gets no
+  `kbuild` and runs none. The shared build rules follow every joined nation's counter on a 0.6.0 host, whatever the
+  client.
+- **Status: proven live** (files\b5\b5_live.py --part e, dist_b5_8 RTW3MP 65DCAFF8677CA262; the 1900 fixture, K =
+  Germany, J = Russia, the host at peace; 34/34, 44 s open). `shipbuilder` on both copies: Germany's B Wettin (487) in
+  Russia's yard, Russia's B Retvizan (496) in Germany's; Germany's BudgetModifier 5. Host month: "nation 1's war budget
+  test answers at war (its war counter 1; the host's at peace)", "war budget: BudgetModifier 5 -> 6", "construction
+  delays test answers at war"; the client's turn report "War emergency funding granted to the navy!". Germany's relation
+  turn (counter 2): the pictures "Due to the current war situation, the authorities in Russia have decided to seize our
+  ship B Wettin, currently building there." and "We have seized the Russian ship B Retvizan, ...", the client's line
+  "handed over 487:1>3 496:3>1", the host's "seized ship 487 1->3 seized ship 496 3->1", `findship` on both copies; the
+  host's VP and EnemyVP unchanged. Suite `war_effects` (M1 the seizures, M3 the war budget 3 -> 4 before the war loan
+  -> 5): group `relations` 98/98, 123 s open.
+- **Notes.** Ships between two people's nations are not seized (the host's own pairs keep the game's rules on the host:
+  its ships in K's yards by K's tension, K's ships in its yards at the host's answer). The other texts of these rules
+  (a month more or less for a ship) stay nation 0's, as before.
+
+## Investigation 2026-10-23: B5 round 2: the allies' war help outcomes (static) and the enemy-revolution rule (design) (0.6.0-dev)
+- **The allies' war help: the outcomes no live run has shown yet, verified statically** (game.cpp `AllyHelpPart`,
+  session.cpp `HostApplyAllyHelp`; GAME-INTERNALS "War help from allies"). Each travels by a path a live run did prove:
+  - Lend-lease ships (`DoLendLease` 0xc77628, once a campaign): `TransferShipAsReparation` from the computer ally to K,
+    recorded by the peace part's hook (`CB_TransferShip` into `g_allyRec`), sent as `aships` and handed over by
+    `HandOverShip` (computer nation -> K only). The same hook, record and `HandOverShip` carried the seizures of
+    "building for war" live (Russia's B Retvizan to Germany, files\b5\run_e1.txt) and B4's peace ships; `lend` sets K's
+    LendLeaseDone on the host (`klend` back to K, any date).
+  - The 2000 of the ally's money: `AllyMaskLeave` takes every other nation's Funds change (`allyFunds`), sent as
+    `afunds`, applied by `AdjustNationField(n, "Funds", d)` (computer nations only, capped at +-5000).
+  - A revoked alliance (the answer's `MessageDlg`) and the co-belligerent offer (Allied := 20, or the nation's Tension + 1):
+    alliance and tension cells of K's pairs, read by the relation turn's diff after the part (the B3 path every turn
+    uses); CoBelligerentDelay stays in K's PC's memory (`g_kCob`, as the game keeps it unsaved).
+  - Cheap test switches would need a forced answer in `ExecuteGeneral` and a forced branch past `GetRandomEnemy`;
+    `allyrand 0` reaches the operations and the joining helper only (both live in round 1). Left for a later suite step.
+- **The enemy-revolution rule (design, not built).** `CheckForRevolutionInEnemyNation` 0xcc5c90 (`ReduceTimeLimits`,
+  before `CheckTurnEvents`): for each nation i at war with nation 0 (Tension > 40): UnrestLevel - 1 above 8 at War 1
+  and at War 2, governments 4/5 above 6: 10 % - 1; `CheckTotalWar(i)` -> stop; UnrestLevel > 10 and Random(10) <
+  UnrestLevel - 10 -> a revolution: VP > EnemyVP and Random(100) < 60: "The government of X has collapsed in revolution!
+  ... harsh peace conditions." (else "racked by unrest ... disputed territories" / "serious internal disturbances ...
+  compromise peace"), Revolution.jpg, `ReturnTakenPossessionsAfterWar`, `PickShipAsReparation`, `SetAITension` /
+  `SetAIAlliance`; with other enemies left (`HasOtherEnemy`) "The other members of the enemy coalition resolve to fight
+  on." (a separate peace with i), else "The enemy coalition collapses. A general peace is concluded." (`ShowPeaceTreaty`,
+  `DoPeace`). Today it runs for the host's enemies only (B2's mask keeps K's pairs out).
+  - Proposal: on K's PC inside `PeaceRunGuarded`'s turn path (the counter before the step, as the game's
+    `ReduceTimeLimits`), before the decision and with the peace records on: `CheckForRevolutionInEnemyNation` in K's
+    view; a general peace comes back as an accepted peace (B4's `paccepted`, code -2: the host's existing apply path:
+    lands, ships, treaty, the wars' end); the decision is skipped when it ended the war.
+  - Two host-side additions it needs: (1) a separate peace (`pseparate=J`: only the war with J ends; its lands, ship and
+    treaty applied, K's other computer wars go on: today `paccepted` ends all of them); (2) the computer enemies'
+    UnrestLevel changes (the relief at War 1/2) as `pdelta` UnrestLevel (today BaseResources, Prestige and BudgetModifier
+    only). The host's computer enemies keep the game's rule. A war between K and the host (or two joined nations)
+    stays out of it today on both sides (B2's mask hides K's pairs from the host's rule): a revolution there would end a
+    war between players, so it should go through the players' own peace (the 0.2.5 treaties), not `DoPeace`: to decide.
+  - Live proof plan: K at war with J, J's UnrestLevel 20 on both copies (Random(10) < 10: a revolution every month),
+    K's war score from `kwarvp` for each branch; a second enemy for the separate peace. Effort: M.
+
+## Investigation 2026-10-23: B5 round 3: the enemy-revolution rule for joined nations (0.6.0-dev)
+- **Facts** (`CheckForRevolutionInEnemyNation` 0xcc5c90, constants read from the image): the branch is harsh (VP >
+  EnemyVP and Random(100) < 60: K's BaseResources +1000, Prestige +1, the enemy's UnrestLevel := 6, HasLostWar),
+  territories (EnemyVP < VP * 1.3: +500, Prestige +1, HasLostWar) or compromise; `HasOtherEnemy` 0xd0b4b0 returns 0, 1
+  (another enemy) or 2 (another enemy with more tonnage than the revolting one, `GetShipTonnage`). Then 2 and VP <
+  EnemyVP * 1.5, or EnemyVP > VP * 1.1 and Random(100) < 50 - War / 2: "The other members of the enemy coalition resolve
+  to fight on." (VCL `ShowMessagePos` 0xa07124: a box, not the turn report), the enemy's Tension with the player :=
+  Random(3) + 2 and its Prestige := 0, no `DoPeace` (a separate peace); otherwise the general peace (the war record cell
+  := 1 or 3, `ShowPeaceTreaty`, `DoPeace`). The revolting nation's wars with everyone end (`SetAITension` Random(5)) and
+  its alliances too. `RevolutionPending` (+0x4a73, saved, reset by `DoPeace`) is an index in `BuilderNations` (the view's
+  when K's view is in place); its post-loop rule raises the player's unrest ("Revolutionary ideas from X ..."). The first
+  enemy for which `CheckTotalWar` is true ends the whole routine.
+- **Built** (game.cpp `RevolutionPart`/`RevolutionGuarded`, called first in `PeacePart`, turn path only): the game's
+  routine (B2's mask thunk bypassed: `MaskOrig`) on K's PC in K's view with B4's masks and records, War = the decision's
+  (the counter before the month's step), K's own RevolutionPending in the form's field (the host keeps it: header
+  `krevo`, result `prevo`, session file `krevo`); the people's nations read as at peace with K (B4's mask): their wars
+  with K never end by it (logged, with "it would be a candidate" above unrest 10). The decision is skipped after a
+  general peace or when no computer enemy is left. Result keys `pseparate` (the enemies whose war ended without
+  `DoPeace`) and `pdelta` UnrestLevel (also `DoPeace`'s). Host (`HostApplyPeace`/`HostApplyRelations`): a separate peace
+  erases only that war's score and blockade flag (K's VP and other wars stay; no war record, as the game keeps none for
+  it), applies the revolting nation's own wars' end, its Prestige to 0 and a chat line; UnrestLevel deltas (-20..+10)
+  for K's (ex-)enemies and nations left without a war. TEST `revotest <0|-1> [n:unrest ...]` (client: the next run's
+  draws 0 and unrest values in K's copy; a people's nation's put back).
+- **Live** (files\b5\run_r3.txt, dist_b5_11, 48/48, 70 s): K = 1 at war with Russia (3), USA (4) and the stand-in
+  nation 2; R1 `revotest 0 3:25 4:3 2:25`, ledger 0:2000: "Russia is suffering serious internal disturbances ...
+  compromise peace", the "fight on" box, "Revolutionary ideas from Russia ..." on K's PC; war 1-3 over on both copies,
+  1-4 and 1-2 go on; host "peace 1-3 ... 3:Prestige-20 3:UnrestLevel-1 separate 1-3 own UnrestLevel+2", ledger 1-3
+  erased, 1-4 kept, RevolutionPending 0 -> 3 kept by the host; nation 2 logged "stays out (unrest 25: it would be a
+  candidate)", its and the host's unrest untouched by the rule, the host's VP/EnemyVP unchanged. R2 USA forced: the
+  general peace (DoPeace, accepted=1), war 1-2 goes on, RevolutionPending 3 -> 0.
+- **Compatibility**: a 0.5.0 host sends no `krevo`: a 0.6.0 client runs no revolution (as 0.5.0). A 0.5.0 client
+  ignores `krevo` and sends no `prevo`/`pseparate`; the host keeps K's RevolutionPending. A 0.5.0 host ignores
+  `pseparate`/`prevo` and the UnrestLevel entries of `pdelta`. Live battles unchanged (engine 17, protocol 3).
+- **Gotchas**: two people at war with the same computer nation each give it the war-start relief (per player-war, as
+  the blockade effects); DoPeace in K's view lowers every nation's unrest: a third nation still at war on the host keeps
+  its own. Open: a suite check in `war_effects` (not added this round).
+
+## Feature 2026-10-23: B5 round 4, joined nations' war effects after the merge (0.6.0-dev)
+- **Merge smoke** (worktree from `int-060` 7b182df, B5 + B6): `war_effects` + `relations_peace` 98/98, 134 s open: no
+  merge regression in B5's area.
+- **The enemy-revolution rule and the host's own war.** On K's PC the host's nation already reads as at peace with K
+  (B4's mask, round 3). On the host, the game's own rule (`CheckForRevolutionInEnemyNation` 0xcc5c90 from
+  `ReduceTimeLimits`, P = the host's nation, through B2's thunk) loops over nations 1..8 whose Tension cell with nation 0
+  (+0x256) is above 40 (0xcc5ceb) and makes a revolution of one above unrest 10 (0xcc5d6d: `UnrestLevel > 10` and
+  `Random(10) < UnrestLevel - 10`). B2's AI mask hides only the cells between nations 1..8, so a joined nation at war
+  with the host was a candidate: its revolution would have forced a peace between players by the computer's rule
+  (harsh / territories / compromise, `DoPeace`). Static (the code read), not provoked live without the fix.
+  - Fix (game.cpp `RevoCapEnter`/`RevoCapLeave` around the call in `MaskedCall`): a nation people play
+    (`IsHumanRemoteNation`) at war with the host reads at most unrest 10 for the call; the rule's own changes (its
+    relief) are kept on top of the real level. Log "relations v2: revolution (host): the nations people play at war with
+    the host stay out of its enemy-revolution rule (no forced peace between players): 1 (unrest 25: it would be a
+    candidate)".
+  - Suite `war_effects` M4 (new): the host's nation at war with nation 1 too (`ls_war01`), client `revotest 0 J:25 0:25`,
+    nation 1's unrest 25 on both copies, the month through `ls_month` (drop12). Live (dist_b54_2, 81/82, 217 s): a live
+    battle 0-1 in the month (100000, drop12) driven by the live months' tools; nation 1's PC: "Russia is suffering
+    serious internal disturbances. They have been forced to accept a compromise peace.", "wars ended 3 (the general
+    peace: DoPeace)", "... stay out ...: 0 (unrest 25: it would be a candidate)"; host "peace 1-3", its own rule's line
+    above; the war 0-1 went on on both copies (nation 1's unrest on the host 25 -> 23, its counter 5 -> 6), then the
+    players' peace (`ls_peace01`). The one FAIL was the setup check's own expectation (the client sees the host's war
+    only with the month; fixed).
+- **Blockade tests count the allies by K's alliances.** `GetBlockadeStrength` 0xc76b74 (E = the blockader) adds, when E
+  is at war with nation 0, every other nation at war with nation 0 (the coalition), else every nation allied with
+  nation 0 (`Allied` +0x29a) and at an AI war (`IsAtAIWar` 0xc68ecc: a cell 1..8 above 40, never the PlayerNation), and
+  nation 0 itself when E is its ally at an AI war. On the host's frame K's tests therefore counted the host's allies.
+  - Built: game.cpp `HostViewEnter(K, war, human)` / `HostViewLeave()` (game.h), B6's inline view of
+    `RunBattleGenerator` made a function (the generator now calls it; one view in the code). warfx.cpp `TestsInView`:
+    the frame's three tests (K blockaded, each enemy alone with the other enemies' relation with K read as peace, each
+    enemy blockaded) in K's view with no nation masked (K's wars with people's nations count too; the host's nation at
+    index K); the credits, flags and effects afterwards on the real indices as before; the host's frame when the view
+    is not in place (logged). Check line suffix "(its view)" / "(the host's frame)". Bridge `warfx strength E N [K]`
+    (read-only probe: the strength and the game's own account on both frames).
+  - Live (dist_b54_3, group `relations` 216/216, 367 s: session 17, relations_peace 33, war_effects 67, battle_generator
+    62, battle_surprise 37): `warfx strength 1 3` -> host "blockade=94 [Germany: 94]", view 1 "blockade=104 [Germany:
+    94, USA: 10]" (USA, nation 1's ally at war with Russia, counts in its view only); the month's line "1(war 1, enemies
+    3): not blockaded, blockading 3 (its view)"; the generator through the shared view unchanged (62/62, 37/37).
+  - Gotcha: in a view `Nation(i)` answers view indices: warfx takes the real records before entering.
+- **(c) Raiders, submarines and the trade war of a joined nation** (`warfx.cpp`, host only; 5cededf).
+  - Static: the game runs them for the host's wars only and only under War > 1: `DoStrategicTurn`'s submarine loop
+    (`CheckSubmarineActivity(N)`, N = 0 and each nation at war with it) before `CheckAIvsAIBattles`, then (War > 1 at
+    0xce20b6) `CheckRaiderActivity` 0xcce50c, the `TdlgSubmarineWarfareSummary`, `CheckResultOfSinkings` 0xd00ac4;
+    both branches then reach `call <War > 0>` at 0xce21af. Raiders: Status 4, `IsOperational`, Used 0; chance 12/15/20
+    by type (x1.5 in the defender's home area, else 2 / half by the defender's possessions there), 5 x Random(100), VP
+    per merchant 0xd46bb0 into the form's `PlayerTradeWarfareVPThisTurn` / `EnemyTradeWarfareVPThisTurn`;
+    `CheckRaiderProblem` 0xcd06ac interns (Status 7), scuttles (8, `SinkShip`) or sends home (0, RepairTime 2) and shows
+    its boxes with `ShowMessagePos` 0xa07124 directly. `CheckSubmarineActivity(N)`: target nation 0 unless N is, else
+    `GetRandomEnemy`; War tests 0xcc9fdf/0xcca022; neutral protests. `CheckAIvsAISubmarineSinking(A, B)` 0xd31e68 (from
+    `CheckAIvsAIBattles` 0xd32aa1): one of A's submarines sunk by B (15 %).
+  - Built: a mid-hook at 0xce21af runs, for each K under the player's rules with its own counter above 1 at war with
+    computer nations, a frame in K's view (`game::HostViewEnter`, the people's nations masked): `CheckSubmarineActivity`
+    of K and of each enemy, CheckRaiderActivity's two loops (markers reset; `CheckRaiderSinkings` per pair with the
+    game's tests: Tension > 40, the defender not `Blockaded`), `CheckResultOfSinkings`. The four monthly loss fields of
+    every nation read 0 for the frame and are added back; the trade VP of each call go by pair
+    (`hookcb::CreditWarVP`, "trade war"; the frame's VP/EnemyVP fields zeroed); EnemyVP and K's VP field hold K's war
+    score during the frame (the raiders' "losing badly" test), then the host's again; the area markers and the other
+    nations' FuelShortage are put back (unless the frame's own sinkings cut a nation's fuel). TurnMessages and
+    RaiderSummary are fresh TStringLists for the frame; its lines, the picture messages (`BeginTextCapture`) and the
+    boxes (`ShowMessagePos` hooked, recording only while a frame runs) go to K's report (`econnews`) with a summary
+    "Trade war this month: our raiders sank m ... (+v VP); enemy raiders sank ...". `CheckAIvsAISubmarineSinking`
+    (hooked) answers False for K's computer pairs (their submarine war is the frame's; the month's count is logged).
+    Bridge `warfx K` `sea=` and `searule=`, TEST `warfxsea R n`. Mine warfare stays the host's.
+  - Gotchas: a blockaded nation's merchants stay at home (the game's raider rule): with K blockaded in M2 the enemy's
+    raiders do nothing and J must not be blockaded for K's raids (`warfxblk J 0`). TStringList's items and count are
+    `FList`/`FCount` by RTTI, not TList's +4/+8 (the first build read no turn message). The TEST raiders are put back
+    only while still on raider status: dist_b54_5 put an interned one (B Brandenburg, "interned in a neutral port due
+    to lack of fuel") back to Active, and the client's next two battles in The Baltic ("3 attacks 0", M2 and M3) failed
+    in the game's `SelectForce` (box "Error in SelectForce procedure! Access violation at address 00FD7A62 ... Read of
+    address 0000000D": 0xbe7a62 with that run's image at 0xc20000; a side with no force, the fallback reads a nil main
+    division). Only that run had an internment; dist_b54_5 restored unconditionally (no `cmp byte ptr [ecx+esi],4` in
+    its SeaFrame, 5cededf has it); not seen since. TEST only (the frame itself writes no Status or LocationArea); the
+    mechanism inside SelectForce is not proven.
+  - Live: dist_b54_5 run 2: "3: raiders 11/0, subs 0/0, VP +55/+0", credit (1, +55, 3). dist_b54_6 (5cededf)
+    `--only war_effects` 86/86, 183 s: M2 "sea war of nation 1 (enemies 3): war counter 2, ... its view, blockaded (no
+    enemy raiders); calls 4, faults 0; 3: raiders 7/0, subs 0/0, VP +35/+0; TEST: 6 raider(s) ...; messages 7";
+    nation 1's report "German raider KE Kohlbrand sinks 1 Russian merchant ships in The Baltic", "German raider B
+    Wittelsbach sinks 2 ...", "Trade war this month: ..."; client "economy: showing 10 message(s)"; no box on either
+    copy; the last month at war "the computer's submarine sinkings dropped ...: 1 (3-1)". Group `relations` on
+    dist_b54_6: 196/196, 373 s (session 17, relations_peace 33, war_effects 69, battle_generator 40, battle_surprise
+    37): M2 "3: raiders 5/0, VP +25/+0", credit (1, +25, 3), client "showing 10 message(s)"; no SelectForce box in
+    either run (no internment either).
+- **(f) Money check in a war's first month** (B6's smoke of the merged build, dist_b63_2, `battles` B1: "nation 1's
+  funds at the month's end 3728 == ComputeExpenses' 2346 + the player's money rules +0 (other +1382)", BM 18 -> 16, the
+  balance -794 -> +3714). Not a B5 money effect: the game's arms-control conference during nation 1's war.
+  - Cause. The host's conference event (DoStrategicTurn: ComputeExpenses 0xce1e0b, then CheckTurnEvents 0xce1e42 ->
+    GetRandomEvent -> HandleEvent -> `TdlgEventAnswer.Execute` 0xc0ed1e/0xc0ed34 -> `CreateArmsControlTreaty`
+    0xcb6bf0) runs under B2's mask (host log 10:05:15 "CreateArmsControlTreaty runs without the pairs of nation(s) 1"),
+    so its first test `AnyNationIsAtAIWar` (0xcb6c26; `IsAtAIWar` 0xc68ecc: a tension above 40 between two of nations
+    1..8) missed the war 1-7 and the treaty was made. Per nation (0xcb7962..): `ScrapShip(n, ship, False)` 0xca0690 for
+    each ship under construction over `GetTreatyLimit` or the calibre limit (not Rebuild): Funds += the scrap value
+    (0xca09c4; StartBuild 2: `GetScrapValue` 0xca0d8c = Round(Displacement / 25) x BuildProgress +0x9a / Cost +0x96),
+    then BudgetModifier -2 (0xcb7aa2, helper 0xab7744 = dec with floor 0). Host 10:05:19 "Germany has scrapped the
+    following ships under construction to comply with the treaty". The same treaty made nation 1's PC show "The outbreak
+    of war cancels the disarmament treaty!" (`CancelTreaty` 0xd30b88 from `UpdateUIValues` 0xc80828 while
+    TreatyTimeRemaining > 0 and its own War > 0): B6's stall at `battles` D1.
+  - Fix (`game.cpp` MaskedCall): for `CreateArmsControlTreaty` the masked pairs at war (above 40 before the mask, its own
+    or a caller's such as `CheckAllyTrouble`'s) show their own tension for the call (TreatyWarsEnter), put back to 5
+    afterwards: a war in progress ends the conference with the game's message before it changes anything, as in single
+    play. The conference's money for K is now in K's record (`economy.cpp` TreatyBefore/TreatyAfter around the call,
+    after ComputeExpenses: `econ` treaty= funds, treatyBM=, conference=; otherFunds and the log line's "other changes"
+    net of it), and the 0.5.0 money check's sum includes it (a treaty at peace is a rule every nation shares, the player
+    included). TEST `econtreaty <chance> [blind]|cancel` (host: the conference at the month's end; blind = without the
+    fix, a treaty cancelled at once). Suite `arms_treaty` (group relations; one scenario with the treaty fix's since the
+  merge: [the disarmament treaty and a joined nation's war](#fix-2026-10-23-the-disarmament-treaty-and-a-joined-nations-war-no-box-every-month-the-host-ends-it-once-v060-dev)).
+  - Live: dist_b54_7 `--only arms_treaty` 43/43, 91 s: M1 (war 1-3) "the arms-control conference
+    (CreateArmsControlTreaty) sees the war(s) of the nations people play: 1-3 3-1", the host's "With a war already in
+    progress, the conference ends in solemn declarations and no action.", treaty months 0 -> 0, `econ 1` conference=1
+    treaty=0 treatyBM=0, money check PASS; M2 blind (B1 reproduced): "Germany has scrapped ... B Preussen, B Hessen, B
+    Wettin", "nation 1: the arms-control conference changed its funds by +1363 and its BudgetModifier by -2", bm 18 ->
+    16, balance -794 -> +3522; money check PASS "5426 == 4063 + 0 + the arms-control treaty's scraps +1363 (other +0)"
+    (the check before had other +1363).
+  - Group `relations` on dist_b54_8: run 1 53/57 (relations_peace M1 had the game's own conference at peace, "A naval
+    arms limitation treaty will be in effect for 14 years!", money check PASS with treaty +0 BM -2; then war_effects
+    M1's Turn was refused on the host: "We have more capital ship tonnage in service than permitted by treaty! You must
+    scrap 16,800 tons ...", `host turn: click handler returned (endOfTurn=0 ...)` -> suite `treaty_guard`); run 2
+    233/234 (arms_treaty M1 no treaty, M2 blind +546 BM -2 recorded; one false positive: war_effects M2 (c)'s box
+    filter matched the host's research messages "Our scientists ... Early coastal submarine" -> skipped); run 3 119/123:
+    war_effects M3 BM 6 instead of 5 (an extra +1, not investigated), arms_treaty M1 timed out in an undeclinable
+    battle of nation 1 (Russia attacks, auto-run still running at 240 s). Open: a battle driver for arms_treaty's war
+    months, the M3 BM.
+- **(g) Group `relations` reliability** (suite only; dist_b54_8 = HEAD's source):
+  - war_effects M3's BudgetModifier 6 (expected 5) is the game's, not B5's: the new month's intelligence result on nation
+    1's PC (client "intel: monthly check for nation 1: ... tension 2:1;, own BudgetModifier:1;", its dialog "Event - Dec
+    1900" answered with the first choice "Give it maximum publicity and denounce the aggressive policies of France"),
+    applied by the host before the check (host "event of Captain (nation 1, #-1 'Intelligence'): tension 1-2 8->9
+    BudgetModifier+1"): both copies 3 -> 4 (war budget) -> 5 (loan) -> 6. The check now wants 5 + the new month's own
+    changes of nation 1 from the host log (`own_field_changes`: its events' `BudgetModifier+n` and its relation turns'
+    `own BudgetModifier+n`, after the relation turn's host line).
+  - arms_treaty M1's timeout: run_month's unplanned path forced the undeclinable battle onto auto-run, answered "No
+    contact between fleets. Do you want to continue searching?" Yes (+180 minutes) and has no restart for a run stopped
+    at a minute boundary; the client logged nothing for 216 s. Its war months and war_effects M1-M3 now run through
+    `war_month` (a `BattleDriver` without a plan: declines, a forced fight on auto-run with its `pocstate` polling and
+    `pocrun` restart, `FIGHT_TIMEOUT` more).
+  - Run g1 (dist_b54_8, 447 s): 241/247; war_effects 69/69 (M3 BM (6, 6), own [event +1]), arms_treaty 26/27 (M1 battle
+    declined at the preview, no treaty; M2 blind treaty recorded). New, not from these changes: the client's "Error in
+    SaveBuildCampaign procedure! Access violation at address 00C25D4B ... Read of address 00000000" at arms_treaty M2's
+    submit and "... 00C2751B ... Read of address 18740127" at battle_generator's start (client image at 0xC20000: static
+    0x835d4b = the memory manager's FreeMem reading a block header, 0x83751b = System.Move with a bad source: a corrupted
+    heap; first after war_effects M4's live battle and a declined battle preview; the known SaveBuildCampaign issue
+    of 0.3.3/0.4.0 had another address), and battle_surprise b) "takeovers: none" (Japan had taken Southern Korea by the
+    game's own event in war_effects M3; Northern Korea was taken in every earlier run).
+  - Run g2 (dist_b54_8, 363 s): **222/222** (session 17, relations_peace 33, war_effects 69: M3 BM (5, 5), no own
+    change; arms_treaty 26: M1 and M2 battles declined at the preview, after M4's live battle as in g1, no error box;
+    battle_generator 40, battle_surprise 37: Northern Korea taken over). The g1 AV did not come back.
+
+## Feature 2026-10-23: B6, the player's battle generator for a joined nation (0.6.0)
+- **What.** A joined nation K under the player's rules gets the player's battles against computer nations, as nation 0
+  in single player: the game's own generator `CheckForBattles2` (0xcecb10) runs for K once a month on the host, in K's
+  view, and its battle goes to K's PC (the battle phase). Before, K's battles came from the computer's generator
+  (`CheckAIvsAIBattles` -> `DoBattleBetweenAINations`), which (the user's report) gave the non-host no battles in some wars.
+- **The game's generator (static, 1.01.44).** `DoTurn2` calls `CheckForBattles2` at 0xce180e (also legacy `DoTurn` and
+  two test menus); `DoStrategicTurn` runs after it unless a battle came. It reads `War` (0xf52ff4 > 0: 0xccd5fc),
+  `PlayerNation` (form +0x3204) and `GetBNation(i).Tension` (+0x256 > 40); CheckForInvasionBattles (0xd10228), 30 %
+  CheckRaiderVsPatrols (0xcce6bc), then 50 % passes over the map areas and enemies (home area, GetStrengthInArea > 7),
+  GetRandomEnemy (0xccd5cc: Random(8)+1 with Tension > 40, 201 tries, nil-safe) passes, the strongest-area helper
+  0xceca88, raiders again, GetRandomHomeArea passes, each calling `CheckAttackLocation(attacker, defender, area)`
+  (0xced17c, ret 4; area nil at 0xcecddf: it picks one itself); the first True ends the search (at most one battle a
+  month), a False goes on. CheckAttackLocation -> 0xced0e8 / DoHomeAreaBattle 0xcee638 / DoPossessionBattle 0xced48c
+  (AIDeclinesBattle 0xcd2188, the map question, DoPlayerDecline 0xd4927c) -> DoBattle 0xcb3b24.
+- **Host (`game::RunBattleGenerator`, hook on CheckForBattles2).** Before the host's own call, for each K with the
+  player's rules, a client announcing `gen=1` that fights its battles and K's war counter > 0: the B3 view on the host
+  (nation list slots 0<->K, permuted relation and alliance cells), `PlayerNation := K's record`, `War := K's counter`,
+  and the nations people play read Tension <= 40 (their battles stay the host's generator's and, between joined
+  players, the computer's live battles). CheckAttackLocation does not run in the view: each call is recorded as an
+  attempt (attacker, defender in real indices, area or "" = the game picks) and answers False like a call without a
+  battle, so the attempts are the ones single player would make until one gives a battle (up to 4, then True).
+  CheckForInvasionBattles and CheckRaiderVsPatrols answer False in the view (generated skip thunks on a view flag).
+  Everything is put back right after. The attempts against computer nations become one request of kind 1.
+- **Request kinds (`BattleReq.kind`):** 0 the computer's generator (as before), 1 the player's generator, 2 a surprise
+  attack (reserved, later). Kind 1 goes only to clients with hello `gen>=1` (MSG_BATTLE `kind`, `att`, `att0..attN`
+  = "a,b,area"); its fallbacks (no battle, failed, time limit, disconnect, the host's decision) never call
+  `ResolveAIBattle`: no battle that month ("* No battle of Germany this month (...)"). With B6 on for K, the computer's
+  generator's battles of K against computer nations are dropped in `HostDeferBattle` (log "left to the player's
+  generator"; returns True to the game = no battle), so K has one generator.
+- **K's PC.** The battle slot replays the attempts in order through the game's CheckAttackLocation (mission,
+  possession and its questions re-rolled there as before; area "" -> nil); an attempt that gives a battle, a preview,
+  a decline (the player's: a new `DoPlayerDecline` counter hook, or the enemy's points) is the month's, else the next
+  ("battle N: attempt i (...) found no battle"). The result carries `cand` and the battle's area (`DoBattle`'s area,
+  captured in its hook), so the host merges it for the right opponent.
+- **Not through this path (later work):** invasion battles need K's own invasion state (form +0x4a8c..+0x4a98 are the
+  host player's; K's invasion orders are not sent); raiders against patrols read the form's pending raider battle
+  (+0x4a1b) and resolve through QuickResolveRaiderBattle (which runs DoStrategicTurn): a later attempt type replayed
+  on K's PC. Battles against the host stay the host's generator's live battles (suite `lockstep_month` 49/49).
+- **Live proof** (`files\b6\b6_live.py`, 1900 fixture, host and client on one PC, dist_b6_1, game open 179 s, 72/75):
+  K=1 Germany at war with Spain (7). `battles gen 1` x40 (dry runs): 40/40 with 4 attempts, opponents only Spain, areas
+  Northern Europe, The Baltic, The Mediterranean and "the game picks", attacks and defences; the host's relations and
+  nation unchanged. Month 1: "the player's battle generator for nation 1 (war counter 1): 4 attempt(s): 7>1 Northern
+  Europe; 7>1 (area by the game); ...", "battle request 1 (the player's generator)", the computer's battle of the pair
+  "left to the player's generator"; on the client Spain declined battle -> "battle 1 applied: ... VP 160/0 ...; the
+  enemy declined battle". Month 2: request 2 fought on the client, "battle 2 applied: 17 ships changed (100 fields),
+  0 removed, VP 0/75". The 3 failures: an injected kind-0 battle whose preview allowed no Decline (fought), a time-limit
+  case the AI avoided, and the client's saved [IntelReports] repeating one entry of its own monthly check (the game's
+  CheckIntelligence; TESTING.md's per-month checks note it in memory), not B6. The proof build also held the next
+  commit's risk-4 changes (declines merged, the result box captured); the generator's path is the same.
+- **Suite** (dist_b6_2): `--only battle_generator,battles,lockstep_month,relations_peace` 218/226 in 368 s with
+  `lockstep_month` 49/49 (battles against the host: the host's generator's live battles, unchanged); the failures were
+  the runner's (the scenario ran after `battles`, which leaves the client with `fightbattles 0`: it now joins again with
+  1) and `battles` c), which risk 4 changes (next commit); then `--only battles,battle_generator` 155/155 in 342 s
+  (battle_generator a)-c): one request of kind 1 a month for three months, war counter 4..6, one computer battle of
+  the pair suppressed each month).
+- **Compatibility.** Protocol 3. A 0.5.0 client announces no `gen`: its nation keeps the computer's generator (kind 0,
+  as before). A 0.5.0 host ignores `gen` and sends kind 0 only. Existing campaigns continue (no new save state).
+- **Bridge:** `battles gen K [queue]` (a dry run of K's generator, or its request), `battles injectgen K J [area]`;
+  `battles list` shows `kind=1:att=N`. **Suite:** scenario `battle_generator` (group `battlegen`, also in `relations`).
+## Fix 2026-10-23: risk 4, a joined player's declined battle is merged and the game's result box stays off the host (0.6.0)
+- **Before.** A battle a joined player declined on its PC came back as `declined` without the slot's result: the host
+  had the game resolve it as a battle between computer nations (`ResolveAIBattle` -> `DoBattleBetweenAINations`
+  0xd32104), whose result box ("In a battle in <area> between the A and B navies ..." / "An indecisive engagement ...",
+  `ShowPicMessage(text, 'Firing.jpg', True)` 0xd326eb) opened on the host and held the new month until the host's player
+  answered it; and the game's consequences of the decline on the player's PC (`DoPlayerDecline` 0xd4927c: the enemy's
+  points EnemyVP +0x4a63, prestige and fleet morale -1 after repeated declines, the decline count +0x32ec, an invasion
+  of the possession) were lost. The same box came for every battle the game resolved (no battle, failed, time limit,
+  the player gone).
+- **Now.** The battle slot counts the player's declines (`DoPlayerDecline` hook: the map question's No, and the
+  preview's Decline, which returns from DoBattle without it) and sends `declined` WITH the slot's result
+  (`ExtractBattleResult`: ships, losses, VP of both sides, prestige and morale): the host merges it like a battle
+  (`battle N applied: ...; the player declined battle`, chat "* Captain declined battle for Germany against Spain in
+  Northern Europe.", the war score credited), for both kinds of request; the game resolves nothing. A battle the game
+  still resolves (kind 0: no battle, failed, time limit, disconnect, the host's decision, a 0.5.0 client's decline)
+  has its picture messages captured instead of shown (`lockstep::BeginTextCapture/EndTextCapture`: the ShowPicMessage
+  hook, installed alone if no live battle installed it yet) and they go to the chat and to the joined player's news of
+  the new month.
+- **Gaps:** the decline count (+0x32ec, a form field) is the battle slot's only (K has no persistent copy of it on the
+  host); a possession the enemy invades after the decline (+0x75/+0x7d) is not in `ApplyBattleResult` (as for battles).
+- **Live** (dist_b6_1, `files\b6\b6_live.py`): a request of the player's generator declined in the preview -> "battle 3
+  applied: 0 ships changed (0 fields), 0 removed, VP 0/63, prestige 0 ...; the player declined battle" (Spain's points
+  of the decline, no resolution by the game). **Suite** (dist_b6_2): `battles` c) (now: merged, both chat lines, never
+  resolved by the game) and `battle_generator` d)-e) in 155/155; e) `battles aitest 1 7 Northern Europe` -> "ok
+  fought=1 captured=1 | An indecisive engagement has taken place between the German and Spanish navies in Northern
+  Europe.", host log "picture message captured: ...", no TdlgPictureMessage on the host.
+- **Mixed versions** (protocol 3): a 0.5.0 host ignores the bundle of `declined` and lets the game resolve it, with its
+  box, as before; a 0.5.0 client sends `declined` without it: a 0.6.0 host lets the game resolve it (kind 0, box
+  captured). **Bridge:** `battles aitest K J area`; `battles list` shows `:declined`/`:avoided`.
+## Investigation 2026-10-23: B6 decisions (attempts, decline counts, generator errors, wording) (v0.6.0-dev)
+- **The decisions** (the caller's, after B6 and risk 4): (1) all of the generator's attempts, (2) the joined nation's
+  own decline counts and the enemy's invasion after a decline, (3) no "Error in CheckForBattles" box on the host and no
+  request that month, (4) the client's wording under an older host. (2)'s invasion is a NO-GO (below).
+- **(1) Attempts.** `kMaxAttempts` 4 -> 64 (game.cpp): the CheckAttackLocation calls in K's view are recorded in the
+  generator's order until it has none left (each answers False, so CheckForBattles2 walks its whole search); 64 only
+  bounds a runaway. The client reads up to 64 (`att`) and replays them in order until a battle, a decline or the
+  enemy's points. Measured (1900 fixture, Germany at war with Spain, war counter 3-4): 20 dry runs had 4-7 attempts
+  ({4: 3, 5: 10, 6: 6, 7: 1}); the month requests 4-6 (5, 6, 4, 4, 4, 5). The first attempt usually decides: request
+  13 "attempt 0 (7 attacks 1 in an area the game picks) found no battle", then the enemy declined at attempt 1.
+- **(2) Decline counts.** `DeclineCount` (form +0x32ec) is saved and loaded ([General]; SaveBuildCampaign 0xc8eacb,
+  LoadBuildCampaign 0xc99f35..0xc99f4a); `EnemyDeclineCount` (+0x32f0) is saved (0xc8eae4) but never loaded (its key
+  has no other user): it lives in memory for the session. So a battle slot held the host player's DeclineCount and the
+  client PC's last EnemyDeclineCount (live: "the save's were 0/1, 0/2, 0/3" = the previous slot's). Writers:
+  DoPlayerDecline (DeclineCount +1 when the war's points are close or behind; -1/-10 after its warnings, with prestige
+  or fleet morale -1), CheckSurpriseAttack := 0 (0xcfdb6a, 0xcfe020), AIDeclinesBattle 0xcd2eaa and 0xbe7111
+  EnemyDeclineCount += 1, 0xbe9f3d := 0. Readers: DoPossessionBattle, DoHomeAreaBattle, ArrangePossessionBattleDetails,
+  AdjustPlayerPenaltyPointsForArea, CheckSurpriseAttack, 0xcf8824 (EnemyDeclineCount in the invasion modifier). Mod:
+  the host keeps each joined nation's (`g_kDecl`, session file `kdecl` "K:own:enemy,", dated like `kwar`) and sends
+  `dc` "own:enemy" with MSG_BATTLE to clients announcing hello `gen>=1` (not live battles); the client sets them after
+  loading the slot ("battle N: the nation's decline counts a/b in the battle slot (the save's were c/d)") and returns
+  the slot's counts with every result (`dc`); the host logs "battle N: nation K's decline counts x/y (were u/v)" and
+  stores them when changed or new. Live: three battles the AI declined 0/1 -> 0/2 -> 0/3; the preview's Decline reset
+  EnemyDeclineCount to 0 and once raised DeclineCount ("battle 12: nation 1's decline counts 1/0 (were 0/3)").
+- **(2) NO-GO: the enemy's invasion after a decline, applied on the host.** DoPlayerDecline 0xd4927c invades
+  (Invaded := InvasionBattlePending, InvasionSupport := -1, InvadedThisTurn := 1, "<X> forces invade <p> without
+  opposition ...") only when the possession is EnemyInvasionTarget (+0x4a94) and InvasionBattlePending (+0x4a98) > 0,
+  i.e. in an enemy invasion battle (CheckForInvasionBattles), which K's view skips; else the player's own invasion
+  (Invaded = 0) loses 2 InvasionSupport. Neither happens in K's battle slot today. The month's invasion resolution
+  (unnamed 0xcf8824..0xcfa1d1, from DoStrategicTurn 0xce1f54) is the player's: all possessions, no owner test; at
+  peace every Invaded := -1 (0xcf9900); at war Invaded > 0 = an enemy invades nation 0's possession (nation 0's
+  strength against a random enemy, its prestige, TakenFrom := 0), Invaded = 0 = nation 0's invasion; AI invasions only
+  start against nation 0's possessions (0xcf9226). K's Invaded/InvadedThisTurn set by name on the host would be
+  cancelled at peace or resolved as the host's: K's invasions need their resolution in K's view (with the landings).
+- **(3) The generator's error box.** CheckForBattles2's own except handler (0xced047) calls
+  `ShowMessage('Error in CheckForBattles procedure!'#13 + E.Message)` (0xced05c -> 0xab7970) and returns, so the mod's
+  `__try` never saw a game exception and the box would open on the host. game.cpp finds ShowMessage from that call
+  site (`FindGeneratorErrorBox`: `mov edx, <literal>; call; mov eax, [ebp-0x14]; call`) and hooks it: in K's view the
+  text is recorded, elsewhere it passes through. RunBattleGenerator then fails ("exception in the game's battle
+  generator: <box text>"), the view is left as usual, no request that month. Startup: "Player's battle generator: its
+  error box in a joined nation's view goes to the log". Test hook `battles gen K fault` (an access violation in the
+  view's first CheckAttackLocation, inside the game's try block). Live: "error exception in the game's battle
+  generator: Error in CheckForBattles procedure! Access violation at address ... in module 'RTW3MP.dll'. Write of
+  address 00000000", the host log line, no request, no window or error box on the host; the next `battles gen 1` ok.
+- **(4) Wording.** The host's welcome carries `gen=1` (it merges a declined battle's result); the client keeps it (0
+  until a welcome has it). With it a decline goes with the slot's result ("* You declined the battle (VP ...)."),
+  without it alone as with 0.5.0, and the chat says "* You declined the battle; the game resolves it.". Test: client
+  `battles hostgen n`, `battles state` shows `hostgen=`. Live (hostgen 0): battle 12 declined in the preview ->
+  client "battle 12: declined", host "battle 12: resolved by the game (Captain declined it)", after the battles
+  "battle 12 resolved by the game: battle" with "picture message captured: '... the Spanish ships DD Furor have been
+  sunk..'", no box on the host, both chat lines.
+- **Mixed versions** (protocol 3, engine 17): 0.5.0 host + 0.6.0 client: no `gen` in the welcome -> the decline goes
+  alone, "the game resolves it" (kind 0 only; the host shows its box as 0.5.0 does); no `dc` -> the slot keeps the
+  host player's DeclineCount, as before. 0.6.0 host + 0.5.0 client: no hello `gen` -> no `dc`, kind 0 only, a decline
+  without its result resolved by the game (box captured), as before. 0.6.0 + 0.6.0: all four.
+- **Suite** (`--only battles,battle_generator`): run 1 on dist_b6_5's first build 165/166 in 312 s (game open 310 s):
+  `battles` 86/86 (c) decision 2, new c2) decision 4, one more month), `battle_generator` 62/63 (a) the hook line, b)
+  attempts and the fault, c) the replay order); the failure was the client's [IntelReports] repeating one entry in
+  M3 (the game's CheckIntelligence, known, not B6). Run 2 (after a rebuild) 154/154 in 356 s; the
+  committed build (dist_b6_5: RTW3MP.dll 5484D8B1, version.dll 72C7FFC4; after a fix: RunBattleGenerator's early
+  return also clears the test fault flag) 178/178 in 361 s (game open 358 s): `battles` 97/97, `battle_generator`
+  64/64; dry runs {4: 5, 5: 10, 6: 3, 7: 2}, the month requests 4-6 attempts, requests 9 and 19 "attempt 0 ... found
+  no battle" then the battle (in order); c2) battle 15 under hostgen 0: "battle 15: resolved by the game (Captain
+  declined it)" -> "battle 15 resolved by the game: battle", captured, none shown. Host and client on one PC; the
+  released 0.5.0 DLLs reinstalled after each run (hashes checked), slots and Preferences restored.
+
+## Investigation 2026-10-23: surprise attacks and takeovers at war start for joined nations (v0.6.0-dev)
+- **The question** (B6 piece 2): a joined nation K's surprise moves at a war's start, which the player's routines make
+  in single player and B3 left out in K's view (`GetRandomPossessionInArea`, `GetRandomPossession`, `DoSurpriseAttack`,
+  `CheckForPlayerSurpriseInvasion` answered nil/False there). Answer: the surprise attacks (both directions) and the
+  takeover of an unowned possession: GO (live, both fought); the surprise landing in K's own possession: NO-GO for now
+  (it needs K's invasions resolved in K's view, below).
+- **CheckForWar's landing block** (1.01.44, static, then live): for B_i with Tension < 40 while War <= 0, with the
+  SurpriseAttack trait (+0x1f3) or GovernmentType 4 (5: Random(100) < 30) and (`WillGoToWar` = 1 or Tension >= 10 and
+  Random(300) < Tension): Tension := 14 (0xc85014); Random(100) < 50, or with the trait Random(100) < 90, else nothing
+  more; `P.GetRandomPossessionInArea(B_i.BuildArea)` (call 0xc85056); worth < 200 (+0x58) and B_i stronger there than
+  half of nation 0 -> the landing (Invaded := i, InvadedThisTurn := 1); otherwise up to three `GetRandomPossession(nil,
+  @B_i.BuildArea)` (0xc850f7/0xc85115/0xc85133) until Owner (+0x61) nil -> "In a surprise move, <adjective> troops have
+  taken control of <p>!" and `ChangePossessionOwner(p, B_i, False)` (0xc85196). 0xab7744 is a floored Dec (WillGoToWar
+  1 -> 0); Tension 14 then declares the war (CountNationsAtWarWithPlayer + 13 <= 14) unless War < -48 and Random(180) <
+  14 (rumours). The war-start block (only while War <= 0) keeps [ebp-0x24] := IndexOf(B_i) with B_i's trait, else 0 with
+  nation 0's; `DoSurpriseAttack` at the end (0xc85a64) when > -1. `CheckForPlayerSurpriseInvasion` (only call 0xc85529,
+  after WarStartsWithNation set War := 1) is unreachable.
+- **DoSurpriseAttack / CheckSurpriseAttack** (static, then live): DoSurpriseAttack 0xd29e84 (EDX never read): nation 0's
+  trait -> CheckSurpriseAttack(nation 0, ECX or GetRandomEnemy), False -> "No opportunity found for surprise attack!";
+  else every nation at war with nation 0 with the trait -> CheckSurpriseAttack(it, nation 0) until True.
+  CheckSurpriseAttack 0xcfd82c (EAX form, EDX attacker, ECX defender; Boolean; own except box "Error in
+  CheckSurpriseAttack procedure!"): `LoadSurpriseWarInfo` reads Data\SurpriseWarInfo.dat keys `Nation1Mission0..10`
+  only (the Far East: Kiautschou Bay, Shanghai, Weihaiwei, Liaotung Peninsula, Southern Korea, The Philippines, Formosa,
+  Cam Ranh Bay, Kwang-Chou-Wan, Hong Kong, Northern Korea; the file's Nation2-8 sections are empty); year < 1896 False;
+  Random(100) < 20 False; war history 0xd0decc(idx, 1901|1935) and Random(100) < 60 False; 1896-1924 the first mission
+  the defender owns (none: False), an AI attacker's `AIDeclinesBattle(..., Implement True, ...)` (declines: False and
+  the player's points); 1925-1934 `DoSubSurprise` (a submarine attack, no battle) and False; from 1935 the carriers'
+  pick 0xbf5798. Then `MapMessageDialog(text, point, NoChoice = an AI attack)` (Decline -> True without a battle), the
+  flag [0xf52ffc] := 1 ([General] BattleIsSurpriseAttack), DeclineCount := 0, "Mobilize all ships for the surprise
+  attack?" (nation 0 attacking), the mobilizations, nation 0's destroyers (cruisers) moved to the area, `DoBattle`
+  called directly. It reads no War, Tension or trait: it runs standalone for any pair with nation 0 on one side (the
+  game's debug menu `Testsurpriseattack1Click` 0xd5cdf4 calls it so) but re-rolls its gates. Fixture 1900: Japan alone
+  has the trait; Germany owns Kiautschou Bay, Japan Formosa; Northern/Southern Korea and Shanghai are unowned.
+- **The mod, K's PC** (game.cpp "Surprise attacks and takeovers"; on when the host's welcome has `gen=2` and the hooks
+  resolved, `SurpriseAvailable`; else B3's skips stay). At start-up the call sites inside CheckForWar are found (E8 to
+  the target in its first 0x1000 bytes: landing pick 1, takeover picks 3, owner change 1; else unavailable: "Surprise
+  attacks and takeovers at a war's start for a joined nation: ok (CheckForWar's call sites 1/3/1)"). While the
+  relation routines run in K's view (`PvRunGuarded(..., surprise)`): `DoSurpriseAttack` runs (its thunk's flag
+  `g_pvSkipSA`); `CheckSurpriseAttack` is hooked: in the view it records (real attacker, real defender) and answers
+  True for K (no "No opportunity" box) or False (the next nation is asked), elsewhere it is the game's;
+  `GetRandomPossessionInArea` at CheckForWar's call site runs and answers nil (no landing), a possession worth < 200
+  blocks this nation's takeover picks (single player would have landed; the strength test is not evaluated: a guess
+  that slightly under-counts takeovers); `GetRandomPossession` at the takeover sites runs; `ChangePossessionOwner` from
+  the takeover site is recorded (the game moves it in K's campaign). Other call sites in the view keep B3's nil. Pairs
+  with a people's nation are dropped. `PlayerTurnResult.surprise/.takeovers` -> relation-turn keys `ksa` ("a,b;") and
+  `sland` (pland's layout, from -1).
+- **The host**: `HostApplySurprise` (relation turns of clients with hello `gen>=2`): `sland` -> `MovePossession(name, -1,
+  to)` (still unowned, a computer nation taking it; else logged and skipped), chat "In a surprise move, X has taken
+  control of P!"; `ksa` -> one `BattleReq` of kind 2 (pairs of K with computer nations, <= 16) for the battle phase after
+  the month, chat "Surprise attack? A may strike B at the war's start. <player> plays it after the month."; not without
+  the player's battles (B6On), before 1896 or in 1925-1934 (logged). Results merge like kind 1 (`cand`); a kind-2
+  `nobattle` carries its reason, chat "No surprise attack of A on B (<why>)."; nothing is resolved by the game.
+- **K's battle slot**: kind 2 checks the slot's year again, skips pairs no longer at war ("the war is over"), then
+  `game::StartSurpriseAttack(a, b)` = the game's CheckSurpriseAttack with its dialogs, mobilization and battle, per pair
+  until a battle, a decline, the enemy's points or True without a battle ("You let the chance of a surprise attack
+  go."); none: "No opportunity found for a surprise attack." (K attacking) / "No surprise attack came about.".
+- **Compatibility** (protocol 3): host welcome `gen=2`, client hello `gen=2`. 0.6.0 host + 0.6.0 client: everything.
+  0.6.0 host + 0.5.0 or f3547a9 client (no hello gen / gen 1): no `ksa`/`sland` (the client's view skips), no kind 2,
+  kind 1 as before. 0.5.0 or f3547a9 host (no welcome gen / gen 1) + 0.6.0 client: the client keeps B3's skips (nothing
+  recorded or sent), declines as before. Live-battle engine unchanged.
+- **Tests**: host `battles injectsa A B`; client `battles saretry n` (TEST: a False of CheckSurpriseAttack with nothing
+  else happening is asked again, passing its 20 %/60 % gates), `battles testsa J [k]` (TEST: the next relation turn has J
+  plan its war on K with the trait; `k` K's trait too; the takeover picks the area's first unowned possession),
+  `battles sadry J [k]` (TEST: DoSurpriseAttack alone in K's view, pairs returned, nothing sent). Scenario
+  `battle_surprise` (groups `battlegen`, `relations`).
+- **Live** (1900 fixture, nation 1 Germany, J Japan): dist_b6_6 run 4 (`--only battle_surprise`, 54/54, 59 s): the
+  relation turn "test: the takeover picks Northern Korea", "nation 5 takes over Northern Korea (owner -1; recorded for
+  the host)", "surprise attack: nation 5 may strike nation 1 at the war's start", K's boxes "In a surprise move,
+  Japanese troops have taken control of Northern Korea!" and "Germany and Japan are now at a state of war!"; host
+  "relations of Captain (...): ... war 1-5 ... takeover Northern Korea -1->5 surprise 5>1", "battle request 1 (surprise
+  attack): nation 1 vs 5, 1 attempt(s): 5>1"; Japan owns it on both copies; `sadry 5 k` -> pairs 1>5 (no box), `sadry
+  5` -> 5>1. Battle 1 (5>1): "StartSurpriseAttack 5 attacks 0 -> False", asked again, "The Japanese navy declines battle!
+  You gain 200 VP!" -> avoided, merged (VP 200/0); battle 2 (injected 1>5): map message, "Mobilize all ships for the
+  surprise attack?" Yes, preview Decline -> declined, merged (17 ships changed: the mobilization; VP 0/176). dist_b6_6
+  run 5 (with battles and battle_generator): both FOUGHT - battle 20 (Japan strikes Germany from the relation turn):
+  "German marginal victory Own VP: 175 Enemy VP: 33"; battle 21 (Germany strikes Japan): mobilized, "6 destroyers
+  unable to take part in battle due to lack of fuel ...", the preview's Decline disabled, "German major victory Own VP:
+  1,072 Enemy VP: 160"; both merged. No dialog of them on the host. dist_b6_7 run 6 (`--only
+  battles,battle_generator,battle_surprise`, 179/179 in 423 s): battle 18 (5>1) avoided ("The Japanese navy declines
+  battle! You gain 200 VP!", merged VP 200/0, EnemyDeclineCount 1 -> 2); battle 19 (1>5) "StartSurpriseAttack 0
+  attacks 5 -> True", "battle 19: fighting nation 1 vs 5 in Southeast Asia (slot 87)", "Enemy marginal victory Own VP:
+  110 Enemy VP: 147", host "battle 19 applied: 21 ships changed (81 fields), 0 removed, VP 110/147"; the decline
+  counts 0/2 -> 0/0.
+- **Approximations and risks**: the landing's strength test (above); the surprise attack is played in the battle phase
+  after the month (single player: at once, before the month's battles), so a war ended meanwhile drops it; the slot
+  re-rolls CheckSurpriseAttack's gates (one roll, as single player; `saretry` is a test); the pre-battle effects
+  (mobilization, ships moved, DeclineCount := 0) reach the host only with a fought, declined or avoided result (the
+  ships' changed fields; not the mobilization's cost), not with a no-battle; [General] BattleIsSurpriseAttack stays in
+  the slot; the request is in memory (a host restart in the month loses it; the war and the takeover are saved); the
+  1925-1934 submarine attack is skipped; the 1935+ carrier path is not tested live (the fixture is 1900); a takeover the
+  host refuses stays on K's PC until the next month's state.
+- **NO-GO for now: the landing in K's own possession** and the rest of K's invasions. The month's invasion resolution
+  (0xcf8824..0xcfa1d1) is nation 0's (GAME-INTERNALS); K's needs: (1) that routine run for K in K's view (on K's PC at
+  its month start, or a host-side view with text capture), every other possession masked, the host's own run kept
+  off K's possessions, the results (owner, TakenFrom, InvasionSupport, Invaded, prestige, VP) recorded and applied by
+  name; (2) K's invasion battles (CheckForInvasionBattles' form fields +0x4a8c..+0x4a98 per K, a request kind for
+  DoPossessionBattle, HandleInvasionResults in the slot, possession fields in the battle result); (3) then the landing
+  (CheckForWar's Invaded := i on K's possession) and (4) DoPlayerDecline's invasion branch. Estimate ~4 working days
+  (1.5 for (1), 2 for (2), 0.5 for (3)+(4) with tests); the main risks are 0xcf8824's size (unnamed, ~6.6 KB) and
+  masking K's possessions out of the host's month.
+
+## Fix 2026-10-23: B6 round 3: the month's own state in a joined player's battle slot, raider battles assessed (v0.6.0-dev)
+Third B6 round on the merged 0.6.0 development line (`int-060`: B5 war effects + B6 generator, surprise attacks).
+Engine level 17, protocol 3 (no protocol change).
+- **The question.** A joined player's game never processes a month (the host's does), and its battle slot is the
+  host's month-end save. What does the battle path (CheckAttackLocation, CheckSurpriseAttack, DoBattle, the battle
+  screen, its close and aftermath) read that only the month writes, or that the save carries as the host player's?
+  0.4.1 fixed the ship-type flags for live battles only (B takes A's).
+- **Static audit** (offline scripts, not in the repo): every function reachable by direct calls from `DoTurn`,
+  `DoTurn2` and `DoStrategicTurn` (stopping at the battle entries) against every function reachable from the battle
+  path (the five entries above plus all methods of `TfrmMain`, `TFightingShip`, `TAirFormation`, `TDivision` and the
+  battle dialogs; stopping at the month), minus what `LoadBuildCampaign` writes; unit variables (direct and through
+  import cells, read/write from the operand access) and `TfrmBuildCamp` fields (approximated as `[reg+disp]`, disp >=
+  0x9dc). Limits: virtual calls and event handlers are not followed (hence all methods of the battle classes as roots);
+  the field pass has false positives from other large classes (`TBuilderNation` is 48 KB), triaged by hand.
+  - *Real, now set in the battle slot:* the ship-type flags `[0xf54935..37]` (BB, BC, carrier exist; only
+    `ReduceTimeLimits` -> `CheckShipTypesExist` 0xd4e314 writes them; `TFightingShip.SetMistakenType` and
+    `IdentifyType` read them: a joined player's game had 0 for all three, so its battles mistook ships and drew Random
+    differently from single player). The month's resets: `[0xf52ffc]` = `[General] BattleIsSurpriseAttack` (DoTurn2
+    clears it, `CheckSurpriseAttack` sets it at 0xcfdb61/0xcfe017, saved and loaded: the host's own surprise attack of
+    the month came into the player's battle slot, and the setup's objectives 0xbe2313, the minute-10 step
+    `tmrMoveIntervalTimer` 0xdafcd8 and `FormClose`'s `AdvanceDesignStudies` 0xdcda03 treated the player's battles as
+    surprise attacks); `[0xf4c5e9]` (the possession battle's flag: DoTurn2, `DoPossessionBattle` and
+    `DoHomeAreaBattle` clear it, `ArrangePossessionBattleDetails` sets it, `CheckSurpriseAttack`'s `DoBattle` reads it
+    as left); `HeroicVictory` (+0x3301), `tmpBattlePrestigeLoss` (+0x4ac6) and `ImportantConvoy` (+0x4ad2)
+    (`DoStrategicTurn` resets them, the battle's end sets them at 0xdc520c/0xdc5bca, `DoBattlePrestigeLoss` reads them:
+    the convoy's unrest message, the glorious-victory and failure prestige; only `HeroicVictory` resets itself there).
+  - *Harmless:* `[0xfb591c]` (`TAirUnit.CheckAircraftType`'s once-a-month "We have no aircraft with ... capability!"
+    flag: once per game session on a joined PC), the form pointers `[0xf53000]`/`[0xf53274]`, per-battle setup
+    variables (the objective text `[0xf4c5f0]`, `[0xfb5920]`), saved and loaded options and research records, and
+    `SurpriseAttackPossession` (`CheckSurpriseAttack` clears it first).
+  - *Not changed:* the host player's invasion state in the slot (`InvasionTarget` +0x4a8c, `EnemyInvasionTarget`
+    +0x4a94, `InvasionBattlePending` +0x4a98, loaded from the save; `InvasionCount` +0x4a90 is not loaded): it matters
+    only for a battle at the host's invasion target, and clearing it while this PC's own `InvasionCount` is set could
+    meet a nil target. Part of the joined nations' invasions, which stay for a release after 0.6.0 (below).
+- **Fix** (`game::RefreshShipTypeFlags`, `game::PrepareBattleSlotMonth`): the client runs the game's
+  `CheckShipTypesExist` (it only counts every nation's ships in play, order-independent, so the nation swap of the slot
+  does not matter) after the month's load (log `month: ship-type flags A -> B (the game's CheckShipTypesExist on the
+  received game)`), after the battle slot's load and when it loads its slot again; the battle slot also gets the
+  month's resets (log `battle N: the month's state in the battle slot: ship-type flags A -> B, surprise attack s -> 0,
+  possession battle p -> 0, HeroicVictory h tmpBattlePrestigeLoss l ImportantConvoy c -> 0`). The two unit variables
+  come from `DoTurn2`'s own code (`mov byte ptr [var], 0` before `SurpriseAttackPossession := nil`; `PendingRaiderBattle
+  := 0; mov eax, [cell]; mov byte ptr [eax], 0`), the fields by name. Computed rather than sent: it works under a 0.5.0
+  host too; the host's flags come from its month's `ReduceTimeLimits`, the client's from the month-end fleet (they differ
+  only if the world's first or last ship of a type is completed or sunk later in that `DoStrategicTurn`). Live battles
+  keep A's flags (0.4.1); a joined player as A now sends the month's flags instead of 0.
+- **Test hooks:** client `battles monthstate [set]` (read; `set`, TEST ONLY: the five month fields to 1, as an earlier
+  battle leaves them); `ls shiptypes <hex>` (0.4.1) sets wrong flags first. Suite: `battle_generator` d)
+  (`month_state_checks`).
+- **Live (dist_b63_2, 1900 fixture, 2026-10-23).** `--only battle_generator,battle_surprise,lockstep_month` 147/148 in
+  307 s (session 17/17, battle_surprise 37/37, lockstep_month 49/49, battle_generator 44/45: the one FAIL was the
+  check's own order, fixed after it: the battle phase comes before the new month reaches the client). After `ls
+  shiptypes 010101` and `battles monthstate set` on the client: `battle 2: the month's state in the battle slot:
+  ship-type flags 010101 -> 000000, surprise attack 0 -> 0, possession battle 1 -> 0, HeroicVictory 1
+  tmpBattlePrestigeLoss 1 ImportantConvoy 1 -> 0`, battle 3 `000000 -> 000000`, the host's `ls shiptypes` 000000 (in
+  1900 no dreadnought, battlecruiser or carrier is in play; a 1935 campaign has 1s), then `month: ship-type flags 000000
+  -> 000000`. The merge's smoke run (`--only battles,battle_generator,battle_surprise`, same build): `battles` 56/58
+  before it stopped, every battle slot with its month-state line; its two FAILs are outside B6: the 0.5.0 money check
+  of B1 (nation 1's funds +1382 "other" in its war-start month: B5's war loan, which the check does not count yet),
+  and D1's month load held by the game's box "The outbreak of war cancels the disarmament treaty!"
+  (`TfrmBuildCamp.CancelTreaty` 0xd30b88 from `UpdateUIValues` 0xc80828 in the client's load, with the nation's own war
+  counter 2 while the host's game had made an arms control treaty, "CreateArmsControlTreaty runs without the pairs of
+  nation(s) 1"): a box on the joined player's screen each such month, and the runner's month timed out.
+- **Raider vs patrol battles for a joined nation: NO-GO for 0.6.0 (assessed, not built).** `CheckRaiderVsPatrols`
+  0xcce6bc (CheckForBattles2, Random(100) < 30): when at war, `CheckRaiderInterceptions(P, B_i)` for each enemy and
+  `(B_i, P)` for each enemy raiding P (B_i.Tension > 40, not blockaded), then `CheckPendingRaiderBattle` 0xcd1910 (its
+  error text). `CheckRaiderInterceptions` 0xccee94 rolls per operational raider and patrolling ship in the same area,
+  records one interception in `PendingRaiderBattle` (+0x4a1b flag, +0x4a1c/+0x4a20 the two `TCampaignShip`s, +0x4a24
+  the enemy nation, +0x4a28 the area, +0x4a2d the caption "X ship intercepts Y raider in A.", +0x4a31 the side) and
+  writes "Patrolling ship/aircraft X thwarts raider Y attack on merchant shipping in A!" lines. `CheckPendingRaiderBattle`
+  asks the player (`TdlgMapMessage.RaiderBattleDialog`): `QuickResolveRaiderBattle` 0xd0b534 (it calls
+  `DoStrategicTurn`, which the battle slot mode skips) or a tactical battle that does not pass `DoBattle` (autosave,
+  `BattleArea`, `CreateForm(TfrmMain)`, the setup 0xbdbf1c: "Sink or damage the enemy raider." / "Escape with minimum
+  damage to be able to continue raiding."). It fits the attempt path as an attempt type: the host's view records
+  "raider check" where the generator called it (and answers False, as now); K's battle slot runs the game's
+  `CheckRaiderVsPatrols` there (K is nation 0 = P, with K's war counter), and a True ends the replay like a battle. Still
+  needed: hello/welcome `gen=3` (older clients must not get the entry), the client's detection of the raider battle
+  screen and of a quick resolution (neither passes `DoBattle`, which `ClientStartBattle` counts), the outcome and merge
+  of a quick resolution, the thwart lines into the player's news (the ship changes come back with the result's ship
+  sections), the order (single player rolls them before the month's raider sinkings, the slot after the host's), and a
+  suite scenario that forces an interception (raider and patrol orders in one area, the random gates). Estimate 1.5-2
+  working days with the live proof; later.
+- **Not in 0.6.0: a joined nation's invasions** (decision 2026-10-23): its own invasion resolution and invasion
+  battles, the landings in its own possessions and the enemy's invasion after a decline. The month's invasion
+  resolution (0xcf8824) is the host player's; K's needs it run in K's view, with invasion battles as a request kind and
+  `HandleInvasionResults` in the slot (estimate ~4 working days; see the surprise attacks entry above).
+
+## Fix 2026-10-23: the disarmament treaty and a joined nation's war: no box every month, the host ends it once (v0.6.0-dev)
+Research agent, branch `fix-treaty` from `b6-r3` c46a9b7 (the merged 0.6.0 development line plus B6 round 3). Engine
+level 17 and protocol 3 unchanged: one new state header key (`armstreaty`, ignored by older clients), live battles
+untouched.
+- **The report.** B6's smoke test of the merged build (suite b63-1, `battles` D1, 2026-10-23 10:05-10:22): the joined
+  player's month load stopped on the game's box "The outbreak of war cancels the disarmament treaty!" (a
+  `TMessageForm`): `TfrmBuildCamp.CancelTreaty` 0xd30b88 called by `UpdateUIValues` 0xc80828 (`SetPlayerNation`'s
+  refresh) with nation 1's own war counter 2, after the host's game had made a treaty in that month (host log
+  "relations v2: CreateArmsControlTreaty runs without the pairs of nation(s) 1"; the host's own counter -6..-70).
+- **The game (static, 1.01.44; the facts in [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-disarmament-treaty-and-the-submarine-ban)).**
+  - The treaty is campaign-wide: `TfrmBuildCamp` fields in `[General]` (TreatyTimeRemaining +0x4a5b, the displacement
+    and calibre limits +0x4a53/+0x4a57, TreatyTonnageBasePercentage +0x4a5f), each nation's TreatyTonnageLimit +0x20e,
+    and the submarine ban SubBanTime +0xa63. `GetTreatyLimit` 0xd023fc, `GetCalibreLimit` 0xd254a0,
+    `CheckAllowableTreatyBuild` 0xc76e58 and `CheckTreatyTonnageLimit` 0xc76800 apply them to every nation, with no
+    exemption for a nation at war; `ReduceTimeLimits` counts down and cuts the player's funding under a treaty.
+  - `CancelTreaty`: `cmp [ebx+0x4a5b],0; jle` -> the box only while months remain (`ShowMessagePos` 0xa07124), then
+    months 0, both limits 0x7fffffff, the treaty label "-", SubBanTime 0. Callers: `UpdateUIValues` (0xc807ba: `call
+    0xccd5fc` = War > 0 -> "At war for N months.", 0xc80828 `call CancelTreaty`, then DisplacementLimit +0x17d and
+    BuildConstraint +0x2ae of nations 0..8 zeroed) and `CheckAITensionEvents` (0xd2e691, right after "War has broken out
+    between X and Y!"). So in single player any war's outbreak ends the treaty for everyone: the player's at the next
+    screen refresh, with the box once (later refreshes find no months left), two computer nations' at once.
+  - `CreateArmsControlTreaty(aChance)` 0xcb6bf0 starts with `AnyNationIsAtAIWar` 0xd30b58 (`IsAtAIWar` 0xc68ecc:
+    AITension[1..8] > 40, false for PlayerNation): a war between two of nations 1..8 ends the conference with "With a war
+    already in progress, the conference ends in solemn declarations and no action."
+- **The cause** (two 0.5.0 pieces, no 0.6.0 change in the path):
+  - *B1:* `LoadCampaign` puts the joined nation's own war counter in `War` and then calls `SetPlayerNation` ->
+    `RefreshUI` -> `UpdateUIValues`; at war that is `CancelTreaty` on the host's copy: the box while the host's treaty
+    has months, and the treaty ended on that PC only (a client never sends `[General]` back). The next month brings the
+    host's treaty again: the box at every month load while the war lasts (and in the battle slot, which gets the
+    nation's counter too), and the joined player's copy without the treaty's limits the host still applies.
+  - *B2:* the relations mask makes the joined nation's pairs neutral (tension 5) while `CreateArmsControlTreaty` runs,
+    so its first test missed the nation's war with a computer nation and the conference went ahead during the war
+    (b63-1).
+- **0.5.0 has it** (static; not run live on 0.5.0): `git show v0.5.0:src/mod/game.cpp` has the same counter swap before
+  `SetPlayerNation` (lines 3101-3103, "war counter: %d (the host's nation) -> %d (nation %d's own)") and the mask entry
+  for `CreateArmsControlTreaty` (line 4023); the client takes `kwar` (v0.5.0 session.cpp 3010). Any 0.5.0 session in
+  which a treaty is in force while a joined nation under the player's rules is at war shows the box every month. Before
+  0.5.0 the joined PC used the host's counter: the box came at most once, with the host's own war, which the host's
+  game ended too.
+- **Design: the joined nation's war counts as the player's** (variant A). In single player no nation at war is bound by
+  the treaty: every war's outbreak ends it for everyone, once. So the host ends the treaty and the submarine ban once
+  (the game's `CancelTreaty`, months set to 0 first so that its box stays off the host's screen) when it is at peace
+  itself and a joined nation's own war counter is above 0; the nation's player gets the game's sentence in the turn
+  report (`econnews`, as the box's place), everyone a chat line. The joined PC ends its copy the same way (without the
+  box) at its first screen refresh at war, but only when the month's header says the host applies the rule
+  (`armstreaty=1`): a war that its relation turn starts at the beginning of a month frees the nation at once, as the
+  player's war does at the refresh after the end of turn in single player, and the host ends it right after
+  (`KWarFollow` of the relation turn), so both copies agree. With an older host the joined PC keeps the host's treaty
+  quietly. Rejected: variant B (the treaty stays and the joined PC keeps it quietly), which would bind a nation at war,
+  and the host's player and the computer's nations with it, under a treaty, which the game never does. The host's own
+  wars stay the game's (its box at the screen's refresh). The conference sees the joined nations' wars (variant A's
+  other half: a war in progress, no treaty).
+- **Changes.**
+  - `session.cpp`: `HostArmsTreatyCheck(why)`, called at the end of `KWarFollow` (the relation turn's, the peace's and
+    the month's step) and at the start of `BroadcastState` (also a resent month, a campaign hosted again): host at peace
+    (`game::WarCounter() <= 0`), a joined nation with `g_kWar` > 0, the treaty or the ban in force ->
+    `game::EndArmsTreatyForWar()`, log `arms treaty: the war of nation(s) 1 ends the disarmament treaty (34 month(s)
+    left, 15000 t, 12 in; submarine ban 0) (the month)`; while months remained, `g_kTreatyNews[K]` -> `econnews` (log
+    `arms treaty: the turn report line of nation 1 goes with state seq N`) and chat `* The outbreak of war cancels the
+    disarmament treaty! (Germany at war)`. `hookcb::JoinedPlayerPC()`. `SendStateTo`: header `armstreaty=1`; the
+    client: `game::SetHostEndsArmsTreaty` (cleared by `Leave`).
+  - `game.cpp`: a MinHook hook on `CancelTreaty` (`d_CancelTreaty`/`CB_KeepArmsTreaty`): on a joined player's PC with
+    the host's rule the game's end without the box (log `arms treaty: ended on this PC for its nation's war, as the host
+    ends it (35 month(s) left, submarine ban 0; war counter 1)`), without it skipped (log `arms treaty: CancelTreaty left
+    to the host (a joined player's PC, an older host; ...)` when the state changes), and skipped on the host while a
+    view puts another war counter in place (`EventActive`). `MaskedCall`: for `CreateArmsControlTreaty`,
+    `AIMaskShowWars` (replaced at the merge with B5 round 4 by its `TreatyWarsEnter`, below) puts the real tension
+    back into the masked pairs at war while it runs and `AIMaskHideWars` masks
+    them again (log `relations v2: CreateArmsControlTreaty sees the war(s) 1-3 of the nations under the player's rules
+    (a war in progress)`). Install log `Disarmament treaty with joined nations' wars: ok (cancel=... conference=...
+    masked=1)`.
+  - Bridge `armstreaty` (read: months, limits, ban, war counter, host, kept, endedhere, ends, last) and TEST `armstreaty
+    set <months> [<disp> <cal>]` (every nation's TreatyTonnageLimit MaxInt: a first try with the fixture's 0 made the
+    host's pre-turn check refuse the Turn, "Due to treaty build restrictions, we can have a maximum of 21,000 tons of
+    warships building"), `armstreaty war <n>`, `armstreaty host <0|1>`, async `armstreaty refresh` and `armstreaty
+    conference <chance>`.
+  - Suite: scenario `arms_treaty` (groups default and `relations`, after `relations_peace`; docs/TESTING.md).
+- **Live proof** (1900 fixture, nation 1 Germany vs Russia; dist_ft_2: RTW3MP 60CA9521CEB1DED1 before the joined PC's own
+  end, dist_ft_3: 78674E49E28D922D, the committed code):
+  - dist_ft_3 `--only relations_peace,arms_treaty` (11:33-11:36): 110/110 (session 17, relations_peace 33, arms_treaty
+    with its month checks). The client's lines: `CancelTreaty left to the host (a joined player's PC, an older host;
+    treaty 35 month(s) ...; war counter 1)` (TEST host 0), `ended on this PC for its nation's war, as the host ends it
+    (35 month(s) left ...)` (host 1), and in M2's battle slot (B6's request, loaded before the host's month-end step)
+    `ended on this PC ... (34 month(s) left ...; war counter 1)` without a box; the host's `the war of nation(s) 1 ends
+    the disarmament treaty (34 month(s) left ...) (the month)` and `CreateArmsControlTreaty sees the war(s) 1-3`.
+  - dist_ft_2 `--only arms_treaty` (11:09-11:11): every behaviour as designed; 2 FAILs of a too wide box filter (it
+    counted the turn report's line as a box), fixed. `--only relations_peace,arms_treaty` (11:21-11:24): session 17/17,
+    relations_peace 33/33, arms_treaty 58/59 (the one FAIL is a month check, below).
+  - The checks (dist_ft_2 runs; dist_ft_3 the same with c) split as above): a) the host's own war under a treaty
+    (`armstreaty set 24`, `war 1`, `refresh`): the game's box on the host, the treaty ended there, nothing left to
+    anyone (unchanged). b) a 36-month treaty reaches the client at peace (both 35, 15000 t, 12 in). c) war 1-3: on
+    dist_ft_2 the client's refresh at war kept it (35 months, no box); M2: one host end (34 months left), both copies 0
+    months and no limits, no `TMessageForm` box on either copy, chat line, the client's turn report "Gain 130 VP for
+    blockade of enemy | The outbreak of war cancels the disarmament treaty!". d) the conference at war: "sees the
+    war(s) 1-3", the picture message "With a war already in progress, the conference ends in solemn declarations and no
+    action.", no treaty. e) M3, M4: the client's loads at war counter 3 and 4, no box, no second end. Peace at the end.
+  - dist_ft_2 `--only battles,relations_peace,arms_treaty` (11:12-11:20): battles 86/86 (D1 included; the game made no
+    treaty this time); relations_peace aborted at its month by a tactical battle of the host, at war with France (the
+    stand-in nation 2, computer's rules) since battles' month C ("War has broken out between Great Britain and France",
+    the game's own): unrelated, the next runs passed. Game open 271 + 132 + 471 + 167 + 175 = 1216 s in five runs.
+- **Notes.** The month check "client save [IntelReports] has no empty or repeated entries" failed in arms_treaty M3: the
+  client's own intelligence check of M2 ("spy event, 2 new reports") made the same report twice; the list check of M2
+  already allows that ("a repeat among its own monthly check's new reports"), the save check doesn't. Unrelated to the
+  treaty (0.4.1's per-player intelligence); left for its owner. `UpdateUIValues` at war also zeroes every nation's
+  DisplacementLimit and BuildConstraint on the joined PC (B1's behaviour, unchanged: the nation's own go back with its
+  turn, as the player's own would in single player).
+- **Merge with B5 round 4 (int-060, 2026-10-23).** B5 round 4 (f) fixed the same cause on its branch (B2's mask hid a
+  joined nation's war from `CreateArmsControlTreaty`; battles B1: a treaty during nation 1's war scrapped its ships under
+  construction, +1,382, and cut its BudgetModifier by 2). One implementation of each part after the merge:
+  - The conference sees the joined nations' wars through B5's `TreatyWarsEnter`/`TreatyWarsLeave` in `MaskedCall` (only
+    cells the mask holds at 5 are shown, also nested in `CheckAllyTrouble`'s mask; TEST `econtreaty <chance> blind`);
+    `AIMaskShowWars`/`AIMaskHideWars` are gone. Log `relations v2: the arms-control conference (CreateArmsControlTreaty)
+    sees the war(s) of the nations people play: 1-3 3-1 (...)`.
+  - The end for a war stays this fix's: the host ends a treaty in force once (`EndArmsTreatyForWar`), no box on any month
+    load, `armstreaty=1` to the clients. B5's TEST cancels (`econtreaty cancel`, `blind`'s cancel at once) now call
+    `EndArmsTreatyForWar` too (the game's original `CancelTreaty`, so also on a joined PC), and B5's month-end conference
+    (`econtreaty <chance>`) runs `TestArmsConference`, the call `armstreaty conference` makes.
+  - B5's money record of a treaty (`econ` treaty=, treatyBM=, conference=; `economy::TreatyBefore`/`TreatyAfter`) is
+    unchanged; a treaty is signed only at peace now.
+  - One suite scenario `arms_treaty` (4 months, group `relations` after `war_effects`, EST 150 s): a) the host's own war
+    as before; b) M1 at peace the game's conference at the month's end (`econtreaty 100`) makes a treaty, its money for
+    nation 1 in the record and the money check, the same treaty on both copies (its tonnage limits then lifted with
+    `armstreaty set`); c) war 1-J, the client's refresh with an older host's rule and with this host's, M2 the host's
+    end once; d) M3 the conference at the month's end during the war: "With a war already in progress", conference=1
+    treaty=0 treatyBM=0; e) M4 no box, no second end. Both war months of B5's version (M1 war, M2 `blind`) are folded
+    in (B5's M2 reproduced the failure, the record is now checked with a treaty signed at peace). The suite's
+    `treaty_guard` is off while the scenario keeps its treaty (`ctx.keep_treaty`).
+  - Live (dist_int060_2, RTW3MP EB12731EA74602CD; 13:05-13:19, game open 823 s): `--only session,relations_peace,
+    war_effects,arms_treaty,battle_generator,battle_surprise,battles,lockstep_month` 417/420: session, battles (D1
+    included), relations_peace, arms_treaty (b: 0 -> 132 months, 15000 t, 10 in; nation 1 `econ` conference=1 treaty=+0
+    treatyBM=-2: none of its ships under construction was over the limits in Jul 1901, B5's runs measured +1,363 and
+    +546 with the same record; M2 `the war of nation(s) 1 ends the disarmament treaty (131 month(s) left ...)`; d) `sees
+    the war(s) ... 1-3 3-1` and the game's message), battle_generator, battle_surprise and lockstep_month all PASS; no
+    game error box on either copy. war_effects 66/69: M2 "host intel list/save [IntelReports] has no repeated
+    entries" (the host's own monthly intelligence gave "Intelligence report France: Our 7 in guns are superior ..."
+    twice in its turn report; the mod's clean-up removed it at the next turn, `intel reports: 11 entries -> 9`; the
+    known repeat of the game's intelligence, not the merge) and M2 (c) "the host shows no dialog for it" (a false
+    positive: the host's turn report line "Research breakthrough: Submarines, Early coastal submarine, ..." matched the
+    box filter; the frame's lines, "Trade war this month: ..." and the client's 10 messages were there).
+  - Suite fix after the merge: war_effects M2 (c) reads a host box line by line (`sea_war_box_lines`: a turn report
+    joins its lines with " | ") and skips the host's research lines ("Our scientists ...", "Research breakthrough:
+    ..."); regression_selftest checks it with that run's turn report (122/122).
+
+## Testing 2026-10-23: the 0.6.0 release candidate dist_rc060_1 (v0.6.0)
+The release candidate dist_rc060_1 (int-060 20eb23a: 0.6.0, live-battle engine 17, protocol 3; RTW3MP.dll SHA-256
+C36D487D01CD10AC..., version.dll 157EE071C3133102...) on the reg-060 runner, installed from its frozen snapshot (`--dist`),
+the released 0.5.0 (dist_rc050_2) put back after every run; slots 1 and 9 and the Preferences identical to their backup
+after every run (hash; the backup equal to the one taken before the 0.5.0 candidates' runs), no copy or delay proxy left.
+- **Runs.** The default run 1061/1063 (2140 s with the game open): every 0.6.0 scenario passed (`war_effects` 69/69,
+  `arms_treaty` 62/62, `battle_generator` 45/45, `battle_surprise` 37/37) and every live-battle one; its two fails are
+  `relations_peace` b)/d) (suite, below). `--stress` 1383/1395 (5943 s): `battles` 119/119, `battle_generator` 68/68,
+  `lockstep_month` long 79/79, `twopc` full 83/83, `lockstep_rejoin` 53/53, `lockstep_torpedo` 19/19, `lockstep_strike`
+  21/21; its fails are suite issues and battle conditions (below). `--group relations` twice: 287/287 (478 s), then
+  261/264 (477 s) with the client's SaveBuildCampaign box (below). No other game error box in any run.
+- **NO-GO: the client's "Error in SaveBuildCampaign procedure! Access violation at address 00C2B9D4 in module 'RTW3.exe'.
+  Read of address 00000029"** in the second `--group relations` run (15:57:38), at `arms_treaty`'s M2 submit: the
+  client had just run c) (TEST `armstreaty` host 0 and 1 with a refresh at war: "arms treaty: CancelTreaty left to the
+  host ...", then "arms treaty: ended on this PC for its nation's war, as the host ends it (276 month(s) left ...)", its
+  war counter 1 -> 0 by the test), the turn checks at war, then the submit's save. RVA 0xB9D0 is `@UStrAddRef` (`mov edx,
+  [eax-8]` with eax = 0x31): the save copied a string whose pointer was 0x31. B5 round 4's run_g1 (dist_b54_8) had the
+  same box at the same submit (00C25D4B, read 00000000) and one at `battle_generator`'s start (00C2751B, read 18740127);
+  no 0.4.x or 0.5.0 run had one, and the client never joined another campaign (the 0.3.3 trigger). Heap or string
+  corruption on the joined player's PC in a 0.6.0 path before that save (`war_effects`' and `arms_treaty`'s client parts
+  are the suspects); the box stops nothing (the turn went in), but per the release rule it is a NO-GO until
+  investigated. Both logs of the run are kept with the developers' session files (`r60\rel2_*`).
+- **The repeated intelligence report is the game's** (open since 0.4.1 RC2). From the live image (RVAs): the host's
+  monthly check `CheckIntelligence` (0x456244) calls `CheckIntelligenceForNation` (0x491288) once per nation (1..8 or
+  8..1, after a hit 60 % stop), which calls `SpySuccess(0, i)` (0x46c744) once (a second time only for a communist
+  player, 1 in 36). `SpySuccess`'s gun branch (0x46d704: the player's spying, Random(100) < 50) loops up to 11 times:
+  a calibre `Random(16) + 2` drawn with replacement, then "Our N in guns are superior to X guns of the same calibre."
+  (0x46d872) or "X N in guns have better performance than ours." (0x46d7d9) and a 40 % chance to go on. A calibre
+  drawn twice gives the same report twice in one call: the host's "Our 7 in guns are superior to French guns of the
+  same calibre." twice in the merge run, and a joined player's "spy event, 2 new reports" (one call of the game's
+  `CheckIntelligence` in its view) with both the same. No routine of the mod runs twice. Suite: the month checks allow
+  such a repeat on the host and in both saves (`GUN_REPORT_RE`, a NOTE).
+- **Suite issues, fixed** (re-run in the relations runs where they apply): `relations_peace` b)/d) after `treaty` h) in
+  the same month (the players' peace had handed ship 495 to France on the host; the client's copy, a month behind,
+  handed it to Russia; the host logged "skipped: not among nation 1's ships"): such a ship stays where the host has it
+  (`PEACE_SHIP_SKIPPED`); `victory_points` a) after the player's own peace in the month's relation turn zeroed nation
+  1's VP (`vp_shown_ok`, `--stress` only); `war_effects` without a ship under construction (a `SKIP-note`) and with an
+  old ship of J commissioned in M1 (the newest ship now); `lockstep_resume` i) counting the re-sent month's "already
+  rolled" (`session_again` waits for that roll). `ls_start_test` ends at once with the game's box when its `pocbattle`
+  gives no battle.
+- **Battle conditions (`--stress`, not re-run: the candidate was stopped):** "Enemy unable to challenge our forces in the
+  area! Gain 102405 VP!" at `lockstep_limits`' and `lockstep_stress` f)'s test battle after a chain of test battles
+  (the message's VP = the form's +0x32fd + 5, RVA 0x3b70bc; seen on 2026-10-17 too); `lockstep_missiles` in a battle whose
+  sides never sighted each other (the game's end at minute 500), 11/18.
+- **Not run on this candidate:** `--stress --only lockstep_month` (its long variant passed inside the `--stress` run,
+  79/79), the re-runs of the battle conditions and the mixed versions (the driver `mixed_060.py`, cases a and b, is in
+  the developers' session files: TESTING.md, Mixed versions).
+- Game open 2140 + 5943 + 478 + 477 = 9038 s. Suite commits on reg-060: 447cb09, b137fbb, 0392dc5, f6bf03c, 0e51b7a.
+
+## Fix 2026-10-23: the joined player's SaveBuildCampaign access violation (0.6.0)
+The release candidate dist_rc060_1 stopped at the joined player's "Error in SaveBuildCampaign procedure! Access
+violation at address 00C2B9D4 ... Read of address 00000029" ([the 0.6.0 release candidate
+dist_rc060_1](#testing-2026-10-23-the-060-release-candidate-dist_rc060_1-v060)). Branch fix-av from int-060 13b33de.
+- **Where it came from.** `SaveBuildCampaign` writes `BattleAreaName` and `BattlePossessionName` (0xc8ee5d-0xc8eecf):
+  `mov eax, [esi+0x4a3b]` (`BattleArea`, a `TMapArea`) or `[esi+0x4a36]` (`BattlePossession`, a `TPossession`), then
+  `mov eax, [eax+0x54]` (`Name`), `push eax` and its "Ident=Value" writer 0xab6bc8, whose prologue `_UStrAddRef`s the
+  value (0x83b9d0: `mov edx, [eax-8]`, the faulting 0x83b9d4 = RVA 0xB9D4; `'XXX'` when the field is nil). The two
+  fields are set by `DoBattle` (0xcb3b9a/0xcb3bb9). The battle screen's close (`TfrmMain.FormClose` 0xdcd9e4) clears
+  the possession, nothing clears the area (`DoStrategicTurn` 0xce19fb reads it for "You may retire the CO <area>, ..."
+  while `RetireAdmiral` +0x9ed is set, and on Yes writes `BattleArea.AreaCommander` +0x178). `LoadBuildCampaign`
+  frees every map area with its possessions (`LoadAndDisplayMap` -> `LoadMapData` 0xce7248 -> `ClearMapData`, then a
+  new `TMapArea` per area; possessions live in `TMapArea.Possessions` +0x84) but sets the two fields from `[BATTLE
+  INFO]` only for a save with a battle in progress (0xc9ad91: ScenarioInProgress or `BattleIndex` > -1, else `jle
+  0xc9aea3` past them; `InvasionTarget`/`EnemyInvasionTarget` are set on every load, 0xc9ab49/0xc9ab5d). So after a
+  battle and any load both point at freed objects, and the next save reads `Name` from whatever the memory manager
+  put there. A `TPossession` is 3420 bytes, a medium block that is coalesced and reused for anything; a `TMapArea` (392
+  bytes) is mostly reused by the next load's areas in the same order. The forms of the box: a `Name` slot holding the
+  characters of a string "1" (0x00000031: the RC's read of 0x29) or "00" (0x00300030: the 0.3.3 read of 0x00300028),
+  "Integer overflow" (the line's concatenation `_UStrCatN` 0x83c71c met a garbage length: the game's own code has no
+  overflow checks, no `jno`/`into` in the image, so the RTL's length check raised it), and FastMM's `FreeMem` (0x835d4b,
+  header 0) or `System.Move` (0x83751b) in B5's run_g1.
+- **The experiment** (the same build, RTW3MP_TEST_KEEPBATTLEPTRS=1 = the game's behaviour, with RTW3MP_DIAG: the
+  pointers and their `Name` before every save and after every load), `--only war_effects,arms_treaty`: the client kept
+  them across 23 loads, the host across 9. One `BattlePossession` pointer 0F43EF00 read "East Prussia" (the battle's)
+  before a save, then "Liaotung Peninsula", "Sakhalin", "Annam" after three loads (each load built another possession
+  in the freed block); another, 10320330: "East Prussia" -> "Northern Korea" -> "Weihaiwei", the name its next save
+  wrote; 11CCFA70: "Finland" -> "British Columbia" -> "Maine" -> "Sakhalin". `BattleArea` 07E71920 kept "The Baltic"
+  (its block reused by the same area); the host's "Northern Europe". No box in that run: it needs a block reused by
+  something other than a possession. With the fix (RTW3MP_DIAG only): "load: the last battle's area The Baltic and
+  possession Eastern Germany cleared (...)" 7 times on the client and 2 on the host; only a live battle's load
+  (ScenarioInProgress) set them again, from its save ("Northern Europe", "United Kingdom"); 155/156 (the one FAIL is the
+  client's own intelligence repeat in its save, open since 0.4.1), no box.
+- **Why 0.6.0** (an inference from the code and the experiment). The stale pointers are as old as the mod's reloads; 0.6.0's battles for joined nations (home waters,
+  possessions, missions, B6) fight and decline battles at possessions on the joined player's PC, and a declined or
+  avoided battle never opens the battle screen whose close clears the possession: `BattlePossession` stayed set
+  through the slot 87/77 reloads. In earlier versions the client's battles came from the computer's generator, mostly
+  without a possession, and a stale `BattleArea` was mostly reused by the same area.
+- **Not the treaty.** `CancelTreaty` (0xd30b88) writes integers, the label's caption ('-', `TControl.SetText`
+  0x981ca0) and `FHint` (+0x90, `_UStrClr`); the treaty's `[General]` keys are integers (0xc8e781-0xc8e820). Its timing
+  in `arms_treaty` c) was the timing of the battles and reloads before M2; the client-side end stays as designed. The B5
+  path (`econtreaty cancel`, `blind`) calls the same routine: the same. The B6 occurrence at `battle_generator`'s start
+  in B5's run_g1 and dist_av_1's "Integer overflow" at `battle_generator`'s M1 submit (16:24:30, run2) are the same
+  stale `Name` reads. The 0.4.1 k2 "Error in AdjustForcesForBattle" box (`@UStrAsg`) may be the same pointers too:
+  the battle setup reads `BattleArea` (`IsHomeArea` 0xbe3f0b) and `BattlePossession` (`DoPlayerDecline` 0xbe4066) (a
+  guess; not reproduced).
+- **The fix** (`game.cpp`, the `LoadBuildCampaign` hook): every load starts with both fields nil, the state
+  `FormCreate` leaves; the load sets them again for a battle in progress; a failed load gets back those that still
+  belong to the campaign in memory. The joined player's PC, the host and the 0.3.3 case (another campaign loaded in
+  the same process) take the same path. Log: "The last battle's area across a load: ok" at the start, "load: the last
+  battle's area X and possession Y cleared (the load sets them again only for a battle in progress)". TEST ONLY:
+  RTW3MP_TEST_KEEPBATTLEPTRS=1.
+- **Diagnosis tools kept** (no effect without the variable): RTW3MP_DIAG's exception handler logs an access violation,
+  integer overflow or division error in the game's code with the registers, the objects they point to (class, 16
+  dwords) and the game's return addresses on the stack (RVAs), Delphi exceptions with their class, and no longer counts
+  the mod's own guarded reads; `pocHeapCheck` (`dl::HeapCheck`) walks frmBuildCamp and the air unit list through RTTI
+  (fields, records, static and dynamic arrays, `TList` and `TStringList` entries; components not entered): every
+  UnicodeString valid, every reference a live object (a freed block starts with the memory manager's link), about 4700
+  objects and 14 500 strings in 16 ms, before every save and after every load. Bridge: `pocheapcheck`, `battleptrs`
+  (read only). Suite: `battle_area_month_check` in `month_checks` (the client holds neither after the month).
+- **Proof** (dist_av_4 = 6bbca05, RTW3MP 69410DC1EA40B9F8, no test variables; game open 1908 s): `--only arms_treaty`
+  five times 83/83, 83/83, 83/83, 82/83, 83/83 (the FAIL: the client's own intelligence repeat in its M2 save, open
+  since 0.4.1); `--group relations` twice 302/302 (497 s) and 276/276 (410 s); `--only
+  war_effects,arms_treaty,battle_generator` 229/229 (343 s). No game error box on either copy, the treaty the same on
+  both copies at every step of `arms_treaty` (its checks), the client's loads cleared the last battle's area and
+  possession 1-11 times a run, and `battle_area_month_check` passed after every month. Before the fix, with the
+  diagnosis on, the box itself came once in three runs: "... Integer overflow" at `battle_generator`'s M1 submit
+  (dist_av_1, `--group relations`), as in the release candidate's second `--group relations` run and B5's run_g1.
+
+## Testing 2026-10-23: the 0.6.0 release candidate 2 dist_rc060_2 (v0.6.0)
+The release candidate dist_rc060_2 (int-060 d0964a3: 0.6.0, live-battle engine 17, protocol 3; RTW3MP.dll SHA-256
+616282C8173AD39A..., version.dll 04CABEAB6A3BB44E...) on the reg-060b runner, installed from its frozen snapshot (`--dist`),
+the released 0.5.0 (dist_rc050_2) put back after every run; slots 1 and 9 and the Preferences identical to their backup
+after every run (hash), no game folder copy, delay proxy or `RTW3.exe` left.
+- **Runs.** The default run 1122/1126 (2083 s with the game open): its fails are `battle_surprise` b) (three lines: the
+  game's takeover step, below) and `lockstep_pvp` f) (suite, below). `--stress`: a first run stopped at `lockstep` after
+  1010 s (suite: `player_copy`, below); the second whole run 1427/1431 (6778 s); its four fails (`lockstep_stress` f),
+  `air_units` M2 and e), `lockstep_missiles` e)) are battle and game conditions: `--stress --only
+  lockstep_stress,air_units,lockstep_missiles` gave 33/37 (868 s: `lockstep_stress` S8, below) and then 176/176 (1727 s).
+  `--group relations` twice: 301/301 (497 s) and 302/302 (663 s). `--stress --only lockstep_month`: 99/99 (398 s).
+- **No SaveBuildCampaign box, and no other game error box, in any run** (the runner's `game_error_boxes`, both logs):
+  the per-month check that the client holds no last battle's area or possession passed every month, and the client's
+  log has "load: the last battle's area ... cleared" at the loads after its battles (10 and 11 in the relations runs).
+- **The old trigger, run** (the joined player's first save after a join on another campaign in the same process, 0.3.3's
+  `air_units` and dist_vp_2's `lockstep_air` start; the fix entry above marked it fixed without running it): the driver
+  `other_campaign.py` (developers' session files `r62`, the reg-060b runner's helpers). The client's game loads slot 9
+  (the 1935 campaign) on its own, joins a session on it (France), fights a live battle there (`pocbattle 2 0`: both
+  games hold its area, "Northern Europe", and no possession), goes back to slot 77 (a load: area 0), then the host moves
+  to slot 1 (1900) and the same client process joins it as nation 1: `battleptrs` area=0 poss=0, `pocheapcheck` bad=0
+  (4714 objects), two months submitted (the client's SaveBuildCampaign) and merged, no game error box, no
+  SaveBuildCampaign or access violation line in either log: 35/35 (91 s; the first run's 34/35 expected a possession
+  for a battle that has none: driver). The control with `RTW3MP_TEST_KEEPBATTLEPTRS=1` (the game's own load): the area
+  pointer 07C90260 survived the return load and the move to the 1900 campaign, its freed block re-allocated for the 1900
+  campaign's own "Northern Europe" (so `pocheapcheck` called it "of this campaign"); no save was made there (9/10, 54 s:
+  the control's STALE expectation was too narrow). The flow is practical: fixed, as the fix entry said.
+- **Mixed versions** (`mixed_060.py`, a folder copy with 0.5.0 outside the Steam library, deleted after each case):
+  a) a 0.6.0 host with a 0.5.0 player: 66/66 (261 s): the join ("battle generator 0"), the player's relation rules, B5's
+  blockade and its message on the 0.5.0 PC, no B6 for its nation, a battle it declined resolved by the game on the host,
+  the host's battle against it **fought live** (514 minutes equal, no DESYNC, agreed end), peace and a normal month.
+  b) a 0.5.0 host with a 0.6.0 player: 54/55 (421 s), then 55/55 (354 s) with the driver's pattern fixed (its bare
+  `surprise` matched B6 round 3's battle-slot state lines, which every 0.6.0 PC logs): hostgen=0, no allies' war help,
+  building for war or surprise moves, a declined battle going alone, the host's battle **fought live** (575 and 436
+  minutes equal, no DESYNC, agreed ends). TESTING.md, Mixed versions.
+- **Suite issues, fixed and run again** (TESTING.md, Known traps): the client save's repeat of what its own monthly
+  check repeated the month before (the host sends the player's reports back: dist_av_4's `arms_treaty` M2, and live in
+  this candidate's first relations run: "Sep 1901  Spain - The Spanish navy is reportedly doing a lot of night
+  training." three times, so not only the gun comparison repeats; `saved_own_repeat`, a NOTE with the texts); B5's
+  blockade points in a war between two players' nations (`victory points: nation G +v (blockade, in its war with nation
+  L) -> t, war score 1-2 x:y`) in `lockstep_pvp` f) and `treaty` k) (`WAR_VP_CREDIT_RE`, `war_score_steps`); `battles` b)
+  when the fought battle is the player's generator's request ("..., 4 attempt(s), fought by Captain": `battle_area`);
+  `player_copy` f) with the war `battle_surprise` leaves in the copy (its month's battle preview stopped the first
+  `--stress` run: peace in the copy first); `battle_surprise` b) without the game's takeover step (a `SKIP-note`).
+- **Battle and game conditions** (each passed when run again): `battle_surprise` b) (CheckForWar's landing/takeover step
+  runs in 50 %, with the trait 95 %); `air_units` M2 (the 1935 campaign's arms-control conference bound the host to
+  scrap 141,500 tons: the game refuses its Turn); `lockstep_stress` f) (the last hash line after the game's own end, the
+  state equal but rng 3 draws apart); `lockstep_stress` S8 (the drop met a `#32770` box on the client: it never came
+  back); `lockstep_missiles` e) (held ships of side 0 lost SSM in the approach, as on dist_rc060_1; the missile code is
+  unchanged since 0.5.0: watch it).
+- **Verdict: GO** for publishing 0.6.0 with exactly dist_rc060_2: no product issue; the SaveBuildCampaign box of
+  dist_rc060_1 did not recur in any run (default, `--stress`, both relations runs, the old trigger), the mixed versions
+  fight live in both directions, every fail was the suite's or a battle or game condition that passed when run again.
+- Game open 2083 + 1006 + 6778 + 868 + 1727 + 497 + 663 + 398 + 261 + 421 + 354 + 91 + 91 + 54 = 15292 s. Suite commits
+  on reg-060b: 8ca6425, a268b03 and this entry's.

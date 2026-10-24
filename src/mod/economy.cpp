@@ -45,7 +45,9 @@
 // GGP rules (R2/R4 read the host's ParliamentDelay) and GetModifiedBudget's x 0.97 (the host's war counter). The computer
 // still develops aircraft prototypes and licences for K (K's own aircraft requests stay on K's PC and are not carried),
 // gives K's new carriers air groups at launch (AdjustShipValuesUponLaunch), and keeps CheckForRevolutionInEnemyNation and
-// WarHelpFromAllies for K (war effects, later work).
+// WarHelpFromAllies for K (war effects, later work). The arms-control conference (CreateArmsControlTreaty, a rule every
+// nation shares) is measured for K's record (0.6.0: TreatyBefore/TreatyAfter from game.cpp's mask, `treaty=`): a treaty
+// scraps K's ships under construction over its limits with their scrap value and cuts its BudgetModifier by 2.
 //
 // Each rule is found by its routine's RTTI name and its instruction bytes (field offsets from RTTI), unique in the routine;
 // a rule whose code does not match stays the game's (the reproduced routines: their code as expected, their texts found).
@@ -182,6 +184,10 @@ struct Month {
     int spyFunds = 0;     // what the left-out spy findings would have paid
     int warStarts = 0, warGame = 0, warPlayer = 0;  // the host's wars with K: the computer's BM increments, the player's
     int shared = 0;       // AdvanceShipConstruction's change of Funds (rules every nation shares: delays, the reclaim)
+    // The arms-control conference after ComputeExpenses (CreateArmsControlTreaty, a rule every nation shares): its change of
+    // Funds (the scrap value of K's ships under construction over the treaty's limits) and BudgetModifier (-2 at the
+    // signing), and how often it ran (TreatyBefore/TreatyAfter, from game.cpp's mask)
+    int treatyFunds = 0, treatyBM = 0, treatyRuns = 0;
     // The player's rules after ComputeExpenses (CheckPlayerFunds, CheckTurnEvents)
     bool rules = false;   // they ran for K
     int kwar = 0;         // K's war counter they saw
@@ -253,9 +259,13 @@ std::string Line(int K, const Month& r) {
     snprintf(b, sizeof(b), "; treaty cut %d; army offensive %d month(s) (budget -%d), ParliamentDelay %d; ", r.n[rTreatyCut],
              r.kao, r.aoCut, r.kpd);
     s += b;
+    if (r.treatyRuns) {
+        snprintf(b, sizeof(b), "arms-control conference %d (funds %+d, BM %+d); ", r.treatyRuns, r.treatyFunds, r.treatyBM);
+        s += b;
+    }
     if (r.ended && r.expenses)
         snprintf(b, sizeof(b), "month's end funds %d (other changes %+d); ", r.fundsEnd,
-                 r.fundsEnd - r.fundsAfter - r.ruleFunds);
+                 r.fundsEnd - r.fundsAfter - r.ruleFunds - r.treatyFunds);
     else
         snprintf(b, sizeof(b), "month's end funds %s; ", r.ended ? std::to_string(r.fundsEnd).c_str() : "unknown");
     s += b;
@@ -593,7 +603,38 @@ void __stdcall WarStartsCB(void* self, void* nation) {
     if (K) SafeWarStartsAfter(K, nation, bm0);
 }
 
+int g_testTreaty = 0;  // TEST ONLY (bridge `econtreaty <chance>`): the arms-control conference at the next month's end
+bool g_testTreatyBlind = false;  // ... `blind`: without B5's view of the joined nations' wars, the treaty cancelled at once
+
+// TEST ONLY: the arms-control conference (game::TestArmsConference: CreateArmsControlTreaty(chance) through its hooked
+// entry, so with game.cpp's mask and the measure below) at the month's end before K's funds are read: after
+// ComputeExpenses, as the game's conference event (CheckTurnEvents -> HandleEvent -> TdlgEventAnswer.Execute). Its dialogs
+// are the host player's. `blind` reproduces the conference before 0.6.0 (a joined nation's war hidden by the mask: a
+// treaty during its war, as in battles B1) and ends a treaty it made at once (game::EndArmsTreatyForWar: CancelTreaty
+// without its box), so the joined nation's PC gets none during its war.
+void TestConference() {
+    int chance = g_testTreaty;
+    bool blind = g_testTreatyBlind;
+    g_testTreaty = 0;
+    g_testTreatyBlind = false;
+    if (!game::ArmsTreatyAvailable()) {
+        Log("economy: TEST: the arms-control conference is unavailable");
+        return;
+    }
+    int t0 = game::ArmsTreatyNow().months;
+    Log("economy: TEST: the arms-control conference (CreateArmsControlTreaty %d%s) at the month's end; treaty months %d",
+        chance, blind ? ", blind to the joined nations' wars" : "", t0);
+    game::TestTreatyBlind(blind);
+    game::TestArmsConference(chance);
+    game::TestTreatyBlind(false);
+    int t1 = game::ArmsTreatyNow().months;
+    if (blind && t1 > 0) game::EndArmsTreatyForWar();
+    Log("economy: TEST: the arms-control conference ran: treaty months %d -> %d%s", t0, t1,
+        blind && t1 > 0 ? " (cancelled at once: blind)" : "");
+}
+
 void MonthEnd() {  // K's funds at the month's end, then the records
+    if (g_testTreaty > 0) TestConference();
     for (auto& e : g_cur) {
         void* n = e.first < game::NationCount() ? game::Nation(e.first) : nullptr;
         if (!n) continue;
@@ -609,6 +650,64 @@ void __stdcall MonthEndCB() {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
+
+// The arms-control conference (CreateArmsControlTreaty, from game.cpp's mask): how much it changed each joined nation's
+// Funds and BudgetModifier. A treaty scraps the ships under construction over its limits for every nation (ScrapShip
+// 0xca0690: Funds += GetScrapValue, the work done of Displacement / 25) and cuts every BudgetModifier by 2 (0xcb7aa2);
+// after ComputeExpenses this is part of K's month besides the player's rules (the 0.5.0 money check reads `treaty=`).
+int g_trFunds[9] = {}, g_trBM[9] = {};
+bool g_trHave[9] = {};
+
+}  // namespace
+
+void TreatyBefore() {
+    __try {
+        for (int K = 1; K <= 8; K++) {
+            g_trHave[K] = false;
+            if (fFunds < 0 || fBM < 0 || !hookcb::InSession() || !hookcb::IsHumanRemoteNation(K) ||
+                K >= game::NationCount())
+                continue;
+            if (void* n = game::Nation(K)) {
+                g_trFunds[K] = Field(n, fFunds);
+                g_trBM[K] = Field(n, fBM);
+                g_trHave[K] = true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+static void TreatyAfterK(int K, int df, int dbm) {
+    auto it = g_cur.find(K);
+    if (it != g_cur.end() && it->second.expenses && !it->second.ended && it->second.date == GameDate()) {
+        it->second.treatyRuns++;
+        it->second.treatyFunds += df;
+        it->second.treatyBM += dbm;
+        if (df || dbm)
+            Log("economy: nation %d: the arms-control conference changed its funds by %+d and its BudgetModifier by %+d "
+                "(after ComputeExpenses: in the month's record)", K, df, dbm);
+    } else if (df || dbm) {
+        Log("economy: nation %d: the arms-control conference changed its funds by %+d and its BudgetModifier by %+d "
+            "(no ComputeExpenses this month yet: part of the funds before it)", K, df, dbm);
+    }
+}
+
+static void TreatyAfterAll() {
+    for (int K = 1; K <= 8; K++) {
+        if (!g_trHave[K]) continue;
+        g_trHave[K] = false;
+        if (void* n = game::Nation(K)) TreatyAfterK(K, Field(n, fFunds) - g_trFunds[K], Field(n, fBM) - g_trBM[K]);
+    }
+}
+
+void TreatyAfter() {
+    __try {
+        TreatyAfterAll();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+namespace {
 
 // AdvanceShipConstruction (ReduceTimeLimits, after the date's step, before ComputeExpenses): how much the rules every
 // nation shares changed each joined nation's Funds (a construction delay pays the month's cost back, the hoarding reclaim
@@ -1821,8 +1920,11 @@ std::string RecordKV(const Month& r) {
              r.rules ? 1 : 0, r.kwar, r.debt, r.debtPrestige, r.morale ? 1 : 0, r.corruption, r.hoard, r.loan, r.complaint,
              r.complaintPrestige, r.budget, r.budgetBM, r.tension.empty() ? "-" : r.tension.c_str(), r.notice,
              r.n[rTreatyCut], r.ruleFunds, r.ruleBM, r.rulePrestige, r.news, r.kao, r.kpd, r.aoCut, r.ended ? 1 : 0,
-             r.fundsEnd, r.ended && r.expenses ? r.fundsEnd - r.fundsAfter - r.ruleFunds : 0, r.n[rASW], r.n[rTechPartner],
-             r.n[rShipBuyer], r.n[rAMC], r.n[rChina]);
+             r.fundsEnd, r.ended && r.expenses ? r.fundsEnd - r.fundsAfter - r.ruleFunds - r.treatyFunds : 0, r.n[rASW],
+             r.n[rTechPartner], r.n[rShipBuyer], r.n[rAMC], r.n[rChina]);
+    s += b;
+    // the arms-control conference after ComputeExpenses (a rule every nation shares; in the money check's sum)
+    snprintf(b, sizeof(b), " treaty=%d treatyBM=%d conference=%d", r.treatyFunds, r.treatyBM, r.treatyRuns);
     return s + b;
 }
 
@@ -1932,6 +2034,25 @@ std::string TestRandom(const std::vector<std::string>& args) {
     Log("economy: TEST econrand %d (the player's rules for joined nations draw %s)", g_testRandom,
         g_testRandom < 0 ? "the game's Random" : "min(v, n - 1)");
     return "ok econrand=" + std::to_string(g_testRandom);
+}
+
+std::string TestTreaty(const std::vector<std::string>& args) {
+    if (!game::ArmsTreatyAvailable()) return "error unavailable";
+    if (args.size() > 1 && args[1] == "cancel") {
+        // the game's CancelTreaty without its box (game::EndArmsTreatyForWar): its limits and caption reset
+        int t = game::ArmsTreatyNow().months;
+        game::EndArmsTreatyForWar();
+        Log("economy: TEST: the arms-control treaty cancelled (%d month(s) left, CancelTreaty without its box)", t);
+    } else if (args.size() > 1) {
+        g_testTreaty = std::max(0, std::min(100, atoi(args[1].c_str())));
+        g_testTreatyBlind = g_testTreaty > 0 && args.size() > 2 && args[2] == "blind";
+        Log("economy: TEST econtreaty %d%s (the arms-control conference at the next month's end: %s)", g_testTreaty,
+            g_testTreatyBlind ? " blind" : "", g_testTreaty ? "armed" : "off");
+    }
+    game::ArmsTreaty t = game::ArmsTreatyNow();
+    return "ok armed=" + std::to_string(g_testTreaty) + " blind=" + (g_testTreatyBlind ? "1" : "0") +
+           " months=" + std::to_string(t.months) + " limit=" + std::to_string(t.disp) +
+           " calibre=" + std::to_string(t.cal);
 }
 
 }  // namespace economy

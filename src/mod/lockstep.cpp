@@ -2414,6 +2414,9 @@ static void* EmitBlockThunk(int idx) {
 }
 
 static bool g_hooksTried = false, g_hooksOk = false;
+static bool g_showPicHooked = false;  // ShowPicMessage: also hooked alone for a text capture (BeginTextCapture)
+static int g_capture = 0;             // BeginTextCapture depth: picture messages are recorded, not shown
+static std::vector<std::wstring> g_captured;
 // The live-battle rules' hooks that are in place (each one optional: without it that rule is off, as in 0.3.x).
 static bool g_ruleAir = false, g_rulePlan = false, g_ruleMissile = false, g_rulePanel = false, g_ruleLandCap = false,
             g_ruleScout = false;
@@ -2433,6 +2436,23 @@ static bool HookOne(void* target, void* detour, void** orig, const char* name) {
 }
 
 static void* DialogForm(const char* cls);
+
+bool BeginTextCapture() {
+    if (!g_showPicHooked) {
+        if (!Resolve() || !E.mShowPic) return false;
+        g_showPicHooked = HookOne(E.mShowPic, (void*)&LS_dShowPic, &g_lsOrigShowPic, "ShowPicMessage");
+        if (!g_showPicHooked) return false;
+    }
+    g_capture++;
+    return true;
+}
+
+std::vector<std::wstring> EndTextCapture() {
+    if (g_capture > 0) g_capture--;
+    std::vector<std::wstring> out;
+    if (g_capture == 0) out.swap(g_captured);
+    return out;
+}
 
 bool EnsureHooks() {
     if (g_hooksTried) return g_hooksOk;
@@ -2502,7 +2522,8 @@ bool EnsureHooks() {
     }
     ok &= HookOne(E.startRun, (void*)&LS_dStartRun, &g_lsOrigStartRun, "StartRun");
     ok &= HookOne(E.msgDlg, (void*)&LS_dMsgDlg, &g_lsOrigMsgDlg, "MessageDlgPosHelp");
-    ok &= HookOne(E.mShowPic, (void*)&LS_dShowPic, &g_lsOrigShowPic, "ShowPicMessage");
+    if (!g_showPicHooked) g_showPicHooked = HookOne(E.mShowPic, (void*)&LS_dShowPic, &g_lsOrigShowPic, "ShowPicMessage");
+    ok &= g_showPicHooked;
     ok &= HookOne(E.mExecGeneral, (void*)&LS_dExecGeneral, &g_lsOrigExecGeneral, "ExecuteGeneral");
     // The live-battle rules for human sides: optional (a routine that was not found keeps 0.3.x's behaviour).
     g_ruleAir = HookOne(E.aiAirstrike, (void*)&LS_dAirStrike, &g_lsOrigAirstrike, "CheckAIAirstrike");
@@ -3587,6 +3608,7 @@ static std::string TypeFlagsHex() {  // "" if not found
     uint8_t b[3] = {*g_typeFlags[0], *g_typeFlags[1], *g_typeFlags[2]};
     return Hex(b, 3);
 }
+std::string ShipTypeFlags() { return TypeFlagsHex(); }
 static bool SetTypeFlagsHex(const std::string& h) {
     uint8_t b[3];
     if (h.size() != 6 || !ResolveTypeFlags() || !Unhex(h, b, 3)) return false;
@@ -7004,6 +7026,12 @@ extern "C" int __stdcall LS_MsgDlg(const wchar_t* msg, int type, int buttons, co
 }
 
 extern "C" int __stdcall LS_ShowPic(const wchar_t* text, const wchar_t* pic) {
+    if (g_capture > 0) {  // BeginTextCapture: recorded for the caller instead of a dialog on this PC
+        std::wstring t = text ? dl::ReadUStr(text) : L"";
+        g_captured.push_back(t);
+        Log("picture message captured: '%s'", W2U(t).c_str());
+        return 1;
+    }
     if (!(S.on && g_sim > 0 && g_results == 0) && !g_quiet) return 0;
     std::wstring t = text ? dl::ReadUStr(text) : L"";
     Log("lockstep: picture message '%s' (%s) skipped", W2U(t).c_str(), pic ? W2U(dl::ReadUStr(pic)).c_str() : "");

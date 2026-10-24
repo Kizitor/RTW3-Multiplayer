@@ -236,6 +236,20 @@ def event_tension_changes(hlog, n=1):
     return out
 
 
+def own_field_changes(hlog, field, n=1):
+    """The changes of nation n's own `field` by its player's routines in the new month, as the host applied them, in a
+    host log slice: its events ("event of <player> (nation n, #idx '<caption>'): ... BudgetModifier+1", e.g. the
+    intelligence result's "Give it maximum publicity ..." answer) and its relation turns ("relations of <player>
+    (nation n; ...): ... own BudgetModifier+1"), in log order: [(source, delta)]."""
+    out = []
+    for ln in log_lines(hlog, rf'event of .* \(nation {n}, #-?\d+ |relations of .* \(nation {n}; '):
+        ev = re.search(rf'event of .* \(nation {n}, #-?\d+ ', ln)
+        body = ln.split("'):", 1)[-1] if ev else ln
+        pat = rf'(?<!own ){field}([+-]\d+)' if ev else rf' own {field}([+-]\d+)'
+        out += [('event' if ev else 'relations', int(m[1])) for m in re.finditer(pat, body)]
+    return out
+
+
 def relrules_month_check(ctx, label, mark=None):
     """Relations v2 (B2), after a processed month in which nation 1 follows the player's rules: the host's month left
     nation 1's relations with the computer's nations alone (its player's routines change them while planning: the new
@@ -544,7 +558,15 @@ def top_windows(pid):
 
 
 def describe_windows(pid):
-    return '; '.join(f'{e2e_test.class_name(h)}:"{e2e_test.window_text(h)[:50]}"' for h in top_windows(pid))
+    # a Win32 message box (#32770) with its static text: the VCL forms' texts are read from memory elsewhere (box_text)
+    def one(h):
+        k = e2e_test.class_name(h)
+        s = f'{k}:"{e2e_test.window_text(h)[:50]}"'
+        if k == '#32770':
+            st = ' '.join(text(c) for c in children(h) if e2e_test.class_name(c) == 'Static' and text(c))
+            s += f' (text: {st[:160]!r})' if st else ''
+        return s
+    return '; '.join(one(h) for h in top_windows(pid))
 
 
 def assert_alive():
@@ -678,6 +700,14 @@ def save_path(slot):
     return os.path.join(SAVE, f'Game{slot}', f'RTWGame{slot}.bcs')
 
 
+# The game's own spying can report the same thing twice in one month: SpySuccess (1.01.44, RVA 0x46c744) compares gun
+# qualities in a loop of up to 11 draws of a calibre (Random(16) + 2, with replacement) and goes on after each report
+# with a 40 % chance, so one success can give "Our 7 in guns are superior to French guns of the same calibre." twice (in
+# the turn report and the intel list; the next load drops the repeat, 0.2.2). MODLOG Testing 2026-10-23 (0.6.0 RC1).
+GUN_REPORT_RE = re.compile(r'^\w{3} \d{4} +.+? - (?:Our \d+ in guns are superior to .+ guns of the same calibre\.|'
+                           r'.+ \d+ in guns have better performance than ours\.)$')
+
+
 def saved_intel(path):
     """[IntelReports] of a saved .bcs: ReportNo, IntelN keys, empty / repeated entries, distinct non-empty ones."""
     try:
@@ -685,6 +715,11 @@ def saved_intel(path):
             txt = f.read().decode('utf-8-sig', errors='replace')
     except OSError:
         return None
+    return intel_section_stats(txt)
+
+
+def intel_section_stats(txt):
+    """saved_intel of a save's text; `gun`: the repeats that are the game's gun-comparison report (GUN_REPORT_RE)."""
     m = re.search(r'^\[IntelReports\][^\n]*\n(.*?)(?=^\[|\Z)', txt, re.S | re.M)
     if not m:
         return None
@@ -699,13 +734,48 @@ def saved_intel(path):
             vals.append(v)
     nonempty = [v for v in vals if v]
     distinct = len(set(nonempty))
+    seen = {}
+    for v in nonempty:
+        seen[v] = seen.get(v, 0) + 1
+    gun = sum(n - 1 for v, n in seen.items() if n > 1 and GUN_REPORT_RE.match(v))
     return dict(ReportNo=report_no, keys=len(vals), empty=len(vals) - len(nonempty), repeated=len(nonempty) - distinct,
-                distinct=distinct)
+                distinct=distinct, gun=gun)
 
 
 def saved_clean(s):
     """No empty or repeated entries: ReportNo == the number of distinct non-empty entries."""
     return bool(s) and s['ReportNo'] == s['distinct'] == s['keys'] and s['empty'] == 0 and s['repeated'] == 0
+
+
+def saved_clean_game(s):
+    """saved_clean, but a repeat of the game's own gun-comparison report (GUN_REPORT_RE: one spy success of the month can
+    report a calibre twice) is allowed: ReportNo == IntelN keys, no empty entry, every repeat such a report."""
+    return bool(s) and s['ReportNo'] == s['keys'] and s['empty'] == 0 and s['repeated'] == s.get('gun', 0)
+
+
+def saved_own_repeat(s, prev_own):
+    """The joined player's save (Game77, the host's month package): its own reports go to the host with its turn and
+    come back in the next month's package, so a repeat that its own monthly check made the month before (the game's
+    CheckIntelligence, excused then in its list: `prev_own` repeats) is in that file once more (the load drops it, 0.2.2).
+    Allowed: ReportNo == IntelN keys, no empty entry, 0 < the other repeats <= prev_own. 0.6.0 RC2."""
+    return (bool(s) and bool(prev_own) and s['ReportNo'] == s['keys'] and s['empty'] == 0
+            and 0 < s['repeated'] - s.get('gun', 0) <= prev_own)
+
+
+def saved_repeated_texts(path):
+    """The repeated non-empty IntelN entries of a saved .bcs with their counts (for the log), or {}."""
+    try:
+        with open(path, 'rb') as f:
+            txt = f.read().decode('utf-8-sig', errors='replace')
+    except OSError:
+        return {}
+    m = re.search(r'^\[IntelReports\][^\n]*\n(.*?)(?=^\[|\Z)', txt, re.S | re.M)
+    seen = {}
+    for ln in (m.group(1).splitlines() if m else []):
+        k, sep, v = ln.partition('=')
+        if sep and re.fullmatch(r'Intel\d+', k) and v:
+            seen[v] = seen.get(v, 0) + 1
+    return {v: n for v, n in seen.items() if n > 1}
 
 
 class _PMC(ctypes.Structure):
@@ -758,7 +828,9 @@ ECON_LINE_RE = (r"economy: nation {n} \([^)]*\) {date}: funds (-?\d+) -> (-?\d+)
 def econ_month_check(ctx, label, n=1, mark=None):
     """0.5.0: the joined nation's month under the player's money rules (economy.cpp): its funds at the month's end are
     ComputeExpenses' result plus what the player's own rules took or gave (debt, corruption, hoarding), nothing else
-    (`econ <n>` on the host: fundsEnd == after + ruleFunds + otherFunds with otherFunds 0, and the funds now). Hosts
+    (`econ <n>` on the host: fundsEnd == after + ruleFunds + otherFunds with otherFunds 0, and the funds now). Since 0.6.0
+    (B5 round 4) also the arms-control conference after ComputeExpenses, a rule every nation shares (`treaty=`: the scrap
+    value of nation n's ships under construction over a new treaty's limits; 0 from a host without the field). Hosts
     without the record (before 0.5.0) and months without a joined nation n are skipped. A war of the host's nation with
     nation n that starts after the month's end (diplomacy at the month's end) opens a record of its own with the same
     date (pending, no ComputeExpenses: logged as "<date>: no ComputeExpenses" with the next month): then the month's own
@@ -778,12 +850,14 @@ def econ_month_check(ctx, label, n=1, mark=None):
         return
     try:
         after, rf, of, end, funds = (int(e[k]) for k in ('after', 'ruleFunds', 'otherFunds', 'fundsEnd', 'funds'))
+        tf = int(e.get('treaty', 0))
     except (KeyError, ValueError):
         check(f'{label}: 0.5.0: econ {n} has the month\'s money record', False, v[:300])
         return
+    tr = f' + the arms-control treaty\'s scraps {tf:+d} (BM {e.get("treatyBM")})' if e.get('conference', '0') != '0' else ''
     check(f'{label}: 0.5.0: nation {n}\'s funds at the month\'s end {end} == ComputeExpenses\' {after} + the player\'s '
-          f'money rules {rf:+d} (other {of:+d}, expected 0); the host\'s funds now {funds}',
-          e.get('ended') == '1' and end == after + rf + of and of == 0 and funds == end, v[:400])
+          f'money rules {rf:+d}{tr} (other {of:+d}, expected 0); the host\'s funds now {funds}',
+          e.get('ended') == '1' and end == after + rf + tf + of and of == 0 and funds == end, v[:400])
 
 
 def month_checks(ctx, label, mark, cmark=None):
@@ -791,7 +865,15 @@ def month_checks(ctx, label, mark, cmark=None):
     month package that does not grow (it doubled every month before 0.2.2); the client rolled the month's random
     event once (0.2.4; at chance 0 the roll finds no event)."""
     prev, s = ctx.intel_prev, intel_snapshot(ctx, mark, label)
-    check(f'{label}: host intel list has no empty or repeated entries', intel_clean(s['host']), s['host'])
+    # the game's own repeat (GUN_REPORT_RE): the host's list repeats exactly the saved gun-comparison repeats of its month
+    rep_h = s['host'][0] - s['host'][1] if None not in s['host'] else None
+    hf = s['host_file'] or {}
+    gun_h = bool(rep_h) and rep_h == hf.get('repeated') == hf.get('gun') and saved_clean_game(hf)
+    if gun_h:
+        log(f'  NOTE {label}: the host\'s list repeats {rep_h} gun-comparison report(s) of the game\'s own spying (one '
+            f'success can report a calibre twice; the next load drops the repeat)')
+    check(f'{label}: host intel list has no empty or repeated entries (but a repeat of the game\'s gun-comparison '
+          f'report)', intel_clean(s['host']) or gun_h, s['host'])
     # Since 0.4.1 the joined player's own monthly check runs the game's CheckIntelligence on its PC, which can add a report
     # it already has (dist_rc041_2 --stress run: "spy event, 4 new reports", 11 entries, 10 distinct; the mod adds none
     # itself, and the next load drops repeats, 0.2.2): a repeat among that check's new reports is the game's own
@@ -809,10 +891,25 @@ def month_checks(ctx, label, mark, cmark=None):
     check(f'{label}: intel reports grow by at most {INTEL_GROWTH_MAX} a month',
           gh is not None and gc is not None and gh <= INTEL_GROWTH_MAX and gc <= INTEL_GROWTH_MAX,
           f'host {prev and prev["host"][0]} -> {s["host"][0]}, client {prev and prev["client"][0]} -> {s["client"][0]}')
-    check(f'{label}: host save [IntelReports] has no empty or repeated entries', saved_clean(s['host_file']),
-          s['host_file'])
-    check(f'{label}: client save [IntelReports] has no empty or repeated entries', saved_clean(s['client_file']),
-          s['client_file'])
+    s['own_rep'] = rep_c if own_rep else 0
+    for who, sf in (('host', s['host_file']), ('client', s['client_file'])):
+        if not saved_clean(sf) and saved_clean_game(sf):
+            log(f'  NOTE {label}: the {who} save repeats {sf["gun"]} gun-comparison report(s) of the game\'s own spying')
+    check(f'{label}: host save [IntelReports] has no empty or repeated entries (but a repeat of the game\'s '
+          f'gun-comparison report)', saved_clean(s['host_file']) or saved_clean_game(s['host_file']), s['host_file'])
+    # the client's save repeats what its own monthly check repeated the month before (sent back by the host: 0.6.0 RC2)
+    prev_own = (prev or {}).get('own_rep') or 0
+    cf = s['client_file']
+    own_save = not saved_clean(cf) and not saved_clean_game(cf) and saved_own_repeat(cf, prev_own)
+    if own_save:
+        log(f'  NOTE {label}: the client save repeats {cf["repeated"] - cf.get("gun", 0)} entr'
+            f'{"y" if cf["repeated"] - cf.get("gun", 0) == 1 else "ies"} that its own monthly check repeated the month '
+            f'before ({prev_own} in its list then; the game\'s CheckIntelligence, sent back with the host\'s package; '
+            f'the load drops the repeat):', saved_repeated_texts(save_path(CLIENT_SLOT)))
+    check(f'{label}: client save [IntelReports] has no empty or repeated entries (but a repeat of the game\'s '
+          f'gun-comparison report, or the month before\'s repeat of its own monthly check)',
+          saved_clean(cf) or saved_clean_game(cf) or own_save, f'{cf}; its own check\'s repeats the month before '
+          f'{prev_own}')
     pp, pn = prev and prev['pkg'], s['pkg']
     grow = f'{(pn / pp - 1) * 100:+.1f} %' if pp and pn else '?'
     check(f'{label}: the month package for the client grows by at most {PACKAGE_GROWTH_MAX:.0%}',
@@ -835,7 +932,42 @@ def month_checks(ctx, label, mark, cmark=None):
     kwar_month_check(ctx, label)
     relrules_month_check(ctx, label, mark)
     econ_month_check(ctx, label, mark=mark)
+    treaty_guard(ctx, label)
+    battle_area_month_check(ctx, label)
     ctx.intel_prev = s
+
+
+def battle_area_month_check(ctx, label):
+    """0.6.0: the game keeps the last battle's area and possession (TfrmBuildCamp.BattleArea/BattlePossession, set by
+    DoBattle) across a load, which frees them (every map area and possession is made anew), so the next save wrote
+    their names from freed memory: the joined player's "Error in SaveBuildCampaign procedure! Access violation ..." or
+    "... Integer overflow". Every load clears them now: after the month the client's game holds neither (`battleptrs`).
+    A copy without the command (before 0.6.0) is not checked."""
+    r = ctl.cmd(C, 'battleptrs', 30)
+    if not r.startswith('ok'):
+        if not getattr(ctx, 'battleptrs_noted', False):
+            ctx.battleptrs_noted = True
+            log(f'  NOTE {label}: the client answers no `battleptrs` ({r[:60]}): its last battle\'s area is not checked')
+        return
+    d = dict(w.split('=', 1) for w in r[3:].split(' ') if '=' in w)
+    check(f'{label}: the client\'s game holds no last battle\'s area or possession after the month\'s load (0.6.0: '
+          f'every load clears them; they pointed into freed memory)', d.get('area') == '0' and d.get('poss') == '0', r)
+
+
+def treaty_guard(ctx, label):
+    """The game's own arms-control conference (a random event of the host's nation; the 1900 fixture has it in Sep or
+    Oct 1900 in some runs) can make a treaty: its tonnage limit then stops the host's next Turn ("We have more capital
+    ship tonnage in service than permitted by treaty! You must scrap ...": the player's rule, nobody scraps here). After
+    each month a treaty in force is cancelled on both copies (TEST `econtreaty cancel`, 0.6.0: CancelTreaty without its
+    box) and noted; copies without the command are left alone. Not while `arms_treaty` keeps its own treaty
+    (ctx.keep_treaty)."""
+    if getattr(ctx, 'keep_treaty', False):
+        return
+    th = econtreaty(H)
+    if th.get('months', 0) > 0:
+        tc = [econtreaty(p, 'cancel').get('months') for p in (H, C)]
+        log(f'  NOTE {label}: the game\'s arms-control treaty in force ({th}) cancelled on both copies for the suite '
+            f'(months now {tc})')
 
 
 def click(pid, key):
@@ -3536,19 +3668,22 @@ def scenario_treaty(ctx):
           None not in (bv[1]['P'], av[1]['P'], want2) and av[1]['P'] == bv[1]['P'] + 2 and av[2]['P'] == want2 and
           host_ok, f'nation 1 {bv[1]["P"]} -> {av[1]["P"]}, nation 2 {bv[2]["P"]} -> {av[2]["P"]} (want {want2}), host '
                    f'{bv[0]["P"]} -> {av[0]["P"]}; host events {host_events}')
-    # k) war score lines of the month's battles between 1 and 2: one per battle, totals consistent from A:B
-    ws = [m for m in re.findall(r'war score (\d+)-(\d+): \+(\d+)/\+(\d+) -> (\d+):(\d+)', hlog) if m[:2] == ('1', '2')]
+    # k) war score lines of the month's battles between 1 and 2: one per battle, totals consistent from A:B (since 0.6.0
+    # with the host's CreditWarVP lines of that war in between, e.g. B5's blockade points: war_score_steps)
+    steps = war_score_steps(hlog, 1, 2)
+    ws = [s for s in steps if s[4] == 'battle']
     cur, chain = (A, B), True
-    for m in ws:
-        nxt = (cur[0] + int(m[2]), cur[1] + int(m[3]))
-        chain = chain and nxt == (int(m[4]), int(m[5]))
-        cur = (int(m[4]), int(m[5]))
+    for s in steps:
+        nxt = (cur[0] + s[0], cur[1] + s[1])
+        chain = chain and nxt == (s[2], s[3])
+        cur = (s[2], s[3])
     seeded = log_lines(hlog, r'war score 1-2: first battle')
     log(f'  war score lines 1-2 in the treaty month: {len(ws)} {ws[:6]}' + ('' if ws else ' (no battle between 1 and '
-                                                                            '2 this month)'))
+                                                                            '2 this month)')
+        + (f'; other credits of the war {[s for s in steps if s[4] != "battle"][:6]}' if len(steps) > len(ws) else ''))
     check('k) war score 1-2 in the processed month: every "+x/+y -> A:B" line adds up from the set score (no battle '
-          'counted twice), no "first battle, already counted" line', chain and not seeded,
-          f'{ws} | {seeded}')
+          'counted twice; the host\'s other credits of the war counted in order), no "first battle, already counted" '
+          'line', chain and not seeded, f'{steps} | {seeded}')
 
     # h) automatic: nation 2 wins a minor victory, nobody claims (applydiplo: exact values, no month in between)
     before = chat(cp)
@@ -3773,9 +3908,41 @@ VP_SHARE_RE = r"victory points: nation (\d+) \+(\d+) of the host's enemies' (\d+
 VP_PEACE_RE = r'victory points: nation (\d+) is at peace; (-?\d+) -> 0'
 VP_AIPEACE_RE = r'AI peace: VP of player nation (\d+) kept at (-?\d+) \(the game set (-?\d+)\)'
 VP_SHOWN_RE = r'victory points shown: own (-?\d+), enemy (-?\d+)'
+# B4 (0.5.0): nation 1's own peace with the computer's nations in its relation turn (the game's DoPeace in its view)
+PLAYER_PEACE_RE = r"relations v2: peace: DoPeace \(nation 1's wars with the computer's nations end\)"
 WAR_SCORE_RE = r'war score (\d+)-(\d+): \+(\d+)/\+(\d+) -> (\d+):(\d+)'
+
+
+def war_score_steps(txt, a, b):
+    """The host's steps of the war score a-b (a < b) in log order: its battle hooks' "war score a-b: +x/+y -> A:B" lines
+    and (0.6.0) its CreditWarVP lines "victory points: nation G +v (<why>, in its war with nation L) -> t, war score a-b
+    A:B" (e.g. B5's blockade points) -> [(+x, +y, A, B, 'battle' | <why>)]."""
+    out = []
+    for ln in txt.splitlines():
+        m = re.search(WAR_SCORE_RE, ln)
+        if m and (int(m[1]), int(m[2])) == (a, b):
+            out.append((int(m[3]), int(m[4]), int(m[5]), int(m[6]), 'battle'))
+            continue
+        m = re.search(WAR_VP_CREDIT_RE, ln)
+        if m and (int(m[5]), int(m[6])) == (a, b) and sorted((int(m[1]), int(m[4]))) == [a, b]:
+            v = int(m[2])
+            out.append((v, 0) + (int(m[7]), int(m[8]), m[3]) if int(m[1]) == a else (0, v, int(m[7]), int(m[8]), m[3]))
+    return out
 VP_PLAYERS = (1, STANDIN)  # the human nations the host credits (the client's and the stand-in's); 3..8 are AI
 VP_AI = tuple(range(3, 9))
+
+
+def vp_shown_ok(clog, cv):
+    """victory_points a): (ok, peace): the client's latest "victory points shown: own V, enemy E" (each month's load)
+    equals its vpinfo (nation 1's VP, the shown Enemy VP), or nation 1's own peace after that line (the month's relation
+    turn after the load: PLAYER_PEACE_RE, the game's DoPeace in its view; a --stress run of 2026-10-23 after 12 months of
+    `battles`' war with Spain) zeroed both."""
+    m = list(re.finditer(VP_SHOWN_RE, clog))
+    if not m or cv is None:
+        return False, False
+    want = (str(cv['vp'].get(1)), str(cv['enemy']))
+    peace = bool(re.search(PLAYER_PEACE_RE, clog[m[-1].end():]))
+    return m[-1].groups() == want or (peace and want == ('0', '0')), peace
 
 
 def vpinfo(port):
@@ -4040,11 +4207,15 @@ def scenario_victory_points(ctx):
               f'{avail}: the remaining checks were not run')
         return
     cv = vpinfo(C)
-    shown = re.findall(VP_SHOWN_RE, log_since(C))
+    clog = log_since(C)
+    shown = re.findall(VP_SHOWN_RE, clog)
+    vp_ok, vp_peace = vp_shown_ok(clog, cv)
+    if vp_peace:
+        log(f'  NOTE a) nation 1 made its own peace with the computer\'s nations after the last month\'s load (the game\'s '
+            f'DoPeace in its relation turn): its VP and the shown Enemy VP are 0 since then ({cv and cv["raw"]})')
     check('a) client log "victory points shown: own V, enemy E" for every loaded month; the latest = the client\'s '
-          'vpinfo (nation 1\'s VP, the shown Enemy VP)',
-          bool(shown) and cv is not None and shown[-1] == (str(cv['vp'].get(1)), str(cv['enemy'])),
-          f'{shown[-3:]} | {cv and cv["raw"]}')
+          'vpinfo (nation 1\'s VP, the shown Enemy VP; 0 and 0 after nation 1\'s own peace in the month\'s relation turn)',
+          vp_ok, f'{shown[-3:]} | {cv and cv["raw"]}')
     r01, r12 = rel(0, 1), rel(1, 2)
     v0 = vpinfo(H)
     log(f'  start: host vpinfo {v0 and v0["raw"]} | client vpinfo {cv and cv["raw"]} | wars of 1: {wars_of(1)}, '
@@ -4263,13 +4434,18 @@ def scenario_victory_points(ctx):
     ws = [m for m in re.findall(WAR_SCORE_RE, hl) if {m[0], m[1]} == {'1', '2'}]
     g1 = sum(int(m[2]) if m[0] == '1' else int(m[3]) for m in ws)
     g2 = sum(int(m[3]) if m[0] == '1' else int(m[2]) for m in ws)
+    # 0.6.0 (B5): a blockade in the war 1-2 gives its points as the player's (warfx: nation 1 under the player's rules)
+    bc = blockade_credits(hl)
+    b1 = sum(v for g, v, lo in bc if g == 1 and lo == 2)
+    b2 = sum(v for g, v, lo in bc if g == 2 and lo == 1)
     log(f'  g) month: host {vj["raw"]} -> {vk["raw"]} | client before {cpre and cpre["raw"]} | wars of 1 {w1} | war '
-        f'score 1-2 lines {ws} | AI peace lines {re.findall(VP_AIPEACE_RE, hl)} | share/peace lines '
-        f'{re.findall(VP_SHARE_RE, hl)} {re.findall(VP_PEACE_RE, hl)} | merge {log_lines(hl, r"merge nation 1")[:1]}')
-    check(f'g) host after the month: nation 1 VP = the credited {credited} + its 1-2 battle points {g1} (the merge kept '
-          f'the host\'s VP; the player\'s copy had {cpre and cpre["vp"].get(1)}); nation 2 = {vj["vp"][2]} + {g2}',
-          w1 == [2] and vk['vp'][1] == credited + g1 and vk['vp'][2] == vj['vp'][2] + g2 and
-          bool(log_lines(hl, r'merge nation 1')), f'wars of 1 {w1}; {vj["raw"]} -> {vk["raw"]}; war score {ws}')
+        f'score 1-2 lines {ws} | blockade credits {bc} | AI peace lines {re.findall(VP_AIPEACE_RE, hl)} | share/peace '
+        f'lines {re.findall(VP_SHARE_RE, hl)} {re.findall(VP_PEACE_RE, hl)} | merge {log_lines(hl, r"merge nation 1")[:1]}')
+    check(f'g) host after the month: nation 1 VP = the credited {credited} + its 1-2 battle points {g1} + its blockade '
+          f'points {b1} (0.6.0; the merge kept the host\'s VP; the player\'s copy had {cpre and cpre["vp"].get(1)}); nation '
+          f'2 = {vj["vp"][2]} + {g2} + {b2}',
+          w1 == [2] and vk['vp'][1] == credited + g1 + b1 and vk['vp'][2] == vj['vp'][2] + g2 + b2 and
+          bool(log_lines(hl, r'merge nation 1')), f'wars of 1 {w1}; {vj["raw"]} -> {vk["raw"]}; war score {ws}; {bc}')
     cv = vpinfo(C)
     want_e = sum(max(0, vk['vp'][j]) for j in w1)
     shown = re.findall(VP_SHOWN_RE, cl)
@@ -4975,6 +5151,335 @@ def peace_war(K, J, t=50):
     return rel(K, J), value(cmd(C, f'rel {K} {J}'))
 
 
+def scenario_battle_generator(ctx):
+    """0.6.0 (B6): the player's battle generator for nation 1 under the player's rules, at war with a computer nation J
+    (`settension` on both copies). a) both logs "Player's battle generator for joined nations: ok", the client's hello
+    "battle generator 1"; b) `battles gen 1` x20 (CheckForBattles2 in nation 1's view on the host, a dry run): attempts
+    with nation 1 on one side and a computer nation on the other only, the host's relations unchanged, all attempts
+    (decision 1: < 64, the old cap of 4 gone); `battles gen 1 fault` (decision 3: a game exception in the view): the
+    game's error box recorded, not shown, no request, the next run works; c) up to 3
+    processed months: the generator runs once a month for nation 1, at most one request of kind 1, no request of the
+    computer's generator for nation 1 against a computer nation (suppressed), the request reaches the client, which
+    replays its attempts in order (fought: merged); d) risk 4: a request of each kind (`battles injectgen`, `battles inject`)
+    declined on the client is merged ("the player declined battle"), never resolved by the game (a preview without an
+    enabled Decline is fought); e) `battles aitest 1 J area`: the game's resolution with its result box captured, no
+    box on the host. The war ends at the end."""
+    K = 1
+    for port, who in ((H, 'host'), (C, 'client')):
+        ln = log_lines(log_since(port), r"Player's battle generator for joined nations")
+        check(f'a) {who} log "Player\'s battle generator for joined nations: ok"', any(': ok' in x for x in ln), ln[:2])
+    ln = log_lines(log_since(H), r"Player's battle generator: its error box")
+    check('a) host log "Player\'s battle generator: its error box in a joined nation\'s view goes to the log" (decision 3: '
+          'the ShowMessage of CheckForBattles2\'s except handler hooked)', any('goes to the log' in x for x in ln), ln[:1])
+    hl = log_lines(log_since(H), r'battle generator \d')
+    check('a) the host logged the client\'s hello with "battle generator 1" (or 2: also surprise attacks, B6 piece 2)',
+          any(re.search(r'battle generator [12]\b', x) for x in hl), hl[:2])
+    rr = relrules(H)
+    if rr is None or K not in rr:
+        log('  nation 1 not under the player\'s rules: forced', cmd(H, f'relrules {K} 1'))
+    if not cstate().get('fight'):  # (scenario battles ends with the client joined with `fightbattles 0`)
+        log('  the client does not fight its battles: joins again with fightbattles 1', rejoin(ctx, K, True)[0])
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    cands = [c for c in battle_pairs(K) if c[2] not in humans]
+    if not check(f'setup: a computer nation with a possession in a sea area where nation {K} has >= 4 ships', cands,
+                 cands[:3]):
+        return
+    _, _, J, area = cands[0]
+    t0 = rel(K, J).get('tension', '5')
+    hr, cr = peace_war(K, J)
+    check(f'setup: nation {K} at war with computer nation {J} on both copies (was {t0}); battles in {area}',
+          hr.get('war') == '1' and 'war=1' in (cr or ''), dict(host=hr, client=cr))
+    # b) dry runs
+    pairs = [(a, b) for a in range(9) for b in range(a + 1, 9)]
+    before = {p: rel(*p).get('tension') for p in pairs}
+    reps = [cmd(H, f'battles gen {K}') for _ in range(20)]
+    flat = []
+    for r in reps:
+        for part in [x.strip() for x in (r.split('attempts=', 1)[1] if 'attempts=' in r else '').split(';') if x.strip()]:
+            m = re.match(r'^(\d+)>(\d+)', part)
+            if m:
+                flat.append((int(m[1]), int(m[2])))
+    opps = sorted({b if a == K else a for a, b in flat})
+    check(f'b) `battles gen {K}` x20: all ok, attempts in {sum(1 for r in reps if "attempts=" in r and r.split("attempts=", 1)[1].strip())}'
+          f'/20; every attempt has nation {K} on one side and a computer nation on the other (opponents {opps})',
+          all(r.startswith('ok') for r in reps) and flat and all(K in p for p in flat) and not set(opps) & humans,
+          reps[:2])
+    after = {p: rel(*p).get('tension') for p in pairs}
+    check('b) the host\'s relations unchanged by the dry runs', before == after,
+          [p for p in pairs if before[p] != after[p]][:6])
+    # b) decision 1: the attempts in the generator's order until it has none left (the cap of 64 only bounds a runaway)
+    counts = [len([x for x in (r.split('attempts=', 1)[1] if 'attempts=' in r else '').split(';') if x.strip()])
+              for r in reps]
+    dist = {n: counts.count(n) for n in sorted(set(counts))}
+    log(f'  b) attempts per dry run (attempts: runs): {dist}')
+    check(f'b) decision 1: every dry run below the cap of 64 attempts (max {max(counts)})', max(counts) < 64, dist)
+    if max(counts) > 4:
+        check(f'b) decision 1: the old cap of 4 is gone (a dry run with {max(counts)} attempts)', True)
+    else:
+        log(f'  SKIP b) decision 1: no dry run had more than 4 attempts (the generator\'s own count): {dist}')
+    # b) decision 3: a game exception inside the generator in nation K's view: no box, no request
+    ids0, t_f, hm = set((battles_list() or {}).get('battles', {})), time.time(), log_mark(H)
+    rf = cmd(H, f'battles gen {K} fault')
+    tops = [e2e_test.class_name(w) for w in top_windows(ctx.hp)]
+    fl = log_lines(log_since(H, hm), rf"the player's battle generator for nation {K}: ")
+    ids1 = set((battles_list() or {}).get('battles', {}))
+    check(f'b) decision 3: `battles gen {K} fault` -> error "exception in the game\'s battle generator: Error in '
+          f'CheckForBattles procedure! ..." (the game\'s except handler\'s box recorded), the host log line, no new '
+          f'request, no box on the host (windows, answered error boxes)',
+          rf.startswith('error') and "exception in the game's battle generator" in rf and 'Error in CheckForBattles' in rf
+          and any('Error in CheckForBattles' in x for x in fl) and not ids1 - ids0 and not game_error_boxes(t_f)
+          and not any(c == 'TMessageForm' or c.startswith('Tdlg') for c in tops),
+          dict(reply=rf[:160], log=fl[:1], new=sorted(ids1 - ids0), windows=tops))
+    r2 = cmd(H, f'battles gen {K}')
+    check(f'b) decision 3: a normal `battles gen {K}` after it works', r2.startswith('ok id=0 '), r2[:160])
+    # c) months
+    fought = None
+    for m in range(1, 4):
+        if rel(K, J).get('war') != '1':
+            log('  the war had ended:', peace_war(K, J))
+        hm = log_mark(H)
+        drv = BattleDriver(ctx, {}, K, J, fight_any=True)
+        drv.label = f'battlegen M{m}'
+        run_month(ctx, drv.label, driver=drv)
+        hlog = log_since(H, hm)
+        gens = log_lines(hlog, rf"the player's battle generator for nation {K} ")
+        reqs = log_lines(hlog, r"battle request \d+ \(the player's generator\)")
+        comp = [x for x in log_lines(hlog, r'battle request \d+: nation \d+ vs \d+ in ')
+                if re.search(rf'nation (?:{K} vs (?!{STANDIN}\b)\d+|\d+ vs {K}) in', x)]
+        outs = {b: r.get('outcome') for b, r in drv.rec.items()}
+        bids = [int(re.search(r'battle request (\d+)', x)[1]) for x in reqs]
+        check(f'c) {drv.label}: the generator ran once for nation {K}; {len(reqs)} request(s) of kind 1 (<= 1), each sent '
+              f'to the client with an outcome; no request of the computer\'s generator for nation {K} against a computer '
+              f'nation ({len(log_lines(hlog, "left to the player"))} suppressed)',
+              len(gens) == 1 and len(reqs) <= 1 and not comp and all(b in outs for b in bids),
+              dict(gen=gens, req=reqs, comp=comp[:2], outcomes=outs))
+        if drv.fought() is not None:
+            fought = drv.fought()
+            check(f'c) battle {fought} of the player\'s generator fought on the client and merged on the host',
+                  re.search(rf'battle {fought} applied: ', hlog), log_lines(hlog, rf'battle {fought} applied'))
+            break
+    log('  c) fought:', fought)
+    # decision 1: every request of the player's generator so far (also of earlier scenarios' months) was replayed in
+    # order on the client: (request, its attempts, the client's "attempt i ... found no battle" indices)
+    call = log_since(C)
+    replay = [(int(mm[1]), int(mm[2]), [int(i) for i in re.findall(rf'\] battle {mm[1]}: attempt (\d+) \(', call)])
+              for mm in re.finditer(r"battle request (\d+) \(the player's generator\): .*?, (\d+) attempt\(s\)",
+                                    log_since(H))]
+    log(f'  c) requests (id, attempts, attempts the client found no battle in): {replay}')
+    if any(r[2] for r in replay):
+        check('c) decision 1: the client replayed each request\'s attempts in order (attempt 0, 1, ... found no battle, '
+              'then the battle or its decline)', all(ix == list(range(len(ix))) and len(ix) <= n for _, n, ix in replay),
+              replay)
+    else:
+        log('  SKIP c) decision 1 replay order: no request had an attempt that found no battle')
+    # d) risk 4: declines merged
+    if rel(K, J).get('war') != '1':
+        log('  the war had ended:', peace_war(K, J))
+    hm = log_mark(H)
+    cm = log_mark(C)
+    # B6 round 3: stale month state on the client first (wrong ship-type flags; the month's battle fields as an earlier
+    # battle leaves them): the month's load and the battle slot must put the month's own values back
+    st_set = cmd(C, 'ls shiptypes 010101'), cmd(C, 'battles monthstate set')
+    r1 = cmd(H, f'battles injectgen {K} {J} {area}')
+    b1 = int(r1.split()[1]) if r1.startswith('ok ') else None
+    b0, r0 = inject(K, J, area)
+    drv = BattleDriver(ctx, {b: 'decline' for b in (b1, b0) if b}, K, J)
+    drv.label = 'battlegen decline'
+    run_month(ctx, drv.label, driver=drv)
+    hlog = log_since(H, hm)
+    month_state_checks(ctx, K, log_since(C, cm), st_set, (b1, b0))
+    for b in (b1, b0):
+        rec_b = drv.rec.get(b, {})
+        o = rec_b.get('outcome')
+        merged = re.search(rf'battle {b} applied: .*the player declined battle', hlog)
+        game = re.search(rf'battle {b} resolved by the game', hlog)
+        check(f'd) battle {b} ({"the player" if b == b1 else "the computer"}\'s generator) declined on the client '
+              f'({o}): merged with the decline\'s consequences, never resolved by the game (the enemy\'s decline, no '
+              f'battle or a preview without Decline: as such)',
+              b is not None and not game and ((o == 'declined' and merged) or o in ('avoided', 'nobattle') or
+                                               (o == 'fought' and rec_b.get('no_decline'))),
+              dict(outcome=o, lines=log_lines(hlog, rf'battle {b}\b')[-3:]))
+    # e) the game's resolution: its box captured
+    hm = log_mark(H)
+    r = cmd(H, f'battles aitest {K} {J} {area}')
+    m = re.match(r'^ok fought=(\d) captured=(\d+)', r)
+    check('e) `battles aitest`: the game\'s resolution of a battle of nation 1 ran; its result box (one when it '
+          'fought) captured on the host (log "picture message captured"), none shown',
+          m and (m[1] == '0' or int(m[2]) >= 1) and not any(e2e_test.class_name(w) == 'TdlgPictureMessage'
+                                                           for w in top_windows(ctx.hp)),
+          dict(reply=r, log=log_lines(log_since(H, hm), r'picture message captured')))
+    peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() else 5)
+
+
+def month_state_checks(ctx, K, clog, st_set, bids):
+    """B6 round 3 (0.6.0): the month's state on a joined player's PC. Before the month the client's ship-type flags
+    were set to 010101 and the month's battle fields to 1 (`ls shiptypes 010101`, `battles monthstate set`). The battle
+    phase comes before the new month reaches the client: its first battle slot computes the flags with the game's
+    CheckShipTypesExist (010101 -> the host's, which its month's ReduceTimeLimits set) and resets the month's fields
+    (the 1s -> 0); the new month's load computes them again (-> the host's)."""
+    hs = re.search(r'shiptypes=([0-9a-f]{6})', cmd(H, 'ls shiptypes') or '')
+    host = hs[1] if hs else None
+    check('month state: the client\'s stale values were set (ls shiptypes 010101, battles monthstate set)',
+          st_set[0].startswith('ok shiptypes=010101') and 'surprise=1 possession=1 heroic=1 loss=1 convoy=1' in st_set[1],
+          st_set)
+    slots = [m for m in re.finditer(r"battle (\d+): the month's state in the battle slot: ship-type flags (\w+) -> "
+                                    r"(\w+), surprise attack (\d+) -> 0, possession battle (\d+) -> 0, HeroicVictory "
+                                    r"(-?\d+) tmpBattlePrestigeLoss (\d+) ImportantConvoy (\d+) -> 0", clog)]
+    played = [int(m[1]) for m in slots]
+    check(f'month state: every battle slot of the month ({[b for b in bids if b]}) logged its month state, the flags '
+          f'equal to the host\'s ({host})', slots and all(b in played for b in bids if b) and
+          all(m[3] == host for m in slots), [m[0] for m in slots])
+    first = slots[0] if slots else None
+    check('month state: the first battle slot computed the flags with the game\'s routine (010101 -> the host\'s) and '
+          'reset the month\'s fields left as an earlier battle leaves them (possession battle, HeroicVictory, '
+          'tmpBattlePrestigeLoss, ImportantConvoy 1 -> 0)',
+          first and first[2] == '010101' and first[3] == host and first[5] == '1' and first[6] == '1' and
+          first[7] == '1' and first[8] == '1', first[0] if first else None)
+    mm = re.search(r'month: ship-type flags (\w+) -> (\w+)', clog)
+    check(f'month state: the new month\'s load computed the ship-type flags with the game\'s routine, equal to the '
+          f'host\'s ({host}) (log "month: ship-type flags ... -> ...")', host and mm and mm[2] == host,
+          dict(host=host, line=mm[0] if mm else None))
+    after = cmd(C, 'battles monthstate')
+    check(f'month state: after the battles the client\'s flags are the host\'s ({host}) (`battles monthstate`)',
+          host and after.startswith(f'ok flags={host} '), after)
+
+
+def scenario_battle_surprise(ctx):
+    """0.6.0 (B6 piece 2): surprise attacks and takeovers at a war's start for nation 1 under the player's rules (its
+    relation turn in its view on the client; a host with welcome `gen` 2). a) both logs "Surprise attacks and takeovers
+    at a war's start for a joined nation: ok (CheckForWar's call sites 1/3/1)", the client's hello "battle generator 2",
+    the client's `battles state` hostgen=2; b) at peace with everyone, `battles testsa J` (J: Japan, the computer nation
+    of the 1896-1924 missions' area) and a month: nation 1's relation turn has J start its war with a takeover (the
+    area's first unowned possession, a test pick) and a surprise attack (CheckSurpriseAttack(J, 1) recorded, not run);
+    the host: the war 1-J, the takeover applied by name (J owns the possession on both copies), one request of kind 2
+    (J>1), the chat lines; c) `battles sadry J k` and `battles sadry J` (DoSurpriseAttack alone in nation 1's view): the
+    pairs 1>J (no "No opportunity found" box) and J>1, nothing sent; d) `battles injectsa 1 J` (nation 1 strikes J),
+    `battles saretry 10` on the client and a month with a battle driver: both requests of kind 2 reach the client, which
+    plays them with the game's CheckSurpriseAttack (its random gates passed by asking again): each a battle (fought,
+    declined or avoided: merged) or a clean no-battle (its reason, the host's "No surprise attack" chat), never resolved
+    by the game, none of their dialogs on the host. Ends at peace."""
+    K = 1
+    for port, who in ((H, 'host'), (C, 'client')):
+        ln = log_lines(log_since(port), r"Surprise attacks and takeovers at a war's start for a joined nation")
+        check(f'a) {who} log "Surprise attacks and takeovers at a war\'s start for a joined nation: ok (CheckForWar\'s '
+              f'call sites 1/3/1)"', any("ok (CheckForWar's call sites 1/3/1)" in x for x in ln), ln[:2])
+    rr = relrules(H)
+    if rr is None or K not in rr:
+        log('  nation 1 not under the player\'s rules: forced', cmd(H, f'relrules {K} 1'))
+    if not cstate().get('fight'):
+        log('  the client does not fight its battles: joins again with fightbattles 1', rejoin(ctx, K, True)[0])
+    hl = log_lines(log_since(H), r'battle generator \d')
+    check('a) the host logged the client\'s hello with "battle generator 2"', any('battle generator 2' in x for x in hl),
+          hl[-2:])
+    cs = cstate()
+    check('a) the client\'s `battles state`: hostgen=2 (the host\'s welcome `gen` 2: surprise attacks and takeovers)',
+          cs.get('hostgen') == 2, cs.get('raw'))
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    nt = nation_table()
+    J = 5 if 5 not in humans and 5 in nt else next((j for j in range(3, 9) if j not in humans and j in nt), None)
+    if not check('setup: a computer nation J for the surprise (Japan preferred)', J is not None, nt):
+        return
+    for j in range(9):  # the landing block needs nation 1 at peace (its war counter <= 0 at the relation turn)
+        if j != K and rel(K, j).get('war') == '1':
+            log(f'  peace {K}-{j} first:', peace_war(K, j, 5))
+    kw = (kwar_counters(H) or {}).get(K)
+    if kw is not None and kw > 0:  # as the game's DoPeace (War := 0) for the wars `settension` ended
+        log(f'  nation {K}\'s war counter {kw} -> 0 (at peace now):', cmd(H, f'kwar {K} 0'))
+    t0 = rel(K, J).get('tension', '5')
+    hm, cm, hp0 = log_mark(H), log_mark(C), chat(ctx.hp)
+    cmd(H, 'mpwindow')
+    rt = cmd(C, f'battles testsa {J}')
+    check(f'b) `battles testsa {J}` on the client: the next relation turn has nation {J} start its war on nation {K} '
+          f'with a surprise', rt.startswith(f'ok testsa={J}'), rt)
+    poss0 = pnames(poss_list(H, f'possessions {J}'))
+    run_month(ctx, 'battlesa M1')
+    hlog, clog = log_since(H, hm), log_since(C, cm)
+    sa_c = log_lines(clog, rf'relations v2: surprise attack: nation {J} may strike nation {K}')
+    tk_c = log_lines(clog, rf'relations v2: surprise move: nation {J} takes over ')
+    pick = log_lines(clog, r'surprise move: test: the takeover picks ')
+    sent = log_lines(clog, rf'relations for nation {K} sent: ')
+    # the game's CheckForWar runs its landing/takeover step only in 50 % (with the trait 95 %, game.cpp "Surprise attacks
+    # and takeovers"): without it the test's pick never runs and the war starts with the surprise attack alone
+    plan = log_lines(clog, rf'relations v2: surprise: test: nation {J} plans its war on nation {K} .*the takeover picks')
+    no_step = bool(plan and sa_c and not pick and not tk_c)
+    if no_step:
+        log(f'  SKIP-note b) the takeover: the game\'s CheckForWar skipped its landing/takeover step this time (50 %, '
+            f'with the trait 95 %; no "test: the takeover picks" line): the war and the surprise attack alone are checked')
+    check(f'b) the client\'s relation turn: nation {J}\'s takeover and its surprise attack recorded in nation {K}\'s view '
+          f'(CheckSurpriseAttack({J}, {K}) not run) and sent ("ksa={J},{K};", "sland=1"; without the game\'s takeover '
+          f'step "sland=0")',
+          sa_c and (tk_c or no_step) and sent and f'ksa={J},{K};' in sent[-1]
+          and ('sland=0' if no_step else 'sland=1') in sent[-1],
+          dict(sa=sa_c[-1:], take=tk_c[-1:], pick=pick[-1:], sent=[x.split('] ', 1)[-1][-160:] for x in sent[-1:]]))
+    name = re.search(r'takes over (.+?) \(owner -1', tk_c[-1])[1] if tk_c and '(owner -1' in tk_c[-1] else None
+    req = log_lines(hlog, rf'battle request (\d+) \(surprise attack\): nation {K} vs {J}, 1 attempt\(s\): {J}>{K}')
+    app = log_lines(hlog, rf'relations of .* \(nation {K};')
+    poss1, cposs = pnames(poss_list(H, f'possessions {J}')), pnames(poss_list(C, f'possessions {J}'))
+    took = (not no_step and name and name not in poss0 and name in poss1 and name in cposs and app
+            and f'takeover {name} -1->{J}' in app[-1]) or (no_step and app and 'takeover' not in app[-1])
+    check(f'b) the host: the war {K}-{J}, the takeover of {name} applied by name (nation {J} owns it on both copies, '
+          f'it did not before; without the game\'s takeover step none), one battle request of kind 2 ({J}>{K}) for the '
+          f'battle phase',
+          rel(K, J).get('war') == '1' and took and len(req) == 1 and app and f'surprise {J}>{K}' in app[-1],
+          dict(war=rel(K, J), name=name, req=req, applied=[x.split('] ', 1)[-1][-220:] for x in app[-1:]]))
+    hc = chat(ctx.hp)
+    want = ([] if no_step else [f'* In a surprise move, {nt[J]["name"]} has taken control of {name}!']) + \
+        [f'* Surprise attack? {nt[J]["name"]} may strike {nt[K]["name"]} at the war\'s start.']
+    check('b) the chat lines of the takeover and of the surprise attack', not new_chat_missing(hp0, hc, want),
+          new_chat_missing(hp0, hc, want))
+    bl = battles_list() or {}
+    sa1 = int(re.search(r'battle request (\d+)', req[0])[1]) if req else None
+    check(f'b) `battles list`: request {sa1} of kind 2 queued (one attempt)',
+          sa1 in bl.get('battles', {}) and 'kind=2:att=1' in bl.get('raw', ''), bl.get('raw', '')[:240])
+    # c) DoSurpriseAttack alone in nation 1's view (the war 1-J is on): both branches, nothing sent
+    cm, t_c = log_mark(C), time.time()
+    r1, r2 = cmd(C, f'battles sadry {J} k'), cmd(C, f'battles sadry {J}')
+    boxes = [b for b in BOX_SEEN if b[0] >= t_c and 'opportunity' in b[3]]
+    tops = [e2e_test.class_name(w) for w in top_windows(ctx.cp)]
+    check(f'c) `battles sadry {J} k`: nation {K} strikes {J} (its trait: the pair {K}>{J}, True: no "No opportunity '
+          f'found" box); `battles sadry {J}`: {J}>{K}; nothing sent',
+          r1 == f'ok ran=1 pairs={K}>{J};' and r2 == f'ok ran=1 pairs={J}>{K};' and not boxes and
+          'TMessageForm' not in tops and not log_lines(log_since(C, cm), rf'relations for nation {K} sent'),
+          dict(r1=r1, r2=r2, boxes=boxes, windows=tops))
+    # d) both directions played on the client
+    r3 = cmd(H, f'battles injectsa {K} {J}')
+    sa2 = int(r3.split()[1]) if r3.startswith('ok ') else None
+    r4 = cmd(C, 'battles saretry 10')
+    check(f'd) `battles injectsa {K} {J}` (request {sa2}, kind 2) and `battles saretry 10` on the client',
+          sa2 is not None and r4 == 'ok saretry=10', dict(inject=r3, retry=r4))
+    hm, cm, hp0, t_d = log_mark(H), log_mark(C), chat(ctx.hp), time.time()
+    # both planned 'fight': the first that comes to a battle is fought, the other declined (the driver's rule; a
+    # defence has no Decline: fought too)
+    drv = BattleDriver(ctx, {b: 'fight' for b in (sa1, sa2) if b}, K, J)
+    drv.label = 'battlesa M2'
+    run_month(ctx, drv.label, driver=drv)
+    hlog, clog, hc = log_since(H, hm), log_since(C, cm), chat(ctx.hp)
+    for b, (att, dfn) in ((sa1, (J, K)), (sa2, (K, J))):
+        if b is None:
+            continue
+        o = drv.rec.get(b, {}).get('outcome')
+        sw = lambda v: 0 if v == K else K if v == 0 else v
+        st = log_lines(clog, rf'StartSurpriseAttack {sw(att)} attacks {sw(dfn)} -> ')
+        merged = re.search(rf'battle {b} applied: ', hlog)
+        nob = log_lines(hlog, rf'battle {b} \(kind 2\): no battle \(')
+        game = re.search(rf'battle {b} resolved by the game', hlog)
+        check(f'd) request {b} ({att} strikes {dfn}): sent to the client, played with the game\'s CheckSurpriseAttack '
+              f'(slot indices {sw(att)}>{sw(dfn)}); {o}: merged, or a clean no-battle with its reason; never resolved '
+              f'by the game', re.search(rf'battle {b} sent to ', hlog) and st and not game and
+              ((o in ('fought', 'declined', 'avoided') and merged) or (o == 'nobattle' and nob)),
+              dict(outcome=o, start=[x.split('] ', 1)[-1] for x in st[-2:]], nobattle=nob[-1:],
+                   answers=drv.rec.get(b, {}).get('answers', [])[:6], lines=log_lines(hlog, rf'battle {b}\b')[-3:]))
+    hb = [b for b in BOX_SEEN if b[0] >= t_d and b[1] == 'host' and re.search(r'urprise|Mobiliz', b[3])]
+    check('d) none of the surprise attacks\' dialogs on the host (map message, mobilization question, boxes)', not hb, hb)
+    log('  d) chat:', [x for x in hc.splitlines()[-12:] if 'urprise' in x or 'battle' in x.lower()])
+    cmd(C, 'battles saretry 0')
+    peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() and int(t0) <= 40 else 5)
+
+
+# The host's log when a ship a joined nation's peace hands over is not that nation's on the host (game.cpp HandOverShip).
+PEACE_SHIP_SKIPPED = r"relations v2: peace of nation {K}: ship (\d+) \(.*?\) skipped: not among nation {K}'s ships"
+
+
 def scenario_relations_peace(ctx):
     """Relations v2 (B4): peace with the computer's nations for a joined nation under the player's rules (nation 1).
     A computer nation J at war with nation 1 (`settension 1 J 50` on both copies: no month needed) and its war score
@@ -5087,14 +5592,26 @@ def scenario_relations_peace(ctx):
           hr.get('war') == '0' and 'war=0' in cr, dict(client=pc.get('raw', '')[:300], host=rec['host'], rel=(hr, cr)))
     sids = [(int(a), b) for a, b in (x.split(':', 1) for x in pc.get('shipids', '').split(',') if ':' in x)]
     held = {sid: (ship_holders(H, sid), ship_holders(C, sid)) for sid, _ in sids}
-    ok_ships = all(h == [int(d.split('>')[1])] and c == [int(d.split('>')[1])] for (sid, d), (h, c) in
-                   ((s, held[s[0]]) for s in sids))
+    # A ship the host does not have as nation K's is skipped there (game.cpp HandOverShip: "skipped: not among nation K's
+    # ships"): a peace between players earlier in the same month (`treaty` h) can have handed it over on the host, and
+    # the client's copy gets that only with the next month (default run of 2026-10-23: ship 495, France's on the host).
+    skipped = {int(m[1]) for m in re.finditer(PEACE_SHIP_SKIPPED.format(K=K), log_since(H, hmark))}
+    if skipped:
+        log(f'  NOTE b) the host skipped ship(s) {sorted(skipped)}: not nation {K}\'s there (a peace between players '
+            f'earlier in this month handed it over on the host; the client\'s copy gets that with the next month)', held)
+
+    def held_ok(sid, d, h, c):
+        to = int(d.split('>')[1])
+        return (len(h) == 1 and h[0] not in (K, to) and c == [to]) if sid in skipped else (h == [to] and c == [to])
+    ok_ships = all(held_ok(sid, d, *held[sid]) for sid, d in sids)
+    moved = [(sid, d) for sid, d in sids if sid not in skipped]
     ships1 = {n: x['ships'] for n, x in nation_table().items()}
     check(f'b) ships handed over ({len(sids)}: {pc.get("shipids") or "none this time"}) are held by the receiver only, '
-          f'on both copies (findship); ship counts on the host follow',
-          ok_ships and ships1.get(K, 0) - ships0.get(K, 0) == -sum(1 for _, d in sids if d.startswith(f'{K}>')) and
-          ships1.get(J, 0) - ships0.get(J, 0) == sum(1 for _, d in sids if d.endswith(f'>{J}')),
-          dict(ships=sids, held=held, before=ships0, after=ships1))
+          f'on both copies (findship; a ship the host skipped as not nation {K}\'s stays where the host has it); ship '
+          f'counts on the host follow',
+          ok_ships and ships1.get(K, 0) - ships0.get(K, 0) == -sum(1 for _, d in moved if d.startswith(f'{K}>')) and
+          ships1.get(J, 0) - ships0.get(J, 0) == sum(1 for _, d in moved if d.endswith(f'>{J}')),
+          dict(ships=sids, held=held, skipped=sorted(skipped), before=ships0, after=ships1))
     dJ = {f[1]: int(f[2]) for f in (x.split(':') for x in pc.get('delta', '').split(';') if x) if len(f) == 3 and f[0] == str(J)}
     lostJ = {f[0]: f[1] for f in (x.split(':') for x in pc.get('lost', '').split(';') if x) if len(f) == 2}.get(str(J))
     rJ1, lost1 = nint(H, J, 'BaseResources'), nflag(H, J, 'HasLostWar')
@@ -5137,8 +5654,10 @@ def scenario_relations_peace(ctx):
     # d) a processed month: the merge keeps one copy of each ship handed over
     run_month(ctx, 'relations_peace M1')
     held2 = {sid: (ship_holders(H, sid), ship_holders(C, sid)) for sid, _ in sids}
-    check('d) after the processed month every ship handed over is held once, by the receiver, on both copies',
-          all(h == [int(d.split('>')[1])] and c == [int(d.split('>')[1])] for (sid, d), (h, c) in
+    check('d) after the processed month every ship handed over is held once, by the receiver, on both copies (a ship '
+          'the host skipped: by the host\'s holder on both)',
+          all((h == c == held[sid][0] and len(h) == 1) if sid in skipped else
+              (h == [int(d.split('>')[1])] and c == [int(d.split('>')[1])]) for (sid, d), (h, c) in
               ((s, held2[s[0]]) for s in sids)), held2)
     check(f'd) the war {K}-{J} is still over on the host and nation {K}\'s war score with {J} is gone',
           rel(K, J).get('war') == '0' and J not in (kwarvp(K) or {}).get('kept', {J: 0}), dict(rel=rel(K, J), ledger=kwarvp(K)))
@@ -5152,6 +5671,620 @@ def scenario_relations_peace(ctx):
     else:
         log(f'  NOTE d): no relation turn of nation {K} this month (relation turn lines: '
             f'{(ctx.relturn or {}).get("lines")}): krelm not checked')
+
+
+def warfx_state(port=H, n=1):
+    """`warfx n` -> dict(flags = the nations blockaded now, raw), or None (a host without the war effects)."""
+    raw = cmd(port, f'warfx {n}') or ''
+    if not raw.startswith('ok'):
+        return None
+    m = re.search(r'flags=(\S*)', raw)
+    return dict(flags={int(x) for x in (m[1] if m else '').split(',') if x.isdigit()}, raw=raw)
+
+
+def blockade_credits(txt):
+    """Host log: 'victory points: nation G +v (blockade, in its war with nation L)' -> [(G, v, L)] (warfx.cpp)."""
+    return [(int(a), int(b), int(c)) for a, b, c in
+            re.findall(r'victory points: nation (\d+) \+(\d+) \(blockade, in its war with nation (\d+)\)', txt)]
+
+
+SEA_WAR_BOX_RE = r'raider|submarine|merchant'
+RESEARCH_LINE_RE = r'(Our (scientists|best brains|engineers|researchers)\b|Research breakthrough:)'
+
+
+def sea_war_box_lines(text):
+    """The lines of a host box (a turn report joins its lines with ' | ') that speak of raiders, submarines or merchant
+    ships (war_effects M2 (c): none may show on the host), without the host's own research messages ("Our scientists
+    report ...", the turn report's "Research breakthrough: Submarines, Early coastal submarine, ..." of a run of
+    2026-10-23)."""
+    return [ln for ln in (text or '').split(' | ') if re.search(SEA_WAR_BOX_RE, ln, re.I) and
+            not re.match(RESEARCH_LINE_RE, ln.strip())]
+
+
+def trade_credits(txt):
+    """Host log: 'victory points: nation G +v (trade war, in its war with nation L)' -> [(G, v, L)] (warfx.cpp, (c))."""
+    return [(int(a), int(b), int(c)) for a, b, c in
+            re.findall(r'victory points: nation (\d+) \+(\d+) \(trade war, in its war with nation (\d+)\)', txt)]
+
+
+def battle_war_score(txt, a, b):
+    """Host log 'war score lo-hi: +x/+y ' (battles: OnBattleVP, CreditWarScore) of the pair a-b -> (a's, b's) summed."""
+    x = y = 0
+    for lo, hi, p, q in re.findall(r'war score (\d+)-(\d+): \+(\d+)/\+(\d+) ', txt):
+        if {int(lo), int(hi)} == {a, b}:
+            x, y = (x + int(p), y + int(q)) if int(lo) == a else (x + int(q), y + int(p))
+    return x, y
+
+
+TREATY_BOX = 'cancels the disarmament treaty'  # the game's CancelTreaty box (TMessageForm)
+NO_LIMIT = 2147483647
+
+
+def arms_treaty(port):
+    """`armstreaty` (0.6.0): the disarmament treaty on a copy -> dict(months, disp, cal, subban, base, war, kept, ends,
+    last) as ints (last a string), or None."""
+    r = value(cmd(port, 'armstreaty'))
+    if r is None:
+        return None
+    d = dict(w.split('=', 1) for w in r.split(' ') if '=' in w)
+    return {k: (int(v) if v.lstrip('-').isdigit() else v) for k, v in d.items()}
+
+
+def treaty_boxes(t0, who=None):
+    """The game's 'The outbreak of war cancels the disarmament treaty!' boxes (TMessageForm; not a turn report's line)
+    answered since t0 ((who, text) list)."""
+    return [(w, t[:120]) for (tm, w, k, t) in BOX_SEEN
+            if tm >= t0 and k == 'TMessageForm' and TREATY_BOX in t and (who is None or w == who)]
+
+
+def treaty_same(h, c):
+    return h and c and all(h.get(k) == c.get(k) for k in ('months', 'disp', 'cal', 'subban'))
+
+
+def scenario_arms_treaty(ctx):
+    """0.6.0: the disarmament treaty, the arms-control conference and a joined nation's war (nation 1 under the player's
+    rules, a computer nation J at peace with everyone, no other war among nations 1-8). The game ends the campaign-wide
+    treaty when a war breaks out (CancelTreaty: nation 0's war at the screen's refresh with its box "The outbreak of war
+    cancels the disarmament treaty!", two computer nations' war when it breaks out); its conference
+    (CreateArmsControlTreaty) ends at once while two of nations 1-8 are at war. a) both logs "Disarmament treaty with
+    joined nations' wars: ok"; the host's own war under a treaty (TEST: `armstreaty set` and `armstreaty war 1` on the
+    host, `armstreaty refresh`): the game's box on the host and the treaty ended there, as before (the host's war counter
+    and the nations' DisplacementLimit/BuildConstraint put back). b) M1 at peace with the game's conference at the
+    month's end (TEST `econtreaty 100`: CreateArmsControlTreaty(100) after ComputeExpenses, as its event does): a treaty
+    signed at peace; its effect on nation 1 is in the month's record (`econ 1` conference=1, treaty= the scrap value of
+    its ships under construction over the limits as the host log line has it, treatyBM < 0: the signing's -2) and in the
+    0.5.0 money check; the same treaty on both copies, the client knows the host's rule (header `armstreaty`: host=1), no
+    box. The treaty's tonnage limits are then lifted on both copies (`armstreaty set` with its own months and limits), so
+    no Turn stops at them (if the conference cannot make one, the TEST treaty `armstreaty set 36 15000 12` on both copies
+    stands in for c-e). c) war 1-J (`settension` on both copies): the client's screen refresh at war (`armstreaty war 1`,
+    `armstreaty refresh` on the client) keeps the host's treaty with an older host's rule (TEST `armstreaty host 0`:
+    "CancelTreaty left to the host") and ends it on its copy at once with this host's (`armstreaty host 1`, as the month's
+    header says), never with a box; M2: the host ends the treaty once ("arms treaty: the war of nation(s) 1 ends the
+    disarmament treaty"), chat "* The outbreak of war cancels the disarmament treaty! (...)", the game's line with the
+    month in the client's turn report, no box on either copy, both copies without a treaty. d) M3 at war with the
+    conference at the month's end (`econtreaty 100`): it sees the war through B2's mask (host log "the arms-control
+    conference (CreateArmsControlTreaty) sees the war(s) of the nations people play: 1-J J-1"), ends with the game's "With
+    a war already in progress" message: no treaty, nation 1's funds and BudgetModifier untouched by it (`econ 1`
+    conference=1 treaty=0 treatyBM=0), the money check passes. e) M4 at war: no box, no treaty on either copy, no second
+    end. The war months run with a BattleDriver (`war_month`). The suite's treaty guard is off meanwhile
+    (ctx.keep_treaty). Ends at peace (peacetest 100 2 1), every nation's tonnage limit as it was."""
+    ctx.keep_treaty = True
+    try:
+        _arms_treaty(ctx)
+    finally:
+        ctx.keep_treaty = False
+
+
+def _arms_treaty(ctx):
+    hp, cp = ctx.hp, ctx.cp
+    K = 1
+    for port, who in ((H, 'host'), (C, 'client')):
+        ok = log_lines(log_since(port), r"Disarmament treaty with joined nations' wars: ok")
+        check(f'start: {who} log "Disarmament treaty with joined nations\' wars: ok"', ok,
+              [x.split('] ', 1)[-1] for x in log_lines(log_since(port), r"Disarmament treaty with")][:2])
+    rr = relrules(H)
+    h0, c0, t0 = arms_treaty(H), arms_treaty(C), econtreaty(H)
+    hw = int(rel(0, 1).get('warCounter', '0'))
+    check('start: nation 1 follows the player\'s rules, the host is at peace, `armstreaty` answers on both copies and '
+          f'`econtreaty` on the host (host {h0}, client {c0})', rr is not None and K in rr and hw <= 0 and h0 and c0 and
+          'armed' in t0, dict(relrules=rr, host_war=hw, econtreaty=t0))
+    if not (rr and K in rr and hw <= 0 and h0 and c0 and 'armed' in t0):
+        return
+    cmd(H, 'mpwindow')
+    cmd(C, 'mpwindow')
+    # nation 1 starts at peace with everyone (an earlier scenario may leave a war with a computer nation)
+    wars0 = [x for x in range(9) if x != K and rel(K, x).get('war') == '1']
+    if wars0:
+        cmark, hmark = log_mark(C), log_mark(H)
+        cmd(C, 'peacetest 100 2 1')
+        wait_peace(ctx, cmark, hmark)
+    wars1 = [x for x in range(9) if x != K and rel(K, x).get('war') == '1']
+    check(f'setup: nation {K} at peace with everyone (its wars at the start {wars0 or "none"} ended by peacetest 100 2 1)',
+          not wars1, dict(before=wars0, after=wars1))
+    if wars1:
+        return
+    nt = nation_table()
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    cands = [j for j in range(3, 9) if j not in humans and j in nt and rel(K, j).get('war') == '0' and
+             rel(K, j).get('ally') == '0' and not any(rel(j, x).get('war') == '1' for x in range(9) if x != j)]
+    if not cands:
+        check('setup: a computer nation at peace with everyone and not allied with nation 1', False, nt)
+        return
+    J = cands[0]
+    others = [(a, b) for a in range(1, 9) for b in range(a + 1, 9) if a in nt and b in nt and rel(a, b).get('war') == '1']
+    check('setup: no war among nations 1-8 (the conference at peace can make a treaty)', not others, others)
+    log(f'  arms treaty: nation {K} {nt[K]["name"]} and the computer nation {J} {nt[J]["name"]}')
+
+    # a) the host's own war under a treaty: the game's own box and end, as before
+    ton = {n: (value(cmd(H, f'nfield {n} TreatyTonnageLimit')), value(cmd(C, f'nfield {n} TreatyTonnageLimit')))
+           for n in range(9)}  # (the treaties below lift them: MaxInt, no tonnage limits)
+    fields = ('DisplacementLimit', 'BuildConstraint')
+    snap = {(n, f): value(cmd(H, f'nfield {n} {f}')) for n in range(9) for f in fields}
+    cmd(H, 'armstreaty set 24 15000 12')
+    hw0 = arms_treaty(H)['war']
+    cmd(H, 'armstreaty war 1')
+    t_a = time.time()
+    r = cmd(H, 'armstreaty refresh')
+    wait_until(lambda: (answer_dialogs(hp, 'host'), treaty_boxes(t_a, 'host'))[1], bool, 10)
+    drain(hp, 2)
+    ha = arms_treaty(H)
+    cmd(H, f'armstreaty war {hw0}')
+    for (n, f), v in snap.items():
+        if v is not None:
+            cmd(H, f'nfield {n} {f} {v}')
+    cmd(H, 'armstreaty refresh')
+    drain(hp, 2)
+    ca = arms_treaty(C)
+    check('a) the host\'s own war under a treaty (TEST armstreaty set 24 15000 12, war 1, refresh): the game\'s box '
+          '"The outbreak of war cancels the disarmament treaty!" on the host, the treaty ended there (0 months, no '
+          'limits), CancelTreaty not left to anyone; the client unchanged',
+          r == 'ok' and len(treaty_boxes(t_a, 'host')) == 1 and ha and ha['months'] == 0 and ha['disp'] == NO_LIMIT and
+          ha['cal'] == NO_LIMIT and ha['kept'] == h0['kept'] and ca and ca['months'] == c0['months'],
+          dict(boxes=treaty_boxes(t_a), host=ha, client=ca))
+    check(f'a) the host\'s war counter ({hw0}) and every nation\'s DisplacementLimit/BuildConstraint put back',
+          arms_treaty(H)['war'] == hw0 and all(value(cmd(H, f'nfield {n} {f}')) == v for (n, f), v in snap.items()),
+          snap)
+
+    # b) M1 at peace: the game's conference at the month's end makes a treaty; its money for nation 1 in the record
+    t_b = time.time()
+    a = econtreaty(H, '100')
+    hm = log_mark(H)
+    run_month(ctx, 'arms_treaty M1')
+    ht = log_since(H, hm)
+    ran = re.findall(r'TEST: the arms-control conference ran: treaty months (-?\d+) -> (-?\d+)', ht)
+    chg = [x.split('] ', 1)[-1] for x in log_lines(ht, rf'economy: nation {K}: the arms-control conference changed')]
+    e = econ_kv(H, K)
+    made = bool(ran) and int(ran[-1][1]) > 0
+    old = int(e.get('fundsEnd', 0)) - int(e.get('after', 0)) - int(e.get('ruleFunds', 0))
+    tf, tbm = int(e.get('treaty', '-1')), int(e.get('treatyBM', '0'))
+    check(f'b) M1 at peace: the conference at the month\'s end (`econtreaty 100`) made a treaty ({ran}) and its effect on '
+          f'nation {K} is in the month\'s record: `econ {K}` conference=1, treatyBM < 0 (the signing\'s -2), treaty= its '
+          f'ships\' scrap value (>= 0) as the host log line has it, = the rest of the money check ({old:+d})',
+          a.get('armed') == 100 and made and e.get('conference') == '1' and tbm < 0 and tf >= 0 and bool(chg) and
+          f'by {tf:+d} and its BudgetModifier by {tbm:+d}' in chg[0] and old == tf,
+          dict(ran=ran, line=chg[:1], econ={k: e.get(k) for k in (
+              'conference', 'treaty', 'treatyBM', 'otherFunds', 'bm', 'after', 'ruleFunds', 'fundsEnd')}))
+    hb, cb = arms_treaty(H), arms_treaty(C)
+    check(f'b) M1: both copies show the same treaty (host {hb}, client {cb}); no box; the client knows the host\'s rule '
+          '(header `armstreaty`: host=1)', made and treaty_same(hb, cb) and hb['months'] > 0 and hb['disp'] < NO_LIMIT and
+          cb['host'] == 1 and not treaty_boxes(t_b), dict(boxes=treaty_boxes(t_b)))
+    if made:  # its tonnage limits lifted (MaxInt) on both copies: no Turn stops at them
+        for port in (H, C):
+            cmd(port, f'armstreaty set {hb["months"]} {hb["disp"]} {hb["cal"]}')
+    else:
+        log('  NOTE b): no treaty from the conference: the TEST treaty (armstreaty set 36 15000 12) on both copies for c-e')
+        for port in (H, C):
+            cmd(port, 'armstreaty set 36 15000 12')
+    hb, cb = arms_treaty(H), arms_treaty(C)
+
+    # c) war 1-J; the client's screen at war: an older host's treaty stays, this host's ends there at once (no box);
+    #    M2: the host ends it once
+    hr, cr = peace_war(K, J)
+    check(f'c) war {K}-{J} on both copies (settension) and nation {K}\'s war counter above 0 on the host',
+          hr.get('war') == '1' and 'war=1' in (cr or '') and (kwar_counters(H) or {}).get(K, 0) > 0,
+          dict(host=hr, client=cr, kwar=kwar_counters(H)))
+    cw0 = cb['war']
+    cmark, hmark, t_c = log_mark(C), log_mark(H), time.time()
+    cmd(C, 'armstreaty host 0')
+    cmd(C, 'armstreaty war 1')
+    r = cmd(C, 'armstreaty refresh')
+    wait_until(lambda: log_lines(log_since(C, cmark), r'arms treaty: CancelTreaty left to the host'), bool, 8)
+    drain(cp, 2, 'client')
+    cc = arms_treaty(C)
+    kept = [x.split('] ', 1)[-1] for x in log_lines(log_since(C, cmark), r'arms treaty: CancelTreaty left to the host')]
+    check('c) with an older host\'s rule (TEST armstreaty host 0, war 1, refresh): the client keeps the host\'s treaty '
+          f'({cc and cc["months"]} months), no box, "CancelTreaty left to the host (a joined player\'s PC, an older host"',
+          r == 'ok' and cc and treaty_same(cc, cb) and cc['kept'] > cb['kept'] and not treaty_boxes(t_c) and
+          any('an older host' in x for x in kept), dict(client=cc, log=kept, boxes=treaty_boxes(t_c)))
+    cmark = log_mark(C)
+    cmd(C, 'armstreaty host 1')
+    r = cmd(C, 'armstreaty refresh')
+    wait_until(lambda: log_lines(log_since(C, cmark), r'arms treaty: ended on this PC'), bool, 8)
+    drain(cp, 2, 'client')
+    ce = arms_treaty(C)
+    cmd(C, f'armstreaty war {cw0}')
+    ended = [x.split('] ', 1)[-1] for x in log_lines(log_since(C, cmark), r'arms treaty: ended on this PC')]
+    check('c) with this host\'s rule (host 1, as the month\'s header says): the client\'s refresh at war ends the treaty '
+          'on its copy at once, without the box (0 months, no limits; "arms treaty: ended on this PC for its nation\'s '
+          'war, as the host ends it")', r == 'ok' and ce and ce['months'] == 0 and ce['disp'] == NO_LIMIT and
+          ce['cal'] == NO_LIMIT and ce['endedhere'] == cc['endedhere'] + 1 and len(ended) == 1 and
+          not treaty_boxes(t_c), dict(client=ce, log=ended, boxes=treaty_boxes(t_c)))
+    hc0 = chat(hp)
+    cmark2 = log_mark(C)
+    war_month(ctx, 'arms_treaty M2', K, J)
+    drain(cp, 3, 'client')
+    hl = log_since(H, hmark)
+    ends = re.findall(rf'arms treaty: the war of nation\(s\) {K} ends the disarmament treaty \((\d+) month', hl)
+    hc, cc = arms_treaty(H), arms_treaty(C)
+    check(f'c) M2: the host ended the treaty once for nation {K}\'s war ("arms treaty: the war of nation(s) {K} ends '
+          f'the disarmament treaty ({ends and ends[0]} month(s) left ...)"; armstreaty ends=1)', len(ends) == 1 and
+          int(ends[0]) > 0 and hc and hc['ends'] == hb['ends'] + 1,
+          [x.split('] ', 1)[-1] for x in log_lines(hl, r'arms treaty:')][:6])
+    check('c) M2: no treaty on either copy (0 months, no limits); no box on either copy since the war',
+          treaty_same(hc, cc) and hc['months'] == 0 and hc['disp'] == NO_LIMIT and hc['cal'] == NO_LIMIT and
+          not treaty_boxes(t_c), dict(host=hc, client=cc, boxes=treaty_boxes(t_c)))
+    line = '* The outbreak of war cancels the disarmament treaty! ('
+    txt = wait_until(lambda: chat(hp), lambda t: t.count(line) > hc0.count(line), 8)
+    reps = [t for (tm, w, k, t) in BOX_SEEN if tm >= t_c and w == 'client' and k == 'TdlgCampTurnRep']
+    sent = log_lines(hl, rf'arms treaty: the turn report line of nation {K} goes with state seq')
+    shown = log_lines(log_since(C, cmark2), r'economy: showing \d+ message')
+    in_rep = any('The outbreak of war cancels the disarmament treaty!' in t for t in reps)
+    log(f'  arms treaty: a recorded turn report of the client holds the line: {in_rep} ({len(reps)} recorded)')
+    check('c) M2: host chat "* The outbreak of war cancels the disarmament treaty! (...)"; the game\'s line "The '
+          'outbreak of war cancels the disarmament treaty!" went with the month and the client showed its turn report',
+          txt.count(line) > hc0.count(line) and len(sent) == 1 and shown,
+          dict(chat=txt[-300:], sent=sent, shown=shown, reports=[t[:400] for t in reps]))
+
+    # d) M3 at war: the conference at the month's end sees nation 1's war and ends at once; nothing in the record
+    others = [(a, b) for a in range(1, 9) for b in range(a + 1, 9) if K not in (a, b) and a in nt and b in nt and
+              rel(a, b).get('war') == '1']
+    a = econtreaty(H, '100')
+    hm, t_d = log_mark(H), time.time()
+    war_month(ctx, 'arms_treaty M3', K, J)
+    ht = log_since(H, hm)
+    seen = [x.split('] ', 1)[-1] for x in log_lines(ht, r'the arms-control conference \(CreateArmsControlTreaty\) sees')]
+    ran = re.findall(r'TEST: the arms-control conference ran: treaty months (-?\d+) -> (-?\d+)', ht)
+    pic = [t[:120] for (tm, w, k, t) in BOX_SEEN if tm >= t_d and w == 'host' and 'With a war already in progress' in t]
+    e = econ_kv(H, K)
+    hd, cd = arms_treaty(H), arms_treaty(C)
+    check(f'd) M3: the conference at the month\'s end during the war {K}-{J} (`econtreaty 100`) saw the war through the '
+          f'mask (host log "... sees the war(s) of the nations people play: {K}-{J} {J}-{K}"), ended with the game\'s '
+          f'"With a war already in progress" message: no treaty on either copy, nation {K}\'s funds and BudgetModifier '
+          f'untouched by it (`econ {K}` conference=1 treaty=0 treatyBM=0; other wars of nations 1..8: {others or "none"})',
+          a.get('armed') == 100 and bool(seen) and f' {K}-{J}' in seen[0] and ran == [('0', '0')] and len(pic) >= 1 and
+          e.get('conference') == '1' and e.get('treaty') == '0' and e.get('treatyBM') == '0' and hd and
+          hd['months'] == 0 and treaty_same(hd, cd),
+          dict(seen=seen[:1], ran=ran, boxes=pic, econ={k: e.get(k) for k in (
+              'conference', 'treaty', 'treatyBM', 'otherFunds', 'bm')}, host=hd, client=cd))
+
+    # e) one more month at war: no box, no treaty, no second end
+    war_month(ctx, 'arms_treaty M4', K, J)
+    he, ce = arms_treaty(H), arms_treaty(C)
+    kw = (kwar_counters(H) or {}).get(K)
+    check(f'e) M2-M4 at war (nation {K}\'s war counter {kw}): no box on either copy, no treaty on either copy, no '
+          f'second end (ends={he and he["ends"]})', kw is not None and kw >= 3 and treaty_same(he, ce) and
+          he['months'] == 0 and he['ends'] == hc['ends'] and not treaty_boxes(t_c), dict(host=he, client=ce,
+                                                                                          boxes=treaty_boxes(t_c)))
+    # ends at peace (the game's peace in nation 1's view)
+    cmark, hmark = log_mark(C), log_mark(H)
+    r = cmd(C, 'peacetest 100 2 1')
+    wait_peace(ctx, cmark, hmark)
+    hr = rel(K, J)
+    check(f'end: peace {K}-{J} (peacetest 100 2 1): the war is over on the host', r == 'ok' and hr.get('war') == '0', hr)
+    if (h0['disp'], h0['cal']) != (NO_LIMIT, NO_LIMIT):
+        cmd(H, f'armstreaty set {h0["months"]} {h0["disp"]} {h0["cal"]}')
+    for n, (vh, vc) in ton.items():  # every nation's tonnage limit as it was, on both copies (the client's own nation's
+        for port, v in ((H, vh), (C, vc)):  # goes back to the host with its turn)
+            if v is not None:
+                cmd(port, f'nfield {n} TreatyTonnageLimit {v}')
+
+
+def scenario_war_effects(ctx):
+    """0.6.0 (B5): the player's war effects for nation 1 under the player's rules. A computer nation J at war with nation 1
+    and a computer ally X of nation 1 at war with J (`settension`/`setally` on both copies), the host at peace.
+    M1: `warfxblk J 1` (TEST: J blockaded in the war effects' test, warfx.cpp) and `allyrand 0` (TEST: the allies' war
+    help draws 0 on the client): the month's blockade check and J's DoBlockadeEffects credit nation 1 (two host lines,
+    nation 1's VP and its war score with J in the ledger up by their sum), J's Blockaded flag on the host and on the
+    client (`kblk`), nation 1's message "Gain x VP for blockade of enemy" in its turn report; the next month's relation
+    turn runs the allies' war help on the client (war counter 2): X's operations add VP to nation 1 and the host applies
+    them to its VP and its war score (`allyvp 1-J+n`). M2: `warfxblk J -1`, `warfxblk 1 1` (nation 1 blockaded): J credited
+    twice (J's VP and its side of the score), nation 1's flag on both copies, its message "The enemy gains x VP for
+    blockading us", the month's StopBlockadedMoves of the next month runs with War 1 (the host at peace: logged). The
+    host's own VP and EnemyVP unchanged. M2 also (c) raiders, submarines and the trade war (0.6.0): `warfxsea 1 6` (TEST:
+    six of nation 1's ships raid in J's build area in the month's sea war frame): its frame (its view, counter 2) sinks
+    J's merchants (the frame's log line, J's MerchantsLostToRaidersThisTurn), the trade war credits nation 1 vs J (VP and
+    its side of the war score), no enemy raiders against the blockaded nation 1, its report gets the raider's line and
+    "Trade war this month: ...", the host shows no dialog for it. War weariness (0.6.0): nation 1 with government 2 and BudgetModifier 20 (`nfield`
+    on both copies); M1 winning by its own score (`kwarvp 1 J 100 0`): the player's rule logs "no (not losing)" and the
+    game's own rule runs for the eight other nations; M2 losing (`kwarvp 1 J 0 5000`, `warfxrand 0`): unrest +1 and the
+    message "Our people is getting dissatisfied with the bad war situation!". M3 also the war loan (0.5.0's rule for
+    nation 1, confirmed here at war) after the war budget of its own counter (0.6.0): `kwar 1 4`, `econrand 1`,
+    BudgetModifier 3 and UnrestLevel 2 on both copies -> the war budget 3 -> 4 with "War budget means increased
+    allocations to the navy!", `econ` loan=1 with the "... authorizes additional war loan! ..." text, BudgetModifier 5 on
+    both copies (+ the new month's own changes of nation 1 by its PC's event and relation turn, as the host log has them:
+    e.g. the intelligence result's "Give it maximum publicity ..." answer, BudgetModifier+1). Building for war (0.6.0):
+    before M1 a ship of nation 1 under construction set to be built in J's yard
+    and one of J's in nation 1's yard (TEST `shipbuilder`, both copies); nation 1's PC hands both over in its relation
+    turn after M1, the host applies them (`findship` on both copies). The war months M1-M3 run with a BattleDriver
+    (`war_month`): a battle of the month is declined, or fought on auto-run when the game allows no decline.
+    M4 (the enemy-revolution rule, 0.6.0): the host's nation at war with nation 1 too (`diplo war 1`), `revotest 0 J:25
+    0:25` on the client and nation 1's unrest 25 on both copies: J's revolution on nation 1's PC ends the war 1-J by the
+    general peace, the host applies it; the war 0-1 stays out of the rule on both sides (logged on each) and goes on; a
+    battle of the host against nation 1 in that month runs through the live months' tools (`ls_month`, drop12).
+    Ends at peace (the wars, the alliance, the fields and the test knobs undone; the war 0-1 by the players' peace)."""
+    K = 1
+    hl = log_lines(log_since(H), r"warfx: the player's war effects for joined nations")
+    cl = log_lines(log_since(C), r'War help from allies for a joined nation')
+    check('start: host log "warfx: the player\'s war effects for joined nations: blockades ok", client log "War help '
+          'from allies for a joined nation: ok"', any('blockades ok' in x for x in hl) and any(': ok' in x for x in cl),
+          [x.split('] ', 1)[-1] for x in hl + cl][:3])
+    rr = relrules(H)
+    if not (rr and K in rr) or warfx_state() is None:
+        check('start: nation 1 follows the player\'s rules (`relrules`) and the host answers `warfx`', False, rr)
+        return
+    cmd(H, 'mpwindow')
+    cmd(C, 'mpwindow')
+    nt = nation_table()
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    cands = [j for j in range(3, 9) if j not in humans and j in nt and rel(K, j).get('war') == '0' and
+             rel(K, j).get('ally') == '0' and not any(rel(j, x).get('war') == '1' for x in range(9) if x != j)]
+    if len(cands) < 2 or rel(0, 1).get('warCounter', '0').lstrip('-').isdigit() and int(rel(0, 1)['warCounter']) > 0:
+        check('setup: two computer nations at peace with everyone, the host at peace', False, cands)
+        return
+    J, X = cands[:2]
+    log(f'  B5: nation {K} {nt[K]["name"]}, its enemy {J} {nt[J]["name"]}, its ally {X} {nt[X]["name"]}')
+    hr, cr = peace_war(K, J)
+    for port in (H, C):
+        cmd(port, f'setally {K} {X} 24')
+        cmd(port, f'settension {K} {X} 2')
+        cmd(port, f'settension {X} {J} 50')
+    check(f'setup: war {K}-{J}, alliance {K}-{X}, war {X}-{J} on both copies', hr.get('war') == '1' and
+          'war=1' in (cr or '') and rel(K, X).get('ally') not in (None, '0') and rel(X, J).get('war') == '1' and
+          'war=1' in (cmd(C, f'rel {X} {J}') or ''), dict(kj=hr, kx=rel(K, X), xj=rel(X, J)))
+    cmd(H, f'warfxblk {J} 1')
+    cmd(H, f'warfxblk {K} 0')
+    cmd(C, 'allyrand 0')
+    # 0.6.0 (round 4): the blockade tests count the allies from nation 1's side (its view on the host): its ally X at war
+    # with J adds to its strength against J there, not on the host's frame (X is not the host's ally)
+    sp = cmd(H, f'warfx strength {K} {J}') or ''
+    sh, sv = (sp.split(' | view ', 1) + [''])[:2]
+    check(f'setup: `warfx strength {K} {J}`: nation {K}\'s ally {X} ({nt[X]["name"]}, at war with {J}) counts in its view '
+          f'(the game\'s account lists it), not on the host\'s frame', sp.startswith('ok') and
+          nt[X]['name'] in sv.split(':', 1)[-1] and nt[X]['name'] not in sh, sp[:400])
+    # war weariness (0.6.0): nation 1 with government 2 and BudgetModifier 20 on both copies, winning in M1
+    gov0, bm0, un0 = ({p: nint(p, K, f) for p in (H, C)} for f in ('GovernmentType', 'BudgetModifier', 'UnrestLevel'))
+    for port in (H, C):
+        cmd(port, f'nfield {K} GovernmentType {(gov0[port] & ~0xFF) | 2}')
+        cmd(port, f'nfield {K} BudgetModifier 20')
+    cmd(H, f'kwarvp {K} {J} 100 0')
+    # building for war (0.6.0): a ship of nation 1 under construction in J's yard and one of J's in nation 1's yard (TEST
+    # `shipbuilder` on both copies): nation 1's PC takes J's and loses its own in its relation turn after M1
+    bk, bj = ([x for x in (cmd(H, f'shipbuilder {n}') or '').split()[1:] if x.count(':') == 2] for n in (K, J))
+    # the newest ship of each (the highest CShipId: laid down last, the most building time left): an older one can be
+    # commissioned in M1 before nation 1's relation turn (a `--group relations` run of 2026-10-23: J's ship 262)
+    newest = lambda lst: max(lst, key=lambda x: int(x.split(':')[1]))  # noqa: E731
+    sk = tuple(int(v) for v in newest(bk).split(':')) if bk else None
+    sj = tuple(int(v) for v in newest(bj).split(':')) if bj else None
+    for port in (H, C):
+        if sk and sj:
+            cmd(port, f'shipbuilder {K} {sk[0]} {J}')
+            cmd(port, f'shipbuilder {J} {sj[0]} {K}')
+    vp0, e0, l0 = nint(H, K, 'VP'), value(cmd(H, 'ffield EnemyVP')), kwarvp(K)
+    h0 = nint(H, 0, 'VP')
+    hm, cm = log_mark(H), log_mark(C)
+    war_month(ctx, 'war_effects M1', K, J)
+    rl = [x.split('] ', 1)[-1] for x in wait_log(H, hm, r'relations of .*\(nation 1;', 30)]
+    ht, ct = log_since(H, hm), log_since(C, cm)
+    cr1 = blockade_credits(ht)
+    gain = sum(v for g, v, lo in cr1 if g == K and lo == J)
+    ah = [x.split('] ', 1)[-1] for x in log_lines(ct, r'war help from allies for nation 1 \(')]
+    m = re.search(r'war counter (\d+)\): VP (-?\d+)', ah[-1]) if ah else None
+    avp = int(m[2]) if m else 0
+    vp1, l1 = nint(H, K, 'VP'), kwarvp(K)
+    lk = lambda led: (led or {}).get('pairs', {}).get(J, (0, 0))
+    check(f'M1: J\'s blockade: two credits to nation {K} in the host\'s log (the check\'s and the effects\') and no '
+          f'other blockade credit', len([1 for g, v, lo in cr1 if g == K and lo == J]) == 2 and
+          all(g == K for g, v, lo in cr1), cr1)
+    check(f'M1: the allies\' war help ran on the client (war counter 2) and ally {X} added VP; the host applied it '
+          f'(VP {avp}, allyvp {K}-{J}+{avp})', m is not None and m[1] == '2' and avp > 0 and
+          any(f' VP {avp}' in x and f'allyvp {K}-{J}+{avp}' in x for x in rl), dict(client=ah[:2], host=rl[:2]))
+    bk, bj = battle_war_score(ht, K, J)  # a battle of the month (declined or fought) has its own points
+    check(f'M1: nation {K}\'s war score with {J} up by the blockade credits {gain} and the allies\' {avp} (+ the battles\' '
+          f'{bk}/{bj}; kwarvp), its VP by at least as much', lk(l1)[0] - lk(l0)[0] == gain + avp + bk and
+          lk(l1)[1] - lk(l0)[1] == bj and vp1 - vp0 >= gain + avp, dict(vp=(vp0, vp1), ledger=(lk(l0), lk(l1))))
+    w = warfx_state()
+    check(f'M1: J\'s Blockaded flag on the host and on the client (kblk), not nation {K}\'s',
+          w and J in w['flags'] and K not in w['flags'] and nflag(C, J, 'Blockaded') == 1 and nflag(C, K, 'Blockaded') == 0,
+          dict(host=w and w['raw'][:200], client=(nflag(C, J, 'Blockaded'), nflag(C, K, 'Blockaded'))))
+    bm = [x.split('] ', 1)[-1] for x in log_lines(ht, r'warfx: blockade check \(month\)')]
+    check(f'M1: the month\'s blockade tests of nation {K} ran in its own view (0.6.0: the allies from its side)',
+          bool(bm) and f' {K}(war ' in bm[0] and '(its view);' in bm[0], bm[:1])
+    check(f'M1: nation {K}\'s message "Gain x VP for blockade of enemy" went with the month and the client showed the '
+          f'month\'s messages', log_lines(ht, r'warfx: message for nation 1: Gain \d+ VP for blockade of enemy') and
+          log_lines(ct, r'economy: showing \d+ message'),
+          [x.split('] ', 1)[-1] for x in log_lines(ht, r'warfx: message for nation 1')][:3])
+    wl = [x.split('] ', 1)[-1] for x in log_lines(ht, r'warfx: war weariness')]
+    kl = [x for x in wl if 'of nation 1 (' in x]
+    sm = [x for x in wl if 'this month' in x]
+    check(f'M1: nation {K}\'s war weariness by its own war counter and score (government 2, BM 20, winning): no unrest; '
+          f'the game\'s own rule for the other eight nations', len(kl) == 1 and 'government 2, BM 20' in kl[0] and
+          'no (not losing)' in kl[0] and bool(sm) and
+          all(f'{n},' in sm[0].split("game's own for ", 1)[-1] for n in (0, 2, 3, 4, 5, 6, 7, 8)), wl[:3])
+    cb = [x.split('] ', 1)[-1] for x in log_lines(ct, r'relations v2: building for war for nation 1 ')]
+    if sk and sj:
+        idk, idj = sk[1], sj[1]
+        check(f'M1: building for war on nation {K}\'s PC (its counter 2): ship {idk} (its own, in {J}\'s yard) taken by '
+              f'{J}, ship {idj} ({J}\'s, in its yard) taken by it; the host applied both; on both copies',
+              bool(cb) and f'{idk}:{K}>{J}' in cb[0] and f'{idj}:{J}>{K}' in cb[0] and
+              any(f'seized ship {idk} {K}->{J}' in x and f'seized ship {idj} {J}->{K}' in x for x in rl) and
+              ship_holders(H, idk) == [J] and ship_holders(C, idk) == [J] and ship_holders(H, idj) == [K] and
+              ship_holders(C, idj) == [K], dict(client=cb[:1], host=rl[:1]))
+    else:
+        # nation 1's ships under construction can all be complete by then (a --stress run of 2026-10-23: more months
+        # before `war_effects`): the check can't be shown (no check)
+        log(f'  SKIP-note M1 building for war: nation {K} or {J} has no ship under construction (`shipbuilder`: '
+            f'{K} {sk}, {J} {sj})')
+
+    # M2: nation 1 blockaded, and losing by its own score (war weariness with the war effects' draws 0)
+    cmd(H, f'warfxblk {J} -1')
+    cmd(H, f'warfxblk {K} 1')
+    cmd(C, 'allyrand -1')
+    cmd(H, f'settension {X} {J} 30')
+    cmd(C, f'settension {X} {J} 30')
+    cmd(H, f'kwarvp {K} {J} 0 5000')
+    cmd(H, 'warfxrand 0')
+    # (c) raiders, submarines and the trade war (0.6.0): six of nation 1's ships raid in J's build area for M2's sea war
+    # frame (TEST `warfxsea`; nation 1 blockaded: no enemy raiders against it, the game's rule)
+    sea_on = 'searule=1' in (cmd(H, f'warfx {K}') or '')
+    if sea_on:
+        cmd(H, f'warfxsea {K} 6')
+        cmd(H, f'warfxblk {J} 0')  # J not blockaded (else its merchants stay at home: the game's raider rule)
+    t2 = time.time()
+    vj0, l0 = nint(H, J, 'VP'), kwarvp(K)
+    hm, cm = log_mark(H), log_mark(C)
+    war_month(ctx, 'war_effects M2', K, J)
+    ht = log_since(H, hm)
+    cr2 = blockade_credits(ht)
+    jg = sum(v for g, v, lo in cr2 if g == J and lo == K)
+    tc2 = trade_credits(ht)
+    tk = sum(v for g, v, lo in tc2 if g == K and lo == J)
+    tj = sum(v for g, v, lo in tc2 if g == J and lo == K)
+    vj1, l1 = nint(H, J, 'VP'), kwarvp(K)
+    bk, bj = battle_war_score(ht, K, J)
+    check(f'M2: nation {K} blockaded: two credits to {J} (the check\'s and the effects\'), {J}\'s side of the war score up '
+          f'by {jg} (+ the battles\' {bj}, the trade war\'s {tj}), its VP by at least as much',
+          len([1 for g, v, lo in cr2 if g == J and lo == K]) == 2 and lk(l1)[1] - lk(l0)[1] == jg + bj + tj and
+          vj1 - vj0 >= jg, dict(credits=cr2, trade=tc2, vp=(vj0, vj1), ledger=(lk(l0), lk(l1))))
+    if sea_on:
+        sl = [x.split('] ', 1)[-1] for x in log_lines(ht, rf'warfx: sea war of nation {K} \(')]
+        m = re.search(rf' {J}: raiders (\d+)/(\d+), subs (\d+)/(\d+), VP \+(\d+)/\+(\d+);', sl[0]) if sl else None
+        a = [int(x) for x in m.groups()] if m else [0] * 6
+        lost = nint(H, J, 'MerchantsLostToRaidersThisTurn')
+        check(f'M2 (c): nation {K}\'s raiders (TEST `warfxsea {K} 6`) sink {J}\'s merchants in its frame (its view, war '
+              f'counter > 1): {J}\'s merchants lost (the frame\'s count), the trade war credits {K} +x vs {J} (the '
+              f'frame\'s VP; its side of the war score up by at least x); no enemy raiders against the blockaded {K}',
+              bool(sl) and 'its view' in sl[0] and 'TEST: 6 raider(s)' in sl[0] and a[0] > 0 and
+              tk == a[4] > 0 and tj == a[5] and a[1] == 0 and 'blockaded (no enemy raiders)' in sl[0] and
+              lk(l1)[0] - lk(l0)[0] >= tk, dict(frame=sl[:1], lost=lost, trade=tc2, ledger=(lk(l0), lk(l1))))
+        news = [x.split('] ', 1)[-1] for x in log_lines(ht, rf'warfx: message for nation {K}: .*(sinks|Trade war this month)')]
+        ct = log_since(C, cm)
+        boxes = [c for t, who, c in ANSWERED if t >= t2 and who == 'host' and 'SubmarineWarfareSummary' in c] + \
+            [ln[:120] for x in BOX_SEEN if x[0] >= t2 and x[1] == 'host' for ln in sea_war_box_lines(x[3])]
+        drop = [x.split('] ', 1)[-1] for x in log_lines(ht, r'warfx: sea war: the computer\'s submarine sinkings dropped')]
+        check(f'M2 (c): nation {K}\'s report gets the frame\'s lines (the raider\'s "... sinks n merchant ships in ..." and '
+              f'"Trade war this month: ..."; client "economy: showing N message"), the host shows no dialog for it',
+              any('sinks' in x for x in news) and any('Trade war this month' in x for x in news) and
+              bool(log_lines(ct, r'economy: showing \d+ message')) and not boxes,
+              dict(news=news[:3], host_boxes=boxes[:3], dropped=drop[:1]))
+        cmd(H, f'warfxblk {J} -1')
+    w = warfx_state()
+    check(f'M2: nation {K}\'s Blockaded flag on both copies; its message "The enemy gains x VP for blockading us"',
+          w and K in w['flags'] and nflag(C, K, 'Blockaded') == 1 and
+          log_lines(ht, r'warfx: message for nation 1: The enemy gains \d+ VP for blockading us'),
+          dict(host=w and w['raw'][:200], client=nflag(C, K, 'Blockaded')))
+    kl = [x.split('] ', 1)[-1] for x in log_lines(ht, r'warfx: war weariness of nation 1 \(')]
+    m = re.search(r'blockaded 1 -> unrest (\d+) -> (\d+)', kl[0]) if kl else None
+    check(f'M2: nation {K} losing by its own score, blockaded, draws 0: the war weariness adds 1 unrest and its message '
+          f'"Our people is getting dissatisfied with the bad war situation!"', m is not None and
+          int(m[2]) == int(m[1]) + 1 and
+          bool(log_lines(ht, r'warfx: message for nation 1: Our people is getting dissatisfied')), kl[:2])
+    # M3: StopBlockadedMoves; the war budget and the war loan at nation 1's counter 4 (BudgetModifier 3: the war budget's
+    # 3 < Random(16) + 8 -> 4, its text "War budget means increased allocations to the navy!" (counter even); econrand 1:
+    # the loan's Random(4) + 2 = 3 < 4, Random(16) + 10 = 11 > 4 -> 5)
+    cmd(H, 'warfxrand -1')
+    for port in (H, C):
+        cmd(port, f'nfield {K} BudgetModifier 3')
+        cmd(port, f'nfield {K} UnrestLevel 2')
+    cmd(H, f'kwar {K} 4')
+    cmd(H, 'econrand 1')
+    hm = log_mark(H)
+    war_month(ctx, 'war_effects M3', K, J)
+    ht = log_since(H, hm)
+    sl = log_lines(ht, r'warfx: StopBlockadedMoves \(run with War 1')
+    check(f'M3: the month\'s StopBlockadedMoves ran with War 1 for nation {K} (the host at peace: its flag since the load)',
+          any(f' {K}:' in x for x in sl), [x.split('] ', 1)[-1] for x in sl][:2])
+    e = cmd(H, f'econ {K}') or ''
+    ln = [x.split('] ', 1)[-1] for x in log_lines(ht, r'economy: nation 1 news: .*war loan')]
+    gl = [x.split('] ', 1)[-1] for x in log_lines(ht, r"warfx: building for war: nation 1's war budget: BudgetModifier 3 -> 4")]
+    # the new month's own changes of nation 1 before this check, on both copies (its PC's event and relation turn; a run
+    # of 2026-10-23: the intelligence result's "Give it maximum publicity ..." answer, BudgetModifier+1)
+    wait_log(H, hm, rf'relations of .* \(nation {K}; ', 10)
+    own = own_field_changes(log_since(H, hm), 'BudgetModifier', K)
+    want = 5 + sum(d for _, d in own)
+    check(f'M3: nation {K}\'s war budget (its counter 4: BudgetModifier 3 -> 4, "War budget means increased allocations to '
+          f'the navy!") and war loan (econ loan=1, the text "... authorizes additional war loan! ..."): BudgetModifier 5 '
+          f'(+ the new month\'s own changes by its PC\'s event and relation turn, host log: {own or "none"}) on both copies',
+          re.search(r'\bloan=1\b', e) is not None and bool(gl) and bool(ln) and
+          bool(log_lines(ht, r'warfx: message for nation 1: War budget means increased allocations to the navy!')) and
+          nint(H, K, 'BudgetModifier') == want and nint(C, K, 'BudgetModifier') == want,
+          dict(econ=e[:160], bm=(nint(H, K, 'BudgetModifier'), nint(C, K, 'BudgetModifier')), want=want, own=own,
+               grant=gl[:1], news=ln[:1]))
+    cmd(H, 'econrand -1')
+    for port in (H, C):
+        cmd(port, f'nfield {K} GovernmentType {gov0[port]}')
+        cmd(port, f'nfield {K} BudgetModifier {bm0[port]}')
+        cmd(port, f'nfield {K} UnrestLevel {un0[port]}')
+    check('M1-M3: the host\'s own VP and EnemyVP unchanged (the host at peace)',
+          nint(H, 0, 'VP') == h0 and value(cmd(H, 'ffield EnemyVP')) == e0,
+          dict(vp=(h0, nint(H, 0, 'VP')), evp=(e0, value(cmd(H, 'ffield EnemyVP')))))
+    cmd(H, f'warfxblk {K} -1')
+    for port in (H, C):
+        cmd(port, f'setally {K} {X} 0')
+        cmd(port, f'settension {X} {J} 30')
+    # M4 (0.6.0, the enemy-revolution rule): the host's nation at war with nation 1 too (`diplo war 1` + applydiplo);
+    # `revotest 0 J:25 0:25` on the client (its next run's draws 0, J's and the host's nation's unrest 25 in nation 1's
+    # copy) and nation 1's own unrest 25 on both copies (a candidate of the host's own rule). Nation 1's PC: J's revolution
+    # ends the war 1-J by the general peace (DoPeace: no other computer enemy), the war 0-1 stays out (logged: "it would be
+    # a candidate"); the host: its own rule keeps nation 1 out (logged), the war 0-1 goes on on both copies. A battle of
+    # the host against nation 1 in the month is handled by the live months' own tools (ls_month, drop12).
+    ls_quiet(ctx)
+    r01 = ls_war01(ctx)
+    for port in (H, C):
+        cmd(port, f'nfield {K} UnrestLevel 25')
+    rt = cmd(C, f'revotest 0 {J}:25 0:25')
+    kw = [(kwar_counters(H) or {}).get(K)]
+    check(f'M4 setup: the war 0-1 on the host (the client gets it with the month), the war {K}-{J} on both copies, nation '
+          f'{K}\'s unrest 25 on both, the client\'s `revotest`',
+          r01.get('war') == '1' and rel(K, J).get('war') == '1' and 'war=1' in (cmd(C, f'rel {K} {J}') or '') and
+          nint(H, K, 'UnrestLevel') == 25 and nint(C, K, 'UnrestLevel') == 25 and (rt or '').startswith('ok revotest=0'),
+          dict(r01=r01, kj=rel(K, J), client=(cmd(C, 'rel 0 1'), cmd(C, f'rel {K} {J}'), nint(C, K, 'UnrestLevel')),
+               revotest=rt))
+    rec = ls_month(ctx, 'war_effects M4', modes=('drop12',))
+    rl = [x.split('] ', 1)[-1] for x in wait_log(H, rec['hmark'], r'relations of .*\(nation 1;', 30) or []]
+    ht, ct = log_since(H, rec['hmark']), log_since(C, rec['cmark'])
+    rv = [x.split('] ', 1)[-1] for x in log_lines(ct, r'relations v2: revolution: ')]
+    rn = [x for x in rv if 'revolution: nation 1 ' in x]
+    hr = [x.split('] ', 1)[-1] for x in log_lines(ht, r'relations v2: revolution \(host\)')]
+    kw.append((kwar_counters(H) or {}).get(K))
+    log(f'  M4: battles {[(b["bid"], b["mode"], b.get("error")) for b in rec["live"]]}; nation {K}\'s war counter '
+        f'{kw[0]} -> {kw[1]}, unrest on the host {nint(H, K, "UnrestLevel")}; host: {hr[:1]} {rl[:1]}')
+    check(f'M4: nation {K}\'s PC ran the enemy-revolution rule: J {J}\'s revolution ended the war {K}-{J} by the general '
+          f'peace (DoPeace); the host applied it (peace {K}-{J})', bool(rn) and f'wars ended {J} (the general peace' in rn[0]
+          and any(f'peace {K}-{J}' in x for x in rl), dict(client=rn[:1], host=rl[:1]))
+    check(f'M4: the war 0-{K} stayed out of the rule on nation {K}\'s PC (logged: the host\'s nation "would be a '
+          f'candidate") and on the host (nation {K} with unrest 25 kept out of the host\'s own rule, logged)',
+          any('stay out' in x and '0 (unrest 25: it would be a candidate)' in x for x in rv) and
+          any(re.search(rf' {K} \(unrest \d+: it would be a candidate\)', x) for x in hr), dict(client=rv[:2], host=hr[:1]))
+    check(f'M4: the war 0-{K} goes on (host and client); the war {K}-{J} is over on both copies',
+          rel(0, K).get('war') == '1' and 'war=1' in (cmd(C, f'rel 0 {K}') or '') and rel(K, J).get('war') == '0' and
+          'war=0' in (cmd(C, f'rel {K} {J}') or ''), dict(r0k=rel(0, K), kj=rel(K, J)))
+    for port in (H, C):
+        cmd(port, f'nfield {K} UnrestLevel {un0[port]}')
+    r01 = ls_peace01(ctx)
+    check('M4 end: peace 0-1 (the players\' own peace: a compromise)', r01.get('war') == '0', r01)
+    peace_war(K, J, 5)
+
+
+def econ_kv(port=H, n=1):
+    """`econ n` -> dict of its key=value fields ({} if unavailable)."""
+    v = value(cmd(port, f'econ {n}') or '') or ''
+    return dict(x.split('=', 1) for x in v.split() if '=' in x)
+
+
+def econtreaty(port=H, arg=''):
+    """`econtreaty [arg]` (TEST, economy.cpp) -> dict(armed, months, limit, calibre) as ints ({} if unavailable)."""
+    v = value(cmd(port, f'econtreaty {arg}'.strip()) or '') or ''
+    return {k: int(x) for k, x in (y.split('=', 1) for y in v.split() if '=' in y) if x.lstrip('-').isdigit()}
 
 
 def scenario_player_copy(ctx):
@@ -5389,7 +6522,11 @@ def scenario_player_copy(ctx):
           f'{rels[1]}')
     p_host = poss_list(C, f'possessions {K}')
     if fx['at_war']:
-        log(f'  WARNING: {me} is at war with {fx["at_war"]} in the copy: the month may generate a battle')
+        # a war the session left (battle_surprise's 1-J ends with the next month's relation turn) would let the copy's
+        # month generate a battle (dist_rc060_2 --stress: its preview stopped the month and the run): peace in the copy
+        ends = {j: cmd(C, f'settension 0 {j} 5') for j in fx['at_war']}
+        log(f'  NOTE f) {me} is at war with {fx["at_war"]} in the copy: peace there before its month (`settension 0 j '
+            f'5`, a throwaway copy; a battle would stop the month): {ends}')
     sp = single_player_month(ctx, 78)
     ctx.months.append(('player_copy (slot 78 alone)', '/'.join(sp['d0'] or ()), '/'.join(sp['d1'] or ()), sp['dt']))
     log(f'  single-player month on slot 78: {sp["d0"]} -> {sp["d1"]} in {sp["dt"]:.0f} s; {len(sp["answered"])} '
@@ -5587,14 +6724,15 @@ def battles_list():
 
 
 def cstate():
-    """Client `battles state` -> dict(state, id, nation, opp, area, slot, slotMode, aftermath, fight, raw)."""
+    """Client `battles state` -> dict(state, id, nation, opp, area, slot, slotMode, aftermath, fight, hostgen, raw)."""
     r = cmd(C, 'battles state')
     m = re.match(r'^ok state=(\S+) id=(-?\d+) nation=(-?\d+) opp=(-?\d+) area=(.*) slot=(\d+) slotMode=(\d) '
-                 r'aftermath=(\d) fight=(\d)$', r)
+                 r'aftermath=(\d) fight=(\d)(?: hostgen=(\d+))?$', r)
     if not m:
         return dict(raw=r)
     return dict(state=m[1], id=int(m[2]), nation=int(m[3]), opp=int(m[4]), area=m[5], slot=int(m[6]),
-                slotMode=m[7] == '1', aftermath=m[8] == '1', fight=m[9] == '1', raw=r)
+                slotMode=m[7] == '1', aftermath=m[8] == '1', fight=m[9] == '1',
+                hostgen=int(m[10]) if m[10] else None, raw=r)
 
 
 def ships_by_id(sec):
@@ -5785,6 +6923,16 @@ class BattleDriver:
                     log(f'  {line}:', cmd(C, line)[:100])
 
 
+def war_month(ctx, label, K, J):
+    """run_month for a month of a war of nation K with the computer nation J (no battle planned): a battle the month sends
+    the client is declined, or fought on auto-run when its preview allows no decline (the player's nation defends); the
+    BattleDriver restarts a run stalled at a minute boundary and gives the month FIGHT_TIMEOUT more (a run of
+    2026-10-23: arms_treaty M1's undeclinable battle, answered without a driver, outlived MONTH_TIMEOUT)."""
+    drv = BattleDriver(ctx, {}, K, J)
+    drv.label = label
+    return run_month(ctx, label, driver=drv)
+
+
 def ship_changes(s0, g87, K, J, slot_k=0):
     """The battle's changes from the host's save as sent (s0, host numbering) and the battle slot after the battle
     (g87: K is nation `slot_k` there (0 in a battle slot), J keeps its number): ({(n, id): {field: (before, after)}},
@@ -5856,8 +7004,9 @@ def scenario_battles(ctx):
     month) against an AI nation at war with nation 1 (`settension`). a) startup lines and defaults; b) one battle
     fought to its end on auto-run (two candidates a month, up to 3 months: the AI often avoids a battle) and its merge
     cross-checked against the battle slot's save; c) a declined battle and d) a battle left open past `battles timeout
-    20` (three candidates each a month, up to 3 months); e) the client joins again with `fightbattles 0`: nothing is
-    deferred. The war ends at the end."""
+    20` (three candidates each a month, up to 3 months); c2) decision 4: a declined battle under an emulated older host
+    (the client's `battles hostgen 0`: the decline alone, the game resolves it, its box captured; up to 2 months); e) the
+    client joins again with `fightbattles 0`: nothing is deferred. The war ends at the end."""
     K = 1
     hl, cl = [log_lines(log_since(p), r"Joined players' battles: ") for p in (H, C)]
     ok = any(re.search(BATTLE_OK_RE, x) for x in hl) and any(re.search(BATTLE_OK_RE, x) for x in cl)
@@ -5974,6 +7123,10 @@ def scenario_battles(ctx):
     check(f'd) `battles timeout {DEFAULT_BATTLE_TIMEOUT}` restores the default', r == 'ok'
           and (battles_list() or {}).get('timeout') == DEFAULT_BATTLE_TIMEOUT, r)
     natural_request_checks(ctx, K, J, me, them, drivers)
+    report_unplanned()
+
+    # c2) decision 4: the decline under an older host (the client's `battles hostgen 0`)
+    battle_oldhost_checks(ctx, K, J, area, me, them)
     report_unplanned()
 
     # e) opt-out: the client joins again with `fightbattles 0`
@@ -6174,27 +7327,101 @@ def battle_fought_checks(ctx, K, J, area, me, them, bid, drv, date0, date1):
 
 
 def battle_declined_checks(ctx, K, J, area, me, them, bid, drv):
-    """c) a battle declined in the game's preview: the client reports it as declined and the host lets the game
-    resolve it."""
+    """c) a battle declined in the game's preview: the client reports it as declined with the game's consequences of
+    the decline on its PC, and the host merges them (0.6.0, risk 4; before, the host let the game resolve it and its
+    result box waited for the host's player)."""
     hlog, clog, rec = log_since(H, drv.hmark), log_since(C, drv.cmark), drv.rec[bid]
     area = battle_area(log_since(H), bid, area)
     out = log_lines(clog, rf'\] battle {bid}: ')
     check(f'c) battle {bid}: the client declined it in the game\'s preview (buttons {rec.get("preview_buttons")})',
           any('BattlePreview' in a and a.endswith('->Decline') for a in rec['answers']), rec['answers'])
-    lines = log_lines(hlog, rf'battle {bid}: resolved by the game|battle {bid} resolved by the game: ')
+    lines = log_lines(hlog, rf'battle {bid} applied: .*the player declined battle')
+    ch = chat(ctx.cp)
+    want = f'* Captain declined battle for {me} against {them} in {area}.'
+    check(f'c) reported as declined: client log "battle {bid}: declined", host "battle {bid} applied: ...; the player '
+          f'declined battle", both chat lines ("{want}", "* You declined the battle (VP ...")',
+          any(x.endswith(f'battle {bid}: declined') for x in out) and lines and want in ch
+          and '* You declined the battle (' in ch, f'client {out}; host {lines}; chat has {want in ch}')
+    gone = log_lines(hlog, rf'battle {bid}: resolved by the game|battle {bid} resolved by the game')
+    check(f'c) the game did not resolve it (no "battle {bid}: resolved by the game"); the month went on',
+          not gone and any(m[0] == drv_month(drv) for m in ctx.months), gone)
+    # decision 2: the nation's own decline counts in the battle slot and back to the host (session file `kdecl`)
+    cl = [re.search(r'counts (-?\d+)/(-?\d+) in the battle slot', x) for x in
+          log_lines(clog, rf'\] battle {bid}: the nation\'s decline counts -?\d+/-?\d+ in the battle slot')]
+    hl = [re.search(r'counts (-?\d+)/(-?\d+) \(were (-?\d+)/(-?\d+)\)', x) for x in
+          log_lines(hlog, rf'battle {bid}: nation {K}\'s decline counts ')]
+    last = [re.search(r'counts (-?\d+)/(-?\d+) \(were', x) for x in
+            log_lines(log_since(H), rf'battle \d+: nation {K}\'s decline counts ')][-1:]
+    kd = {e.split(':')[0]: e.split(':', 1)[1] for e in session_file().get('kdecl', '').split(',') if e.count(':') == 2}
+    check(f'c) decision 2: client "battle {bid}: the nation\'s decline counts a/b in the battle slot (the save\'s were '
+          f'...)", host "battle {bid}: nation {K}\'s decline counts x/y (were a/b)"; {SESSION_FILE} kdecl has nation {K}\'s '
+          f'latest counts', cl and hl and cl[0] and hl[0] and cl[0].groups() == hl[0].groups()[2:] and last and last[0]
+          and kd.get(str(K)) == f'{last[0][1]}:{last[0][2]}',
+          dict(client=[x[0] for x in cl if x], host=[x[0] for x in hl if x], kdecl=kd))
+
+
+def battle_oldhost_checks(ctx, K, J, area, me, them):
+    """c2) decision 4 (0.6.0): a decline under an older host. The client's `battles hostgen 0` takes the host's welcome
+    as one without `gen` (a 0.5.0 host): the decline goes alone (client "battle N: declined", chat "* You declined the
+    battle; the game resolves it."), the host has the game resolve it ("battle N: resolved by the game (Captain declined
+    it)", after the battles "battle N resolved by the game: battle|no battle" with its result box captured, none shown).
+    Three injected battles a month (nation K attacks: the preview's Decline is enabled), up to 2 months; then
+    `battles hostgen` back to the welcome's value (1; 2 since B6 piece 2)."""
+    g0 = cstate().get('hostgen') or 1
+    r = cmd(C, 'battles hostgen 0')
+    check('c2) client `battles hostgen 0` -> "ok hostgen=0", `battles state` hostgen=0',
+          r == 'ok hostgen=0' and cstate().get('hostgen') == 0, r)
+    found, notes, r1 = None, [], None
+    try:
+        for attempt in range(1, 3):
+            if rel(K, J).get('war') != '1':
+                log('  the war ended (AI peace?): again', cmd(H, f'settension {K} {J} 50'))
+            drv = BattleDriver(ctx, {b: 'decline' for b, _ in [inject(K, J, area) for _ in range(3)] if b}, K, J)
+            drv.label = f'battles D{attempt}'
+            run_month(ctx, drv.label, driver=drv)
+            for b, rec in sorted(drv.rec.items()):
+                notes.append((b, rec.get('outcome'), rec.get('preview_buttons')))
+                if not found and rec.get('outcome') == 'declined' and rec.get('preview_t') and not rec.get('no_decline'):
+                    found = (b, drv)
+            if found:
+                break
+            log(f'  c2) no battle declined in its preview (attempt {attempt}): {notes}')
+    finally:
+        r1 = cmd(C, f'battles hostgen {g0}')
+    check(f'c2) a battle declined in its preview under the emulated older host (id, outcome, preview buttons); '
+          f'`battles hostgen {g0}` after (the welcome\'s value)', found and r1 == f'ok hostgen={g0}',
+          dict(notes=notes, restore=r1))
+    if not found:
+        return
+    bid, drv = found
+    hl, out = log_since(H, drv.hmark).splitlines(), log_lines(log_since(C, drv.cmark), rf'\] battle {bid}: ')
+    gone = [x for x in hl if f'battle {bid}: resolved by the game (Captain declined it)' in x]
+    fin = [i for i, x in enumerate(hl) if re.search(rf'battle {bid} resolved by the game: (battle|no battle)$', x)]
+    caps, i = [], (fin[0] - 1 if fin else -1)
+    while i >= 0 and not re.search(r'resolved by the game: (battle|no battle)$|battle phase', hl[i]):
+        caps += [hl[i]] if 'picture message captured' in hl[i] else []
+        i -= 1
     ch = chat(ctx.cp)
     want = [f'* The battle of {me} against {them} in {area} was resolved by the game (Captain declined it).',
             '* You declined the battle; the game resolves it.']
-    check(f'c) reported as declined: client log "battle {bid}: declined", host "battle {bid}: resolved by the game '
-          f'(Captain declined it)", both chat lines',
-          any(x.endswith(f'battle {bid}: declined') for x in out) and any('(Captain declined it)' in x for x in lines)
-          and all(x in ch for x in want), f'client {out}; host {lines}; chat missing {[x for x in want if x not in ch]}')
-    gone = [x for x in lines if re.search(rf'battle {bid}: resolved by the game \(', x)]
-    fin = [x for x in lines if re.search(r'resolved by the game: (battle|no battle)$', x)]
-    seen = f'* The battle of {me} against {them} in {area} was resolved by the game ('
-    check(f'c) the host had the game resolve it: "battle {bid}: resolved by the game (<why>)", then "battle {bid} '
-          f'resolved by the game: battle|no battle" after the month, the host\'s chat line; the month went on',
-          gone and fin and seen in ch and any(m[0] == drv_month(drv) for m in ctx.months), lines)
+    check(f'c2) battle {bid}: client "battle {bid}: declined" sent alone (no "battle {bid} applied" on the host), host '
+          f'"battle {bid}: resolved by the game (Captain declined it)", both chat lines',
+          any(x.endswith(f'battle {bid}: declined') for x in out) and gone
+          and not any(f'battle {bid} applied' in x for x in hl) and all(x in ch for x in want),
+          dict(client=out[-2:], host=gone[:1], chat_missing=[x for x in want if x not in ch]))
+
+    def day_secs(ts):
+        lt = time.localtime(ts)
+        return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + ts % 1
+
+    t_a, t_b = (log_secs(gone[0]), log_secs(hl[fin[0]]) + 2) if gone and fin else (None, None)
+    shown = [a[2] for a in ANSWERED if t_a is not None and a[1] == 'host' and 'TdlgPictureMessage' in a[2]
+             and t_a <= day_secs(a[0]) <= t_b]
+    res = hl[fin[0]] if fin else ''
+    check(f'c2) after the battles the host had the game resolve it ("battle {bid} resolved by the game: battle|no '
+          f'battle"), its result box captured ("picture message captured" when it fought), none shown on the host',
+          fin and (res.endswith('no battle') or caps) and not shown,
+          dict(result=res[-40:], captured=[x[-90:] for x in caps[:2]], shown=shown[:2]))
 
 
 def drv_month(drv):
@@ -6203,9 +7430,10 @@ def drv_month(drv):
 
 
 def battle_area(hlog, bid, default):
-    """The sea area of battle `bid` from its request line in the host log (injected or found by the game)."""
+    """The sea area of battle `bid` from its request line in the host log (injected or found by the game; 0.6.0: the
+    player's generator's "... in <area>, N attempt(s), fought by Captain")."""
     req = log_lines(hlog, rf'battle request {bid}[ :]')
-    m = re.search(r' in (.+?)(?: \(\d+:\d+ ships\).*)?$', req[0]) if req else None
+    m = re.search(r' in (.+?)(?:, \d+ attempt\(s\).*| \(\d+:\d+ ships\).*)?$', req[0]) if req else None
     return m[1] if m else default
 
 
@@ -6881,7 +8109,17 @@ def ls_start_test(ctx, tag, timeout=150):
     d0 = gen_date(HOST_SLOT)
     hm, cm, t0 = log_mark(H), log_mark(C), time.time()
     r = cmd(H, 'pocbattle 1 0')
-    a, b = ls_wait(lambda: ls_both_running(H, C), timeout, f'battle {tag} running on both')
+
+    def started():  # both running, or the game's DoBattle gave no battle (e.g. "Enemy unable to challenge our forces")
+        return ls_both_running(H, C) or ('none' if re.search(r'pocbattle: DoBattle returned 0 after \d+ ms; battle '
+                                                             r'screen closed', log_since(H, hm)) else None)
+    res = ls_wait(started, timeout, f'battle {tag} running on both')
+    if res == 'none':
+        box = [t for ts, w, k, t in BOX_SEEN if ts >= t0 and w == 'host'][-1:]
+        raise RuntimeError(f'battle {tag}: the game\'s DoBattle gave no battle ({box}): the earlier test battles\' results '
+                           f'stay in the host\'s campaign in memory (TESTING.md, Known traps: the 0.6.0 release '
+                           f'candidate); run the scenario again')
+    a, b = res
     dt = time.time() - t0
     d1 = gen_date(HOST_SLOT)
     log(f'  battle {tag}: running on both after {dt:.1f} s ({r}); bid {a.get("bid")} epoch {a.get("epoch")}; '
@@ -8935,6 +10173,8 @@ def pvp_checks(ctx, stress, rec, lives, hm, pbid, ibid, ws):
 
 
 PVP_REQ_RE = r'battle request (\d+): nation (\d+) vs (\d+) in .* \(\d+:\d+ ships\), fought live by (\S+) and (\S+)'
+WAR_VP_CREDIT_RE = (r'victory points: nation (\d+) \+(\d+) \((.*?), in its war with nation (\d+)\) -> -?\d+, war score '
+                    r'(\d+)-(\d+) (\d+):(\d+)$')
 
 
 def pvp_war_score_check(ws, hlog):
@@ -8943,7 +10183,9 @@ def pvp_war_score_check(ws, hlog):
     the host's save that month (`battle N applied: ... VP a/b`: a = the battle's own nation K, the first player's, b =
     its opponent J, as in the request `battle request N: nation K vs J ..., fought live by ...`; mapped onto the pair
     order 1, 2) plus the host's own credits of the month (`war score 1-2: +x/+y -> A:B` of its battle hooks: battles the
-    game resolved on the host, e.g. an unfought request). Before 0.3.0 the host's game fought such battles and its hooks
+    game resolved on the host, e.g. an unfought request; since 0.6.0 also its CreditWarVP lines of that war, e.g. B5's
+    blockade: `victory points: nation G +v (blockade, in its war with nation L) -> t, war score 1-2 x:y`). Before 0.3.0
+    the host's game fought such battles and its hooks
     credited the ledger; since 0.3.0 they are fought on the players' PCs and merged into the save."""
     w0, w1, wlog = ws.get('before'), ws.get('after'), ws.get('log', '')
     req = {int(m[1]): (int(m[2]), int(m[3])) for m in re.finditer(PVP_REQ_RE, hlog)}
@@ -8958,6 +10200,12 @@ def pvp_war_score_check(ws, hlog):
     lines = log_lines(wlog, rf'war score 1-{STANDIN}\b')
     hooks = [tuple(int(x) for x in re.search(WAR_SCORE_RE, ln).groups()[2:4]) for ln in lines
              if re.search(WAR_SCORE_RE + '$', ln) and "player's PC" not in ln]
+    # 0.6.0: the host's other credits of a war between players' nations (CreditWarVP, e.g. B5's blockade VP:
+    # "victory points: nation G +v (blockade, in its war with nation L) -> t, war score 1-2 x:y")
+    for ln in lines:
+        m = re.search(WAR_VP_CREDIT_RE, ln)
+        if m and sorted((int(m[1]), int(m[4]))) == [1, STANDIN] and (m[5], m[6]) == ('1', str(STANDIN)):
+            hooks.append((int(m[2]), 0) if int(m[1]) == 1 else (0, int(m[2])))
     restart = [ln for ln in lines if re.search(r'starts at|first battle', ln)]
     add = (sum(x['v12'][0] for x in merged) + sum(h[0] for h in hooks),
            sum(x['v12'][1] for x in merged) + sum(h[1] for h in hooks))
@@ -14035,6 +15283,7 @@ def session_again(ctx):
     if sstatus(C).get('role') == 'client':
         scmd(C, 'leave')
         time.sleep(1.5)
+    cm = log_mark(C)
     ll_join(C)
     time.sleep(3)
     if sstatus(C).get('myNation') != '1':
@@ -14042,6 +15291,9 @@ def session_again(ctx):
         time.sleep(1.5)
     cmd(H, 'start')
     client_planning(ctx, timeout=150)
+    # the month sent again: its event roll ("already rolled") comes right after the planning phase; wait for it, so that
+    # the next month's checks count only that month's roll (a --stress run of 2026-10-23 counted it in lockstep_resume)
+    wait_event_roll(ctx, cm)
     cmd(H, f'reserve {STANDIN} Bot')
     cmd(C, 'mpwindow')
     ls_leakcheck(ctx, (H, C))
@@ -15651,14 +16903,15 @@ SCENARIOS = [  # name, months processed, what it guards, function
      scenario_design_study),
     ('diplomacy', 2, 'offers/accept/decline/withdraw, war/peace/alliance at month end, AI peace kept away from '
                      'player wars, Diplomacy buttons via posted clicks', scenario_diplomacy),
-    ('battles', 3, 'joined players fight their battles against AI nations on their own PC: an injected battle (war '
+    ('battles', 4, 'joined players fight their battles against AI nations on their own PC: an injected battle (war '
                    '1-J by settension) is deferred to the battle phase after the month (save, strategic screen '
                    'locked, sent to the player), fought in the client\'s battle slot (Game87, nation 0 = the player; '
                    'the game\'s preview, battle screen on auto-run, results, history prompt; DoStrategicTurn skipped) '
                    'and merged on the host (ships cross-checked with the battle slot\'s save, VP, prestige, counts); a '
-                   'declined battle and one left past `battles timeout 20` are resolved by the game (late answer '
-                   'ignored); a client that joined with `fightbattles 0` gets nothing deferred (one more month if '
-                   'the game finds no battle; the war ends afterwards)', scenario_battles),
+                   'declined battle is merged (risk 4; the nation\'s own decline counts, `kdecl`), one declined under an '
+                   'emulated older host (`battles hostgen 0`) and one left past `battles timeout 20` are resolved by the '
+                   'game (late answer ignored); a client that joined with `fightbattles 0` gets nothing deferred (one '
+                   'more month if the game finds no battle; the war ends afterwards)', scenario_battles),
     ('victory_points', 1, 'joined players\' victory points (0.2.6): a host battle against a joined nation credits '
                           'it (battlevp = the game\'s HandleBattleAftermath), EnemyVP outside battles (enemyvpadd) is '
                           'shared among the host\'s enemies at month end (1 enemy, 2 enemies 51/50, a drop shares '
@@ -15679,6 +16932,43 @@ SCENARIOS = [  # name, months processed, what it guards, function
                            'J\'s BaseResources/HasLostWar; "Propose peace" (diplo peace J, NegotiatePeace(40, 0)) '
                            'one a month; a processed month keeps one copy of each ship; the session file keeps the '
                            'months of the peace and the relation turn (kpeacem, krelm)', scenario_relations_peace),
+    ('war_effects', 1, '0.6.0 (B5): the player\'s war effects for nation 1 under the player\'s rules: a war 1-J with a '
+                       'computer ally X of nation 1 at war with J (settension/setally); M1 J blockaded (TEST warfxblk) and '
+                       'the allies\' war help drawing 0 (TEST allyrand): the blockade credits to nation 1 (log, VP, kwarvp), '
+                       'J\'s flag on both copies (kblk), the message in nation 1\'s turn report, the allies\' war help on the '
+                       'client applied by the host (VP, allyvp); M2 nation 1 blockaded: J\'s credits, the flag, the message; '
+                       'M1/M2 war weariness by nation 1\'s own counter and score (government 2, BM 20; kwarvp: winning '
+                       'no unrest, losing with draws 0 unrest +1 and the message); '
+                       'M3 StopBlockadedMoves with War 1 (the host at peace) and the war loan at nation 1\'s counter 4 '
+                       '(econrand 1) after the war budget of its counter (BM 3 -> 5 on both copies, both texts); building for war: '
+                       'M1 a ship of 1 in J\'s yard and one of J in 1\'s yard (TEST shipbuilder) change hands on 1\'s PC, '
+                       'applied by the host; the host\'s VP and EnemyVP unchanged; M4 the enemy-revolution rule (TEST revotest): J\'s '
+                       'revolution ends the war 1-J (the general peace), the war 0-1 (diplo war 1) stays out of it on both '
+                       'sides (nation 1\'s unrest 25), goes on, then the players\' peace',
+     scenario_war_effects),
+    ('arms_treaty', 4, '0.6.0: the disarmament treaty, the arms-control conference and nation 1\'s war with a computer '
+                       'nation J: the host\'s own war under a treaty (TEST armstreaty set/war/refresh) as before (the '
+                       'game\'s box, the treaty ended); M1 at peace the conference at the month\'s end (TEST econtreaty '
+                       '100) makes a treaty: its scraps and BM -2 for nation 1 in `econ 1` (treaty=, treatyBM=) and in '
+                       'the money check, the same treaty on both copies; war 1-J: the client\'s refresh at war keeps it '
+                       'with an older host\'s rule (TEST armstreaty host 0) and ends it at once with this host\'s, no '
+                       'box; M2 the host ends it once (log, chat, the line with the month), no box, both copies without '
+                       'a treaty; M3 the conference at war sees the war 1-J and ends ("With a war already in progress"; '
+                       'no treaty, conference=1 treaty=0 treatyBM=0); M4 at war: no box, no second end; peace '
+                       '(peacetest 100 2 1)',
+     scenario_arms_treaty),
+    ('battle_generator', 4, '0.6.0 (B6): the player\'s battle generator for nation 1 (CheckForBattles2 in its view on the '
+                            'host): dry runs (`battles gen`: attempts against computer nations only, relations '
+                            'unchanged), up to 3 months (the generator once a month, at most one request of kind 1, the '
+                            'computer\'s generator suppressed for nation 1, the request replayed and fought or answered '
+                            'on the client); risk 4: declines of both kinds merged, never resolved by the game; the '
+                            'game\'s resolution\'s box captured on the host (`battles aitest`)', scenario_battle_generator),
+    ('battle_surprise', 2, '0.6.0 (B6 piece 2): surprise attacks and takeovers at a war\'s start for nation 1: a forced '
+                           'war start in its relation turn (`battles testsa`: the takeover recorded and applied on the '
+                           'host by name, CheckSurpriseAttack recorded -> a request of kind 2), `battles sadry` (both '
+                           'branches of DoSurpriseAttack in the view), both directions played in the battle slot with '
+                           'the game\'s CheckSurpriseAttack (`battles injectsa`, `battles saretry`): a battle or a clean '
+                           'no-battle, never resolved by the game', scenario_battle_surprise),
     ('player_copy', 1, 'a joined player\'s "Copy game" (0.2.7): the client\'s copy (copygame = the game\'s '
                        'CopyGameToOtherSlot through the hook) is its own campaign (its nation is nation 0, the host\'s '
                        'nation AI nation 1; relations, sections, numbers, war state, cooldowns, map, divisions, designs '
@@ -15820,7 +17110,8 @@ GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), i
     'missiles': ('lockstep_missiles',),
     'live-limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo',
                     'lockstep_air', 'lockstep_strike', 'lockstep_missiles'),
-    'relations': ('relations_peace',),
+    'relations': ('relations_peace', 'war_effects', 'arms_treaty', 'battle_generator', 'battle_surprise'),
+    'battlegen': ('battle_generator', 'battle_surprise'),
     'twopc': ('twopc',),
 }
 # Game time per scenario in seconds: measured in the dist_ll_7 default run (the 0.3.2-era scenarios) and on the 0.4.0
@@ -15828,10 +17119,12 @@ GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), i
 # 61, lockstep_air 264; lockstep_torpedo 465, lockstep_strike ~400 plus ~60 per replaced night battle,
 # lockstep_missiles ~330, lockstep_rejoin 563, lockstep_resume 378). --list and --dry-run add them up.
 EST = dict(session=14, intel_reports=1, file_lock=4, events=4, merge=17, research=5, doctrine=6, design_study=45,
-           diplomacy=92, battles=107, victory_points=44, treaty=47, player_copy=45, lockstep=93, lockstep_ui=215,
+           diplomacy=92, battles=180, victory_points=44, treaty=47, player_copy=45, lockstep=93, lockstep_ui=215,
            lockstep_limits=175, lockstep_pvp=72, lockstep_month=109, lockstep_rejoin=565, lockstep_resume=380,
            lockstep_torpedo=470, lockstep_stress=1310, lockstep_air=265, air_units=65, lockstep_strike=420,
-           lockstep_missiles=330, twopc=175, relations_peace=40)  # relations_peace: dist_rv_7, 2026-10-22 (39 s)
+           lockstep_missiles=330, twopc=175, relations_peace=40, war_effects=220, arms_treaty=150,
+           battle_generator=150, battle_surprise=60)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s);
+# battles: dist_b6_5, 2026-10-23 (180 s with c2), one more month; battle_surprise: dist_b6_7, 2026-10-23 (57 s, one fought battle)
 # their long variants (--stress; dist_ll_16, twopc on dist_tp_1)
 EST_STRESS = dict(lockstep_pvp=235, lockstep_month=710, twopc=200)
 

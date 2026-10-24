@@ -13,6 +13,7 @@ std::string Missing();          // what Resolve could not find
 void ApplyTestSwitches(const char* when);
 bool TestPrefsWanted();
 bool EnsureHooks();             // installs the battle hooks (once; they do nothing outside a lockstep battle or a POC)
+std::string ShipTypeFlags();    // the campaign's ship-type flags (BB, BC, carrier exist) as 6 hex digits ("" if not found)
 void* BattleForm();             // the battle screen (TfrmMain) or nullptr
 bool BattleVisible();
 int Minute();                   // battle minutes elapsed (the game's minute counter)
@@ -74,6 +75,10 @@ struct Hooks {
 void SetHooks(const Hooks& h);
 
 bool Available();       // the engine resolved (live battles possible with this game version)
+// The game's picture messages (ShowPicMessage) are recorded instead of shown on this PC until EndTextCapture, which
+// returns them (host, 0.6.0: the game's resolution of a joined player's battle). False: not available (shown as usual).
+bool BeginTextCapture();
+std::vector<std::wstring> EndTextCapture();
 bool Prepare();         // resolves the engine when a session starts (hooks are installed with the first live battle)
 bool Active();          // a lockstep battle runs on this PC (A or B), including its start
 bool Busy();            // don't load a month or touch the open save now

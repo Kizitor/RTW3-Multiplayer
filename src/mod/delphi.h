@@ -62,4 +62,14 @@ uint8_t* FindPattern(uint8_t* start, size_t len, const std::vector<int>& pat);
 // Targets of E8 rel32 calls found while linearly scanning a function (stops at maxLen).
 std::vector<uint8_t*> CallTargets(uint8_t* fn, size_t maxLen);
 
+// pocHeapCheck (diagnosis): walks the objects reachable from the roots through RTTI (fields, records, arrays, dynamic
+// arrays, TList and TStringList entries; components other than the roots are not entered) and reports every string
+// that is no valid UnicodeString and every reference that is no live object (a freed block starts with the memory
+// manager's link instead of a VMT).
+struct HeapCheckResult {
+    int objects = 0, strings = 0, bad = 0;
+    std::vector<std::string> problems;  // the first ones: "<what> <path> = <value>"
+};
+HeapCheckResult HeapCheck(const std::vector<std::pair<void*, std::string>>& roots);
+
 }  // namespace dl

@@ -3,6 +3,7 @@
 #include "delphi.h"
 #include "economy.h"
 #include "game.h"
+#include "warfx.h"
 #include "lockstep.h"
 #include "net.h"
 #include "session.h"
@@ -133,15 +134,91 @@ static BOOL CALLBACK FindAppWindow(HWND h, LPARAM l) {
     return TRUE;
 }
 
+// RTW3MP_DIAG: an access violation in the game's code (the first 8) with its registers, the objects they point to and
+// the game's return addresses on the stack (RVAs), to find where a bad pointer came from.
+static bool DiagGameCode(uint32_t a) { return dl::g_base && a >= dl::g_base + 0x1000 && a < dl::g_base + dl::g_size; }
+
+static bool DiagAfterCall(uint32_t a) {  // a return address: a call instruction ends right before it
+    const uint8_t* p = (const uint8_t*)(uintptr_t)a;
+    return p[-5] == 0xE8 || (p[-6] == 0xFF && (p[-5] & 0x38) == 0x10) || (p[-2] == 0xFF && (p[-1] & 0x38) == 0x10) ||
+           (p[-3] == 0xFF && (p[-2] & 0x38) == 0x10) || (p[-4] == 0xFF && (p[-3] & 0x38) == 0x10) ||
+           (p[-7] == 0xFF && (p[-6] & 0x38) == 0x10);
+}
+
+static void DiagAccessViolation(EXCEPTION_POINTERS* ep) {
+    CONTEXT* c = ep->ContextRecord;
+    uint32_t base = (uint32_t)dl::g_base;
+    char buf[1400];
+    int n = 0;
+    __try {
+        n += snprintf(buf + n, sizeof(buf) - n, "diag: exception %08lx at rva %x (%s %08lx, thread %lu%s): eax=%08lx "
+                      "ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx ebp=%08lx esp=%08lx",
+                      ep->ExceptionRecord->ExceptionCode, (uint32_t)c->Eip - base,
+                      ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                      (DWORD)ep->ExceptionRecord->ExceptionInformation[1], GetCurrentThreadId(),
+                      GetCurrentThreadId() == g_mainTid ? ", main" : "", c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi,
+                      c->Edi, c->Ebp, c->Esp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    Log("%s", buf);
+    const char* names[] = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"};
+    DWORD regs[] = {c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp};
+    for (int r = 0; r < 7; r++) {
+        if (regs[r] < 0x10000) continue;
+        n = 0;
+        __try {
+            const char* cls = dl::ClassNameOf((void*)(uintptr_t)regs[r]);
+            n += snprintf(buf + n, sizeof(buf) - n, "diag:   %s %08lx (%s):", names[r], regs[r], cls);
+            const DWORD* p = (const DWORD*)(uintptr_t)(regs[r] - 16);
+            for (int i = 0; i < 16; i++) n += snprintf(buf + n, sizeof(buf) - n, " %08lx", p[i]);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            n += snprintf(buf + n, sizeof(buf) - n, " (unreadable)");
+        }
+        Log("%s", buf);
+    }
+    n = 0;
+    int found = 0;
+    __try {
+        NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+        uint32_t top = (uint32_t)(uintptr_t)tib->StackBase, sp = c->Esp;
+        n += snprintf(buf + n, sizeof(buf) - n, "diag:   stack (return rvas from esp+0):");
+        for (uint32_t a = sp; a + 4 <= top && a < sp + 0x6000 && found < 60; a += 4) {
+            uint32_t v = *(const uint32_t*)(uintptr_t)a;
+            if (!DiagGameCode(v) || !DiagAfterCall(v)) continue;
+            n += snprintf(buf + n, sizeof(buf) - n, " +%x:%x", a - sp, v - base);
+            found++;
+            if (n > (int)sizeof(buf) - 40) {
+                Log("%s", buf);
+                n = snprintf(buf, sizeof(buf), "diag:   stack (more):");
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        n += snprintf(buf + n, sizeof(buf) - n, " (stack unreadable)");
+    }
+    Log("%s", buf);
+}
+
 static LONG CALLBACK DiagVeh(EXCEPTION_POINTERS* ep) {
-    static volatile LONG count = 0;
+    static volatile LONG count = 0, avs = 0;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == 0x40010006 || code == 0x4001000A || code == 0x406D1388) return EXCEPTION_CONTINUE_SEARCH;
-    if (InterlockedIncrement(&count) <= 20) {
-        Log("exception %08lx at %p (thread %lu) info %p %p", ep->ExceptionRecord->ExceptionCode,
+    uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress, me = (uintptr_t)g_inst;
+    bool mine = me && at >= me &&
+                at < me + ((IMAGE_NT_HEADERS32*)(me + ((IMAGE_DOS_HEADER*)me)->e_lfanew))->OptionalHeader.SizeOfImage;
+    if (code == EXCEPTION_ACCESS_VIOLATION && mine) return EXCEPTION_CONTINUE_SEARCH;  // the mod's guarded reads
+    if (InterlockedIncrement(&count) <= 40) {
+        const char* cls = "";
+        if (code == 0x0EEDFADE && ep->ExceptionRecord->NumberParameters >= 2)  // a Delphi exception: its object
+            cls = dl::ClassNameOf((void*)ep->ExceptionRecord->ExceptionInformation[1]);
+        Log("exception %08lx at %p (thread %lu) info %p %p %s", ep->ExceptionRecord->ExceptionCode,
             ep->ExceptionRecord->ExceptionAddress, GetCurrentThreadId(),
-            (void*)ep->ExceptionRecord->ExceptionInformation[0], (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+            (void*)ep->ExceptionRecord->ExceptionInformation[0], (void*)ep->ExceptionRecord->ExceptionInformation[1],
+            cls);
     }
+    if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_INT_OVERFLOW || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+         code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION) &&
+        DiagGameCode((uint32_t)ep->ContextRecord->Eip) && InterlockedIncrement(&avs) <= 8)
+        DiagAccessViolation(ep);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -190,6 +267,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     if (!game::InstallHooks()) Log("some hooks failed; multiplayer may not work");
     economy::Install();
+    warfx::Install();
     g_msgHook = SetWindowsHookExW(WH_GETMESSAGE, GetMsgProc, g_inst, g_mainTid);
     PostThreadMessageW(g_mainTid, WM_NULL, 0, 0);
     Log("init done: build %s, main thread %lu, msg hook %p", game::BuildFingerprint().c_str(), g_mainTid, g_msgHook);

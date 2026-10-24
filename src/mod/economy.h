@@ -29,5 +29,13 @@ void OnWarChanged(int K);
 std::string ClientArmyOffensive(int months);
 // TEST ONLY (bridge `econrand <v>`, host): the rules' Random(n) draws min(v, n - 1); -1 (the default) the game's Random.
 std::string TestRandom(const std::vector<std::string>& args);
+// Host, around the arms-control conference (CreateArmsControlTreaty, game.cpp's mask): each joined nation's Funds and
+// BudgetModifier before, and their changes after into its month's record (`treaty=`, `treatyBM=`) when ComputeExpenses ran.
+void TreatyBefore();
+void TreatyAfter();
+// TEST ONLY (bridge `econtreaty <chance> [blind]|cancel`, host): the arms-control conference at the next month's end (after
+// ComputeExpenses, before the month's funds are read); `blind`: without B5's view of the joined nations' wars (before
+// 0.6.0), a treaty cancelled at once; `cancel`: the game's CancelTreaty without its box.
+std::string TestTreaty(const std::vector<std::string>& args);
 
 }  // namespace economy

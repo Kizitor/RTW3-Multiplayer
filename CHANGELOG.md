@@ -9,6 +9,148 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.6.0 (2026-10-23)
+After 0.5.0 gave each joined player's nation the player's relations, peace and money, 0.6.0 gives it the effects of
+its wars and its battles as the player's nation gets them in single player: blockades, the help of allies, war
+weariness, building for war, revolutions in enemy nations, and the raider and submarine war on merchant shipping; and
+the player's battle rules, with battles in home waters, at possessions and on missions, its own record of declined
+battles, and surprise attacks at a war's start. A joined nation's war now ends a disarmament treaty once, on the host,
+instead of the box "The outbreak of war cancels the disarmament treaty!" at every month load. **Update the host and
+the joined players:** most war effects need 0.6.0 only on the host, but the help of allies, ship seizures, enemy
+revolutions and the new battles need 0.6.0 on the host and on the player's PC. The protocol is still 3, and 0.6.0
+keeps the live-battle engine of 0.4.1 and 0.5.0 (17): players on 0.4.1, 0.5.0 and 0.6.0 fight their live battles
+together. Not built yet: a joined nation's invasions and its raider battles (see Known issues).
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.6.0)
+
+### New for joined players
+- **The effects of your wars.** In your nation's wars with the computer's nations, the host's month and your game run
+  the rules that single player runs only for the player's nation, by your nation's own months at war and war score.
+  Their messages come in your game's turn report at the start of the new month, or as the game's dialogs on your
+  screen at the start of your month; the host's screen shows none of them.
+  - **Blockades:** your blockades of your enemies and theirs of you give victory points ("Gain 100 VP for blockade of
+    enemy", "The enemy gains 90 VP for blockading us") and the game's effects on a blockaded nation's ship moves,
+    trade and unrest ("Shortages due to the blockade are causing hardship for our people!"). Your allies at war add
+    their ships to your blockades, and your enemies' ships count together against you. The relations panel marks the
+    blockades of your wars. A war between two joined players' nations gets blockade points too, each side its own.
+  - **Help from allies,** at the start of your month at war: your allies' operations add victory points ("The
+    operations of our ally USA adds 13VP"), allies join your war ("Our ally USA joins the war against Russia!"),
+    quarrel or hesitate, with the game's questions for you (lend-lease ships, money, the alliance), and nations at war
+    with your enemy offer an alliance.
+  - **War weariness:** your unrest grows when your own war goes badly ("Our people is getting dissatisfied with the
+    bad war situation!"), for the governments that the game applies it to.
+  - **Building for war:** the wartime rules for construction delays, submarine building and the war budget ("War
+    budget means increased allocations to the navy!", "War emergency funding granted to the navy!") go by your own
+    war. At the start of your month at war, your ships building in a computer enemy's yards are seized, and you seize
+    its ships building in yours ("Due to the current war situation, the authorities in Russia have decided to seize
+    our ship B Wettin, currently building there.", "We have seized the Russian ship B Retvizan, ...").
+  - **Revolutions in enemy nations,** at the start of your month at war: a computer enemy in turmoil can be forced to
+    make peace ("Russia is suffering serious internal disturbances. They have been forced to accept a compromise
+    peace."), a peace with all your computer enemies or a separate peace with that one while the others fight on
+    ("The other members of the enemy coalition resolve to fight on."). A war between players never ends this way.
+  - **Raiders, submarines and the trade war:** your raiders and submarines sink your computer enemies' merchant ships
+    and theirs sink yours, each sinking with victory points against that enemy, the game's messages and a summary
+    ("Trade war this month: our raiders sank ..."). The computer's own submarine war between those nations is dropped,
+    so nothing counts twice.
+  - **War loans** work as in 0.5.0 (now also tested in a war).
+- **Your battles against computer nations follow the player's rules.** With **Fight my battles** on, the host runs the
+  game's battle rules of single player for your nation once a month: battles in your home areas, at your possessions
+  and on the game's missions, attacks and defences, at most one a month. Your game plays the battle the rules find
+  after the month, with their questions and the battle preview. The computer's battle rules no longer make battles for
+  your nation against computer nations; your battles against the host's nation stay live battles, as before.
+  - A battle that you decline (on the map or in the preview) counts as in single player: the enemy's points and, after
+    the game's warnings, lost prestige or fleet morale for repeated declines. The host takes over that result, and
+    everyone's chat shows "* Captain declined battle for Germany against Spain in Northern Europe.".
+  - The game's count of your declined battles (and of the enemy's) is your nation's own, kept by the host; before,
+    your battles used the host's.
+  - A battle that isn't fought (the time limit, a disconnect, a battle left before its end) means no battle for you
+    that month ("* No battle of Germany this month (...)"): the game doesn't resolve it.
+- **Surprise attacks at a war's start.** When a war between your nation and a computer nation starts at the start of
+  your month, the game's surprise moves of single player run on your screen: a computer nation can take an unowned
+  possession ("In a surprise move, Japanese troops have taken control of Northern Korea!"), and, with **Fight my
+  battles** on, a nation with the game's surprise attack trait can strike you, or you it ("Mobilize all ships for the
+  surprise attack?"). The host moves the possession for everyone and announces the attack ("* Surprise attack? Japan
+  may strike Germany at the war's start. Captain plays it after the month."); you play it with your battles after the
+  month, not at once as in single player.
+
+### Fixed
+- **The disarmament treaty and a joined nation's war:** while a joined player's nation was at war and a treaty was in
+  force, their game showed "The outbreak of war cancels the disarmament treaty!" at every month load, and the treaty
+  ended only on that PC (the host's game kept it). Now a joined nation's war ends the treaty and the submarine ban
+  once, on the host, as the player's war does in single player: the player gets the game's sentence in the turn
+  report, everyone's chat "* The outbreak of war cancels the disarmament treaty! (Germany at war)", and no box. The
+  host's own wars end it as before.
+- **A treaty during a joined nation's war:** the game's arms-control conference didn't see a joined nation's wars, so
+  it could make a treaty during one, which scrapped the nation's ships under construction above the limits and cut
+  its budget. The conference now sees them and ends as in single player: "With a war already in progress, the
+  conference ends in solemn declarations and no action.".
+- **A revolution could end a war between players:** in a war with the host's nation, the game's rule for a
+  revolution in an enemy nation treated the joined nation as a computer nation, so its unrest could force a peace
+  between the two players. Players' nations stay out of that rule now (found in the game's code).
+- **Blockades in a war with the host's nation:** a blockaded joined nation got the blockade's victory points itself
+  (the game's rule for computer nations), its unrest went by the host's months at war, and the messages went to the
+  host. Now the points go to the host, and the joined player gets the unrest by their own war and the messages.
+- **War weariness and the wartime build rules went by the host's war:** a joined nation's unrest grew while the host's
+  nation lost a war, whatever its own wars, with the message on the host; its war budget, construction delays and
+  submarine building followed the host's months at war. Now they follow the nation's own wars.
+- **Battles that the game resolves held the host's new month:** when the game resolved a joined player's battle (not
+  fought, a time limit, a player gone, a decline), its result box ("In a battle in ... between the ... navies ...")
+  opened on the host's screen and held the new month until the host closed it. Its messages now go to the chat and to
+  the player's turn report. A declined battle is no longer resolved by the game at all (see New).
+- **A joined player's battles ran with the host's month-end state:** the game's marks of which ship types exist
+  (dreadnoughts, battlecruisers, carriers) read none, so the game identified ships differently from single player, and
+  what the host's own battles had left (a surprise attack, a possession battle, a convoy, a heroic victory) carried
+  into the player's battle. Each battle now gets the month's own state, as in single player.
+- **"Error in SaveBuildCampaign procedure! ..." after battles:** a battle leaves its sea area and possession marked in
+  the game, and loading the campaign again (multiplayer does it every month and around every battle) freed them but
+  kept the marks, so a later save could read freed memory and show "Error in SaveBuildCampaign procedure! Access
+  violation ..." or "... Integer overflow". It was seen on joined players' PCs in tests of 0.6.0, whose battles at
+  possessions made it more likely; the host's game kept such marks too. Every load now clears them, as a freshly
+  started game has them. The same cause explains the box for a player who joined a session on another campaign
+  without restarting the game (known since 0.3.3).
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0 and 0.6.0 can join each other's hosts and play the campaign
+  together.
+- 0.6.0 has the same live-battle engine as 0.4.1 and 0.5.0 (17), so players on these versions fight their live
+  battles live, with each other and with a host on any of them. A player on 0.4.0 (engine 14) or older can't fight a
+  live battle with a host or player on 0.6.0: the battle is fought against the computer or resolved by the game, and
+  the chat and the notices say why ("live battles need the same live-battle engine on both PCs: the host has 0.6.0
+  (engine 17), you have 0.4.0 (engine 14)").
+- A host on 0.6.0 and a joined player on 0.5.0: the player's nation gets the war effects that the host's month runs
+  (blockades, without their marks on the player's relations panel; war weariness; the wartime build rules; the raider
+  and submarine war; their messages in the turn report), the end of a disarmament treaty and the conference that sees
+  its wars. It gets no help from allies, no ship seizures, no enemy revolutions, no surprise attacks or takeovers, and
+  its battles still come from the computer's rules, as in 0.5.0: a battle it declines is resolved by the game, with the
+  messages in the chat and the player's turn report instead of a box on the host.
+- A host on 0.5.0 and a joined player on 0.6.0: as in 0.5.0 (none of the war effects, the computer's battle rules, a
+  declined battle resolved by the game with its box on the host: the player's chat says "* You declined the battle;
+  the game resolves it."), except that the player's battles get the month's own state, and the player's game keeps
+  the host's disarmament treaty during a war without the box.
+- Existing campaigns go on from where they are: a war that is already going on gets the war effects from the first
+  month that a host on 0.6.0 runs, by the nation's months at war and war score, and a joined nation's count of
+  declined battles starts at 0.
+
+### Known issues
+- **Not built yet for joined nations** (planned for a later version):
+  - invasions: the nation's own invasions and invasion battles, landings in its possessions (also an enemy's surprise
+    landing at a war's start) and an enemy's invasion of a possession after a declined battle;
+  - battles between raiders and patrols (a patrol intercepting a raider);
+  - in a war between two joined players' nations, neither side raids the other's merchant shipping, and ships
+    building in each other's yards aren't seized (blockades and war weariness work);
+  - a joined nation's army offensive gives no victory points, and it has no total war of its own (the game keeps that
+    state for the host's nation): its peace offers follow the rules of a war that isn't total.
+- The help of allies only comes in wars with computer nations. Lend-lease and the co-belligerent alliance offer were
+  checked in the game's code, not yet in a game.
+- Neutral nations' protests against your raiders and submarines are not kept.
+- A surprise attack is played after the month, so a war that ends in that month drops it, and so does a restart of the
+  host's game during the month (the war and a takeover are kept). From 1925 to 1934, when the game's surprise attack
+  is a submarine attack without a battle, joined nations get none. Surprise attacks from 1935 on (with carriers) were
+  not tested in a game. A computer nation's takeover of an unowned possession at a war's start comes a little less
+  often than in single player.
+- The known issues of 0.5.0 remain, except the ones about the war effects, battles and surprise attacks of joined
+  nations, about a revolution in a war with the host's nation and about joining a session on another campaign
+  without restarting the game (fixed, above).
+
 ## 0.5.0 (2026-10-23)
 Each joined player's nation now follows the player's rules of single player instead of the computer's, after the
 reports of two players who played on two PCs ("the tension bars are supposed to be independent for each player", "the

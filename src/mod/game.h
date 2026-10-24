@@ -29,6 +29,14 @@ void SetCurrentSlot(int slot);
 std::wstring SaveDir(int slot);  // "...\Save\Game<slot>\"
 
 bool SaveGame();                             // same as the Save button (normal save into the current slot)
+// pocHeapCheck (diagnosis only): RTW3MP_DIAG checks the campaign's objects before every save and after every load
+// (dl::HeapCheck; also the bridge's `pocheapcheck`), the summary and the first problems to the log.
+bool PocDiag();
+std::string PocHeapCheck(const char* where);
+bool KeepBattlePointersTest();  // TEST ONLY (RTW3MP_TEST_KEEPBATTLEPTRS=1): loads keep BattleArea/BattlePossession
+// The last battle's area and possession (TfrmBuildCamp.BattleArea/BattlePossession): every load starts with both nil
+// (0.6.0); the bridge's `battleptrs`: "ok area=<0|1> poss=<0|1> names=<area>/<possession>".
+std::string BattlePointersState();
 // Full load like the title screen, then optionally switch nation. modReload: the mod's own reload (its load keeps the
 // saved victory points even outside a multiplayer session); false = as the player's own load (the test bridge).
 bool LoadCampaign(int slot, int playerIdx, bool modReload = true);
@@ -127,12 +135,49 @@ bool BattlesAvailable();
 void SetBattleSlotMode(bool on);  // a battle slot: the battle screen's close doesn't run the rest of a month
 bool BattleSlotMode();
 bool BattleAftermathSeen();       // the battle ended with the game's aftermath (VP, prestige) in battle slot mode
-bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& area);
-bool StartPlayerBattle(int attacker, int defender, const std::wstring& area);
+bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& area,
+                     std::vector<std::wstring>* texts = nullptr);  // texts: its result box, captured (not shown)
+bool StartPlayerBattle(int attacker, int defender, const std::wstring& area);  // area "": the game picks one
+// 0.6.0 (B6 piece 2): a surprise attack at a war's start in a battle slot: the game's CheckSurpriseAttack(attacker,
+// defender) (one of them the player nation; its year decides: missions 1896-1924, a submarine attack without a battle
+// 1925-1934, carriers from 1935). True: a battle was set up, or the player let the chance go.
+bool StartSurpriseAttack(int attacker, int defender);
 std::vector<std::wstring> AreaNames();
 bool ModalOpen();                  // a modal game dialog is open
 void SetStrategicEnabled(bool on); // the host's strategic screen accepts input (off while battles are fought)
 int DoBattleCalls();               // how often the game's battle setup (DoBattle) was entered
+// B6 (0.6.0), host: the player's battle generator (CheckForBattles2) for a joined nation K, run in K's view (K as the
+// player nation, War := `war`; the nations people play, human[real index], read Tension <= 40). Its CheckAttackLocation
+// calls are recorded in order as attempts (attacker, defender in real indices; area "" = the game picks it) and not run.
+struct BattleAttempt {
+    int a = -1, b = -1;
+    std::wstring area;
+};
+bool BattleGeneratorAvailable();
+bool BattleReplayAvailable();      // a battle slot here can replay the generator's attempts and report declines
+bool RunBattleGenerator(int K, int war, const bool human[9], std::vector<BattleAttempt>& out, std::string& err);
+// 0.6.0 (B6's view, shared with B5), host: K's view of the campaign (K at index 0 and as PlayerNation, the host's nation
+// at index K, relation and alliance cells permuted, War := `war`; human[real index] nations read Tension <= 40 with K).
+// Not nested; false (nothing changed) when the campaign is not in place. No game exception may unwind through it:
+// game calls inside go under __try. HostViewLeave puts everything back. Nation(i) answers view indices meanwhile.
+bool HostViewEnter(int K, int war, const bool human[9]);
+void HostViewLeave();
+int PlayerDeclineCalls();          // how often the game's DoPlayerDecline ran (the player declined a battle)
+// 0.6.0: the player's decline counts (form DeclineCount, saved with the campaign, and EnemyDeclineCount, which the game
+// saves but never loads: a battle slot holds the host player's and this PC's last): a joined nation's own are put in
+// its battle slot and read back afterwards.
+bool GetDeclineCounts(int& own, int& enemy);
+bool SetDeclineCounts(int own, int enemy);
+// 0.6.0 (B6 round 3): the month's state a joined player's game lacks (it never processes a month). The ship-type flags
+// from the loaded campaign by the game's CheckShipTypesExist ("before -> after", "" if unavailable); for the battle slot
+// also the month's resets (the surprise-attack and possession battle flags, the aftermath's prestige fields): a log text.
+std::string RefreshShipTypeFlags();
+std::string PrepareBattleSlotMonth();
+// "flags=<6 hex> surprise=n possession=n heroic=n loss=n convoy=n" ("" if unavailable); setForTest (TEST ONLY) first
+// sets the five month fields to 1, as an earlier battle or the host's surprise attack would leave them.
+std::string MonthStateText(bool setForTest);
+void TestGeneratorFault();         // tests: the next generator run in a joined nation's view meets a game exception
+std::wstring LastBattleArea();     // the sea area of the last battle the game set up (DoBattle)
 // Tests: a nation's research budget (% of the total) and its research priorities; the Research button's handler.
 std::string DebugResearch(int idx);
 void OpenResearch();
@@ -165,6 +210,9 @@ std::string BuildFingerprint();
 bool DiplomacyAvailable();
 int Tension(int a, int b);
 void SetTensionRaw(int a, int b, int value);  // both directions, no side effects
+// TEST ONLY (bridge `econtreaty <chance> blind`): the arms-control conference's masked call without its view of the wars
+// of the nations people play (the behaviour before 0.6.0: their wars hidden by B2's mask; MaskedCall's TreatyWarsEnter).
+void TestTreatyBlind(bool on);
 bool AtWar(int a, int b);
 bool AtWarWithAnyAI(int idx);                 // any war of `idx` with nations 1..8
 int AllianceMonths(int a, int b);
@@ -178,6 +226,33 @@ int CountAtWarWithHost();
 void StartWar(int a, int b);                  // what the game does when a war breaks out
 void MakePeace(int a, int b, int hostOutcome = 3);  // ends only the war between a and b; hostOutcome 1 won, 2 lost, 3 compromise
 void SetAlliance(int a, int b, int months);   // 0 ends it
+
+// 0.6.0: the disarmament treaty (CreateArmsControlTreaty) and the submarine ban, campaign-wide ([General]). Any war's
+// outbreak ends both in the game (CancelTreaty: nation 0's war at the screen's refresh, two computer nations' war when
+// it breaks out). On a joined player's PC CancelTreaty runs without its box when the host ends them for a joined
+// nation's war too (SetHostEndsArmsTreaty, the month's header `armstreaty`), else it leaves them as the host has them,
+// as it does in a view on the host.
+struct ArmsTreaty {
+    int months = 0;  // TreatyTimeRemaining (> 0: in force)
+    int disp = 0;    // TreatyDisplacementLimit (MaxInt: none)
+    int cal = 0;     // TreatyCalibreLimit (MaxInt: none)
+    int subBan = 0;  // SubBanTime (> 0: submarines banned)
+    int base = 0;    // TreatyTonnageBasePercentage
+    bool ok = false;
+};
+ArmsTreaty ArmsTreatyNow();
+bool ArmsTreatyAvailable();
+// Host: a joined nation's war ends the treaty and the submarine ban, as a war's outbreak does in the game (its
+// CancelTreaty, without the box). True if either was in force. Also the TEST ends (bridge `econtreaty cancel`, `blind`).
+bool EndArmsTreatyForWar();
+void SetHostEndsArmsTreaty(bool on);  // a joined PC: the host ends them for a joined nation's war (header `armstreaty`)
+bool HostEndsArmsTreaty();
+int ArmsTreatyKept();       // CancelTreaty calls left to the host on this PC (bridge `armstreaty`)
+int ArmsTreatyEndedHere();  // ends on this joined PC with the host's rule (bridge `armstreaty`)
+void TestSetArmsTreaty(int months, int disp, int cal);  // TEST ONLY (bridge `armstreaty set`)
+void TestArmsConference(int chance);                    // TEST ONLY (bridge `armstreaty conference`, `econtreaty`):
+                                                        // the game's CreateArmsControlTreaty(chance), through B2's mask
+void TestSetWarCounter(int months);                     // TEST ONLY (bridge `armstreaty war`): this PC's game War
 
 // The relations view: on a PC that plays nation K > 0 as the player (a joined player's PC) the game's tension panel,
 // war and alliance marks, flags, map strength bars and war state show nation K's relations (game.cpp, KViewBegin).
@@ -209,6 +284,10 @@ struct PeaceSetup {
     bool force = false;
     int vp = 0, enemyVP = 0;    // K's war score in its wars with the computer's nations (the host's ledger)
     int* used = nullptr;        // K's own event cooldowns (100 values, in/out); nullptr: the save's
+    // B5: the enemy-revolution rule before the decision (a 0.6.0 host applies its separate peace: `krevo`), with K's own
+    // RevolutionPending (real index, 0 none; the host keeps it)
+    bool revolution = false;
+    int revoPending = 0;
 };
 struct PeaceLand {  // ChangePossessionOwner
     std::wstring name;
@@ -239,6 +318,11 @@ struct PeaceResult {
     std::map<int, std::map<std::string, int>> delta;  // other nations: BaseResources, Prestige, BudgetModifier changes
     std::map<int, int> lostWar;                       // other nations: HasLostWar afterwards (changed ones)
     std::vector<std::wstring> treaty;                 // the "Peace treaty" lines
+    // B5: the enemy-revolution rule ran; the enemies whose war with K it ended without the game's DoPeace (a separate
+    // peace: the others fight on), K's RevolutionPending afterwards (real index)
+    bool revolution = false;
+    std::vector<int> separate;
+    int revoPending = 0;
 };
 struct PlayerTurnSetup {
     int K = -1;
@@ -249,13 +333,30 @@ struct PlayerTurnSetup {
     bool human[9] = {};          // nations played by people (the host's nation 0 and the joined ones)
     std::vector<PastWar> history;  // K's past wars (TensionEffectOfPreviousWars)
     PeaceSetup peace;
+    // Relations v2, B5 (d): the war help of K's allies (WarHelpFromAllies) before the relation routines, in the same view
+    // (the host runs it: `khelp`; K at war with a computer nation, its war counter above 1 as the game's War > 1), with K's
+    // own LendLeaseDone (the host keeps it: `klend`).
+    bool allyHelpHost = false;
+    bool allyHelp = false;
+    bool lendDone = false;
+    // Relations v2, B5 (e): the ship seizures of a war (CheckBuildingShipsForWar) right after, in the same view (the host
+    // applies them: `kbuild`; K's war counter above 0 as the game's War > 0).
+    bool buildWarHost = false;
+    bool buildWar = false;
+    // 0.6.0 (B6 piece 2): surprise attacks and takeovers at a war's start are made and recorded (a host with welcome
+    // `gen` 2; else B3's skips). Tests: nation testSaNation (a computer nation) gets the SurpriseAttack trait for the
+    // turn (its war plan comes in `will`), testSaK: K too (K attacks), testTakeover: the takeover's pick is the area's
+    // first unowned possession; testSaDry: only DoSurpriseAttack(testSaNation) in the view (no routines).
+    bool surprise = false;
+    int testSaNation = -1;
+    bool testSaK = false, testTakeover = false, testSaDry = false;
 };
 struct PairChange {
     int a, b, before, after;  // a < b
 };
 struct PlayerTurnResult {
     std::string error;
-    bool ranTension = false, ranPreviousWars = false, ranWar = false;
+    bool ranTension = false, ranPreviousWars = false, ranWar = false, ranSurprise = false;
     std::vector<PairChange> tension, alliance;  // every pair that changed (real indices)
     int will[9] = {}, techSharing[9] = {};      // K's per-relation state afterwards
     std::map<int, int> budget;                  // BudgetModifier changes of the other nations (relation routines)
@@ -264,9 +365,31 @@ struct PlayerTurnResult {
     std::map<std::string, int> self;            // K's own fields the turn or proposal changed (field -> delta)
     std::vector<std::wstring> messages;         // the turn messages the routines wrote
     PeaceResult peace;
+    // B5 (d): WarHelpFromAllies ran; K's VP from it (also in vpDelta), the other nations' Funds it changed, the ships it
+    // handed over (lend-lease: TransferShipAsReparation), K's LendLeaseDone afterwards.
+    bool ranAllyHelp = false;
+    int allyVP = 0;
+    std::map<int, int> allyFunds;
+    std::vector<PeaceShip> allyShips;
+    bool lendDone = false;
+    // B5 (e): CheckBuildingShipsForWar ran; the ships it handed over (TransferShipAsReparation), between K and a computer
+    // nation.
+    bool ranBuildWar = false;
+    std::vector<PeaceShip> buildShips;
+    // 0.6.0: CheckSurpriseAttack's pairs in DoSurpriseAttack's order (attacker, defender; K and a computer nation; area
+    // ""), and the unowned possessions taken over (ChangePossessionOwner, from -1)
+    std::vector<BattleAttempt> surprise;
+    std::vector<PeaceLand> takeovers;
 };
+bool AllyHelpAvailable();  // B5 (d): WarHelpFromAllies for K in its view
+bool BuildWarAvailable();  // B5 (e): CheckBuildingShipsForWar for K in its view
+std::string TestAllyRandom(int v);  // TEST ONLY (bridge `allyrand <0|-1>`): 0 = the allies' war help draws 0 throughout
+// TEST ONLY (bridge `revotest <0|-1> [n:unrest ...]`): the next enemy-revolution run on this PC: its draws 0 (-1: the
+// game's) and these nations' UnrestLevel (real indices) in K's copy first
+std::string TestRevolution(const std::vector<std::string>& args);
 bool PlayerTurnAvailable();
 bool PeaceAvailable();  // B4: the peace part's routines and hooks
+bool SurpriseAvailable();  // 0.6.0: surprise attacks and takeovers at a war's start in the view (hooks, call sites)
 PlayerTurnResult RunPlayerTurn(const PlayerTurnSetup& setup);
 // Relations v2, B4 (host): a joined nation's peace, applied with the game's own routines. "" or why not.
 std::string MovePossession(const std::wstring& name, int from, int to, bool removeCA);  // `from` must own it
@@ -275,6 +398,11 @@ std::string HandOverShip(int id, int from, int to, const std::wstring& name, con
 std::string SetPossessionWarState(const PeaceTaken& t);  // by name; `t.owner` must own it
 bool SetNationFlag(int idx, const std::string& field, bool value);  // a Boolean field (HasLostWar, Blockaded)
 int NationFlag(int idx, const std::string& field);                  // -1 if unknown
+// B5 (warfx.cpp): told after every call of the game's CheckBlockadeStatus (the load's, after its victory points were
+// put back, `load` true; the month's), on the main thread. The game's [General] War cell (the host's nation's war
+// counter), or nullptr.
+void SetBlockadeCheckedHook(void(__stdcall* fn)(void* form, bool load));
+int* WarCell();
 // The turn messages of RunPlayerTurn in the game's own turn report dialog (modal), on this PC.
 void ShowTurnMessagesOf(const std::vector<std::wstring>& lines);
 
@@ -292,6 +420,13 @@ bool PlayerRulesNation(int idx);
 // Host (relations v2): a joined nation's own war counter, as the game's War for the host's nation (months at war > 0,
 // at peace < 0; stepped after the month). The player's economy rules for that nation read it (economy.cpp).
 int KWarCounter(int idx);
+// Host (relations v2, B5: warfx.cpp): `vp` victory points of a war effect (a blockade, ...) for `gainer` in its war with
+// `loser`: the nation's VP and the pair's war score (the B4 ledger of a nation under the player's rules with a computer
+// nation, or a war between two players).
+void CreditWarVP(int gainer, int loser, int vp, const char* why);
+// Host (B5: warfx.cpp): nation K's war score over all its wars now (the B4 ledger with the computer's nations, the score
+// of a war between two players with the host's or another joined nation): K's points and its enemies'.
+void KWarScore(int K, int& vp, int& evp);
 void OnBeforeAIMoves(void* self);
 void OnAfterAIMoves(void* self);
 bool OnBeforeAIPeace(int nationIdx, bool badLoss);  // true => skip the game's AI peace for this nation
@@ -303,6 +438,8 @@ void OnHostPeace(bool after);  // the game's end of the host's last war (DoPeace
 void OnAfterCopyGame(int fromSlot, int toSlot);  // the game's "Copy game" finished (or was cancelled)
 // The game resolves a battle between two nations it runs (DoBattleBetweenAINations); true = defer it (host).
 bool OnAIBattle(int a, int b, int countA, int countB, const std::wstring& area);
+// B6 (host): the game's CheckForBattles2 is about to look for the host's battle of the month (the joined nations' first).
+void OnBattleGenerator();
 // The game's DoBattle returned (opp = the opponent's nation index); the battle screen is open if it was fought.
 void OnDoBattleDone(int opp, bool result);
 // The game's LoadBuildCampaign returned (a battle in progress in that save is resumed inside it: the screen is open).
@@ -311,4 +448,5 @@ void OnBattleSlotSkippedTurn();  // a battle slot's close skipped DoStrategicTur
 void OnStrategicTurnRuns();      // DoStrategicTurn runs (outside a battle slot)
 void OnCampaignLoading();        // LoadBuildCampaign is about to load a campaign
 bool InSession();                // a multiplayer session is up on this PC (hosting or joined)
+bool JoinedPlayerPC();           // this PC plays a joined nation in a session: its campaign is the host's copy
 }  // namespace hookcb

@@ -11,6 +11,7 @@
 #include "poc_battle.h"
 #include "session.h"
 #include "ui.h"
+#include "warfx.h"
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -151,6 +152,18 @@ static std::string Execute(const std::string& line) {
         RunOnMainThread([args] { Log("ls %s -> %s", args.size() > 1 ? args[1].c_str() : "", mp::DebugLockstep(args).c_str()); });
         return "ok";
     }
+    // TEST ONLY (0.6.0): armstreaty conference <chance> (host: the game's CreateArmsControlTreaty, its dialogs) and
+    // armstreaty refresh (the screen's refresh: at war the game's CancelTreaty, with its box on the host)
+    if (cmd == "armstreaty" && (arg(1) == "conference" || arg(1) == "refresh")) {
+        if (game::EventActive()) return "error an event dialog is open";
+        if (arg(1) == "conference") {
+            int chance = atoi(arg(2, "100").c_str());
+            RunOnMainThread([chance] { game::TestArmsConference(chance); });
+        } else {
+            RunOnMainThread([] { game::RefreshUI(); });
+        }
+        return "ok";
+    }
     return RunSync(line);
 }
 
@@ -160,8 +173,10 @@ static std::string ExecuteOnMain(const std::string& line) {
     auto arg = [&](size_t i, const std::string& def = "") { return i < args.size() ? args[i] : def; };
     // While a joined player's event dialog is open the nation list is reordered: only read-only commands.
     static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview", "relview",
-                                                    "rellast", "peacelast", "kwarvp"};
+                                                    "rellast", "peacelast", "kwarvp", "battleptrs", "pocheapcheck"};
     if (game::EventActive() && !kReadOnly.count(cmd)) return "error an event dialog is open";
+    // pocheapcheck (diagnosis, read only): the campaign's objects through RTTI (strings, object references)
+    if (cmd == "pocheapcheck") return "ok " + game::PocHeapCheck("bridge");
     if (cmd.compare(0, 3, "poc") == 0) return poc::Command(args);  // research POC (battles), see poc_battle.cpp
     {
         std::string err;
@@ -218,6 +233,8 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "chat") return mp::SendChat(line.size() > 5 ? line.substr(5) : ""), "ok";
         if (cmd == "turn") return game::ClickTurnButton(), "ok";
         if (cmd == "save") return game::SaveGame() ? "ok" : "error save";
+        // battleptrs (read only): the last battle's area and possession the game holds (nil after every load, 0.6.0)
+        if (cmd == "battleptrs") return game::BattlePointersState();
         if (cmd == "load")  // load <slot> [player] [mod]: as the player's own load; `mod`: as the mod's own reload
             return game::LoadCampaign(atoi(arg(1).c_str()), atoi(arg(2, "0").c_str()), arg(3, "") == "mod") ? "ok"
                                                                                                             : "error load";
@@ -370,6 +387,15 @@ static std::string ExecuteOnMain(const std::string& line) {
             game::SetTensionRaw(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3).c_str()));
             return "ok";
         }
+        if (cmd == "setally") {  // setally <a> <b> <months>: an alliance (0 ends it), raw as the game's own routines
+            game::SetAlliance(atoi(arg(1).c_str()), atoi(arg(2).c_str()), atoi(arg(3).c_str()));
+            return "ok ally=" + std::to_string(game::AllianceMonths(atoi(arg(1).c_str()), atoi(arg(2).c_str())));
+        }
+        // TEST ONLY: allyrand <0|-1>: every Random draw of the allies' war help for this PC's nation is 0 (-1: the game's)
+        if (cmd == "allyrand") return game::TestAllyRandom(atoi(arg(1).c_str()));
+        // TEST ONLY: revotest <0|-1> [n:unrest ...]: the next enemy-revolution run on this PC (a joined nation's turn):
+        // draws 0 (-1 the game's) and these nations' UnrestLevel in this copy first (a people's nation's put back)
+        if (cmd == "revotest") return game::TestRevolution(args);
         if (cmd == "rel") {  // rel <a> <b>
             int a = atoi(arg(1).c_str()), b = atoi(arg(2).c_str());
             return "ok tension=" + std::to_string(game::Tension(a, b)) + " war=" + (game::AtWar(a, b) ? "1" : "0") +
@@ -433,11 +459,39 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "econ") return economy::BridgeCommand(args);  // econ <K>: the player's economy rules (economy.cpp)
         // TEST ONLY: econrand <v>: the player's economy rules for joined nations draw min(v, n - 1) for Random(n); -1 off
         if (cmd == "econrand") return economy::TestRandom(args);
+        // TEST ONLY: econtreaty [<chance> [blind]|cancel]: the arms-control conference at the next month's end; cancel
+        if (cmd == "econtreaty") return economy::TestTreaty(args);
+        if (cmd == "warfx") return warfx::BridgeCommand(args);  // warfx [K]: the player's war effects (warfx.cpp)
+        // TEST ONLY: warfxblk <n> <-1|0|1>: the war effects' blockade test of nation n answers 1 / 0; -1 the game's
+        if (cmd == "warfxblk") return warfx::TestBlockade(args);
+        // TEST ONLY: warfxrand <v>: the war effects' own Random(n) draws min(v, n - 1); -1 the game's
+        if (cmd == "warfxrand") return warfx::TestRandom(args);
+    // TEST ONLY: warfxsea <R> <n>: n of R's ships raid in the next sea war frame (raiders, submarines, trade war)
+    if (cmd == "warfxsea") return warfx::TestSea(args);
+        // TEST ONLY: shipbuilder <n> [<ship> <builder>]: nation n's ships under construction / one ship's building nation
+        if (cmd == "shipbuilder") return warfx::TestBuilder(args);
         if (cmd == "ffield") {  // ffield <IntegerField>: a campaign field (e.g. ArmyOffensive, ParliamentDelay), read only
             void* f = game::BuildCamp();
             int off = dl::Field("TfrmBuildCamp", arg(1).c_str());
             if (!f || off < 0) return "error no campaign/field";
             return "ok " + std::to_string(dl::At<int>(f, off));
+        }
+        // armstreaty: the disarmament treaty and the submarine ban on this PC (0.6.0); TEST ONLY: `armstreaty set <months>
+        // [<displacement> <calibre>]` puts one in force, `armstreaty war <n>` sets this PC's game war counter, `armstreaty
+        // host <0|1>` (a joined PC) what it assumes of the host's rule until the next month's header
+        if (cmd == "armstreaty") {
+            if (arg(1) == "set")
+                game::TestSetArmsTreaty(atoi(arg(2, "0").c_str()), atoi(arg(3, "2147483647").c_str()),
+                                        atoi(arg(4, "2147483647").c_str()));
+            if (arg(1) == "war") game::TestSetWarCounter(atoi(arg(2, "0").c_str()));
+            if (arg(1) == "host") game::SetHostEndsArmsTreaty(arg(2, "1") != "0");
+            game::ArmsTreaty t = game::ArmsTreatyNow();
+            if (!t.ok) return "error treaty unavailable";
+            return "ok months=" + std::to_string(t.months) + " disp=" + std::to_string(t.disp) + " cal=" +
+                   std::to_string(t.cal) + " subban=" + std::to_string(t.subBan) + " base=" + std::to_string(t.base) +
+                   " war=" + std::to_string(game::WarCounter()) + " host=" + (game::HostEndsArmsTreaty() ? "1" : "0") +
+                   " kept=" + std::to_string(game::ArmsTreatyKept()) + " endedhere=" +
+                   std::to_string(game::ArmsTreatyEndedHere()) + mp::DebugArmsTreatyEnds();
         }
         return "error unknown command";
     }

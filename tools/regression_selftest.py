@@ -551,6 +551,85 @@ def intel_samples():
           and R.intel_panel_bad(1, names, None, ii) and R.intel_panel_bad(0, names, view(0), host_ii) == []
           and R.intel_panel_bad(1, names, view(0), host_ii),
           (R.intel_panel_bad(1, names, rv, ii), R.intel_panel_bad(0, names, view(0), host_ii)))
+    # the game's gun-comparison repeat (0.6.0 RC1: SpySuccess's calibre loop) in a save's [IntelReports]
+    gun = 'Jun 1901  France - Our 7 in guns are superior to French guns of the same calibre.'
+    other = 'Jun 1901  Italy - New ship under construction of class CL Iride is rumoured to carry 7 in main guns.'
+    better = 'Jul 1901  Russia - Russian 9 in guns have better performance than ours.'
+
+    def sec(*v):
+        return f'[General]\nX=1\n[IntelReports]\nReportNo={len(v)}\n' + ''.join(
+            f'Intel{i}={x}\n' for i, x in enumerate(v)) + '[Other]\nY=2\n'
+    s_gun, s_oth, s_bet = (R.intel_section_stats(sec(*v)) for v in ((gun, other, gun), (gun, other, other),
+                                                                     (better, better, gun)))
+    s_clean, s_empty = R.intel_section_stats(sec(gun, other)), R.intel_section_stats(sec(gun, '', other))
+    check('intel_section_stats / saved_clean_game: a repeated gun-comparison report ("Our N in guns are superior to X '
+          'guns of the same calibre." / "X N in guns have better performance than ours.") is the game\'s own repeat '
+          '(gun=1: allowed), any other repeat or an empty entry is not; a clean list passes both',
+          s_gun['repeated'] == s_gun['gun'] == 1 and R.saved_clean_game(s_gun) and not R.saved_clean(s_gun)
+          and s_oth['repeated'] == 1 and s_oth['gun'] == 0 and not R.saved_clean_game(s_oth)
+          and s_bet['gun'] == 1 and R.saved_clean_game(s_bet)
+          and R.saved_clean(s_clean) and R.saved_clean_game(s_clean) and not R.saved_clean_game(s_empty)
+          and R.intel_section_stats('[General]\nX=1\n') is None, (s_gun, s_oth, s_bet, s_empty))
+    # the client's save repeats what its own monthly check repeated the month before (0.6.0 RC2, dist_av_4 arms_treaty M2)
+    s_own2 = R.intel_section_stats(sec(other, other))
+    check('saved_own_repeat: the client\'s save may repeat as many entries as its own monthly check repeated in its list '
+          'the month before (the host sends the player\'s reports back), never more, never with an empty entry or '
+          'without such a repeat',
+          R.saved_own_repeat(s_oth, 1) and R.saved_own_repeat(s_own2, 1) and R.saved_own_repeat(s_own2, 2)
+          and not R.saved_own_repeat(s_own2, 0) and not R.saved_own_repeat(s_own2, None)
+          and not R.saved_own_repeat(R.intel_section_stats(sec(other, other, other)), 1)
+          and not R.saved_own_repeat(R.intel_section_stats(sec(other, '', other)), 1)
+          and not R.saved_own_repeat(s_clean, 1) and not R.saved_own_repeat(None, 1),
+          (s_oth, s_own2))
+    sk = ("13:34:33.569 [37012] relations v2: peace of nation 1: ship 495 (Imperator Aleksandr III) skipped: not among "
+          "nation 1's ships\n13:34:33.570 [37012] relations v2: peace of nation 1: ship 12 (X (Y)) skipped: not among "
+          "nation 2's ships\n")
+    check('PEACE_SHIP_SKIPPED: the host\'s "ship N (name) skipped: not among nation K\'s ships" for nation K only',
+          [int(m[1]) for m in re.finditer(R.PEACE_SHIP_SKIPPED.format(K=1), sk)] == [495])
+    cl = ('14:09:20.322 [38852] victory points shown: own 5548, enemy 673\n'
+          '14:09:34.970 [38852] victory points shown: own 5730, enemy 675\n')
+    peace = ("14:09:38.799 [38852] relations v2: peace: DoPeace (nation 1's wars with the computer's nations end)\n")
+    cv0 = dict(vp={1: 0, 7: 675}, enemy=0)
+    check('vp_shown_ok: the latest shown line equals vpinfo; after nation 1\'s own peace (DoPeace in its relation turn) '
+          'its VP and Enemy VP 0 pass; 0/0 without that peace, or the peace before the last load, fail',
+          R.vp_shown_ok(cl, dict(vp={1: 5730}, enemy=675)) == (True, False)
+          and R.vp_shown_ok(cl + peace, cv0) == (True, True) and R.vp_shown_ok(cl, cv0) == (False, False)
+          and R.vp_shown_ok(peace + cl, cv0) == (False, False) and R.vp_shown_ok(cl + peace, None) == (False, False)
+          and R.vp_shown_ok(cl + peace, dict(vp={1: 10}, enemy=0))[0] is False)
+    # lockstep_pvp f): the host's CreditWarVP lines of the players' war count (dist_rc060_2's default run: B5 blockade)
+    req = '18:00:40.100 [45452] battle request 32: nation 1 vs 2 in North Sea (5:5 ships), fought live by Captain and Bot\n'
+    blk = ('18:00:16.874 [45452] victory points: nation 2 +100 (blockade, in its war with nation 1) -> 291, war score 1-2 '
+           '55:291\n18:00:16.874 [45452] victory points: nation 2 +140 (blockade, in its war with nation 1) -> 431, war '
+           'score 1-2 55:431\n18:00:16.900 [45452] victory points: nation 3 +50 (blockade, in its war with nation 1) -> '
+           '90\n')
+    tail = ('18:00:53.595 [45452] battle 32 applied: 4 ships changed (24 fields), 0 removed, VP 0/0, prestige 0 (player: '
+            'VP 0/0, prestige 0, morale 0)\n18:00:54.238 [45452] war score 1-2: +2/+0 -> 57:431\n')
+    ws = dict(before=dict(a=55, b=191), after=dict(a=57, b=431), war='1')
+    check('pvp_war_score_check: the host\'s CreditWarVP credits of the war 1-2 ("victory points: nation G +v (blockade, '
+          'in its war with nation L) -> t, war score 1-2 x:y") count with the battle hooks; a credit of another pair '
+          'does not; without the credit lines the same score fails',
+          R.pvp_war_score_check(dict(ws, log=blk + tail), req) is True
+          and R.pvp_war_score_check(dict(ws, log=tail), req) is False
+          and bool(re.search(R.WAR_VP_CREDIT_RE, blk.splitlines()[0])) and not re.search(R.WAR_VP_CREDIT_RE,
+                                                                                         blk.splitlines()[2]))
+    # treaty k): the war score 1-2 steps in log order (dist_rc060_2's --stress run: blockade points before the battle line)
+    tk = ('18:18:13.525 [9180] victory points: nation 1 +100 (blockade, in its war with nation 2) -> 100, war score 1-2 '
+          '1000:100\n18:18:13.525 [9180] victory points: nation 1 +90 (blockade, in its war with nation 2) -> 190, war '
+          'score 1-2 1090:100\n18:18:14.000 [9180] victory points: nation 3 +40 (blockade, in its war with nation 1) -> 40'
+          '\n18:18:17.934 [9180] war score 1-2: +2/+0 -> 1092:100\n')
+    st = R.war_score_steps(tk, 1, 2)
+    check('war_score_steps: the host\'s battle lines and CreditWarVP lines of the war 1-2 in log order (another pair\'s '
+          'credit left out)', st == [(100, 0, 1000, 100, 'blockade'), (90, 0, 1090, 100, 'blockade'),
+                                     (2, 0, 1092, 100, 'battle')], st)
+    # battles b): the area of a fought battle from its request line (dist_rc060_2 --stress: the player's generator's)
+    rq = ("18:14:34.842 [ 9180] battle request 3 (the player's generator): nation 1 vs 7 in Northern Europe, 4 "
+          "attempt(s), fought by Captain\n18:14:30.000 [ 9180] battle request 1 injected: nation 1 vs 7 in The Baltic\n"
+          "18:14:31.000 [ 9180] battle request 5: nation 1 vs 2 in North Sea (5:6 ships), fought live by Captain and Bot\n")
+    check('battle_area: the sea area of a request line (the player\'s generator\'s ", N attempt(s), fought by X", an '
+          'injected one, a live one with its ship counts; the default without a line)',
+          (R.battle_area(rq, 3, 'x'), R.battle_area(rq, 1, 'x'), R.battle_area(rq, 5, 'x'), R.battle_area(rq, 9, 'x'))
+          == ('Northern Europe', 'The Baltic', 'North Sea', 'x'),
+          (R.battle_area(rq, 3, 'x'), R.battle_area(rq, 1, 'x'), R.battle_area(rq, 5, 'x')))
 
 
 def relations_samples():
@@ -590,6 +669,15 @@ def relations_samples():
     check('expected_copy (0.5.0): the copy\'s [General] War = K\'s own war counter when it agrees with K\'s wars (0 at '
           'peace after the last war, -3, 4 at war), else the host\'s guess (-1; -12 after the host\'s war; 1 at war)',
           got == ['0', '-1', '-3', '4', '1', '-12'], got)
+    rep = ('Unrest is reduced as there is room in the government budget for some modest welfare programmes. | USA has laid '
+           'down a CA of Indianapolis class! | Intelligence report France: Our 7 in guns are superior to French guns of the '
+           'same calibre. | Research breakthrough: Submarines, Early coastal submarine, Enables building of coastal '
+           'submarines')
+    got = (R.sea_war_box_lines(rep), R.sea_war_box_lines('Our scientists report progress on submarines.'),
+           R.sea_war_box_lines(rep + ' | German raider B Wittelsbach sinks 2 Russian merchant ships in The Baltic'))
+    check('sea_war_box_lines (war_effects M2 (c)): a host turn report with only its own research line on submarines (a '
+          'run of 2026-10-23) and a research box have none; a raider\'s line in the report is found',
+          got == ([], [], ['German raider B Wittelsbach sinks 2 Russian merchant ships in The Baltic']), got)
 
 
 def tracefiles(sandbox):
