@@ -115,6 +115,10 @@ std::string DebugKWar(const std::vector<std::string>& args);
 std::string DebugArmsTreatyEnds();
 // Tests (host, relations v2): which joined nations follow the player's rules (`relrules`), `relrules <K> <0|1>` forces one.
 std::string DebugRelRules(const std::vector<std::string>& args);
+// Tests (0.6.1): `warline`: the nations whose wars with this PC's nation come only from the players (bar hints) and, on
+// the host, the pairs of people's nations above the war line at the last check; TEST ONLY (host): `warline forget`
+// clears that memory, `warline check` runs the month's check now.
+std::string DebugWarLine(const std::vector<std::string>& args);
 // Tests (relations v2, B3): `relturn` (client, async: the player's relation routines now, with their dialogs);
 // `rellast`: the last relation turn sent (client) or applied (host).
 void DebugRelTurn();

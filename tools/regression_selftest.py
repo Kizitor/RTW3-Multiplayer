@@ -340,6 +340,16 @@ def samples():
           'sites between their ENTER and EXIT', len(e) == 14 and b == [['565c1c', '58d80d'], ['6aa000', '6aa001']], (e, b))
     check('expected_ls_level: this source tree\'s MP_LS_LEVEL (11 or later: the live-battle limits)',
           (R.expected_ls_level() or 0) >= 11, R.expected_ls_level())
+    scan = ("22:41:07.512 [4120] data files: 1415 files of Data (but Data\\Graphics and the game's temporary files tmp*: "
+            "Data\\tmpMapData.dat, Data\\tmpShip.ttp) hashed in 2531 ms: 7d1c0e5a9b3f2468\n"
+            "22:41:09.001 [4120] data files: 1417 files of Data (but Data\\Graphics and the game's temporary files tmp*: "
+            "none) hashed in 812 ms: 00000000000000ff\n")
+    p1, p2 = R.parse_datafiles_scan(scan.split('\n')[0]), R.parse_datafiles_scan(scan)
+    check('parse_datafiles_scan (engine level 18): the file count, the temporary files left out (lower case) and the '
+          'hash; the last scan line of a log counts ("none": no temporary file); a log without one: None',
+          p1 == dict(files=1415, temporary=['data\\tmpmapdata.dat', 'data\\tmpship.ttp'], hash='7d1c0e5a9b3f2468')
+          and p2 == dict(files=1417, temporary=[], hash='00000000000000ff') and R.parse_datafiles_scan('x') is None,
+          (p1, p2))
     m = re.search(R.AUTO_OFF_RE, 'lockstep: side 1 back to its player as in single player: the lead divisions of 2 forces; 1 '
                                  'forces stay with the computer as before auto-run; 9 divisions stay with the computer (31 '
                                  'ships) at t=05:40')
@@ -678,6 +688,35 @@ def relations_samples():
     check('sea_war_box_lines (war_effects M2 (c)): a host turn report with only its own research line on submarines (a '
           'run of 2026-10-23) and a research box have none; a raider\'s line in the report is found',
           got == ([], [], ['German raider B Wittelsbach sinks 2 Russian merchant ships in The Baltic']), got)
+
+
+def divisions_samples():
+    """Campaign divisions (0.6.1): the bridge's `divs` / `divstore <K>` replies (parse_divs) and an .off's
+    [CampaignDivisions] (off_divisions)."""
+    got = R.parse_divs('ok n=2 nation=1 list=5:RT K Div 1:2:174.175|6:RT K Div 2R_x:1:150')
+    check('parse_divs: `divs` with two divisions (nation, ids, a name with ":" made "_")',
+          got and got['n'] == 2 and got['nation'] == 1 and [(d['id'], d['name'], d['ships'], d['ids']) for d in got['divs']]
+          == [('5', 'RT K Div 1', 2, ['174', '175']), ('6', 'RT K Div 2R_x', 1, ['150'])], got)
+    got = [R.parse_divs(x) for x in ('ok n=0 nation=0 list=', 'ok n=0 list=', 'ok n=1 list=990001:Host Div A:0:',
+                                     'ok n=2 nation=0 list=nil|7:A:2:nil.12')]
+    check('parse_divs: none (`divs`, `divstore` without nation), a division without ships, a nil division and a nil ship',
+          got[0] and got[0]['n'] == 0 and got[0]['nation'] == 0 and got[0]['divs'] == []
+          and got[1] and got[1]['nation'] is None and got[1]['divs'] == []
+          and got[2] and got[2]['divs'] == [dict(id='990001', name='Host Div A', ships=0, ids=[])]
+          and got[3] and got[3]['divs'][0]['id'] is None and got[3]['divs'][1]['ids'] == ['nil', '12'], got)
+    bad = [R.parse_divs(x) for x in ('error unavailable', 'error the joined nations\' records are not loaded (host only)',
+                                     'ok n=2 nation=1 list=5:A:2:1.2', 'ok n=1 nation=1 list=5:A:x:1', 'ok 3', None)]
+    check('parse_divs: an error reply, a count that disagrees with the list, a bad ship count -> None', bad == [None] * 6,
+          bad)
+    off = R.parse_save('[General]\r\nYear=1900\r\n[CampaignDivisions]\r\nCampDivNo=2\r\nCampDiv0CDivId=990001\r\n'
+                       'CampDiv0Name=Host Div A\r\nCampDiv0ShipCount=2\r\nCampDiv0ShipId0=122\r\nCampDiv0ShipId1=123\r\n'
+                       'CampDiv1CDivId=990002\r\nCampDiv1Name=Host Div B\r\nCampDiv1ShipCount=0\r\n'.encode())
+    got = R.off_divisions(off.get('CampaignDivisions'))
+    check('off_divisions: CampDivNo and each division\'s id, name, ship ids; none for a missing section',
+          got == dict(no=2, divs=[dict(id='990001', name='Host Div A', ids=['122', '123']),
+                                  dict(id='990002', name='Host Div B', ids=[])])
+          and R.off_divisions(None) == dict(no=None, divs=[])
+          and R.div_summary(got) == 'Host Div A[122.123]; Host Div B[]', got)
 
 
 def tracefiles(sandbox):
@@ -1080,6 +1119,7 @@ def main():
     twopc_samples()
     intel_samples()
     relations_samples()
+    divisions_samples()
     sandbox = os.path.abspath('regression_selftest_sandbox')
     if os.path.exists(sandbox):
         shutil.rmtree(sandbox)

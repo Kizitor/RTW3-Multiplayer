@@ -271,6 +271,7 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "vpinfo") return mp::DebugVPInfo();
         if (cmd == "kwar") return mp::DebugKWar(args);  // relations v2: the joined nations' war counters
         if (cmd == "relrules") return mp::DebugRelRules(args);  // relations v2: nations under the player's rules
+        if (cmd == "warline") return mp::DebugWarLine(args);    // 0.6.1: players' bars and the war line's memory
         if (cmd == "rellast") return mp::DebugRelLast();        // relations v2: the last relation turn
         if (cmd == "peaceevent")  // B4: the next turn's peace event [the chance of its NegotiatePeace]
             return mp::DebugPeaceEvent(atoi(arg(1, "0").c_str()), atoi(arg(2, "0").c_str()));
@@ -351,6 +352,10 @@ static std::string ExecuteOnMain(const std::string& line) {
             int count = game::AirUnitCount();
             return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count);
         }
+        // Campaign divisions (0.6.1, read only): divs: the in-memory list (Fleet organization) with PlayerNation's index;
+        // divstore <K> (host): nation K's list the host keeps from its turns
+        if (cmd == "divs") return game::CampaignDivisionsInfo();
+        if (cmd == "divstore") return nplay::HostDivisionsInfo(atoi(arg(1, "0").c_str()));
         if (cmd == "doctrine") {  // doctrine <nation>: training priorities, pending ones, months left; missile storage
             game::DoctrineState d = game::GetDoctrine(atoi(arg(1).c_str()));
             if (!d.valid) return "error unavailable";

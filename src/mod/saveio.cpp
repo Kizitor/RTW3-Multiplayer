@@ -266,6 +266,16 @@ bool BuildSubmission(const std::wstring& slotDir, int slot, int nationIdx, long 
     if (ReadFileBytes(slotDir + L"DesignFiles" + std::to_wstring(nationIdx) + L".des", des)) out.Add("designs.des", des);
     std::string map;
     if (ReadFileBytes(slotDir + L"MapData" + s + L".dat", map)) out.Add("mapdata.dat", map);
+    // 0.6.1: the player's own campaign divisions as its game saved them right before (the host keeps them for the
+    // nation's next packages)
+    std::string off;
+    std::vector<std::string> divs;
+    if (ReadFileBytes(slotDir + L"RTWGame" + s + L".off", off) && OffDivisionLines(off, divs)) {
+        IniDoc dd;
+        dd.bom = d.bom;
+        dd.sections.push_back({"CampaignDivisions", divs});
+        out.Add("divisions.ini", WriteIni(dd));
+    }
     return true;
 }
 
@@ -1035,6 +1045,268 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
               std::to_string(removedShips) + " removed, VP " + KVStr(kv, "dVP_K", "0") + "/" + KVStr(kv, "dVP_J", "0") +
               ", prestige " + KVStr(kv, "dPrestige_K", "0") +
               (skipped ? ", " + std::to_string(skipped) + " section(s) of other players skipped" : "");
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Campaign divisions (saveio.h). TfrmBuildCamp.LoadCampaignDivisions creates CampDivNo divisions and TCampaignDivision.
+// LoadMe reads each one's keys; it adds whatever FindCShipWithId(PlayerNation, id) returns to the division's ships (nil
+// for an id the nation doesn't have) and takes the commander from PlayerNation's officers.
+
+static const char* kDivFields[] = {"CDivId",   "Name",      "Abbreviation", "DivisionType", "DivisionExperience",
+                                   "Training", "Commander", "LeadDivision", "Role"};
+
+// "ShipId<j>" with j as the game writes it (no leading zero).
+static bool ShipIdField(const std::string& f, int& j) {
+    if (!KeyShape(f, "ShipId", "") || f.size() > 10 || (f.size() > 7 && f[6] == '0')) return false;
+    j = atoi(f.c_str() + 6);
+    return true;
+}
+
+std::string CampDiv::Get(const std::string& field, const std::string& def) const {
+    for (auto& f : fields)
+        if (f.first == field) return f.second;
+    return def;
+}
+
+void CampDiv::Set(const std::string& field, const std::string& value) {
+    for (auto& f : fields)
+        if (f.first == field) {
+            f.second = value;
+            return;
+        }
+    fields.push_back({field, value});
+}
+
+bool ParseDivisions(const std::vector<std::string>& lines, std::vector<CampDiv>& out, bool strict, std::string& err) {
+    out.clear();
+    auto fail = [&](const std::string& why) {
+        err = why;
+        out.clear();
+        return false;
+    };
+    int count = -1;
+    std::map<int, std::vector<std::pair<std::string, std::string>>> byNo;  // division number -> (field, value)
+    std::set<std::string> keys;
+    for (auto& l : lines) {
+        if (l.empty()) continue;
+        std::string k, v;
+        if (!SplitKV(l, k, v)) {
+            if (strict) return fail("a line without a key");
+            continue;
+        }
+        if (strict && !keys.insert(k).second) return fail("key " + k.substr(0, 40) + " twice");
+        if (k == "CampDivNo") {
+            int n = atoi(v.c_str());
+            bool ok = IsInt(v) && v.size() <= 6 && n >= 0 && n <= (strict ? kMaxDivisions : 99999);
+            if (!ok && strict) return fail("CampDivNo=" + v.substr(0, 20));
+            if (count < 0) count = ok ? n : 0;  // the first one, as the game's reader takes it
+            continue;
+        }
+        size_t p = 7;
+        if (k.compare(0, 7, "CampDiv") == 0)
+            while (p < k.size() && isdigit((unsigned char)k[p])) p++;
+        // CampDiv<i><Field>, i as the game writes it (no leading zero)
+        if (p == 7 || p > 11 || p >= k.size() || (p > 8 && k[7] == '0')) {
+            if (strict) return fail("unknown key " + k.substr(0, 40));
+            continue;
+        }
+        std::string field = k.substr(p);
+        int j = 0;
+        if (strict) {
+            bool known = field == "ShipCount" || (ShipIdField(field, j) && j < kMaxDivisionShips);
+            for (const char* f : kDivFields) known = known || field == f;
+            if (!known) return fail("unknown key " + k.substr(0, 40));
+            bool text = field == "Name" || field == "Abbreviation";
+            bool bad = text ? v.size() > 200 || v.find_first_of(std::string("\r\n\0", 3)) != std::string::npos
+                            : !IsInt(v) || v.size() > 11;
+            if (bad) return fail("bad value of " + k.substr(0, 40));
+        }
+        byNo[atoi(k.c_str() + 7)].push_back({field, v});
+    }
+    if (count < 0) {
+        if (strict) return fail("no CampDivNo");
+        count = 0;
+    }
+    for (auto& e : byNo) {
+        if (e.first >= count) {
+            if (strict) return fail("division " + std::to_string(e.first) + " beyond CampDivNo");
+            continue;
+        }
+        CampDiv d;
+        int shipCount = -1;
+        std::map<int, std::string> ships;
+        for (auto& fv : e.second) {
+            int j = 0;
+            if (fv.first == "ShipCount") {
+                if (shipCount < 0) shipCount = std::max(0, atoi(fv.second.c_str()));
+            } else if (ShipIdField(fv.first, j)) {
+                ships.insert({j, fv.second});
+            } else if (KeyShape(fv.first, "ShipId", "")) {
+                continue;  // (a number the game never reads)
+            } else {
+                bool seen = false;
+                for (auto& f : d.fields) seen = seen || f.first == fv.first;
+                if (!seen) d.fields.push_back(fv);
+            }
+        }
+        shipCount = std::max(0, shipCount);
+        std::string what = "division " + std::to_string(e.first);
+        if (strict && d.Get("CDivId").empty()) return fail(what + " without CDivId");
+        if (strict && shipCount > kMaxDivisionShips) return fail(what + " with " + std::to_string(shipCount) + " ships");
+        for (auto& sh : ships) {  // (j order)
+            if (sh.first < shipCount)
+                d.ships.push_back(sh.second);
+            else if (strict)
+                return fail(what + ": ship " + std::to_string(sh.first) + " beyond ShipCount");
+        }
+        if (strict && (int)d.ships.size() != shipCount) return fail(what + ": a ship missing");
+        out.push_back(std::move(d));
+    }
+    if (strict && (int)out.size() != count) return fail("CampDivNo=" + std::to_string(count) + " but " +
+                                                        std::to_string(out.size()) + " divisions");
+    return true;
+}
+
+std::vector<std::string> DivisionLines(const std::vector<CampDiv>& divs) {
+    std::vector<std::string> out = {"CampDivNo=" + std::to_string(divs.size())};
+    for (size_t i = 0; i < divs.size(); i++) {
+        std::string p = "CampDiv" + std::to_string(i);
+        for (auto& f : divs[i].fields) out.push_back(p + f.first + "=" + f.second);
+        out.push_back(p + "ShipCount=" + std::to_string(divs[i].ships.size()));
+        for (size_t j = 0; j < divs[i].ships.size(); j++)
+            out.push_back(p + "ShipId" + std::to_string(j) + "=" + divs[i].ships[j]);
+    }
+    return out;
+}
+
+DivPrune PruneDivisions(std::vector<CampDiv>& divs, const std::set<std::string>* shipIds) {
+    DivPrune r;
+    std::set<std::string> ids, ships;
+    std::vector<CampDiv> keep;
+    for (auto& d : divs) {
+        if (!ids.insert(d.Get("CDivId")).second) {
+            r.divisions++;
+            continue;
+        }
+        CampDiv k;
+        k.fields = d.fields;
+        for (auto& s : d.ships) {
+            if ((shipIds && !shipIds->count(s)) || !ships.insert(s).second) {
+                r.ships++;
+                continue;
+            }
+            k.ships.push_back(s);
+        }
+        keep.push_back(std::move(k));
+    }
+    for (auto& d : keep) {
+        std::string lead = d.Get("LeadDivision");
+        if (!lead.empty() && lead != "-1" && !ids.count(lead)) {
+            d.Set("LeadDivision", "-1");
+            r.leads++;
+        }
+    }
+    divs.swap(keep);
+    return r;
+}
+
+std::set<std::string> NationShipIds(const IniDoc& bcs, int K) {
+    std::set<std::string> ids;
+    if (const IniSection* s = bcs.Find("Nation" + std::to_string(K) + "Ships"))
+        for (auto& l : s->lines) {
+            std::string k, v;
+            if (SplitKV(l, k, v) && KeyShape(k, "Ship", "Id")) ids.insert(v);
+        }
+    return ids;
+}
+
+bool OffDivisionLines(const std::string& off, std::vector<std::string>& lines) {
+    IniDoc d = ParseIni(off);
+    const IniSection* s = d.Find("CampaignDivisions");
+    if (!s) return false;
+    lines.clear();
+    for (auto& l : s->lines)
+        if (!l.empty()) lines.push_back(l);
+    return true;
+}
+
+std::string WithDivisionLines(const std::string& off, const std::vector<std::string>& lines) {
+    std::string body;
+    for (auto& l : lines) body += l + "\r\n";
+    // The section's first line and the next section's header line, as ParseIni sees them.
+    size_t p = off.size() >= 3 && off.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
+    size_t start = std::string::npos, end = off.size();
+    while (p < off.size()) {
+        size_t e = off.find('\n', p);
+        size_t next = e == std::string::npos ? off.size() : e + 1;
+        std::string line = off.substr(p, (e == std::string::npos ? off.size() : e) - p);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() >= 2 && line[0] == '[' && line.back() == ']') {
+            if (start != std::string::npos) {
+                end = p;
+                break;
+            }
+            if (line == "[CampaignDivisions]") start = next;
+        }
+        p = next;
+    }
+    std::string out = start == std::string::npos ? off : off.substr(0, start);
+    if (!out.empty() && out.back() != '\n') out += "\r\n";
+    if (start == std::string::npos) return out + "[CampaignDivisions]\r\n" + body;
+    return out + body + off.substr(end);
+}
+
+int PutDivisions(std::string& off, const std::string& bcs, int K, std::vector<CampDiv> divs, std::string& summary) {
+    std::set<std::string> ids = NationShipIds(ParseIni(bcs), K);
+    DivPrune pr = PruneDivisions(divs, &ids);
+    off = WithDivisionLines(off, DivisionLines(divs));
+    summary = std::to_string(ids.size()) + " ships of nation " + std::to_string(K) + "; " + std::to_string(pr.ships) +
+              " ship id(s) removed (not the nation's, or repeated), " + std::to_string(pr.divisions) +
+              " repeated division(s) dropped, " + std::to_string(pr.leads) + " lead division(s) reset";
+    return (int)divs.size();
+}
+
+bool PutSlotDivisions(const std::wstring& slotDir, int slot, int K, const std::vector<std::string>* ownLines,
+                      int& written, std::string& summary, std::string& err) {
+    std::wstring s = SlotStr(slot), offPath = slotDir + L"RTWGame" + s + L".off";
+    std::string off, bcs;
+    written = 0;
+    if (!ReadFileBytes(slotDir + L"RTWGame" + s + L".bcs", bcs) || !ReadFileBytes(offPath, off)) {
+        err = "the slot has no .bcs/.off";
+        return false;
+    }
+    std::vector<CampDiv> divs;
+    std::string perr;
+    if (ownLines) ParseDivisions(*ownLines, divs, false, perr);
+    written = PutDivisions(off, bcs, K, divs, summary);
+    if (!WriteFileBytes(offPath, off)) {
+        err = "cannot write the .off (Windows error " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    return true;
+}
+
+bool OwnDivisionLines(const std::wstring& slotDir, int slot, int K, std::vector<std::string>& lines, int& foreign) {
+    std::wstring s = SlotStr(slot);
+    std::string off, bcs, err;
+    lines.clear();
+    foreign = 0;
+    if (!ReadFileBytes(slotDir + L"RTWGame" + s + L".off", off) || !ReadFileBytes(slotDir + L"RTWGame" + s + L".bcs", bcs))
+        return false;
+    std::vector<std::string> sec;
+    std::vector<CampDiv> divs, mine;
+    if (OffDivisionLines(off, sec)) ParseDivisions(sec, divs, false, err);
+    std::set<std::string> ids = NationShipIds(ParseIni(bcs), K);
+    for (auto& d : divs) {
+        bool own = true;
+        for (auto& id : d.ships) own = own && ids.count(id) > 0;
+        if (own)
+            mine.push_back(d);
+        else
+            foreign++;
+    }
+    lines = DivisionLines(mine);
     return true;
 }
 

@@ -202,6 +202,18 @@ belong to 0.4.0.
     [B5 round 3: the enemy-revolution rule for joined nations](#investigation-2026-10-23-b5-round-3-the-enemy-revolution-rule-for-joined-nations-060-dev);
     [B6 decisions (attempts, decline counts, generator errors, wording)](#investigation-2026-10-23-b6-decisions-attempts-decline-counts-generator-errors-wording-v060-dev);
     [surprise attacks and takeovers at war start for joined nations](#investigation-2026-10-23-surprise-attacks-and-takeovers-at-war-start-for-joined-nations-v060-dev)
+- **0.6.1** (fixes of bugs reported on 0.6.0; its entries carry "0.6.1-dev" or "0.6.1")
+  - Fix:
+    [the tension bar above the war line between two players: its hint and a chat line say why no war comes](#fix-2026-10-25-the-tension-bar-above-the-war-line-between-two-players-its-hint-and-a-chat-line-say-why-no-war-comes-v061);
+    [Fire torpedoes greyed out in live battles: the battle's Realism in both players' chat](#fix-2026-10-25-fire-torpedoes-greyed-out-in-live-battles-the-battles-realism-in-both-players-chat-v061-dev);
+    [the ship designer's temporary file no longer stops live battles](#fix-2026-10-25-the-ship-designers-temporary-file-no-longer-stops-live-battles-v061);
+    [a reserved nation is played by a person on the host too](#fix-2026-10-25-a-reserved-nation-is-played-by-a-person-on-the-host-too-v061);
+    [campaign divisions of joined players and duplicated divisions](#fix-2026-10-25-campaign-divisions-of-joined-players-and-duplicated-divisions-v061);
+    [battles the game resolves for joined players: no battle when a side has no ship there that can fight](#fix-2026-10-26-battles-the-game-resolves-for-joined-players-no-battle-when-a-side-has-no-ship-there-that-can-fight-v061)
+  - Testing:
+    [campaign divisions, the live proof and the scenario divisions](#testing-2026-10-25-campaign-divisions-the-live-proof-and-the-scenario-divisions-v061);
+    [the 0.6.1 release candidate dist_rc061_1](#testing-2026-10-26-the-061-release-candidate-dist_rc061_1-v061);
+    [the 0.6.1 release candidate 2 dist_rc061_2](#testing-2026-10-26-the-061-release-candidate-2-dist_rc061_2-v061)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -6089,3 +6101,600 @@ after every run (hash), no game folder copy, delay proxy or `RTW3.exe` left.
   fight live in both directions, every fail was the suite's or a battle or game condition that passed when run again.
 - Game open 2083 + 1006 + 6778 + 868 + 1727 + 497 + 663 + 398 + 261 + 421 + 354 + 91 + 91 + 54 = 15292 s. Suite commits
   on reg-060b: 8ca6425, a268b03 and this entry's.
+
+## Fix 2026-10-25: the tension bar above the war line between two players: its hint and a chat line say why no war comes (v0.6.1)
+- **The report** (0.6.0, two friends on two PCs; the host plays nation 0, the joined player nation K): "The tension bar
+  when exceeds the critical threshold and no war is declared for non host".
+- **The "critical threshold"** is the war line of the strategic screen's tension panel (static, 1.01.44): a TShape
+  `WarLine` in `pnTension` (Top 43 of the panel's 251), no code touches it. `ShowOneTensionLevel` 0xc7f1e4 sets each
+  bar's Height to Tension x 20 and its Top to 251 minus that: a bar crosses the line at Tension 11 and fills the panel
+  at about 12.6; `GetTensionColor` 0xd10c80 colours it (< 4 green, 4-6 olive, 7-9 yellow, 10-20 orange, 21 and more
+  red); its hint is "Tension with X is t", above 40 "You are at war with X" (GAME-INTERNALS, the tension bars).
+- **The single-player rule** (`CheckForWar` 0xc84f04, static; GAME-INTERNALS has it in full): per nation at tension
+  T < 40 (0xc84f9c skips T >= 40), the war plan `WillGoToWar` counts down; with a plan only rumours; else at a long
+  peace (War < -48) Random(180) < T turns the month into rumours; else a declaration when T >= 13 + the nations at war
+  with the player (or 12, or 10-11 with War > 2, with chances); else at War < -48 and T >= 11 a war plan of 3-8 months
+  (5 %) with the spy report. So in single player a nation whose bar is that far above the line declares war within the
+  month, or soon.
+- **Two readings, both reproduced live on the released 0.6.0** (dist_rc060_2 installed, the 1900 campaign: host Great
+  Britain = 0, client "Captain" Germany = 1, "Bot" France = 2 reserved; a driver in the session folder, 268 + 88 s open):
+  - (a) K and a computer nation: `settension 1 3 15` and `1 4 25` on both copies -> in K's first relation turn the
+    client's dialogs "War has broken out between Germany and Russia" and "USA has joined the war against Germany!",
+    host `relations of Captain (nation 1; ...): ... war 1-3 war 1-4`. **Works**, as the host's own (`settension 0 5 15`,
+    `0 6 25`: "Great Britain and Japan are now at a state of war!", "Italy has declared war on us!" in its month).
+    K and Japan at 40: never a war in 3 months, as in single player (T >= 40 is skipped; the mod stops tension
+    changes at 40: `HostApplyRelations`, the events, `PlayerMaskLeave`).
+  - (b) the two players: host-K 25 -> 26 -> 28 -> 28 over 3 months, **no war**: pushed by both players' own
+    `RandomTensionChanges` ("Tension with Great Britain increases as the war is increasing tensions!", "... due to
+    historical enmity!") and never relieved; both screens "Tension with Germany is 28" / "Tension with Great Britain is
+    28", the bars far above the war line, and nothing said why.
+  - The report is (b).
+- **Cause: by design, but silent.** Since relations v2 wars between players are declared only by the players
+  (Diplomacy in the Multiplayer window): the host's `CheckForWar` sees K as a player (`PlayerMaskEnter` kind 1: K's
+  tension with the host reads 5, no plan), K's own (B3, in K's view) sees the host's and the other people's nations so
+  (`MaskAsPlayer`), and the computer's rules leave K's pairs alone (B2). A computer nation that far above the line would
+  have declared; the players got no word that the game never will.
+- **A hypothesis dropped: CheckForWar twice a month.** Its call sites are `DoTurn` 0xce100c and `DoEndOfTurn` 0xcfcdb3,
+  but `DoTurn` 0xce09f4 has no code callers (only the RTTI method table points at it; GAME-INTERNALS already called it
+  unused): the month is `btbnTurnClick` 0xd57c7b -> `DoTurn2` 0xce1644 -> `CheckForBattles2` 0xce180e ->
+  `DoStrategicTurn` 0xce181a (`CheckTurnEvents` 0xce1e42 with `RandomTensionChanges` and
+  `TensionEffectOfPreviousWars`, the war step, `WarHelpFromAllies` 0xce218f, `CheckBuildingShipsForWar` 0xce21c5) ->
+  `DoEndOfTurn` 0xce21f4 -> `ShowTurnMessages` -> `CheckForWar` (unless `GameOver` +0xa05). Single player runs it once
+  a month, after the tension routines: B3's order already. Running it twice for K would have doubled K's war chances
+  against single player, so B3 is unchanged; GAME-INTERNALS' "runs from DoTurn and from DoEndOfTurn" is corrected.
+- **What changed** (the rule stays: the game declares no war between players; whether it should is left to a later
+  decision):
+  - *The bar's hint, on every PC in a session* (game.cpp `PeoplesBarHints` after `ShowTensionLevels`, outside the
+    relations view): at peace the bar of a nation people play gets " - played by a person: wars between players are
+    declared only in the Multiplayer window (Diplomacy), never by the game" after the game's "Tension with X is t".
+    Which nations (`hookcb::WarOnlyByPlayers`, session.cpp): on the host a joined nation under the player's rules (the
+    one its CheckForWar sees as a player); on a joined player's PC, while the month's header has `rel` or `kvp` (the
+    host runs the player's rules for its nation), the host's nation (slot K in the view) and the nations of the
+    header's `humans` and of the lobby (a reserved nation too: K's CheckForWar sees it as a player and B2 leaves the
+    pair alone).
+  - *A chat line, from the host* (session.cpp `WarLineNews`, as each month goes out in `BroadcastState`, after "New
+    month"): for every pair of the host's nation and the joined nations under the player's rules at peace whose
+    tension is 11 or more and was below at the last check (a per-pair memory; the first check after hosting tells the
+    pairs above it already), both players get `* Tension between Great Britain and Germany is 25, above the war line.
+    Wars between players are declared only by the players (Multiplayer window, Diplomacy); the game will not declare
+    one.` (a joined player as a notice, the host in its own chat with a flash); log `war line: ... (told: the host
+    nation 1)`.
+  - Bridge `warline` (read-only: the nations with the hint on this PC, the host's pairs above the line) and, TEST
+    ONLY on the host, `warline forget` / `warline check`. No protocol change (3), live-battle engine 17.
+- **Version mixes** (static: both parts are local to the PC that has them): a 0.6.1 host with a 0.6.1 player: the
+  hints on both screens, the line on both. A 0.6.1 host with a 0.6.0 player: the host's hint and line; the player
+  gets the line as a chat notice ("* ..." from the host, as any host line), no hint on its bars. A 0.6.0 host with a
+  0.6.1 player: no line (the host sends none); the player's bars have the hint (a 0.6.0 host sends `rel`, `kvp` and
+  `humans`), the host's not. 0.6.0 with 0.6.0: as before.
+- **Live proof** (dist_fw_1 installed with the driver, `fw_live.py --proof --months 2 --ka 15 --kh 0 --kb 25`: nation
+  1's war counter -10 for the month, so the rumour branch at War < -48 cannot take the declaration's place; 73 s
+  open, 48/48 checks; slot 1 and the Preferences restored, 0.6.0 reinstalled):
+  - (a) Sep 1900: the client's box "Germany and Russia are now at a state of war!", its log `relations for nation 1
+    sent: tension=0:1:25:24;1:2:7:6;1:3:15:50;1:7:4:3; ... kwar=1 ran=tension,previous wars,war msgs=6`, the host's
+    `relations of Captain (nation 1; tension,previous wars,war; 6 message(s)): 0-1 25->24 1-2 7->6 war 1-3 ...`.
+  - (b) the host's `war line: Tension between Great Britain and Germany is 25, above the war line. ... (told: the
+    host nation 1)`; the line once in each PC's chat in M1 and not again in M2 (tension 24, then 23); `relview`: host
+    slot 1 "Tension with Germany is 24 - played by a person: ...", client slot 1 "Tension with Great Britain is 24 -
+    played by a person: ...", no computer nation's bar with it (the client's France bar has it: reserved for Bot; the
+    host's not: France does not follow the player's rules there, `warline` people=1,); no war 0-1.
+- **Suite**: a new scenario `relations_war` (group `relations`; TESTING.md): (a) and (b) as above, with `warline
+  forget` before the month and `warline check` after it (told=0), ending at peace (`peacetest 100 2 1`) with the
+  players' tension and nation 1's war counter as they were. On dist_fw_1, `--only session,relations_peace,war_effects,lockstep_pvp,relations_war`: **172/172**
+  in 323 s (session 17/17, relations_peace 34/34, war_effects 73/73, relations_war 18/18 in 37 s with Russia: "War has
+  broken out between Germany and Russia", lockstep_pvp 30/30: the live battle between two joined players fought, no
+  DESYNC); `regression_selftest.py` 129/129.
+- Game open: 268 + 88 (the 0.6.0 repro runs) + 73 (proof) + 323 (suite) = 752 s.
+
+## Fix 2026-10-25: Fire torpedoes greyed out in live battles: the battle's Realism in both players' chat (v0.6.1-dev)
+Report (0.6.0, two friends on two PCs): "torpedoes can't be manually fired player vs player combat". Static reading of
+1.01.44 with `rdis.py`; live runs on the released 0.6.0 (dist_rc060_2) and on this fix (dist_ftp_1): the 1900 fixture
+in slot 1, host-vs-player test battles, each copy with its own battle preference Realism in memory
+(`RTW3MP_TEST_PREFS=RealismSetting=<n>`, as two PCs' Preferences), the division report and the torpedo dialog driven
+the player's way with posted messages (the ship tree's "Status...", BM_CLICK on *Fire torpedoes*, posted clicks on the
+target and mount lists, BM_CLICK on *Fire*; the session folder's `ftp_live.py`). Engine level stays 17.
+- **The game's rule.** `TdlgDivisionReport.FormShow` (0xae2298) enables *Fire torpedoes* only above Realism's second
+  level: `mov eax, [0xf278b4]; cmp dword ptr [eax+0x56], 1; setg dl; mov eax, [ebx+0x4bc]` (`bnTorps`) `...; call
+  [ecx+0x9c]` (SetEnabled), 0xae22ca..0xae22de, the class's only access of +0x4bc; the DFM has the button
+  `Enabled = False` and no hint. The levels are `TdlgPrefs.rgRealism`'s items: 0 "Admiral's mode", 1 "Rear admiral's
+  mode", 2 "Captain's mode" (its hint: "This will govern which divisions you can control manually during battle.").
+  **The game's default is 1:** `TdlgPrefs.LoadPrefs` pushes 1, the default, before `ReadInteger('Settings',
+  'RealismSetting')` (0xe0b688..0xe0b69b). The automatic torpedo fire (`CheckTorpedoTargetsForAllShips` 0xda9648 and
+  the routines it calls, 0xda7688..0xda9c00, `FireMount` with `Manual` = 0) reads no preference (no reference to the
+  cell 0xf278b4 there): ships fire their torpedoes on their own at every level, unless their division holds torpedo
+  fire.
+- **Cause: the gate is A's Realism, the game's default closes it, and nothing told the players.** Since 0.4.1 a live
+  battle runs both PCs with A's 14 battle preferences (`kPrefs`, RealismSetting among them; A is the host in its own
+  battles, the player who starts it in a battle between two joined players). With A at the default, Rear admiral's
+  mode, *Fire torpedoes* is greyed out on both PCs, whatever B chose. The only trace was B's log line; the README said
+  it in its torpedo and troubleshooting entries. Not a regression and no refusal on B: the button follows A's level on
+  both PCs, and at Captain's mode both players fire.
+- **Live on 0.6.0** (dist_rc060_2; game open about 8.5 minutes in two runs):
+  - (a) A at Rear admiral's mode, B at Captain's mode: *Fire torpedoes* disabled on both copies (`ls ctl` enabled=0);
+    B's record RealismSetting=1 during the battle (`ls prefs` "after the battle: RealismSetting 1 -> 2"); no chat line
+    about the realism or torpedoes on either PC; B's log only: `battle preferences: Admiral's for the load and the
+    simulation (RealismSetting 2 -> 1); this PC's own come back after the battle`; `ls torp` refused on both ("the
+    division report's Fire torpedoes is disabled (button=0: ...)").
+  - (b) A at Captain's mode, B at Admiral's mode: enabled on both copies; B's record 2, its own 0 kept for after the
+    battle: B's button follows A's level, not its own Preferences. (c), both at Captain's mode, is the suite's
+    `lockstep_torpedo` (B, A and both at one boundary, through `ls torp`: 19/19 on dist_rc060_1, no fail in
+    dist_rc060_2's whole `--stress` run); B's own level never reaches the battle (its record holds A's), so (b) and
+    (c) fire alike; the salvoes through the real dialog are the live proof below, on the fix, whose change touches no
+    part of the fire path.
+- **The fix** (`lockstep.cpp`: `BattleRealism`, `RealismName`, `RealismLine`, `TorpOffNotice`; each PC's own chat, no
+  change to the battle):
+  - *At the start* both players read the battle's Realism and what it means for torpedoes. A: `Realism: <mode> (your
+    battle preference, for both players). ...`; B: `Realism: <mode> (<A>'s battle preference, for both players; yours
+    isn't used). ...`; at Captain's mode `... Fire torpedoes in the division report works while the battle is
+    paused.`, below it `... Fire torpedoes in the division report needs Captain's mode, which <you|A> can choose in
+    the Preferences before the next battle. Your ships still fire torpedoes on their own.` (`ACheckReady`, the first
+    running: A's own line, and B's text through A's `info` message; at a rejoin only B's). A's start message carries
+    `rz=1` ("A says it"): a B whose A sends none (A on 0.6.0) says it itself at its first `go`, from its record (A's
+    level since the load).
+  - *Once per battle*, when a division report is on screen with *Fire torpedoes* off for the Realism (`TorpOffNotice`
+    from `lockstep::Tick`, every 250 ms: the report visible, `bnTorps.FEnabled` 0, the record's level below 2), each
+    PC logs `a division report shows Fire torpedoes off (the battle's RealismSetting <n>)`, says `Fire torpedoes is
+    off: it needs the battle preference Realism at Captain's mode, and this battle uses yours, <mode>. Your ships still
+    fire torpedoes on their own; choose Captain's mode in the Preferences before the next battle to fire them
+    yourself.` (B: `... uses <A>'s, <mode> (yours isn't used). Your ships still fire torpedoes on their own; <A> can
+    choose Captain's mode in the Preferences before the next battle.`) and sets the notice `Live battle: Fire torpedoes
+    needs Realism at Captain's mode (see the chat)` (the Multiplayer window flashes). A disabled button gets no click
+    (no `OnClick`), so the notice comes with the report; a hint on the button would need a Delphi string written into
+    the game's control for the same words.
+  - Bridge: `ls realism` -> `ok realism=<n> name=<mode> torps=<0|1> said= a_says= noted=`.
+- **Decision: the game's rule stays.** Realism is a package of the simulation's rules (which divisions the player
+  commands, detach, lead changes and turn-aways, the sighting routine, the objectives: 18 routines read it), and the
+  game offers manual torpedo fire only at Captain's mode in single player too. Both PCs use one level, A's, so the
+  battle is the same for both players and stays deterministic. Enabling *Fire torpedoes* below Captain's mode in live
+  battles only would hand players a control their chosen level withholds, while the automatic fire launches torpedoes
+  for both sides at every level. What was broken is that the rule was invisible; the gating itself works.
+- **Versions** (engine level 17 kept: `rz` is a new key that 0.6.0 ignores; the lines are chat, outside the battle's
+  state): 0.6.1 with 0.6.1: both start lines and both notices. A on 0.6.1, B on 0.6.0: both start lines (B shows A's
+  `info` line like any other), the notice on A only. A on 0.6.0, B on 0.6.1: B's own start line and B's notice, nothing
+  new on A. 0.6.0 with 0.6.0: as before. Live (two game folders, the second with dist_rc060_2's DLLs; 113 s): a 0.6.1
+  host at Admiral's mode with a 0.6.0 player: A's line and notice, on B `Realism: Admiral's mode (Admiral's battle
+  preference, for both players; yours isn't used). ...` from A, no notice on B; a 0.6.0 host at Rear admiral's mode
+  with a 0.6.1 player: no line on A, B's own line (`ls realism` a_says=0) and B's notice. Each battle 7 minutes equal
+  on both copies, no LEAK, no DESYNC.
+- **Live proof on dist_ftp_1** (game open about 26 minutes in five runs, most of it finding torpedo range):
+  - A at Rear admiral's mode, B at Captain's mode: *Fire torpedoes* disabled on both; A's `Realism: Rear admiral's mode
+    (your battle preference, for both players). Fire torpedoes in the division report needs Captain's mode, which you
+    can choose in the Preferences before the next battle. Your ships still fire torpedoes on their own.`, B's `Realism:
+    Rear admiral's mode (Admiral's battle preference, for both players; yours isn't used). ... which Admiral can choose
+    ...`; the report opened on each copy: the notice once on each, `ls realism` realism=1 torps=0 noted=1 on both
+    (a_says=1 on B); 7 minutes equal.
+  - Both at Captain's mode: enabled on both, `Realism: Captain's mode (...). Fire torpedoes in the division report
+    works while the battle is paused.` on both, no notice, `ls realism` torps=1 noted=0. Through the real dialog
+    (both sides' divisions steered at each other with `ls order`, positions from `pocdump`): B alone, `S22 mount 0 at
+    Mallard, course 244.0, speed 24, range 700, manual 1: 1 torpedoes in the water (1 -> 0 left, reload 0)` carried out
+    at minute 20 on both copies, B's chat `Torpedo salvo fired: S22 launched 1 torpedo.`; A alone, `Revenge mount 0 at
+    G10, course 120.0, ...` at minute 25 (reload 22); 44 minutes equal, no LEAK, no DESYNC. Both at one boundary
+    (another battle): `deferred torpedo salvo of side 0 carried out at minute 31 (given for minute 31): Benbow mount 1
+    at Gefion, course 300.0, speed 15, range 1800, manual 1: ...` then `... of side 1 ...: G10 mount 0 at Welland,
+    course 155.0, ...` on both copies in that order, each giver's chat, 33 minutes equal, no LEAK, no DESYNC.
+  - The game's own lines in the torpedo dialog seen on the way: "Centreline swivel mount HIGH 244", "Forward (sub)
+    HIGH 120", "Out of arc", "No solution", "Expended", "Friendly ship in line of fire!".
+- **Suite:** `limits_realism` (`lockstep_limits` f), `lockstep_torpedo` a)) takes the battle's start marks and checks
+  the start lines on both copies and, below Captain's mode, the notice on both (`ls realism` noted=1), at Captain's
+  mode none. On dist_ftp_1 with the run's RealismSetting 2 (`--only lockstep_torpedo,lockstep_ui,lockstep_pvp`):
+  109/109 (session 16/16, `lockstep_ui` 41/41, `lockstep_pvp` 30/30, `lockstep_torpedo` 22/22: a) with the new
+  checks, B, A and both at one boundary with the random-draw trace, the resync with torpedoes in the water, auto-run),
+  630 s with the game open. (d) A battle between two joined players (`lockstep_pvp`, relayed by the host): Captain
+  was A (`Realism: Captain's mode (your battle preference, for both players). ...`), Bot was B (`Realism: Captain's
+  mode (Captain's battle preference, for both players; yours isn't used). ...`), through the host's relay.
+- **Found on the way (not fixed here):** the live battles' data-file check compares `Data\tmpShip.ttp`. Two copies
+  started from two game folders (the mixed-version runs' first try) had their live battle refused: "Captain's game
+  data files differ from this PC's: 1 files: Data\tmpShip.ttp", and the battle went on against the computer. The game
+  folder's copy had been rewritten during another run that day (19076 bytes, 21:40; the folder copy's 14400 bytes of
+  10/04). The path is used by a `TfrmDesignMain2` routine (0xb1765c: `'\Data\tmpShip.ttp'` at 0xb17bb8, then
+  `LoadShipGraphic`); which actions write it was not traced. If normal play writes it, two real PCs' files differ and
+  their live battles fall back to the computer; `datafiles.cpp` skips only `Data\Graphics`.
+- Docs: README (torpedo salvoes, troubleshooting), ARCHITECTURE (manual torpedo salvoes: the lines, `rz`, the
+  decision), GAME-INTERNALS (the levels, the default, the automatic fire), TESTING (`ls realism`, the lines, the
+  catalog rows of `lockstep_limits` and `lockstep_torpedo`).
+
+## Fix 2026-10-25: the ship designer's temporary file no longer stops live battles (v0.6.1)
+Found by the torpedo fix's mixed-version proof (a host from the game folder, a player from a copy of it): the host's
+`Captain's game data files differ from this PC's: 1 files: Data\tmpShip.ttp`, and the live battle went to the
+computer. The game folder's `Data\tmpShip.ttp` had been rewritten that day by another test run (19076 bytes, the
+install's had 14400). Static reading of 1.01.44 with `rdis.py`; live runs on dist_i61_1.
+- **The file.** The only `tmp` file name among the game's strings is `'\Data\tmpShip.ttp'` (0xb17bb8). Its one user is
+  a `TfrmDesignMain2` routine (0xb1765c): when the designer has no ship object yet (`[form+0xc6b] = 0`) it builds the
+  game folder + that path, writes the file (0xb02fa8) and reads it back (`LoadShipGraphic` 0xb0021c). The routine has
+  25 callers, all the designer's own handlers (`FormShow`, `bnNewShipClick`, `bnAddTurretClick`, `bnDeleteTurretClick`,
+  `bnAddTorpMountClick`, `seDisplacementChange`, `sbAutoBuildClick`, ...); 0xb02fa8 has 4, all designer handlers
+  (`bnSaveClick`, `bnLoadTemplateClick`, the routine, `bnExportDesignClick`). So every use of the ship designer
+  rewrites it, and no battle reads it. `Data\tmpMapData.dat` (2.3 MB, dated the install) is named nowhere: not in the
+  game's image (ASCII or UTF-16), not in `Launcher.exe`. Write dates: of the 1417 files of `Data` (Graphics aside) on
+  this PC, after three weeks of tests only `tmpShip.ttp` is newer than the install (rewritten again at 22:16 by
+  another agent's run). `Data\IDes` is written only by a developer's Alt+click on the designer's `Label37`
+  (`Label37MouseDown`: `test [ebp+0x10],2`, then a nested routine with `'Data\IDes\'`), not by play; it stays in the
+  hash (its designs are real data: the battle load reads coastal battery designs there).
+- **The impact (0.6.0, engine 16 and 17).** `datafiles.cpp` hashed every file of `Data` but `Data\Graphics`: on two
+  real PCs a player who had used the ship designer (or whose designer was used last with another design) had another
+  `tmpShip.ttp`, so every live battle of the session was refused by B ("your game data files differ from ...'s:
+  Data\tmpShip.ttp") and fought against the computer.
+- **The fix (engine level 18).** The scan leaves out every file whose name starts with `tmp` (case-insensitive) at any
+  level of `Data` (`Temporary`), and logs them: `data files: 1415 files of Data (but Data\Graphics and the game's
+  temporary files tmp*: Data\tmpMapData.dat, Data\tmpShip.ttp) hashed in <ms> ms: <hash>`. The test switch
+  (`ls testdatafile`, `RTW3MP_TEST_DATAFILE`) leaves such names out as well and says so ("(not hashed, the game's
+  temporary files: ...)"). The combined hash is not 0.6.0's, so `MP_LS_LEVEL` 18: a 0.6.0 PC and a 0.6.1 PC are told
+  apart by the level check before any battle loads ("... the host has 0.6.1-dev (engine 18), you have 0.6.0 (engine
+  17)") instead of a data-file notice naming files that are the same.
+- **Proof (dist_i61_1, the fix with the merged 0.6.1 work).** The suite, `--only
+  session,relations_war,lockstep_torpedo,lockstep_ui,lockstep_pvp,twopc,lockstep_data`: **200/200** in 828 s of game
+  (session 17, relations_war 19, lockstep_ui 41, lockstep_data 11, lockstep_pvp 30, twopc 61, lockstep_torpedo 21).
+  The new `lockstep_data` (13 s): both scans `1415 files of Data (but Data\Graphics and the game's temporary files
+  tmp*: Data\tmpMapData.dat, Data\tmpShip.ttp)`, hash `aebbfdfd9daeb498` on both; B's `ls testdatafile
+  Data\tmpShip.ttp;Data\IDes\tmpProbe.sdf` left the hash as it was, and the live test battle started live (B:
+  `the game data files are the same on both PCs (1415 files, aebbfdfd9daeb498)`), 4 minutes equal, ended by the game
+  inside minute 5; the control `Data\Gundata.dat` changed it (`395928512d7dce60`), `off` put it back.
+- **Proof with two game folders (dist_i61_1; the session folder's `i61_tmp.py`, 161 s of game).** The host from the
+  game folder, the client from a copy outside the Steam library (deleted afterwards) whose `Data\tmpShip.ttp` differs
+  (SHA-256 `C4D2B0A6...` against `DF05EBE3...`) and which has `Data\IDes\tmpProbe.txt` too. Both 0.6.1: the client's
+  scan left out its three `tmp*` files, the host's its two, both 1415 files and `aebbfdfd9daeb498`; the live test
+  battle started live (B: `the game data files are the same on both PCs (1415 files, aebbfdfd9daeb498)`), 4 minutes
+  equal, ended inside minute 5. With `RTW3MP_TEST_FILELOG=1` on both, the battle's load, minutes and close opened 61
+  (host) and 94 (client) files, `Data\Gundata.dat` among them, no `tmp*` file. The released 0.6.0 in the copy: the
+  host logged `battle against Captain: fought against the AI (live-battle engine level 17, the host's 18)`, its chat
+  `* The battle against Germany is fought against the computer: live battles need the same live-battle engine on both
+  PCs: this host has 0.6.1-dev (engine 18), Captain has 0.6.0 (engine 17).`, the player's `* The host fights its
+  battle against Germany against the computer: ... the host has 0.6.1-dev (engine 18), you have 0.6.0 (engine 17).`,
+  no data-file line on either PC; the host finished alone. (Two checks of the suite's session scenario failed there as
+  expected of a mixed pair: "both copies run the build under test", and the host's slot 1 bar still read the tension
+  5 after the 0.6.0 player's intelligence event had made it 6: the host doesn't redraw its bars after an event of a
+  player, as before.)
+- Docs: README (same game data files, the engine, troubleshooting, Upgrading 0.6.1), ARCHITECTURE (level 18, the
+  data files), GAME-INTERNALS (the game's temporary files), TESTING (the scan line, `ls testdatafile`, the two-folder
+  check, the `lockstep_data` row). Game open: 828 s (the suite, with the next fix) + 161 s (two folders) = 989 s.
+
+## Fix 2026-10-25: a reserved nation is played by a person on the host too (v0.6.1)
+The war line's follow-up: on the host, the tension bar of a nation reserved for a player who wasn't connected had no
+"played by a person" hint, while the joined player's PC showed it (fix-war's proof: client slot 2, France, reserved for
+Bot: the hint; host slot 2: none, `warline` people=1,).
+- **Why.** The host asked `PlayerRulesNation`: a joined nation under the player's rules (its player's PC announced
+  `rel`, or did when it was last connected: `relRules`). A nation reserved without such a player (a reservation without
+  a join, a player away since before 0.5.0, an older version) followed the computer's rules, and the host's own
+  `CheckForWar` could declare a war between the host and it. A joined player's PC sees every reserved or claimed nation
+  as a person's (the header's `humans` and the lobby's).
+- **The fix.** On the host a nation people play is one reserved or claimed by a player, connected or not
+  (`hookcb::IsHumanRemoteNation`), for the bar's hint (`WarOnlyByPlayers`), the war-line chat line (`WarLineNews`) and
+  the host's own player routines (`MaskAsPlayer`: CheckForWar sees its tension with the host as 5, no war plan, no
+  alliance of its own; RandomTensionChanges at least 6), so the hint is true: the game declares no war between the
+  host and a nation a person plays. The computer's routines (`AIMaskEnter`) still leave only the nations under the
+  player's rules alone: a reserved nation without a player who runs its relations keeps its relations with the
+  computer's nations as before. Log: `relations v2: CheckForWar sees nation(s) 1 2 as players (the nations people
+  play)`.
+- **Proof (dist_i61_1, the same suite run, 200/200).** `relations_war` 19/19 with a new check of the stand-in's
+  nation 2 (France, reserved for Bot, not connected): the host's bar "Tension with France is 8 - played by a person:
+  ...", the client's "Tension with France is 6 - played by a person: ..." (both at peace with it), `warline` people
+  `1,2,` on the host (before: `1,`) and `0,2,` on the client; the host's log `relations v2: CheckForWar sees
+  nation(s) 1 2 as players (the nations people play)` in each month, and no war, chat line or box of the month
+  changed in the other scenarios (session, lockstep_pvp, twopc: all passed).
+- Docs: ARCHITECTURE (B2's player routines, the war line, the hooks table), README (wars between players), TESTING
+  (the `relations_war` row).
+
+## Fix 2026-10-25: campaign divisions of joined players and duplicated divisions (v0.6.1)
+Two players of 0.6.0 on two PCs reported: "Non host player sees hosts player ships on vessel overview and not their
+own. Divisions seems to not exists for a non host player but seem to work and save for a host player." and "Divisions
+seem to duplicate for the host on no host trial." Branch fix-div from dev-061 9a163f1 (0.6.1-dev): the fix 30b2e7e, the
+review's fix edaeb16, the scenario 6bcdc08
+([the proof and the scenario](#testing-2026-10-25-campaign-divisions-the-live-proof-and-the-scenario-divisions-v061)).
+- **The screen.** The "vessel overview" is the strategic screen's *Fleet organization* tab, index 9 of `TabControl1`
+  (Map, Ships in service, Ships under construction, Submarines, Coastal fortifications, Ships sunk or scrapped, Area
+  overview, Base overview, Officers, Fleet organization): the panel `pnDivisionEditor` with the list view
+  `lvDivisions`, which `FillDivisionList2` (0xd39c14) fills with every campaign division and its ships
+  (`DoCampDivShipLine`), and *New division* (`bnNewDiv` -> `TdlgCreateDivision`). `TfrmCampOverview` ("Campaign force
+  listing") belongs to the Steam and Iron campaign (`TfrmCampaign.bnOverviewClick`), not to the strategic game.
+- **The game's model** (static reading of 1.01.44;
+  [GAME-INTERNALS](docs/GAME-INTERNALS.md#campaign-divisions-the-fleet-organization-tab)). The game keeps one division
+  list, its player's: `TfrmBuildCamp.CampaignDivisions` (+0xaf0). The save keeps it in the slot's `.off`,
+  `[CampaignDivisions]`: `CampDivNo`, then `CampDiv<i>CDivId`, `Name`, `Abbreviation`, `DivisionType` (CA 3, DD 9,
+  ...), `DivisionExperience`, `Training`, `Commander`, `LeadDivision`, `Role`, `ShipCount` and `ShipId<j>` (`Commander`
+  and `LeadDivision` -1 = none, booleans 0/1), next to `[Officers]` (`PlayerNation.OfficerList`, written by
+  `SaveBuildCampaign` at 0xc8f20d). `LoadBuildCampaign` sets `PlayerNation := BuilderNations[0]` (0xc9a69d), loads
+  `[Officers]` into `PlayerNation.OfficerList`, then calls `LoadCampaignDivisions(CampaignDivisions, file,
+  'CampaignDivisions')` (0xd37054), which appends without clearing. `TCampaignDivision.LoadMe` (0xd607ac) takes the
+  commander from `PlayerNation.GetOfficerWithId` and adds `FindCShipWithId(PlayerNation, id)` to the division's ships
+  without a nil check (0xd60a96). So on a joined player's PC the month's `.off`, the host's, resolved against nation
+  0: the host's ships. *Add ships to division* (`AddShipToDivision`) offers PlayerNation's ships (seen live: Germany's
+  cruisers); *Ships in service* lists PlayerNation's ships with their division
+  (`GetCampaignDivisionForShip`). `TCampaignDivision.Create` takes `CDivId` from the campaign's `IDNo` counter
+  (0xd79de4): unique in a campaign the game saved. The battle generator (the quick-battle unit, the callers of
+  `GetRelatedDivision`) builds the player's side from the player's campaign divisions (seen live, below).
+- **The mod up to 0.6.0.** The month package carried the host's whole slot, its `.off` included; a turn carried only
+  nation K's `.bcs` sections, its designs and its map data, no `.off`. The host merged the turns and reloaded its slot
+  in place every month with a submission; the client reloaded slot 77 in place every month.
+- **Reproduced on the released 0.6.0** (dist_rc060_2; three runs, game open 353 s): the host's two divisions ("Host Div
+  A" and "Host Div B", two British ships each) written into slot 1's `.off`, the client's made with the game's own
+  dialogs (posted messages). The client's *Fleet organization* showed the host's two divisions with British ships while
+  its *Ships in service* showed 30 German ships. The client's divisions ("K Div 1" and "K Div 2"; ships added from an
+  *Add ships to division* dialog that offered Germany's cruisers, one renamed, one dissolved) never reached the host and
+  were gone from slot 77 after a month; they stayed on the client's screen only because its list was never cleared.
+  The host's divisions doubled with every merged month, 2 -> 4 -> 8, in its `.off`, its `Autosave.off` and on its
+  screen (the month's "Some ships or divisions have no commander assigned ..." question gave the copies admirals); the
+  client's screen list grew 4 -> 8 -> 16. No exception in either log.
+- **Causes.**
+  - *The host's divisions on the joined player's screen:* the month's `.off` was the host's, and every load resolves
+    the divisions against nation 0, the host's nation in slot 77.
+  - *The joined player's own divisions lost:* nothing carried them to the host, and the next month's `.off` replaced the
+    slot's.
+  - *Duplicates:* `LoadCampaignDivisions` appends and the game loads a campaign once per process, but the mod reloads
+    in the same process (the host after every merge, the client every month, the battle slots, the live battles), so
+    each reload added the save's divisions to those in memory and the next save wrote them all: a third appended list
+    after the intel reports (0.2.2) and the air units (0.3.3).
+- **The fix** (`game.cpp`, `saveio.cpp`, `nationplay.cpp`, `session.cpp`, `bridge.cpp`; the design in
+  [ARCHITECTURE](docs/ARCHITECTURE.md#each-joined-players-campaign-divisions-061)):
+  - *Every load* (single player too): the `LoadBuildCampaign` hook takes the divisions out of the list before the load
+    and frees them after a successful one (the *Fleet organization* list view, whose rows point at them, is filled
+    again first with the game's `FillDivisionList2`); a failed load that left the list empty gets them back. A hook of
+    `LoadCampaignDivisions` drops repeated `CDivId`s after the call (the first kept, `LeadDivision` links pointed at it:
+    the repair of saves an earlier version wrote) and packs nil ships out of every division.
+  - *A joined player's own slot:* while the mod loads slot 77 as nation K, the hook makes `PlayerNation` nation K's for
+    the `LoadCampaignDivisions` call and puts it back (also after an exception), so the divisions find K's ships and
+    officers.
+  - *The turn* carries `divisions.ini`, the slot `.off`'s `[CampaignDivisions]`. The host validates it (only the game's
+    fields, integers but `Name` and `Abbreviation`, at most 200 divisions of 40 ships; a rejected list keeps the stored
+    one), drops repeats and keeps it in `rtw3mp_nations.ini` `[Nation<K>Divisions]`. The host's save and month never
+    see it.
+  - *K's month package:* its `.off` gets K's stored divisions pruned to K's ships of the month (header `divs=1`) for a
+    client whose hello has `div` >= 1; an older client gets an empty list. Every other byte of the `.off` stays.
+  - *K's battle package* (a battle against the computer) gets K's divisions for every client version (header `divs=1`;
+    the battle slot's `MakeNationPlayer` keeps the divisions whose ships are all K's).
+  - *A client of an older host* (no `divs`) writes its own divisions from slot 77 into the month's `.off` (when the slot
+    holds this nation's game of the month before; divisions with other nations' ships left out) and into its battle
+    slots. A client whose division hook is unavailable (no hello `div`) writes an empty list instead (edaeb16, from the
+    review): its load would resolve the nation's ship ids against nation 0 and leave nil ships that the *Fleet
+    organization* dereferences.
+  - Protocol 3 and live-battle engine 17 unchanged (new keys and a new file that older peers ignore). Bridge: `divs`,
+    `divstore <K>` (read-only, [TESTING.md](docs/TESTING.md#bridge-command-reference)).
+- **Version mixes** (from the code; not run with mixed versions).
+  - 0.6.1 host, 0.6.1 player: the whole round trip.
+  - 0.6.1 host, 0.6.0 player: the player gets an empty division list, no longer the host's divisions and ships. Its own
+    divisions are not sent and are gone from its slot every month (its 0.6.0 game still appends on its own reloads).
+    The host's divisions never double. The player's battles against the computer get what the host stored for it:
+    nothing, from a 0.6.0 player.
+  - 0.6.0 host, 0.6.1 player: the host still doubles its own divisions (0.6.0's code). The player drops the host's
+    divisions and keeps its own from its slot, pruned to its ships, in its months and its battle slots; they never
+    reach the host.
+  - 0.6.0 host, 0.6.0 player: as reported.
+  - A save that 0.6.0 doubled is repaired when 0.6.1 loads it (the first division of each `CDivId` stays). A joined
+    player's divisions that 0.6.0 lost can't be recovered: the player makes them again.
+- **Not covered.** A joined nation's live battles: the host's game generates them, the nation is a computer nation
+  there, and the game uses campaign divisions for its player's side only. What the host's month and battles would
+  change in a joined nation's divisions (experience from battles, the monthly division training and experience) is not
+  applied to them: they stay as the player's last turn sent them. A player who reconnects before the merge gets the
+  stored list again (division changes not yet merged are lost, like other orders).
+  *Note 2026-10-25 (docs, from the code, not run):* only the live battles with the host's nation are generated by the
+  host's game. A live battle between two joined players is generated in its first player's battle slot (`SendBattle`
+  with `pvp=1`, whose package carries that player's divisions like any battle package, then `MakeNationPlayer`), so
+  there only the second player's divisions go unused.
+
+## Testing 2026-10-25: campaign divisions, the live proof and the scenario divisions (v0.6.1)
+dist_fd_2 (edaeb16: 0.6.1-dev, protocol 3, live-battle engine 17; RTW3MP.dll 6E601883E5F01B08..., version.dll
+F153C56827DEA9BB...), installed from its frozen snapshot, the released 0.6.0 (dist_rc060_2) put back after every run;
+host and client on one PC with the 1900 test campaign (the host Great Britain in slot 1, the client Germany as nation
+1). Slot 1 and the Preferences identical to their backup after every run (hash), Game77 and Game87 removed.
+- **The live proof** (one run, game open 212 s; slot 1's `.off` given the host's two divisions "Host Div A" and "Host
+  Div B" twice, as a 0.6.0 month leaves them):
+  - a) *Session start:* the client's `divs` n=0 nation=1, slot 77's `.off` `CampDivNo=0` and its *Fleet organization*
+    empty, while the host's showed its two ("divisions of nation 1: 0 in its month (none stored yet)").
+  - b) *The joined player's own divisions:* the client made "K Div 1" (CA Hertha and Victoria Louise) and "K Div 2" (B
+    Brandenburg and Wittelsbach), renamed "K Div 2R", with the game's own dialogs (the ship picker offered Germany's
+    ships). After each of three months (Sep, Oct and Nov 1900): the client's `divs` n=2 nation=1 with the same ship ids
+    (CDivId 60561 and 60562: nation 1's id range of the month package), slot 77's `.off` `CampDivNo=2`; the host's
+    `divstore 1` the same two; the host's `divs` exactly its own two, its `.off` and `Autosave.off` `CampDivNo=2`; each
+    copy's *Fleet organization* its own two. Logs: "divisions of nation 1: 2 stored", "divisions of nation 1: 2 in its
+    month (34 ships of nation 1; 0 ship id(s) removed ...)", "divisions: the month holds nation 1's own 2", "campaign
+    divisions: 2 of nation 1 loaded", "campaign divisions: 2 from before the load dropped; the campaign's 2 kept",
+    "campaign divisions: the Fleet organization list filled again". No exception, access violation, game error box or
+    "Missing ship".
+  - c) *The repair:* the host's load of the doubled `.off` logged "campaign divisions: 2 repeated divisions of the save
+    dropped (4 -> 2; a save of an earlier version)", and its next save wrote 2.
+  - d) *A battle against the computer:* Germany against Spain in Northern Europe in the third month, fought (a second
+    one the enemy declined): the host's "divisions of nation 1: 2 in its battle (...)", the client's "player copy in
+    slot 87: ... divisions 2 kept / 0 dropped", Game87's `.off` `CampDivNo=2`, and in the battle `ls forces div` listed
+    "K Div 1" as side 0's division 0: the game's generator built the player's side from it.
+- **The scenario `divisions`** (6bcdc08; [TESTING.md](docs/TESTING.md#scenario-catalog)): in the default run after
+  `battles`, two processed months, about 90 s. The host and the client make two divisions each with the game's dialogs
+  (New division, Add ships to division, one Rename division on the client; posted messages only). Checks: the client's
+  hello "campaign divisions 1"; the host's divisions never on the client (`divs`, its list); the client's two with
+  nation 1's ships only; after each month (the first with the *Fleet organization* shown, so the list is filled again
+  inside the load) the client keeps exactly its own two (`divs`, its list, slot 77's `.off`), the host stored them
+  (`divstore 1`, the log lines) and keeps exactly its own two (`divs`, its list, slot 1's `.off` and `Autosave.off`
+  `CampDivNo`: no duplicates after its reload); no exception, access violation, "Error in FillDivisionList2" or
+  "Missing ship" in either log or box. 18 checks + 2 x the month checks = 42. New parsers `parse_divs` and
+  `off_divisions` with their self-tests: `regression_selftest.py` 133/133.
+- **The suite** on dist_fd_2, `--only session,battles,lockstep_month,divisions`: session 17/17, battles 90/90,
+  divisions 42/42, lockstep_month 51/51 = **200/200** (game open 486 s).
+- Game open 353 (the 0.6.0 reproduction) + 212 + 486 = 1051 s.
+
+## Testing 2026-10-26: the 0.6.1 release candidate dist_rc061_1 (v0.6.1)
+The release candidate dist_rc061_1 (a2d918d: 0.6.1, live-battle engine 18, protocol 3; RTW3MP.dll SHA-256
+08E1AE99C7DC2B35..., version.dll 650AD2502DB71783...) on the reg-061 runner (a2d918d plus the suite changes below),
+installed from its frozen snapshot (`--dist`), the released 0.6.0 (dist_rc060_2) put back after every run (hash
+checked); slots 1 and 9 and the Preferences identical to their backup after every run (hash), the save folders as before,
+no game folder copy, delay proxy, `python` or `RTW3.exe` left. Both logs of every run after the first are kept with the
+developers' session files (`r61\logs_run_*`).
+- **Runs** (checks, seconds with the game open):
+  - The default run (29 scenarios): 1183/1189 (2456 s); its five failing scenarios are below.
+  - `--stress` (35 scenarios, with the engine-18 live scenarios `lockstep_limits`, `lockstep_rejoin`, `lockstep_resume`
+    and `relations_war`, `battle_generator`, `player_copy`, `lockstep_pvp`, `lockstep_air`): 1514/1515 (6055 s); the one
+    fail is `player_copy` f) (suite, fixed); `--only relations_war,player_copy` with the fix: 74/74 (106 s).
+  - `--group relations` (the host now counts the reserved nation 2 as a player in its CheckForWar): 295/295 (473 s), then
+    318/321 (646 s): the game's DoBattleBetweenAINations box, below.
+  - `--stress --only lockstep_month`: 99/99 (294 s).
+  - With the game open: 2456 + 6055 + 106 + 473 + 646 + 294 = 10030 s, and 767 s for the mixed cases.
+- **A game error box in the second relations run: "Error in DoBattleBetweenAINations procedure! Access violation at
+  address 00603D64 in module 'RTW3.exe'. Read of address 000000AC"**, on the host, during `battle_generator` e)'s TEST
+  command `battles aitest 1 7 Northern Europe` (`ResolveAIBattle`: the game's `DoBattleBetweenAINations` of nation 1
+  against Spain now, with the counts 3/3). The game's own except handler showed it (a TMessageForm, which the routine's
+  text capture does not take), so the command timed out (`error timeout (main thread busy)`; nothing in the host log from
+  03:27:33 to the next month) and the next scenario's answerer answered it (`battle_surprise`'s box check and `session`'s
+  whole-run check fail with it). In that run the scenario's three months had no fought battle (every request avoided or
+  declined: `c) fought: None`); in the three runs where e) passed (`ok fought=1 captured=1`: default, `--stress`, the first
+  relations run) a battle had been fought before. Not reproduced, no `RTW3MP_DIAG` in the run. Per the release rule a
+  NO-GO until investigated: the TEST command's fixed counts may exceed the forces in the area (a test artifact), but the
+  same routine resolves a declined kind-0 battle in the battle phase with the counts of the game's request
+  (`ResolveAIBattle`'s caller in session.cpp). Not new in 0.6.1 (the path and the check date from 0.6.0). Both logs:
+  `r61\logs_run_20261026_033126`.
+- **The default run's other fails**, by class:
+  - `battle_generator` (and `session`'s whole-run check): the host's "Error in SaveBuildCampaign procedure! Cannot create
+    file "...\Save\Game1\RTWGame1.bcs". The process cannot access the file because it is being used by another process"
+    at its month-end save, one second after `battle 24 applied` (M2). Environmental: a file-sharing collision (the game
+    creates its save without sharing; the runner reads slot 1 right after each `battle N applied`; the save folder is in
+    OneDrive); the run's logs were not kept. Not seen again: the scenario passed in `--stress` and in both relations
+    runs (TESTING.md, Known traps).
+  - `relations_war` M1 (two checks): the host's intel list and save repeated "Intelligence report Italy: The Italian navy
+    is reportedly doing a lot of night training." (two adjacent copies in one month; not the gun comparison the checks
+    allow). No routine of the mod makes intelligence reports on the host (the joined player's monthly check runs on its
+    PC), so the game's own spying; flaky: 19/19 in `--stress`, in the re-run and in both relations runs.
+  - `player_copy` f): `nations` had Russia's funds 9646 in the copy and 9694 in the client's memory. Suite:
+    `relations_war` (new in 0.6.1's suite, right before) ends with `peacetest` on the client after slot 77's save, and the
+    game's peace changes the funds of the nations it touches (`--stress`: Russia 13480/13420 and Japan 3324/3315, the
+    nations of the peace's delta; the re-run: France, Japan and Italy, whose scrapped ships its turn report lists). The
+    copy is made from slot 77, so f) now compares the other nations' funds with slot 77's `[NationJ] Funds` (a NOTE lists
+    the nations whose memory differs): 74/74.
+  - `lockstep_air` g): a formation B readied stayed at status 1 and left B's list at minute 37 before the Stand down
+    could run: the battle's own course (flaky); `--stress` 41/41 (the Stand down through the real dialog passed).
+- **Campaign divisions in a live battle between two joined players** (a docs question, `lockstep_pvp`'s new NOTE):
+  CONFIRMED in the `--stress` run. Battle 28 is set up on the attacker's PC (A, the client, nation 1 Germany, side 0)
+  and relayed to the defender (B, the third copy "Bot", nation 2 France, side 1): A's campaign divisions "RT K Div 2R" (2
+  ships) and "RT K Div 1" (1 ship) are battle divisions of side 0 on both copies; B's "RT Bot Div" is nowhere, its side has
+  the game's own divisions ("France Battle Division 2", "France Cruiser Division 4", ...). The battle's 26 divisions
+  (index, side, name) are the same on both copies (the new check).
+- **Suite changes** (reg-061, selftest 134/134): ac4b2db `battle_dialogs` records the game's error boxes answered in a
+  joined player's battle (the mixed run's 0.6.0 player boxes had passed unnoticed); 9c85a02 `lockstep_pvp`'s campaign
+  divisions (above); 9eb0b23 `player_copy` f) against slot 77 (above).
+- **Mixed versions** (TESTING.md, "Mixed versions"): a) a 0.6.1 host with a 0.6.0 player 91/91 (190 s): the battle against
+  the player fought against the computer with both notices naming the engines (18 and 17), the old player's divisions
+  stay on its PC (`divstore 1` empty, no duplicate on the host); the 0.6.0 player's own boxes in its battles against the
+  computer after it made a division (CreateDivisionForBCBattle and SelectForce access violations, "Missing ship in RT K
+  Div 1") are 0.6.0's: the same with both PCs on 0.6.0 (control z: 46/48, 199 s), fixed by 0.6.1 (0.6.0 players:
+  upgrade). b) a 0.6.0 host with a 0.6.1 player 89/89 (183 s) and b2 57/57 (151 s): the player keeps its own two
+  divisions in `divs`, slot 77 and its battle slot. c) two 0.6.1 folders with different `Data\tmpShip.ttp`: 24/24 (44 s),
+  the data files the same, 4/4 minutes equal.
+- **Verdict**: every scenario passed in at least one run; the suite fails were fixed and re-run, the default run's
+  other fails were flaky or environmental. The DoBattleBetweenAINations box (a game error box) blocks the automatic
+  release until the developers have looked at it. (Cause and fix: [Fix 2026-10-26, below](#fix-2026-10-26-battles-the-game-resolves-for-joined-players-no-battle-when-a-side-has-no-ship-there-that-can-fight-v061).)
+
+## Fix 2026-10-26: battles the game resolves for joined players: no battle when a side has no ship there that can fight (v0.6.1)
+The 0.6.1 release candidate's second `--group relations` run (MODLOG "Testing 2026-10-26: the 0.6.1 release candidate
+dist_rc061_1") showed the host's "Error in DoBattleBetweenAINations procedure! Access violation at address 00603D64 in
+module 'RTW3.exe'. Read of address 000000AC" during `battle_generator` e)'s `battles aitest 1 7 Northern Europe`.
+Branch fix-aib from int-061 cc955eb.
+- **The address.** The box's address is absolute, and RTW3.exe has ASLR: that run's start lines say `random=000E7834`
+  (RVA 0x7834), so the base was 0xE0000 (not 0x400000) and the fault RVA 0x523D64: in the analysis image (0x830000)
+  0xd53d64, the first instruction of `TCampaignShip.IsOperational`, `movzx edx, byte ptr [eax+0xac]` (`Status`), with
+  Self (eax) nil.
+- **The routine.** `DoBattleBetweenAINations(NationA, NationB, ShipCountA, ShipCountB, anArea)` 0xd32104 plays about
+  min(ShipCountA, ShipCountB) rounds (3 above 6; the exact rule in GAME-INTERNALS); each round picks one side's ship
+  (50 %) with its nested picker 0xd31f78: `GetRandomShipInArea(anArea, nation, [ssActive, ssTradeProtection, ssRaider,
+  ssColonies])` (set word 0x0059), then `IsOperational` on the pick without a nil check (0xd31fa4).
+  `GetRandomShipInArea` 0xd10d60 returns nil when the nation has no ship in the area with that status that is
+  operational (in play, `RepairTime` 0, not interned or a museum): the AV. The routine's except handler (0xd3270a)
+  shows the box, a modal TMessageForm, so the host's main thread waits for an answer (the run's `battles aitest` timed
+  out after 120 s). When the picks happen to take only the side that has ships, the routine "fights" the battle: the
+  other side loses ships to a fleet that isn't there.
+- **The game's own call never meets it.** Its only caller, `CheckAivsAIBattleInArea` 0xd32c2c (from
+  `CheckAIvsAIBattles`), counts both nations with `CountShipsInArea(stAll, anArea, [the same set])` (0xc5d958) and calls
+  the routine only when both counts are above 0, with those counts. Neither sets any other field: the routine and its
+  nested procedures never read `BattleArea` (+0x4a3b) or `BattlePossession` (+0x4a36), so 0.6.0's clearing of both
+  before every load (6bbca05) has nothing to do with it.
+- **The mod's calls.** `game::ResolveAIBattle` called the routine with counts it was given: the battle phase's fallback
+  (session.cpp `FinishBattlePhase`) for a kind-0 battle that wasn't fought (`BattleFallback`: the time limit, the player
+  disconnected or not connected, a decline from an older version, "no battle came about" on the player's PC, a battle
+  that could not be sent, built or applied, `battles resolve`), with the counts of when the game found it, and `battles
+  aitest` (0.6.0, risk 4) with 3/3. Neither looked at the ships in the area at that time.
+- **Normal play reaches it (since 0.3.0, f6ee827, the fallback).** The game finds a battle with ships of both sides in
+  the area, but the fallback runs after the month (`CheckRaiderActivity`, the rest of `DoStrategicTurn`) and after the
+  battle phase, whose fought battles are merged into the save before it. A side can be without a ship that can fight
+  there by then: sunk or damaged (`RepairTime`) in another battle of that month in the same area (a second battle of
+  the player's nation there, the game's own battle of the computer nation against a third nation, another joined
+  player's battle against it, an earlier fallback of the same battle phase), or by raiders later in the month. And "no
+  battle came about" on the player's PC, the commonest fallback, is just what a player's nation without a ship that can
+  fight there gets. The test path since 0.6.0: `battle_generator` e) takes an area where nation J has a possession and
+  nation 1 at least 4 ships; J's ships are there only in some months (in the failed run every battle there was avoided
+  or declined; in the three passing runs a battle had been fought there).
+- **Reproduced live** (the RC dist_rc061_1, the probe `aib_probe.py` with the suite's helpers in the developers'
+  session files: the session scenario, then one month; 57 s with the game open): `battles aitest 1 5 Northern Europe`
+  (Japan has no ship there, Germany 29) showed the box 3 times out of 3 and `battles aitest 1 5 Southeast Asia` (Germany
+  none there, Japan 4) 2 of 2, each command held until the probe answered the box; after the month 2 of 3 (the first
+  "fought": the picks took only Germany's side). The real fallback: two kind-0 battles injected in Southeast Asia
+  (`battles inject 1 5 Southeast Asia`; nation 1 has no ship there) came back from the player's PC as "no battle came
+  about" (the game there found no battle), and the host's fallback had the routine resolve them after the battle
+  phase: one showed the box on the host ("battle 2 resolved by the game: no battle"), the other was "fought" ("battle 1
+  resolved by the game: battle": Japan's ships against a German fleet that isn't there). `battles aitest 1 7 Northern
+  Europe` (both nations have ships there) fought, its box captured, no error box.
+- **The fix** (e80e507): `ResolveAIBattle` counts both nations the game's way (`TBuilderNation.CountShipsInArea(stAll,
+  area, [ssActive, ssTradeProtection, ssRaider, ssColonies])`, new `FightingShipsInArea`). Either 0 (or the count not
+  available): no battle, the routine not called, host log `ResolveAIBattle K-J in <area>: no battle (ships that can
+  fight there: a/b; when found c/d)`; else the routine gets the counts of now, as from the game's own caller (log `...
+  ships that can fight there a/b (when found c/d)`). The fallback's chat line stays ("* The battle of ... was resolved
+  by the game (...)"), with no result text when there was no battle. 0.6.0's clearing before every load stays.
+- **Suite** (0d17a7d): `battle_generator` e2) `battles aitest 1 J <area>` where J has no ship that can fight (the
+  host's save; new helper `fighting_ships_by_area`): `ok fought=0 captured=0`, the log line, no game error box. Check e)
+  depended on where J's ships happened to be. Selftest 134/134.
+- **Proof** (dist_ab_1 = 0d17a7d, SHA-256 RTW3MP.dll 352905F2..., version.dll B9DBE5E3...): the probe 37/37 (163 s
+  with the game open): `battles aitest 1 5 Northern Europe` 3 of 3 and `... Southeast Asia` 2 of 2 `ok fought=0
+  captured=0` with "no battle (ships that can fight there: 29/0; when found 3/3)" and "0/4", after the month
+  3 of 3 (28/0); the two Southeast Asia fallbacks (no battle came about) "no battle (ships that can fight there: 0/4;
+  when found 3/3)"; a battle against Spain in Northern Europe held past the time limit (the time-limit fallback, ships
+  on both sides) resolved with "ships that can fight there 29/16 (when found 3/3)", its result captured; `battles aitest
+  1 7 Northern Europe` fought (29/15, 28/15). No error box. The suite: `--group relations` 321/321 (526 s) and 309/309
+  (575 s), `--only battles,battle_generator` 168/168 (440 s). e) fought in all three (Spain had ships in Northern
+  Europe); e2) `battles aitest 1 7 Northeast Asia` "no battle (ships that can fight there: 1/0; ...)" in all three.
+  `battles`: five battles held past the time limit in Northern Europe resolved with 28/17, 27/16, 26/15, 26/15, 26/14
+  (each resolution sinks ships, so the counts fall: how a later fallback in the same area can find a side with none),
+  and c2)'s three declines under an emulated older host with 26/13, 24/13, 23/12; no box. After every run v0.6.0 was put
+  back, slots 1 and 9 and the Preferences were identical to their backup, no `RTW3.exe` left. With the game open: 57 +
+  163 + 526 + 575 + 440 = 1761 s.
+- **Compatibility**: only the host resolves these battles, so a host on 0.6.1 is enough; protocol, engine and
+  saves unchanged.
+- Docs: CHANGELOG (0.6.1 Fixed, Compatibility), README (battles against computer nations), ARCHITECTURE (the game's
+  resolution in the battle phase), GAME-INTERNALS (the routine's precondition, absolute addresses in error boxes),
+  TESTING (`battles aitest`, e2), the trap).
+
+## Testing 2026-10-26: the 0.6.1 release candidate 2 dist_rc061_2 (v0.6.1)
+The second release candidate dist_rc061_2 (int-061 c7955f9: 0.6.1, live-battle engine 18, protocol 3; RTW3MP.dll
+SHA-256 8D70CE59B0199F80..., version.dll 38556CF04D05A6E2...): RC1 with the fix above (e80e507) and `battle_generator`
+e2) (0d17a7d). Run on the reg-061b runner (c7955f9, no suite change), installed from its frozen snapshot (`--dist`),
+the released 0.6.0 (dist_rc060_2) put back after every run (hash checked); slots 1 and 9 and the Preferences identical
+to their backup after every run (hash; the backup equal to RC1's), the save folders as before, no game folder copy,
+delay proxy, `python` or `RTW3.exe` left. Both logs of every run are kept with the developers' session files
+(`r63\logs_*`).
+- **Runs** (checks, seconds with the game open):
+  - The default run (29 scenarios): 1133/1135 (2112 s); its two fails are below.
+  - `--stress --only lockstep_month`: 99/99 (464 s): the host's battle against the player in Aug 1900 agreed at minute
+    417 (14/14), the one in Sep 1900 ended soon at minute 7 (16/16).
+  - `--group relations`: 321/321 (520 s).
+  - `--only lockstep_limits,lockstep_data` (the re-run): 83/83 (206 s).
+  - Mixed versions a): 78/78 (180 s), below.
+  - With the game open: 2112 + 464 + 520 + 206 + 180 = 3482 s.
+- **No game error box** on either PC in any run: the runner's box checks passed, and the run outputs and every kept log
+  have no "Error in", "Access violation", "Integer overflow" or "Missing ship" but `battle_generator` b)'s own `battles
+  gen 1 fault` (decision 3: the box recorded, none shown).
+- **The fix at work**: `battle_generator` e) `battles aitest 1 7 Northern Europe` fought (`ResolveAIBattle 1-7 in
+  Northern Europe: ships that can fight there 25/3 (when found 3/3)`; the relations run 32/4), e2) `battles aitest 1 7
+  Northeast Asia` gave no battle and no box (`ResolveAIBattle 1-7 in Northeast Asia: no battle (ships that can fight
+  there: 1/0; when found 3/3)`) in both runs; the default run's `battles` had two more resolutions by the game (a
+  battle left at the time limit among them), both fought (27/6, 25/2).
+- **The default run's fails**, flaky (a battle condition of the game): `lockstep_limits` (8/9: its live case did not
+  start) and `lockstep_data` b) (8/9): the host's `pocbattle 1 0` got "Enemy unable to challenge our forces in the area!
+  Gain 102405 VP!" (DoBattle returned 0: no ship of nation 1 for the test battle) right after `lockstep`'s and
+  `lockstep_ui`'s test battles (Great Britain's 30 and 26 ships against Germany's 11, none sunk in the live minutes;
+  `lockstep_ui`'s host ends its battle alone on auto-run). The test battles' results stay in the host's campaign in
+  memory (TESTING.md, Known traps: seen before in `--stress` only); the campaign was at March 1903 (RC1's default run, at
+  April 1903, started both). The re-run passed: `lockstep_limits` 55/55 (its live case 47/47), `lockstep_data` 11/11.
+- **Mixed versions** (TESTING.md, "Mixed versions"; `mixed_061.py --case a --no-battle87` in the developers' session
+  files `r63`): a 0.6.1 host with a 0.6.0 player in a folder copy outside the Steam library (deleted afterwards): 78/78
+  (180 s). The join line `Captain: mod 0.6.0, live-battle engine 17 (this host: 18), ..., campaign divisions 0`; the
+  host's battle against the player in Aug 1900 fought against the computer (`battle against Captain: fought against the
+  AI (live-battle engine level 17, the host's 18)`), the host's chat "* The battle against Germany is fought against the
+  computer: live battles need the same live-battle engine on both PCs: this host has 0.6.1 (engine 18), Captain has
+  0.6.0 (engine 17)." and the player's notice "... the host has 0.6.1 (engine 18), you have 0.6.0 (engine 17)."; nothing
+  held or sent; nothing stuck (the month completed Aug -> Sep 1900 with the player's turn merged, the player plans again
+  in slot 77, no battle window, the strategic screen enabled); the peace month and two division months as in RC1; no
+  game error box, exception or data-file "differ" line. The battles on the 0.6.0 player's PC (`battle87`) were left out:
+  after it made a division they show 0.6.0's own boxes (RC1's control z).
+- **Verdict: GO** for publishing 0.6.1 with exactly this build: every scenario passed (the two flaky fails when run
+  again), no game error box anywhere, the mixed versions as designed.

@@ -24,6 +24,16 @@ void HostDetach();
 void HostTransformState(Bundle& b, int K);          // K's month package: K's own intelligence instead of the host's
 void HostTakeSubmission(const Bundle& sub, int K);  // K's intelligence from its turn
 void HostTakeIntelEvent(const KV& kv, int K, std::string& applied);  // K's spying results (sent right away)
+// Campaign divisions (0.6.1; the strategic screen's Fleet organization). The game keeps one division list, its
+// player's, saved in the slot's .off and loaded against the player's nation. The host keeps each joined nation's own
+// list (from the nation's turns, "divisions.ini") in its records and puts it into the nation's packages instead of
+// the host's own divisions.
+void HostTakeDivisions(const Bundle& sub, int K);  // K's list from its turn (validated); a turn without one keeps it
+// The package's .off gets K's stored divisions pruned to K's ships of the package's .bcs (own = false: an empty list,
+// for a player whose mod would look K's ships up among the host's). `what` names the package in the log. Returns the
+// divisions written, -1 if the package has no .off.
+int HostPutDivisions(Bundle& b, int K, bool own, const char* what);
+std::string HostDivisionsInfo(int K);  // bridge `divstore`: "ok n=<n> list=<CDivId>:<name>:<ships>:<id.id...>|..."
 void SetNewsSink(std::function<void(int nation, const std::string& line)> fn);  // the month's news for a player
 std::string HostDebug();
 

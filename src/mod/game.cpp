@@ -42,6 +42,11 @@ struct Api {
     // air units (TList of TAirUnit the game appends to on every load and never clears): the cell of its unit variable
     uint32_t airUnitsCell = 0;
     void* mObjFree = nullptr;
+    // campaign divisions (TfrmBuildCamp.CampaignDivisions: the player's TList of TCampaignDivision, appended to by every
+    // load), LoadCampaignDivisions, the Fleet organization list view and its fill routine
+    int fCampaignDivisions = -1, fDivId = -1, fDivName = -1, fDivShips = -1, fDivLead = -1, fLvDivisions = -1;
+    void *mLoadDivisions = nullptr, *mFillDivisionList = nullptr, *mListPack = nullptr, *mListAdd = nullptr;
+    bool divisions = false;
     // the load's blockade check (credits victory points on every load): the routine, the return address of
     // LoadBuildCampaign's call of it, the nations' Blockaded flag
     void* mCheckBlockade = nullptr;
@@ -62,7 +67,7 @@ struct Api {
     void *mChangeOwner = nullptr, *mAdjacent = nullptr, *mRemoveShipInPeace = nullptr, *mShowTreaty = nullptr,
          *mSLCreate = nullptr, *mFree = nullptr, *mBattleAftermath = nullptr,
          *mAIBattle = nullptr, *mRaiderBattle = nullptr, *mUpdateVPNumbers = nullptr, *mCopyGame = nullptr,
-         *mResearchExecute = nullptr, *mResearchClick = nullptr, *mDoResearch = nullptr;
+         *mResearchExecute = nullptr, *mResearchClick = nullptr, *mDoResearch = nullptr, *mCountShipsInArea = nullptr;
     int fResearchPct = -1, fResearchAreas = -1, fBtbnResearch = -1;
     // Tactical battles of joined players
     void *mCheckAttack = nullptr, *mStrategicTurn = nullptr, *mDoBattle = nullptr;
@@ -175,6 +180,7 @@ static void ResolveTreaties() {
     A.mFree = dl::Method("TObject", "Free");
     A.mBattleAftermath = dl::Method("TfrmBuildCamp", "HandleBattleAftermath");
     A.mAIBattle = dl::Method("TfrmBuildCamp", "DoBattleBetweenAINations");
+    A.mCountShipsInArea = dl::Method("TBuilderNation", "CountShipsInArea");
     A.mRaiderBattle = dl::Method("TfrmBuildCamp", "QuickResolveRaiderBattle");
     A.mUpdateVPNumbers = dl::Method("TfrmBuildCamp", "UpdateVPNumbers");
     A.mCopyGame = dl::Method("TfrmBuildCamp", "CopyGameToOtherSlot");
@@ -522,6 +528,16 @@ bool Resolve() {
         else
             Log("WARNING: air unit list not found; reloading a campaign will duplicate its air units");
     }
+    A.fCampaignDivisions = dl::Field("TfrmBuildCamp", "CampaignDivisions");
+    A.fDivId = dl::Field("TCampaignDivision", "CDivId");
+    A.fDivName = dl::Field("TCampaignDivision", "Name");
+    A.fDivShips = dl::Field("TCampaignDivision", "Ships");
+    A.fDivLead = dl::Field("TCampaignDivision", "LeadDivision");
+    A.fLvDivisions = dl::Field("TfrmBuildCamp", "lvDivisions");
+    A.mLoadDivisions = dl::Method("TfrmBuildCamp", "LoadCampaignDivisions");
+    A.mFillDivisionList = dl::Method("TfrmBuildCamp", "FillDivisionList2");
+    A.mListPack = dl::Method("TList", "Pack");
+    A.mListAdd = dl::Method("TList", "Add");
     A.fTraining = dl::Field("TBuilderNation", "TrainingPriorities");
     A.fPendingTraining = dl::Field("TBuilderNation", "PendingTrainingPriorities");
     A.fPendingTrainingTime = dl::Field("TBuilderNation", "PendingTrainingTime");
@@ -801,6 +817,185 @@ static void DedupAirUnits() {
     *(int*)((uint8_t*)l + 8) = k;
     for (void* o : drop) dl::Call(A.mObjFree, (uint32_t)(uintptr_t)o);
     Log("air units: %d repeated units of the save dropped (%d -> %d; a save of an earlier version)", (int)drop.size(), n, k);
+}
+
+// Campaign divisions (the strategic screen's Fleet organization). TfrmBuildCamp.CampaignDivisions (a TList of
+// TCampaignDivision made by FormCreate, freed by FormDestroy, never cleared) is the player's division list, the only
+// one the game keeps. LoadBuildCampaign calls LoadCampaignDivisions (0xd37054), which creates and adds the save's
+// divisions without clearing the list: the game itself always loads into a fresh strategic screen, but the mod's
+// in-place reloads appended them again (the host's divisions doubled with every month that merged a turn, a joined
+// player's list grew every month). CB_BeforeLoad takes the divisions out of the list, so the load fills an empty list,
+// and CB_AfterLoad frees them once the load succeeded. Nothing else keeps TCampaignDivision pointers but the divisions'
+// own LeadDivision (resolved by the load against the list, GetCampaignDivisionWithId, so against the new divisions) and
+// the Fleet organization list view's rows (RefillDivisionView); the division dialogs are modal and closed during a load.
+// TCampaignDivision.LoadMe looks each ship (FindCShipWithId) and the commander (GetOfficerWithId) up in PlayerNation,
+// which the load has set to BuilderNations[0]: for a joined player's own slot (LoadCampaign with its nation) the hook
+// d_LoadDivisions makes that the player's nation while the divisions load.
+static std::vector<void*> g_divBefore;
+static int g_divNation = 0;  // inside game::LoadCampaign of a joined player's own slot: its nation
+static struct DivSwap {
+    bool active = false;
+    void* prev = nullptr;  // PlayerNation as the load set it
+} g_divSwap;
+
+static void* DivisionList(void* form) {
+    if (!A.divisions || !form) return nullptr;
+    void* l = dl::At<void*>(form, A.fCampaignDivisions);
+    return l && dl::IsInstanceOf(l, "TList") ? l : nullptr;
+}
+
+bool DivisionsAvailable() { return A.divisions; }
+
+static void TakeOutDivisions(void* form) {
+    g_divBefore.clear();
+    void* l = DivisionList(form);
+    int n = dl::ListCount(l);
+    for (int i = 0; i < n; i++) g_divBefore.push_back(dl::ListItem(l, i));
+    if (n > 0) *(int*)((uint8_t*)l + 8) = 0;  // TList.FCount (as dl::ListCount)
+}
+
+// The Fleet organization list view (lvDivisions: OnMouseUp only, no owner draw) keeps each row's division or ship in
+// the row's Data, and its popup menu (PopupDivisionsPopup and the menu's routines) works on the selected row's: rows of
+// the divisions from before a load would name freed objects. When it holds rows, the game's own FillDivisionList2
+// (called after every change of a division) fills it again from the loaded list. False: rows stay that can't be refilled.
+static bool RefillDivisionView(void* form) {
+    void* lv = dl::At<void*>(form, A.fLvDivisions);
+    if (!lv || !dl::IsInstanceOf(lv, "TListView")) return false;
+    HWND h = dl::At<HWND>(lv, A.fHandle);
+    if (!h || !IsWindow(h) || SendMessageW(h, 0x1004 /* LVM_GETITEMCOUNT */, 0, 0) <= 0) return true;
+    dl::Call(A.mFillDivisionList, (uint32_t)(uintptr_t)form, 0);
+    Log("campaign divisions: the Fleet organization list filled again");
+    return true;
+}
+
+static void DropOldDivisions(void* form, bool loaded) {
+    std::vector<void*> old;
+    old.swap(g_divBefore);
+    if (g_divSwap.active && form) {  // LoadCampaignDivisions was left by an exception: its hook's second half never ran
+        dl::At<void*>(form, A.fPlayerNation) = g_divSwap.prev;
+        g_divSwap.active = false;
+        Log("campaign divisions: PlayerNation put back after an interrupted division load");
+    }
+    void* l = DivisionList(form);
+    if (!l || old.empty()) return;
+    int n = dl::ListCount(l), n0 = (int)old.size();
+    if (!loaded) {
+        if (n == 0 && A.mListAdd) {
+            for (void* d : old) dl::Call(A.mListAdd, (uint32_t)(uintptr_t)l, (uint32_t)(uintptr_t)d);
+            Log("campaign divisions: the load failed; the %d from before it are back", n0);
+        } else {
+            Log("campaign divisions: the load failed with %d loaded; the %d from before it dropped (not freed)", n, n0);
+        }
+        return;
+    }
+    if (!RefillDivisionView(form)) {
+        Log("WARNING: campaign divisions: %d from before the load dropped, not freed (list view rows); the campaign's %d "
+            "kept", n0, n);
+        return;
+    }
+    void** items = *(void***)((uint8_t*)l + 4);
+    std::set<void*> now;
+    for (int i = 0; items && i < n; i++) now.insert(items[i]);
+    int freed = 0;
+    for (void* d : old)
+        if (d && !now.count(d) && dl::IsInstanceOf(d, "TCampaignDivision")) {
+            dl::Call(A.mObjFree, (uint32_t)(uintptr_t)d);
+            freed++;
+        }
+    Log("campaign divisions: %d from before the load dropped; the campaign's %d kept", freed, n);
+}
+
+// A campaign saved by an earlier version may hold the same divisions several times (TCampaignDivision.Create takes
+// CDivId from the campaign's IDNo counter: unique in a campaign the game itself saved). The first of each CDivId stays,
+// the repeats are dropped and freed; LeadDivision links resolve to the first match (GetCampaignDivisionWithId), and any
+// that names a dropped copy is pointed at the division kept with its CDivId.
+static int DedupDivisions(void* l) {
+    int n = dl::ListCount(l);
+    void** items = n > 0 ? *(void***)((uint8_t*)l + 4) : nullptr;
+    if (!items) return 0;
+    std::map<int, void*> first;
+    std::map<void*, void*> keptFor;  // dropped copy -> the division kept with its CDivId
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        void* d = items[i];
+        if (d) {
+            auto it = first.find(dl::At<int>(d, A.fDivId));
+            if (it != first.end()) {
+                keptFor[d] = it->second;
+                continue;
+            }
+            first[dl::At<int>(d, A.fDivId)] = d;
+        }
+        items[k++] = d;
+    }
+    if (keptFor.empty()) return 0;
+    *(int*)((uint8_t*)l + 8) = k;
+    for (int i = 0; i < k; i++) {
+        if (!items[i]) continue;
+        void*& lead = *(void**)((uint8_t*)items[i] + A.fDivLead);  // (a packed field: unaligned)
+        auto it = keptFor.find(lead);
+        if (it != keptFor.end()) lead = it->second;
+    }
+    for (auto& e : keptFor) dl::Call(A.mObjFree, (uint32_t)(uintptr_t)e.first);
+    Log("campaign divisions: %d repeated divisions of the save dropped (%d -> %d; a save of an earlier version)",
+        (int)keptFor.size(), n, k);
+    return (int)keptFor.size();
+}
+
+// LoadMe adds FindCShipWithId's result without a nil check: a ship id the nation doesn't have (sunk, captured, or
+// another nation's) leaves a nil entry that the Fleet organization display would dereference. TList.Pack drops them.
+static int PackDivisionShips(void* l, int& divisions) {
+    int removed = 0;
+    divisions = 0;
+    for (int i = 0, n = dl::ListCount(l); i < n; i++) {
+        void* d = dl::ListItem(l, i);
+        void* ships = d ? dl::At<void*>(d, A.fDivShips) : nullptr;
+        if (!ships || !dl::IsInstanceOf(ships, "TList")) continue;
+        int before = dl::ListCount(ships), nils = 0;
+        for (int j = 0; j < before; j++) nils += dl::ListItem(ships, j) ? 0 : 1;
+        if (!nils) continue;
+        if (A.mListPack) {
+            dl::Call(A.mListPack, (uint32_t)(uintptr_t)ships);
+        } else {
+            void** items = *(void***)((uint8_t*)ships + 4);
+            int k = 0;
+            for (int j = 0; j < before; j++)
+                if (items[j]) items[k++] = items[j];
+            *(int*)((uint8_t*)ships + 8) = k;
+        }
+        removed += before - dl::ListCount(ships);
+        divisions++;
+    }
+    return removed;
+}
+
+// The bridge's `divs` (read only): the divisions in memory.
+std::string CampaignDivisionsInfo() {
+    static int fCShipId = dl::Field("TCampaignShip", "CShipId");
+    void* l = DivisionList(BuildCamp());
+    if (!l) return "error unavailable";
+    int n = dl::ListCount(l);
+    std::string s;
+    for (int i = 0; i < n; i++) {
+        void* d = dl::ListItem(l, i);
+        if (i) s += "|";
+        if (!d) {
+            s += "nil";
+            continue;
+        }
+        std::string name = W2U(dl::ReadUStr(dl::At<void*>(d, A.fDivName)));
+        for (char& c : name)
+            if (c == '|' || c == ':') c = '_';
+        void* ships = dl::At<void*>(d, A.fDivShips);
+        int sc = ships ? dl::ListCount(ships) : 0;
+        std::string ids;
+        for (int j = 0; j < sc; j++) {
+            void* sh = dl::ListItem(ships, j);
+            ids += (j ? "." : "") + (sh && fCShipId >= 0 ? std::to_string(dl::At<int>(sh, fCShipId)) : std::string("nil"));
+        }
+        s += std::to_string(dl::At<int>(d, A.fDivId)) + ":" + name + ":" + std::to_string(sc) + ":" + ids;
+    }
+    return "ok n=" + std::to_string(n) + " nation=" + std::to_string(PlayerIndex()) + " list=" + s;
 }
 
 int IntelReportCount(int* unique) {
@@ -1893,6 +2088,34 @@ static void KViewFlagHints(void* f) {
     }
 }
 
+// 0.6.1: the bars of the nations people play. Their tension with this PC's nation can stay far above the panel's war line
+// (the game's WarLine: a bar crosses it at Tension 11) without a war: wars between players are declared only by the
+// players (the host's CheckForWar sees the joined nations as players, a joined player's the other people's nations), so
+// at peace the bar's hint says so (at war the game's "You are at war with X" stays).
+static const wchar_t kPeopleHint[] = L" - played by a person: wars between players are declared only in the Multiplayer "
+                                     L"window (Diplomacy), never by the game";
+
+static void PeoplesBarHints(void* f) {
+    if (!A.relView || g_kv.on || g_kvDepth > 0 || EventActive() || NationCount() < 9) return;
+    const std::wstring tail = kPeopleHint;
+    int K = ShownNationIndex();  // this PC's nation (0: the host); on a joined player's PC slot K shows the host's nation
+    for (int i = 1; i <= 8; i++) {
+        int r = K > 0 && i == K ? 0 : i;
+        void* shape = FormCtl(f, A.fShape[i]);
+        if (!shape || r == K || Tension(K, r) > 40 || !hookcb::WarOnlyByPlayers(r)) continue;
+        std::wstring h = dl::ReadUStr(dl::At<void*>(shape, A.fHint));
+        if (h.empty() || (h.size() >= tail.size() && h.compare(h.size() - tail.size(), tail.size(), tail) == 0)) continue;
+        SetCtlHint(shape, h + tail);
+    }
+}
+
+static void SafePeoplesBarHints(void* f) {
+    __try {
+        PeoplesBarHints(f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 static void ShowTensionInView(void* f, void* orig) {
     __try {
         if (KViewBegin()) KViewFlagHints(f);
@@ -1900,6 +2123,7 @@ static void ShowTensionInView(void* f, void* orig) {
     } __finally {
         KViewEnd();
     }
+    SafePeoplesBarHints(f);
 }
 
 static void StrengthBarsInView(void* f, void* area, void* orig) {
@@ -2056,7 +2280,9 @@ static void AIMaskLeave() {
 
 // The host's CheckForWar (kind 1) and RandomTensionChanges (kind 2) with K seen as a player; on a joined player's PC
 // (B3, the routines in K's view) the same for the other nations people play: the host's nation and the other joined
-// ones, so no war or alliance between players comes from these routines.
+// ones, so no war or alliance between players comes from these routines. On the host (0.6.1) also a nation reserved or
+// claimed by a player whose PC doesn't run the player's rules (its player away since before 0.5.0, an older version, a
+// reservation without a join), as a joined player's PC sees every reserved nation.
 static struct {
     bool on;
     bool k[9];
@@ -2064,7 +2290,10 @@ static struct {
 } g_pw;
 static int g_pwKind = 0;
 
-static bool MaskAsPlayer(int k) { return g_pvOn ? g_pvHuman[k] : PlayerRules(k); }
+static bool MaskAsPlayer(int k) {
+    if (g_pvOn) return g_pvHuman[k];
+    return PlayerRules(k) || (A.playerRules && k >= 1 && k <= 8 && hookcb::IsHumanRemoteNation(k));
+}
 
 static void PlayerMaskEnter(int kind, const char* routine) {
     g_pw.on = false;
@@ -2093,7 +2322,7 @@ static void PlayerMaskEnter(int kind, const char* routine) {
     }
     g_pw.on = !ks.empty();
     if (g_pw.on && g_maskLogged.insert(routine).second)
-        Log("relations v2: %s sees nation(s)%s as players (player's rules)", routine, ks.c_str());
+        Log("relations v2: %s sees nation(s)%s as players (the nations people play)", routine, ks.c_str());
 }
 
 static void PlayerMaskLeave() {
@@ -3744,6 +3973,10 @@ bool LoadCampaign(int slot, int playerIdx, bool modReload) {
         explicit ModReload(bool b) : on(b) { g_modReload += on; }
         ~ModReload() { g_modReload -= on; }
     } mr(modReload);
+    struct DivNation {  // a joined player's own slot: its divisions load against its nation (d_LoadDivisions)
+        explicit DivNation(int k) { g_divNation = std::max(0, k); }
+        ~DivNation() { g_divNation = 0; }
+    } dn(playerIdx);
     bool ok = (dl::Call(A.mLoad, self, s.ptr()) & 0xFF) != 0;
     if (dl::At<int>(f, A.fBattleOpponentIdx) == -1) dl::Call(A.mShow, self);
     if (ok) {
@@ -3832,6 +4065,7 @@ extern "C" void* o_AIMoves = nullptr;
 extern "C" void* o_AIPeace = nullptr;
 extern "C" void* o_DesignStudies = nullptr;
 extern "C" void* o_Load = nullptr;
+extern "C" void* o_LoadDivisions = nullptr;
 extern "C" void* o_ReduceTimeLimits = nullptr;
 extern "C" void* o_Likelihood = nullptr;
 
@@ -4145,6 +4379,11 @@ extern "C" void __stdcall CB_BeforeLoad(void* self) {
     } catch (...) {
         Log("exception clearing intel reports");
     }
+    try {
+        TakeOutDivisions(self);
+    } catch (...) {
+        Log("exception taking out the campaign divisions before a load");
+    }
 }
 extern "C" void __stdcall CB_AfterLoad(void* self, uint32_t result) {
     try {
@@ -4159,6 +4398,11 @@ extern "C" void __stdcall CB_AfterLoad(void* self, uint32_t result) {
         BattlePointersAfterLoad(self, loaded);
     } catch (...) {
         Log("exception dropping the air units from before the load");
+    }
+    try {
+        DropOldDivisions(self, (result & 0xFF) != 0);
+    } catch (...) {
+        Log("exception dropping the campaign divisions from before the load");
     }
     try {
         hookcb::OnAfterCampaignLoad();
@@ -4184,6 +4428,71 @@ extern "C" __declspec(naked) void d_Load() {
         pop eax
         add esp, 4
         ret
+    }
+}
+
+// LoadCampaignDivisions (d_LoadDivisions, see DivisionList): for a joined player's own slot the divisions load against
+// the player's nation (PlayerNation for the call, put back afterwards); then repeated divisions and nil ships go.
+extern "C" void __stdcall CB_BeforeLoadDivisions(void* self, void* list) {
+    try {
+        g_divSwap.active = false;
+        if (g_divNation <= 0 || !self) return;
+        void* nation = dl::ListItem(dl::At<void*>(self, A.fBuilderNations), g_divNation);
+        if (!nation || !dl::IsInstanceOf(nation, "TBuilderNation")) {
+            Log("WARNING: campaign divisions: the campaign has no nation %d; loaded against the save's player", g_divNation);
+            return;
+        }
+        g_divSwap.prev = dl::At<void*>(self, A.fPlayerNation);
+        g_divSwap.active = true;
+        dl::At<void*>(self, A.fPlayerNation) = nation;
+    } catch (...) {
+        Log("exception before loading the campaign divisions");
+    }
+}
+extern "C" void __stdcall CB_AfterLoadDivisions(void* self, void* list) {
+    bool swapped = g_divSwap.active;
+    try {
+        if (swapped) {
+            dl::At<void*>(self, A.fPlayerNation) = g_divSwap.prev;
+            g_divSwap.active = false;
+        }
+    } catch (...) {
+        Log("exception putting PlayerNation back after the campaign divisions");
+    }
+    try {
+        if (!list || !dl::IsInstanceOf(list, "TList")) return;
+        DedupDivisions(list);
+        int touched = 0, removed = PackDivisionShips(list, touched);
+        if (removed)
+            Log("campaign divisions: %d ship(s) the nation doesn't have removed from %d division(s)", removed, touched);
+        if (swapped)
+            Log("campaign divisions: %d of nation %d loaded", dl::ListCount(list), g_divNation);
+        else
+            Log("campaign divisions: %d loaded", dl::ListCount(list));
+    } catch (...) {
+        Log("exception repairing the campaign divisions");
+    }
+}
+
+// LoadCampaignDivisions(Self=EAX, aList=EDX, aFile=ECX, aDesignation on the stack): a procedure, `ret 4`.
+extern "C" __declspec(naked) void d_LoadDivisions() {
+    __asm {
+        push eax
+        push edx
+        push ecx
+        push edx
+        push eax
+        call CB_BeforeLoadDivisions
+        pop ecx
+        mov edx, [esp]
+        mov eax, [esp + 4]
+        push dword ptr [esp + 12]
+        call dword ptr [o_LoadDivisions]
+        push dword ptr [esp]
+        push dword ptr [esp + 8]
+        call CB_AfterLoadDivisions
+        add esp, 8
+        ret 4
     }
 }
 
@@ -4627,6 +4936,20 @@ static uint32_t GuardedCall(void* fn, uint32_t a, uint32_t d, uint32_t c, int n,
     }
 }
 
+// The ships of a nation that can fight a battle in an area, counted as the game's own caller of
+// DoBattleBetweenAINations (CheckAivsAIBattleInArea) counts them: CountShipsInArea(stAll, anArea, [ssActive,
+// ssTradeProtection, ssRaider, ssColonies]) (operational ones: in play, not under repair, not interned or a museum).
+// -1 = the count is not available.
+static int FightingShipsInArea(void* nation, void* area) {
+    if (!A.mCountShipsInArea || !nation || !area) return -1;
+    const uint32_t stAll = 0x16, fightingStatus = 0x59;  // the set word of CheckAivsAIBattleInArea and its picker
+    uint32_t stack[1] = {fightingStatus};
+    int ok = 0;
+    uint32_t n = GuardedCall(A.mCountShipsInArea, (uint32_t)(uintptr_t)nation, stAll, (uint32_t)(uintptr_t)area, 1,
+                             stack, &ok);
+    return ok ? (int)n : -1;
+}
+
 bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& areaName,
                      std::vector<std::wstring>* texts) {
     void* f = BuildCamp();
@@ -4637,7 +4960,21 @@ bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& a
         Log("ResolveAIBattle %d-%d in %s: not possible", a, b, W2U(areaName).c_str());
         return false;
     }
-    uint32_t stack[3] = {(uint32_t)countA, (uint32_t)countB, (uint32_t)(uintptr_t)area};
+    // 0.6.1: the routine picks each round's ship with GetRandomShipInArea and uses the pick without a nil check: a
+    // nation without a ship that can fight in the area is an access violation in TCampaignShip.IsOperational (the
+    // game's box "Error in DoBattleBetweenAINations procedure!"). The game calls it only after counting both sides'
+    // ships there (both > 0) and passes those counts. A battle resolved later (the battle phase's fallback, `battles
+    // aitest`) is set up the same way, with the ships there now: since the battle was found they may have been sunk,
+    // damaged or moved (a battle fought on a player's PC, the game's own battles and raids of the month).
+    int shipsA = FightingShipsInArea(na, area), shipsB = FightingShipsInArea(nb, area);
+    if (shipsA <= 0 || shipsB <= 0) {
+        Log("ResolveAIBattle %d-%d in %s: no battle (ships that can fight there: %d/%d; when found %d/%d)", a, b,
+            W2U(areaName).c_str(), shipsA, shipsB, countA, countB);
+        return false;
+    }
+    Log("ResolveAIBattle %d-%d in %s: ships that can fight there %d/%d (when found %d/%d)", a, b,
+        W2U(areaName).c_str(), shipsA, shipsB, countA, countB);
+    uint32_t stack[3] = {(uint32_t)shipsA, (uint32_t)shipsB, (uint32_t)(uintptr_t)area};
     int ok = 0;
     // 0.6.0 (risk 4): its result box ("In a battle in <area> between ...") is the joined player's news, not a dialog
     // on the host that holds the new month until the host's player answers it.
@@ -5653,8 +5990,18 @@ bool InstallHooks() {
     if (A.mDoResearch && A.fResearchAreas >= 0) Hook(A.mDoResearch, (void*)&d_DoResearch, &o_DoResearch, "DoResearch");
     if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
+    bool loadHook = false;
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
-        Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
+        loadHook = Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
+    // 0.6.1: campaign divisions (CB_BeforeLoad/CB_AfterLoad of the load's hook, and LoadCampaignDivisions)
+    A.divisions = loadHook && A.fCampaignDivisions >= 0 && A.fDivId >= 0 && A.fDivName >= 0 && A.fDivShips >= 0 &&
+                  A.fDivLead >= 0 && A.fLvDivisions >= 0 && A.mFillDivisionList && A.mObjFree &&
+                  Hook(A.mLoadDivisions, (void*)&d_LoadDivisions, &o_LoadDivisions, "LoadCampaignDivisions");
+    if (!A.divisions)
+        Log("WARNING: campaign divisions unavailable (list %d, fields %d/%d/%d/%d, list view %d, routines %p/%p): a "
+            "reload duplicates the divisions; as a joined player this PC gets an empty division list",
+            A.fCampaignDivisions, A.fDivId, A.fDivName, A.fDivShips, A.fDivLead, A.fLvDivisions, A.mLoadDivisions,
+            A.mFillDivisionList);
     if (A.loadBlockadeRet) Hook(A.mCheckBlockade, (void*)&d_CheckBlockade, &o_CheckBlockade, "CheckBlockadeStatus");
     if (A.doctrine || A.playerRules)
         Hook(A.mReduceTimeLimits, (void*)&d_ReduceTimeLimits, &o_ReduceTimeLimits, "ReduceTimeLimits");

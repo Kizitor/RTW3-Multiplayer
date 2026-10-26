@@ -1,13 +1,13 @@
-// The game data files a live battle depends on (engine level 16).
+// The game data files a live battle depends on (engine level 16; the game's temporary files left out since level 18).
 //
 // The battle's load and simulation read the game's own data (the battle's save comes from A): the `Data` folder (the
 // probe RTW3MP_TEST_FILELOG saw a battle load read Gundata, HorPen, VerPen, Torpedodata, BasicData, MapData and the
 // nations' WarInfo .dat, the WorldRTW, RTWShallow and NoGo map layers and coastal battery designs in Data\IDes; the
 // minutes read no game file). Two PCs whose files differ load or play the same battle differently, and a live battle
-// between them would only resync until it is given up. Every file of `Data` but its Graphics folder (about 1400 files,
-// 40 MB) is hashed once on a background thread when a session starts. A's start of a live battle carries the combined hash; a B whose hash differs refuses the
-// battle with its per-file list, A names the differing files to both players and fights the battle against the
-// computer (lockstep.cpp).
+// between them would only resync until it is given up. Every file of `Data` but its Graphics folder and the game's
+// temporary files (about 1400 files, 40 MB) is hashed once on a background thread when a session starts. A's start of a
+// live battle carries the combined hash; a B whose hash differs refuses the battle with its per-file list, A names the
+// differing files to both players and fights the battle against the computer (lockstep.cpp).
 #include "datafiles.h"
 
 #include <algorithm>
@@ -29,6 +29,18 @@ struct Entry {
 const wchar_t* const kRoots[] = {L"Data"};
 // Not hashed: the drawings of hulls, turrets, equipment and aircraft (the display only; a graphics mod keeps live battles).
 const wchar_t* const kSkip[] = {L"Data\\Graphics"};
+
+// Not hashed either (engine level 18): the game's temporary files, names starting with "tmp" at any level of Data. The
+// ship designer writes Data\tmpShip.ttp whenever it is used (TfrmDesignMain2 only: 1.01.44 0xb1765c, then its
+// LoadShipGraphic), so two PCs' copies differ after one player designed a ship; no battle opens it. Data\tmpMapData.dat
+// is named nowhere in the game.
+bool Temporary(const wchar_t* name) { return !_wcsnicmp(name, L"tmp", 3); }
+
+bool TemporaryPath(const std::string& path) {  // (a name of `ls testdatafile`, e.g. "Data\\tmpShip.ttp")
+    size_t s = path.find_last_of("\\/");
+    std::string n = s == std::string::npos ? path : path.substr(s + 1);
+    return n.size() >= 3 && !_strnicmp(n.c_str(), "tmp", 3);
+}
 
 std::vector<Entry> g_files, g_scanned;  // (g_scanned: as read, for `ls testdatafile off`)
 uint64_t g_combined = 0, g_scannedCombined = 0;
@@ -79,7 +91,7 @@ bool HashFile(const std::wstring& path, uint64_t& out) {
     return ok;
 }
 
-void Walk(const std::wstring& dir, const std::wstring& rel, std::vector<Entry>& out) {
+void Walk(const std::wstring& dir, const std::wstring& rel, std::vector<Entry>& out, std::string& temporary) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -90,7 +102,11 @@ void Walk(const std::wstring& dir, const std::wstring& rel, std::vector<Entry>& 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             bool skip = false;
             for (auto s : kSkip) skip = skip || !_wcsicmp(r.c_str(), s);
-            if (!skip) Walk(dir + L"\\" + n, r, out);
+            if (!skip) Walk(dir + L"\\" + n, r, out, temporary);
+            continue;
+        }
+        if (Temporary(n.c_str())) {
+            temporary += (temporary.empty() ? "" : ", ") + Narrow(r);
             continue;
         }
         Entry e;
@@ -114,9 +130,15 @@ std::vector<std::string> Split(const std::string& s, char sep) {
     return v;
 }
 
-// TEST ONLY: these names hash as if their content differed on this copy (names not in the list: extra files).
-void ApplyTest(std::vector<Entry>& files, const std::string& list) {
+// TEST ONLY: these names hash as if their content differed on this copy (names not in the list: extra files). The
+// game's temporary files are left out as the scan leaves them out (their names are returned).
+std::string ApplyTest(std::vector<Entry>& files, const std::string& list) {
+    std::string temporary;
     for (auto& n : Split(list, ';')) {
+        if (TemporaryPath(n)) {
+            temporary += (temporary.empty() ? "" : ", ") + n;
+            continue;
+        }
         std::string ln = Lower(n);
         bool hit = false;
         for (auto& e : files)
@@ -132,6 +154,7 @@ void ApplyTest(std::vector<Entry>& files, const std::string& list) {
             files.push_back(e);
         }
     }
+    return temporary;
 }
 
 // Sorts the list by name and returns the combined hash.
@@ -149,19 +172,22 @@ void Scan() {
     DWORD t0 = GetTickCount();
     std::wstring game = GameDir();
     std::vector<Entry> files;
-    for (auto r : kRoots) Walk(game + L"\\" + r, r, files);
+    std::string temporary;
+    for (auto r : kRoots) Walk(game + L"\\" + r, r, files, temporary);
     char test[512] = {0};
     if (GetEnvironmentVariableA("RTW3MP_TEST_DATAFILE", test, sizeof(test)) > 0 && test[0]) {
-        ApplyTest(files, test);
-        Log("TEST: RTW3MP_TEST_DATAFILE=%s: these game data files hash as if they differed on this copy", test);
+        std::string left = ApplyTest(files, test);
+        Log("TEST: RTW3MP_TEST_DATAFILE=%s: these game data files hash as if they differed on this copy%s%s", test,
+            left.empty() ? "" : " (not hashed, the game's temporary files: ", left.empty() ? "" : (left + ")").c_str());
     }
     g_combined = g_scannedCombined = Seal(files);
     g_scanned = files;
     g_files.swap(files);
     g_done = true;
     SetEvent(g_doneEvent);
-    Log("data files: %d files of Data (but Data\\Graphics) hashed in %lu ms: %016llx", (int)g_files.size(),
-        GetTickCount() - t0, (unsigned long long)g_combined);
+    Log("data files: %d files of Data (but Data\\Graphics and the game's temporary files tmp*: %s) hashed in %lu ms: "
+        "%016llx", (int)g_files.size(), temporary.empty() ? "none" : temporary.c_str(), GetTickCount() - t0,
+        (unsigned long long)g_combined);
 }
 
 }  // namespace
@@ -199,9 +225,10 @@ void SetTestDiff(const std::string& names) {
         Log("TEST: data files: as scanned again: %016llx", (unsigned long long)g_combined);
         return;
     }
-    ApplyTest(g_files, names);
+    std::string left = ApplyTest(g_files, names);
     g_combined = Seal(g_files);
-    Log("TEST: data files: %s hash as if they differed on this copy: %016llx", names.c_str(),
+    Log("TEST: data files: %s hash as if they differed on this copy%s%s: %016llx", names.c_str(),
+        left.empty() ? "" : " (not hashed, the game's temporary files: ", left.empty() ? "" : (left + ")").c_str(),
         (unsigned long long)g_combined);
 }
 

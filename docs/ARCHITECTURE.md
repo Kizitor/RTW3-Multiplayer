@@ -1,10 +1,10 @@
 # Architecture
 
-How RTW3 Multiplayer works in the current version (0.6.0, protocol 3) on Rule the Waves 3 1.01.44. This is the
-developer view; players read the [README](../README.md). The history of each part, with the measurements and the
-dead ends, is in [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game facts (calling
-convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing is in
-[TESTING.md](TESTING.md).
+How RTW3 Multiplayer works in the current version (0.6.1, protocol 3, live-battle engine level 18) on Rule the Waves 3
+1.01.44. This is the developer view; players read the [README](../README.md). The history of each part, with the
+measurements and the dead ends, is in [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game
+facts (calling convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing
+is in [TESTING.md](TESTING.md).
 
 ## Contents
 - [Overview](#overview)
@@ -18,6 +18,7 @@ convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-
 - [Save slots and files](#save-slots-and-files)
 - [The save merge](#the-save-merge)
 - [Per-player intelligence, trade protection and foreign stations](#per-player-intelligence-trade-protection-and-foreign-stations)
+- [Each joined player's campaign divisions (0.6.1)](#each-joined-players-campaign-divisions-061)
 - [Network protocol](#network-protocol)
 - [User interface](#user-interface)
 - [Joined players' battles against AI nations (the battle phase)](#joined-players-battles-against-ai-nations-the-battle-phase)
@@ -62,13 +63,13 @@ RTW3.exe (Delphi/VCL, Steam DRM stub)
 | `src/mod/delphi.cpp`, `delphi.h` | Delphi runtime interop: VMT scan, method and field lookup by name, `dl::Call`, `ConstUStr`/`ReadUStr`, byte patterns. |
 | `src/mod/game.cpp`, `game.h` | Game bindings and all campaign hooks; callbacks into the session (`hookcb::*`). |
 | `src/mod/session.cpp`, `session.h` | The multiplayer session (host and client). |
-| `src/mod/saveio.cpp`, `saveio.h` | `IniDoc`, `Bundle`, month packages, submissions, the merge, `MakeNationPlayer`, `ExtractBattleResult`/`ApplyBattleResult`. |
+| `src/mod/saveio.cpp`, `saveio.h` | `IniDoc`, `Bundle`, month packages, submissions, the merge, `MakeNationPlayer`, `ExtractBattleResult`/`ApplyBattleResult`, the `.off`'s campaign divisions (0.6.1). |
 | `src/mod/net.cpp`, `net.h` | TCP transport, message types, LAN discovery. |
 | `src/mod/ui.cpp`, `ui.h` | The Multiplayer window, the title-screen button, the Claim land window, `config.ini`. |
 | `src/mod/lockstep.cpp`, `lockstep.h` | Live battles: the battle engine bindings, the deterministic RNG, the minute protocol. |
 | `src/mod/x87.cpp`, `x87.h`, `softmath.h` | Live battles (engine level 16): the hooks of the game's 11 x87 transcendental routines and their software versions (fdlibm's algorithms in SSE2 doubles, with the x87's own 66-bit pi reduction, out-of-range and special-value rules and the game's Exp rounding, within 1 ulp of a double of the CPU's results), the same bits on every CPU; the CPU vendor. |
-| `src/mod/datafiles.cpp`, `datafiles.h` | Live battles (engine level 16): the hash of the game's `Data` folder (but `Data\Graphics`), computed in a background thread when a session starts, and the list of files a start compares. |
-| `src/mod/nationplay.cpp`, `nationplay.h` | What the game does for its player only, for joined players' nations: intelligence, the Turn's trade protection and foreign stations questions, the month's consequences ([below](#per-player-intelligence-trade-protection-and-foreign-stations)). |
+| `src/mod/datafiles.cpp`, `datafiles.h` | Live battles (engine level 16): the hash of the game's `Data` folder (but `Data\Graphics` and, since level 18, the game's temporary files `tmp*`), computed in a background thread when a session starts, and the list of files a start compares. |
+| `src/mod/nationplay.cpp`, `nationplay.h` | What the game does for its player only, for joined players' nations: intelligence, the Turn's trade protection and foreign stations questions, the month's consequences ([below](#per-player-intelligence-trade-protection-and-foreign-stations)); the host's store of their campaign divisions (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
 | `src/mod/economy.cpp`, `economy.h` | The player's economy rules for joined nations on the host (relations v2, B5 money): the computer's money and budget bonuses left out, MinHook at single instructions found by pattern. |
 | `src/mod/warfx.cpp`, `warfx.h` | The player's war effects for joined nations on the host (0.6.0, B5): blockades (their points, flags, effects and messages), war weariness, the build rules' war tests, and raiders, submarines and the trade war (a frame in K's view in DoStrategicTurn) for each joined nation at war. |
 | `src/mod/bridge.cpp` | The test bridge. |
@@ -126,10 +127,11 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `DoResearch` | Puts a joined nation's research priorities back after the game's AI branch. |
 | `TfrmResearch.Execute` | On a joined player's PC, opens the Research screen for the player's nation instead of nation 0. |
 | `EventLikelihoodCheck` | Vetoes events that need the host while a joined player's event is rolled. |
-| `LoadBuildCampaign` | Clears the intel report list before a load and drops empty or repeated entries after it. Drops (and frees) the air units the global list held before the load once the load succeeded, and repeated air units of the save (the same `AirUnitId`): the game's `LoadAircraftData` appends without clearing, and the mod reloads in the same process every month and at every live battle load (0.3.3). Clears the last battle's area and possession (`BattleArea`, `BattlePossession`) before every load: the load frees every map area and possession but sets the two again only for a save with a battle in progress, and the next save wrote their names from freed memory (the joined player's "Error in SaveBuildCampaign procedure! ..." box, 0.6.0; [GAME-INTERNALS](GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)). |
+| `LoadBuildCampaign` | Clears the intel report list before a load and drops empty or repeated entries after it. Drops (and frees) the air units the global list held before the load once the load succeeded, and repeated air units of the save (the same `AirUnitId`): the game's `LoadAircraftData` appends without clearing, and the mod reloads in the same process every month and at every live battle load (0.3.3). Clears the last battle's area and possession (`BattleArea`, `BattlePossession`) before every load: the load frees every map area and possession but sets the two again only for a save with a battle in progress, and the next save wrote their names from freed memory (the joined player's "Error in SaveBuildCampaign procedure! ..." box, 0.6.0; [GAME-INTERNALS](GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)). Takes the campaign divisions out of their list before every load and frees them after a successful one (the *Fleet organization* list view, whose rows point at them, filled again first when it has rows; a failed load that left the list empty gets them back): the game's `LoadCampaignDivisions` appends too, and the next save wrote every copy (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
+| `LoadCampaignDivisions` | After the call: repeated divisions of the save (the same `CDivId`) dropped and freed, nil ships packed out. For a joined player's own slot (`game::LoadCampaign` as nation K > 0) `PlayerNation` is nation K's during the call, so the divisions find K's ships and officers instead of the host's (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
 | `CheckBlockadeStatus` | Only the call of `LoadBuildCampaign` (told apart by its return address): the game's load credits every blockade between nation 0 and a nation at war with it (nation 0's VP, or EnemyVP) as the month does; the hook keeps the flags and the random draws and puts the loaded VP and EnemyVP back, so a load gives exactly the saved values (0.4.0). Only in multiplayer: every load while a session is up (hosting or joined) and the mod's own reloads (`game::LoadCampaign`; outside a session that is a joined player's return to its slot after a live battle that outlived the session). A load without a session (the title screen, the host's first load before hosting, the resume after a restart) is the game's own: one credit per start, as in single player, logged as `kept: no multiplayer session`. The month's own calls (`DoTurn`, `DoStrategicTurn`) are untouched. |
 | `CopyGameToOtherSlot` | A joined player's copy becomes the player's own campaign (`MakeNationPlayer`). |
-| `ShowTensionLevels`, `DrawAreaStrengthBars` | On a PC that plays nation K > 0 (a joined player's), run in the relations view (0.4.1): nation K at index 0, the host's nation at index K, every nation's `Tension`/`Allied` its relation with K; put back afterwards. The tension panel's flags are renamed for the view first. |
+| `ShowTensionLevels`, `DrawAreaStrengthBars` | On a PC that plays nation K > 0 (a joined player's), run in the relations view (0.4.1): nation K at index 0, the host's nation at index K, every nation's `Tension`/`Allied` its relation with K; put back afterwards. The tension panel's flags are renamed for the view first. 0.6.1 (every PC in a session): afterwards the bars of the nations people play get, at peace, the hint that wars between players come only from the players (`PeoplesBarHints`). |
 | `SetValues`, `UpdateUIValues` | On such a PC, afterwards: slot K's flag shows the host's nation; the War results box, the war line and the player name's hint follow K's own wars (0.4.1). |
 | `TdlgNationData.Execute` | On such a PC, a flag's nation index 0 <-> K (the slot K flag shows the host's nation, the player's own flag K) (0.4.1). |
 | `CheckAITensionEvents`, `TBuilderNation.DoAITensionChanges`, `CheckStopPlayerAgression`, `CheckAllyTrouble`, `CheckBlitzkrieg`, `CheckChineseConcessions`, `CheckForceOnForeignStations`, `CreateArmsControlTreaty`, `CheckForRevolutionInEnemyNation` | Relations v2 (B2), host: generated thunks (`EmitMaskThunk` -> `MaskedCall`, the call inside `__try`/`__finally`) run the computer's relation rules with every pair of a joined nation under the player's rules looking neutral (tension 5, no alliance); put back afterwards. |
@@ -137,7 +139,7 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `CheckWarsWithNation`, `GetRandomPossessionInArea`, `GetRandomPossession`, `DoSurpriseAttack`, `CheckForPlayerSurpriseInvasion` | Relations v2 (B3), only while the player's routines run in a joined nation's view on its PC: the nation's own past wars; no surprise landing or attack (generated thunks and detours test the routines' flag; not in B4's peace part). 0.6.0 with a host taking them (welcome `gen=2`): DoSurpriseAttack runs, the takeover branch of CheckForWar runs (its call sites only), the landing in K's own possession stays out. Elsewhere the originals. |
 | `CheckSurpriseAttack` | 0.6.0 (B6 piece 2), only in a joined nation's view on its PC: its (attacker, defender) is recorded for a battle request of kind 2 and it does not run (True for K: no "No opportunity found" box; False: the next nation is asked). Elsewhere (the battle slot's replay, the host) the original. |
 | `NegotiatePeace`, `ChangePossessionOwner`, `TransferShipAsReparation`, `ShowPeaceTreaty` | Relations v2 (B4), only while a joined nation's peace part runs in its view on its PC: record the arguments, the possession owner changes, the ships handed over (id, new name, log line) and the treaty's lines for the host. `ChangePossessionOwner` also records the takeover at a war's start in the view (0.6.0, CheckForWar's call site). Elsewhere (the host's own peace and the players' treaties included) the originals. |
-| `CheckForWar`, `RandomTensionChanges` | Relations v2 (B2), host: the host's player routines see a nation under the player's rules as a player: in CheckForWar its tension with the host reads 5 (at peace), it plans no war and has no alliances of its own; in RandomTensionChanges its tension reads at least 6 (no alliance offer in its name); the routines' own changes are kept. |
+| `CheckForWar`, `RandomTensionChanges` | Relations v2 (B2), host: the host's player routines see a nation under the player's rules (since 0.6.1 every nation reserved or claimed by a player) as a player: in CheckForWar its tension with the host reads 5 (at peace), it plans no war and has no alliances of its own; in RandomTensionChanges its tension reads at least 6 (no alliance offer in its name); the routines' own changes are kept. |
 | `ComputeAINationIntelCost` | Host: a joined player's nation pays its own intelligence spending instead of getting the AI's intelligence money (0.4.1, `nationplay.cpp`). |
 | `GetIntelCostForPlayerNation`, `IntelToString`, `ChangeIntel` | Joined player's PC: the budget's Intelligence line, the labels and the +/- buttons of the politics panel are the player's own; the player's own flag stands for the host's nation (0.4.1). |
 | `GetPatrolRequirement` | Joined player's PC: the budget panel's trade protection requirement is the player's nation's, against its own enemies (0.4.1). |
@@ -196,8 +198,9 @@ the game's 11 x87 transcendental routines in `x87.cpp`) with the first live batt
    larger than the network limit is not sent (`NOT sent` in the log).
 3. **Load it on the client.** The client writes the package into slot 77 (it refuses slots below 50), notes its
    nation in `rtw3mp_player.ini`, loads the campaign with its nation as the player nation (with its nation's own war
-   counter in place of the host's, relations v2) and shows its own enemies' VP. The Turn button becomes **Submit**. The
-   client acknowledges the month and rolls this month's random event (33 % by default, once per calendar month).
+   counter in place of the host's, relations v2, and its own campaign divisions, 0.6.1) and shows its own enemies'
+   VP. The Turn button becomes **Submit**. The client acknowledges the month and rolls this month's random event (33 %
+   by default, once per calendar month).
 4. **Plan.** Everyone plans at the same time. Diplomacy requests (`MSG_DIPLO`) and event results (`MSG_EVENT`) go to
    the host at once. **Submit** saves the client's game and sends its part (`MSG_SUBMIT`, see
    [the save merge](#the-save-merge)); a player can submit again until the month starts.
@@ -225,8 +228,8 @@ the game's 11 x87 transcendental routines in `x87.cpp`) with the first live batt
 ## Save slots and files
 | Where | Who | What |
 |---|---|---|
-| `Save\Game<n>`, n = 1-49 | host | The campaign the host plays and hosts: a normal save. Also `rtw3mp_session.ini`, `rtw3mp_nations.ini` (the joined nations' own intelligence and foreign-station warning, 0.4.1: [below](#per-player-intelligence-trade-protection-and-foreign-stations)), and during the host's live battle `rtw3mp_livebattle.ini` (the battle save is a live battle's snapshot: [resume](#live-battles-between-players-lockstep)). |
-| `Save\Game77` (`RTW3MP_CLIENT_SLOT`, 50-999) | joined player | The month the player plans, as sent by the host, plus `rtw3mp_player.ini` (the player's nation, for Copy game after leaving the session). |
+| `Save\Game<n>`, n = 1-49 | host | The campaign the host plays and hosts: a normal save. Also `rtw3mp_session.ini`, `rtw3mp_nations.ini` (the joined nations' own intelligence and foreign-station warning, 0.4.1: [below](#per-player-intelligence-trade-protection-and-foreign-stations); their campaign divisions, 0.6.1: [below](#each-joined-players-campaign-divisions-061)), and during the host's live battle `rtw3mp_livebattle.ini` (the battle save is a live battle's snapshot: [resume](#live-battles-between-players-lockstep)). |
+| `Save\Game77` (`RTW3MP_CLIENT_SLOT`, 50-999) | joined player | The month the player plans, as sent by the host (since 0.6.1 its `.off` holds the player's own campaign divisions), plus `rtw3mp_player.ini` (the player's nation, for Copy game after leaving the session). |
 | `Save\Game87` (client slot + 10, `RTW3MP_BATTLE_SLOT`) | joined player | The battle slot: the month's files with the player's nation made nation 0 (the Copy-game transform), for the player's battles and live battles. |
 | the slot a Copy game goes to | joined player | The game's copy of slot 77, turned into the player's own campaign. |
 | `RTW3MP\` next to `Save\` | everyone | `config.ini` (name, IP, port, time limit, Fight my battles), `rtw3mp.log` and `rtw3mp.prev.log` (`rtw3mp_<tag>` with `RTW3MP_LOG_TAG`), `events_<hash>.ini` (a joined player's event cooldowns). |
@@ -240,7 +243,9 @@ overwrite a regular save slot").
   `.off` file is INI as well; `IniDoc` (`saveio.cpp`) parses and writes them line by line (with CRLF), so lines the
   mod doesn't change are written back unchanged. `DesignFiles<i>.des` is positional text and moves as a whole file.
 - **A submission** (`BuildSubmission`) holds `[NationK]`, `[NationKShips]`, `[NationKCoastalArtillery]` and
-  `[NationKSubmarines]` with the client's `IDNo`, its `DesignFilesK.des` and its map data.
+  `[NationKSubmarines]` with the client's `IDNo`, its `DesignFilesK.des` and its map data; since 0.6.1 also
+  `divisions.ini`, the nation's campaign divisions, which the host keeps outside the save
+  ([below](#each-joined-players-campaign-divisions-061)).
 - **The merge** (`MergeSubmission`) checks the nation and the month, replaces those sections in the host's save but
   keeps the host's values of the diplomacy keys (`Tension`, `Allied`, `AITension<j>`, `AIAlliance<j>`), of `VP` and
   (0.4.1) of `IntelligenceSpending` and `IntelEffort` (the host's own spending on and effort against nation K: the
@@ -251,10 +256,12 @@ overwrite a regular save slot").
   NOT applied: <why>`) and shown to the host. Relations v2 (B4): a ship of the player's section that another nation's
   ships section on the host holds too (the same `Ship<n>Id`: a ship handed over twice) is dropped from the player's
   section and its `ShipCount` follows (`DropForeignShips`, logged).
-- **Not transferred** from joined players: officers and divisions (`.off`), air units and aircraft types.
+- **Not transferred** from joined players: officers (`.off`), air units and aircraft types. Their campaign divisions
+  travel since 0.6.1 but never enter the host's save ([below](#each-joined-players-campaign-divisions-061)).
 - **The Copy-game transform** (`TransformNationPlayer`/`MakeNationPlayer`, 0.2.7) swaps nation 0 and K in every
   section, relation, ship, air unit, mine, possession and design file, so K becomes the save's player nation; it is
-  used for Copy game and for the battle slot.
+  used for Copy game and for the battle slot. The `.off` keeps its officers and only the divisions whose ships are all
+  K's (since 0.6.1 the player's own: the copy and the battle slot keep them).
 - Details: [design v1](../MODLOG.md#feature-2026-10-04-multiplayer-design-v1-historical-v010),
   [locked files](../MODLOG.md#fix-2026-10-05-a-players-turn-could-be-dropped-when-a-save-file-was-briefly-locked-v023),
   [Copy game](../MODLOG.md#fix-2026-10-13-a-joined-players-copy-game-played-the-hosts-nation-v027).
@@ -273,7 +280,8 @@ intelligence, paid nothing for it, and got none of the questions or consequences
 - **The host's records:** `rtw3mp_nations.ini` in the host's slot, with the campaign key as `rtw3mp_session.ini`:
   `[Nation<K>]` `IntelSpend` and `IntelEffort` (K's spending on and effort against nations 0-8),
   `ForeignStationsWarned` (the game's `LeaderWarnedAboutForeignStations`, for K), and `[Nation<K>IntelReports]`
-  (`ReportNo`, `Intel<i>`). The host's own intelligence stays in the save as in single player.
+  (`ReportNo`, `Intel<i>`). The host's own intelligence stays in the save as in single player. Since 0.6.1 also
+  `[Nation<K>Divisions]`, K's campaign divisions ([below](#each-joined-players-campaign-divisions-061)).
 - **K's month package** (`HostTransformState`): `IntelligenceSpending`/`IntelEffort` of every `[Nation<j>]` hold K's
   values, K's own section 0, `[IntelReports]` K's list; the `MSG_STATE` header has `intel=1`. The Copy-game and
   battle-slot transform (0 <-> K) then gives K's spending on the host's nation to the host's new index, as the game
@@ -321,6 +329,64 @@ intelligence, paid nothing for it, and got none of the questions or consequences
   (no `intel=1`) keeps the 0.4.0 intelligence (the host's), and still gets the Turn's questions (they are local).
 - Details: [MODLOG](../MODLOG.md#fix-2026-10-20-joined-players-intelligence-mirrored-the-hosts-no-trade-protection-warnings-v041).
 
+## Each joined player's campaign divisions (0.6.1)
+The game keeps one list of campaign divisions, its player's (the strategic screen's *Fleet organization* tab), in the
+slot's `.off`; a load appends the save's divisions to the list and looks their ships and commanders up in nation 0
+([GAME-INTERNALS](GAME-INTERNALS.md#campaign-divisions-the-fleet-organization-tab)). Up to 0.6.0 a joined player's month
+carried the host's `.off`: the player saw the host's divisions with the host's ships, its own never reached the host
+and were gone after a month, and every reload in the same process doubled the divisions in memory and in the next save
+(the host's with every merged month).
+- **Every load** (`game.cpp`; single player too). `CB_BeforeLoad` (the `LoadBuildCampaign` hook) takes the divisions
+  out of the list (`TakeOutDivisions`); `CB_AfterLoad` frees them after a successful load (`DropOldDivisions`; when
+  the *Fleet organization* list view has rows, which hold division and ship pointers, the game's `FillDivisionList2`
+  fills it again first) and puts them back after a failed load that left the list empty. The hook of
+  `LoadCampaignDivisions` (`d_LoadDivisions`) then drops repeated `CDivId`s (`DedupDivisions`: the first stays and
+  `LeadDivision` links follow it; the repair of a save an earlier version doubled) and packs the nil ships out of every
+  division (`PackDivisionShips`). Every load logs `campaign divisions: <m> loaded` (`<m> of nation <K> loaded` for a
+  joined player's own slot), and lines for the divisions dropped from before the load, the refilled list, repeats and
+  removed ships.
+- **A joined player's own slot.** While `game::LoadCampaign(slot, K)` loads a slot for nation K > 0 (slot 77), the hook
+  makes `PlayerNation` nation K's for the `LoadCampaignDivisions` call and puts it back afterwards (`DropOldDivisions`
+  puts it back when the call raised), so the divisions find K's ships and officers. Without the hooks
+  (`game::DivisionsAvailable()` false: `WARNING: campaign divisions unavailable` in the log) the PC announces `div=0`.
+- **The turn** (`BuildSubmission`) carries `divisions.ini`: the slot `.off`'s `[CampaignDivisions]` as the player's
+  game saved it for the submission. In the merge the host passes it to `nplay::HostTakeDivisions`, which checks it
+  strictly (`saveio::ParseDivisions`: only the game's fields, integers but `Name` and `Abbreviation` (at most 200
+  bytes, no line breaks), no key twice, at most 200 divisions of at most 40 ships), drops repeated divisions and ship
+  ids (`PruneDivisions`) and keeps it in `rtw3mp_nations.ini` `[Nation<K>Divisions]` (renumbered lines; `divisions of
+  nation <K>: <n> stored`). A rejected list is logged and the stored one stays, as for a turn without the file
+  (0.6.0). The host's save never holds a joined nation's divisions: the host's month sees and changes only the host's.
+- **K's month package** (`SendStateTo`, after `HostTransformState`): `nplay::HostPutDivisions` writes K's stored list,
+  pruned to K's ships in the package's `.bcs` (`saveio::PutDivisions`), into the `.off`'s `[CampaignDivisions]`
+  (`divisions of nation <K>: <n> in its month (...)`); every other byte of the `.off` stays, its `[Officers]` the
+  host's as before. The header gets `divs=1`. A player whose hello has no `div` >= 1 gets an empty list: its game would
+  look K's ship ids up in nation 0.
+- **K's battle package** (`SendBattle`: a battle against the computer, or a battle between two joined players, sent
+  to its first player) gets K's list for every client version (header `divs=1`): the battle slot's `MakeNationPlayer`
+  keeps the divisions whose ships are all K's, and the game's battle generator builds the player's side from them. The
+  game uses campaign divisions for its player's side only: the second player of a battle between two joined players is
+  a computer nation in the first player's slot, and a live battle with the host's nation is generated by the host's
+  game, where K is a computer nation, so K's divisions don't shape those two.
+- **The player's PC** (`ClientApplyPendingState`). With `divs=1` the month's `.off` holds the nation's own divisions
+  (`divisions: the month holds nation <K>'s own <n> ...`). From an older host (no `divs`: its `.off` holds the host's)
+  the client writes its own instead, as its game saved them in slot 77 (`OwnSlotDivisions`: when `rtw3mp_player.ini`
+  names the same nation and the slot's month is at most one month older; divisions holding another nation's ships,
+  such as the host's from a 0.6.0 month, left out), or an empty list without the division hooks. A battle from an
+  older host gets the nation's own divisions in the battle slot the same way (`BattleSlotDivisions`, before
+  `MakeNationPlayer`).
+- **Not covered.** What the host's month and battles would change in a joined nation's divisions (experience from
+  battles, the monthly division training and experience) is not applied: they stay as the player's last turn sent
+  them. A player who reconnects before the merge gets the stored list again (division changes not yet merged are lost,
+  like other orders). A division's commander is looked up among nation K's officers (none when not found).
+- **Mixed versions** (protocol 3: older peers ignore the hello's `div`, the header's `divs` and the turn's
+  `divisions.ini`). A 0.6.0 player of a 0.6.1 host gets an empty list (no longer the host's divisions); its own are not
+  sent and are gone from its slot every month (its game still appends on its own reloads); its battles against the
+  computer get what the host stored for it (nothing). A 0.6.1 player of a 0.6.0 host keeps its own divisions from its
+  slot in its months and battle slots; they never reach the host, which still doubles its own.
+- Bridge: `divs` (the list in memory) and `divstore <K>` (the host's stored list),
+  [TESTING.md](TESTING.md#bridge-command-reference). Details:
+  [MODLOG](../MODLOG.md#fix-2026-10-25-campaign-divisions-of-joined-players-and-duplicated-divisions-v061).
+
 ## Network protocol
 - **Transport:** TCP; the host listens on the port (default 47624), clients connect. One background thread does all
   socket I/O with `TCP_NODELAY`. A frame is `[u32 length][u16 type][payload]`; the receiver drops frames above 96 MB
@@ -330,10 +396,12 @@ intelligence, paid nothing for it, and got none of the questions or consequences
 - **Payloads:** `KV` text (`key=value` lines), or a header and a body (`PackHB`: a 4-byte header length, a `KV`
   header, then binary data such as a `Bundle` of files).
 - **Handshake:** the client's `MSG_HELLO` carries `proto`, `mod`, `build`, `name`, `pw`, `battles` (Fight my battles),
-  `ls` (live battles possible), since relations v2 `rel` (the player's relation routines run on that PC) and since 0.6.0
+  `ls` (live battles possible), since relations v2 `rel` (the player's relation routines run on that PC), since 0.6.0
   `gen` (1: the player's battle generator's requests replayed; 2: also surprise attacks, kind 2, and the view's
-  takeovers). The host answers `MSG_WELCOME` (the final name; since 0.6.0 `gen`: the host's battle requests, 1 = it
-  merges a declined battle's result, 2 = it also takes surprise attacks and takeovers) or `MSG_REJECT` with the reason:
+  takeovers) and since 0.6.1 `div` (1: the PC loads its nation's own campaign divisions and sends them with its turn,
+  [above](#each-joined-players-campaign-divisions-061); the host logs it as `campaign divisions <d>`). The host answers
+  `MSG_WELCOME` (the final name; since 0.6.0 `gen`: the host's battle requests, 1 = it merges a declined battle's
+  result, 2 = it also takes surprise attacks and takeovers) or `MSG_REJECT` with the reason:
   "protocol mismatch (host mod X)", "different game version than the host" or "wrong password".
 
 | Message | Direction | Content |
@@ -343,14 +411,14 @@ intelligence, paid nothing for it, and got none of the questions or consequences
 | `MSG_PICK` | client -> host | A nation pick by name. |
 | `MSG_STATUS` | host -> all | Phase, remaining time, status text. |
 | `MSG_CHAT` | both | Chat lines; `notice=1` flashes the window; `treaty` carries a peace treaty for the player's dialog. |
-| `MSG_STATE` | host -> client | The month: header (seq, nation, date, remaining time; `intel=1` from 0.4.1: the package holds the player's own intelligence; relations v2: `kwar`, the nation's war counter, and for a nation under the player's rules `rel=1`, `kwill`, `kts`, `khist`, `humans`; B4: `kvp`, `kevp`, `kpairs`, `kpeace`; 0.5.0: `kao`, the nation's army-offensive months, and `econnews`, the texts of the player's money rules for its player; 0.6.0: `econnews` also carries the war effects' texts, `kblk` the nations blockaded, and with `rel=1` `khelp` (the host applies the allies' war help), `kbuild` (... and the ship seizures of a war) and `klend`) and the slot's files. |
+| `MSG_STATE` | host -> client | The month: header (seq, nation, date, remaining time; `intel=1` from 0.4.1: the package holds the player's own intelligence; relations v2: `kwar`, the nation's war counter, and for a nation under the player's rules `rel=1`, `kwill`, `kts`, `khist`, `humans`; B4: `kvp`, `kevp`, `kpairs`, `kpeace`; 0.5.0: `kao`, the nation's army-offensive months, and `econnews`, the texts of the player's money rules for its player; 0.6.0: `econnews` also carries the war effects' texts, `kblk` the nations blockaded, and with `rel=1` `khelp` (the host applies the allies' war help), `kbuild` (... and the ship seizures of a war) and `klend`; 0.6.1: `divs=1`, the package's `.off` holds the nation's own campaign divisions) and the slot's files. |
 | `MSG_ACK` | client -> host | The month was loaded. |
-| `MSG_SUBMIT` | client -> host | The player's turn (header and the submission bundle; from 0.4.1 with `[MPIntel]` and `[IntelReports]`). |
+| `MSG_SUBMIT` | client -> host | The player's turn (header and the submission bundle; from 0.4.1 with `[MPIntel]` and `[IntelReports]`; from 0.6.1 with `divisions.ini`, the nation's campaign divisions). |
 | `MSG_FORCE_SUBMIT` | host -> all | The time limit ran out: submit now. |
 | `MSG_DIPLO` | client -> host | A diplomacy request (war, ally, peace, leave, cancel, claim). |
 | `MSG_EVENT` | client -> host | The result of the player's random event (relation changes, own fields), or (0.4.1, `intel=1`) of its monthly spying check. |
 | `MSG_RELATIONS` (40) | client -> host | Relations v2: what the player's relation routines changed for its nation this month (pairs before/after, alliances, per-relation state, other nations' budget changes, VP, war counter); B4: the peace with the computer's nations (`peace`, `pcode`, `pevent`, `pargs`, `paccepted`, `pwinner`, `penemies`, `pland`, `pships`, `ptaken`, `pdelta`, `plost`, `ptreaty`; 0.5.0: `self`, the nation's own BudgetModifier/Prestige/BaseResources/UnrestLevel changes; 0.6.0: `ally`, `allyvp`, `afunds`, `aships`, `lend`, the allies' war help; `bwar`, `bships`, the ship seizures of a war), also alone for a proposal (`kind=peace`; `test=1` from `peacetest`). 0.6.0 (to a `gen=2` host): `ksa` (the surprise attacks "a,b;") and `sland` (the takeovers of unowned possessions, pland's layout). |
-| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. |
+| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. 0.6.1: the battle's `divs=1` (the slot's `.off` holds the nation's own campaign divisions). |
 | `MSG_LOCKSTEP` | both (the host relays between two clients) | Live battle traffic. |
 | `MSG_PING`, `MSG_PONG`, `MSG_BYE` | both | Keep-alive and round-trip time; leaving. |
 
@@ -443,7 +511,10 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   (the enemy's points of the decline, prestige, morale): the game resolves nothing. The battles the game still resolves
   (kind 0 only: no battle, failed, time limit, the player gone, the host's decision, a 0.5.0 client's decline) have
   their picture messages captured (`lockstep::BeginTextCapture`) and sent to the chat and the player's news instead
-  of a box on the host that would hold the new month.
+  of a box on the host that would hold the new month. Since 0.6.1 `ResolveAIBattle` first counts both nations' ships
+  that can fight in the area, as the game's own caller does (`CountShipsInArea`), and passes those counts; with either
+  at 0 it is no battle and the game's routine is not called (it would read a nil ship: "Error in
+  DoBattleBetweenAINations procedure!", GAME-INTERNALS).
 - **The nation's own decline counts (0.6.0).** The game's `DeclineCount` is saved with the campaign (nation 0's) and
   `EnemyDeclineCount` lives in memory (saved, never loaded), so a battle slot held the host player's DeclineCount and
   the client PC's last EnemyDeclineCount. The host keeps
@@ -512,7 +583,10 @@ decided later). Done so far:
     0 (no declaration, surprise landing, volunteering, war-plan warning or alliance quarrel in K's name; afterwards K's
     alliance cells take the other nations' side of each pair, so their decisions about K stay); during
     RandomTensionChanges K's tension with the host reads at least 6 (no alliance offer in K's name). Both keep the
-    routine's own changes of the host-K tension.
+    routine's own changes of the host-K tension. Since 0.6.1 these two routines also see so a nation reserved or
+    claimed by a player while it follows the computer's rules (its player away and never announced the player's rules,
+    an older version, a reservation without a join), as a joined player's PC sees every reserved nation: the game
+    declares no war between the host and a nation a person plays (`MaskAsPlayer`: `hookcb::IsHumanRemoteNation`).
   - Unchanged: the players' diplomacy (wars, peace, alliances between players), the events, the host's coalition (a
     computer nation joining the host's war, also against K), battles (`CheckAIvsAIBattles` sees K's real wars).
   - A game exception that unwinds through a routine still puts the mask back (`MaskedCall` runs the original inside
@@ -554,6 +628,28 @@ decided later). Done so far:
     budget changes; K's VP. Chat `* War: Russia and Germany are now at war.`; log `relations of Captain (nation 1;
     tension,previous wars,war; 2 message(s)): war 1-3 1-0 5->6 ...`.
   - Bridge `relturn` (client, async: the routines now, also a second time) and `rellast` (the last turn sent or applied).
+  - *Once a month, in the game's order* (checked 2026-10-25): single player runs `CheckForWar` once a month, from
+    `DoEndOfTurn` after `CheckTurnEvents`' tension routines (its second call site is in the unused `DoTurn`;
+    GAME-INTERNALS); B3 runs the three in that order, once.
+  - *The war line between players (0.6.1).* Wars between people's nations come only from the players (Diplomacy in the
+    Multiplayer window): the host's CheckForWar sees K as a player (above), K's sees the other people's nations so, and
+    the computer's rules leave K's pairs alone (B2). So their tension can stay far above the tension panel's war line
+    (a bar crosses it at 11; GAME-INTERNALS), pushed by both players' `RandomTensionChanges` ("... as the war is
+    increasing tensions!", "... due to historical enmity!") and never relieved by a declaration as a computer nation's
+    would be (the 0.6.0 report "the tension bar exceeds the critical threshold and no war is declared"). Since 0.6.1 the
+    bar of a nation people play carries, at peace, the hint " - played by a person: wars between players are declared
+    only in the Multiplayer window (Diplomacy), never by the game" (game.cpp `PeoplesBarHints` after
+    `ShowTensionLevels`; `hookcb::WarOnlyByPlayers`: on the host a nation reserved or claimed by a player, connected or
+    not, as on K's PC, where they are the host's nation and the nations of `humans` and the lobby while the header has
+    `rel` or `kvp`), and the host, as
+    each month goes out (`BroadcastState` -> `WarLineNews`), tells both players of a pair of people's nations at peace
+    whose tension rose to 11 or more since its last check (once; the first check after hosting tells the pairs above it
+    already): `* Tension between Great Britain and Germany is 25, above the war line. Wars between players are declared
+    only by the players (Multiplayer window, Diplomacy); the game will not declare one.` (a joined player's as a notice,
+    the host's in its own chat; log `war line: ...`; bridge `warline`). The rule itself is unchanged (no game war
+    between players); whether the game should declare such wars is left to a later decision. Mixed versions: a 0.6.0
+    host sends no such line and shows no hint (a 0.6.1 player still shows the hint on its own bars); a 0.6.0 player
+    shows the host's line as a chat notice, without the hints.
 - **B4, peace with the computer's nations.** The host's header carries K's war score with its computer enemies (`kvp`,
   `kevp`, `kpairs`: the ledger, `g_warVP` pairs of K and a computer nation counted from 0:0 by `OnBattleVP` and
   `CreditWarScore`), `kpeace` (K's peace this month settled already) and `humans`, also in a month whose turn was
@@ -764,7 +860,8 @@ decided later). Done so far:
   software (`softmath.h`: the argument rounded to a double, fdlibm's algorithms in SSE2 doubles, the same bits on
   every CPU); a stub check at install keeps each CPU's own maths if it fails. B loads with A's x87 control word, and
   both PCs check it before and after every simulation step, at every minute's boundary, every release and every
-  hash, and put A's back (logged). `datafiles.cpp` hashes the game's `Data` folder but `Data\Graphics` in a
+  hash, and put A's back (logged). `datafiles.cpp` hashes the game's `Data` folder but `Data\Graphics` (and, since
+  engine level 18, the game's temporary files `tmp*`) in a
   background thread when a session starts (the host's `Prepare`, the client's `Join`); A's start carries the hash
   (`dh=`), a B whose hash differs refuses before loading and sends its file list in the `abort` (`dm=`), and A names
   the files to both players (`datadiff`) and fights the battle against the computer. A READY mismatch is explained
@@ -1020,7 +1117,13 @@ decided later). Done so far:
   appears; nothing changes there. The AI's own fire (inside the simulation) passes through the hook. When a minute
   starts the torpedo dialog is hidden on both PCs (its solutions are for the paused boundary), as before every reload.
   The *Fire torpedoes* button itself is enabled by the game only with the battle preference *Realism* above its second
-  level, which both PCs take from A.
+  level, which both PCs take from A. The game's default is the second level (Rear admiral's mode), so since 0.6.1 both
+  players' chat names the battle's Realism at the start (A's start message carries `rz=1`: A says it to both; a B
+  whose A sends no `rz` says it itself), and the first division report on screen with *Fire torpedoes* off says why,
+  once per battle on each PC (`TorpOffNotice`, from the tick). The game's rule is kept: Realism is a package of rules
+  of the simulation (division control, detach, lead changes, sighting, objectives), manual torpedo fire is part of
+  Captain's mode in single player too, and the automatic torpedo fire reads no preference, so both sides' ships fire
+  their torpedoes on their own at every level, under the same rule on both PCs.
 - **Routine air operations and land-based CAP (engine level 6).** *Routine air ops* (`sbRoutineAirOps`, "Manage CAP
   and air recon") and the ship tree's *Search pattern* open the game's modal `TdlgSearch` as in single player, for the
   player's own forces: `TdlgSearch.Execute` is hooked and refuses a force of the other side (the battle screen opens it
@@ -1169,19 +1272,19 @@ decided later). Done so far:
 - The command reference, the runner and the scenario catalog are in [TESTING.md](TESTING.md).
 
 ## Versions and protocol
-- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.4.1
+- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.6.1
   starting (protocol 3)`).
 - The host refuses a client with another protocol or another game build. Protocol history: 1 = 0.1.0, 2 =
-  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0 and 0.6.0 (relations v2 and 0.6.0 keep 3: their new keys are
-  ignored by older peers).
+  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0 and 0.6.1 (relations v2, 0.6.0 and 0.6.1 keep 3: their new
+  keys are ignored by older peers).
   Within a protocol, versions can play together, but features may need both
   sides (see [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is not checked; the notices about
   another live-battle level quote it.
 - Live battles have their own version, the live-battle engine level `MP_LS_LEVEL` (`src/mod/common.h`): 1 = 0.3.0 to
-  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0. Levels 2 to 13 were development levels of 0.4.0 (the live-battle
-  limits branch, whose MODLOG entries say "v0.4.0", "v0.5.0" and "v0.6.0" after the release plan of 2026-10-16, but
-  it shipped as one version, 0.4.0), and levels 15 and 16 were rounds of 0.4.1's two-PC fixes; none of them was
-  released. A client announces its level in its hello (`ls=<level>`), and the host pairs a live battle
+  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1. Levels 2 to 13 were development levels of 0.4.0 (the
+  live-battle limits branch, whose MODLOG entries say "v0.4.0", "v0.5.0" and "v0.6.0" after the release plan of
+  2026-10-16, but it shipped as one version, 0.4.0), and levels 15 and 16 were rounds of 0.4.1's two-PC fixes; none of
+  them was released. A client announces its level in its hello (`ls=<level>`), and the host pairs a live battle
   only when the player's level (both players' levels for a relayed battle) equals its own. Otherwise the battle falls
   back as when a player has live battles off, and the player gets a notice. A's start message carries `lv=` (B
   refuses another level) and B's `ready` carries it too (A drops an older B), for hosts that don't check it: a 0.3.x
@@ -1220,6 +1323,12 @@ decided later). Done so far:
   (Captain)"). The hello and the welcome carry `cpu=` and `dh=` (logged by both sides). Level 17 (0.4.1 as released,
   the strike battles' fix): A's start carries the campaign's ship-type flags (`st=`), which B uses for the battle and
   which are in the state hash, and the software maths reproduces the x87's own results (see *CPUs, the x87 control
-  word and the data files* above); a level-16 PC gets no live battle with a level-17 PC.
+  word and the data files* above); a level-16 PC gets no live battle with a level-17 PC. Level 18 (0.6.1, the game's
+  temporary files): the data files' hash leaves out the files whose names start with `tmp` at any level of `Data`
+  (`Data\tmpShip.ttp`, which the ship designer rewrites whenever it is used, and `Data\tmpMapData.dat`, which the game
+  never opens); until then a player who had used the ship designer got "game data files differ: Data\tmpShip.ttp" and
+  every live battle of the session was fought against the computer. The combined hash is not level 17's, so a 0.6.0
+  PC (17) and a 0.6.1 PC (18) are told apart by their levels: the engine notice ("live battles need the same
+  live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0 (engine 17)"), not a data-file one.
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

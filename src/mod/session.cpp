@@ -37,6 +37,7 @@ struct Player {
     int offeredSerial = -1;  // the last rejoinable battle offered to this player (lockstep RejoinInfo.serial, phase 5b)
     int relLevel = 0;        // relations v2: the player's PC runs the player's relation routines (hello `rel`; 0 = no)
     int genLevel = 0;        // 0.6.0: its PC replays the player's battle generator's attempts (hello `gen`; 0 = no)
+    int divLevel = 0;        // 0.6.1: its PC loads and sends the nation's own campaign divisions (hello `div`; 0 = no)
 };
 
 // The ten nations of the game, offered for lobby picks before the host has a campaign.
@@ -190,6 +191,9 @@ static int g_relTurnSeq = -1;
 static int g_evShownSeq = -1;
 static game::PlayerTurnSetup g_relSetup;
 static std::string g_lastRelations = "none";
+// 0.6.1 (client): the host runs the player's rules for this nation (the month's header has `rel` or `kvp`): the game
+// declares no war between it and the nations people play (hookcb::WarOnlyByPlayers).
+static bool g_relRulesHost = false;
 // Relations v2, B4 (client): the host applies this nation's peace with the computer's nations (its header's kvp); the war
 // scores of those wars (nation -> this nation's points, theirs); the month (Year*12+Month) in planning and the one whose
 // peace was settled here (a proposal or a peace event: one a month); a "Propose peace" waiting for an idle moment; the
@@ -2190,6 +2194,10 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     // The player's own intelligence (spending, effort, reports) instead of the host's (nationplay.cpp).
     nplay::HostAttach(dir, CampaignKey());
     nplay::HostTransformState(b, p.nation);
+    // 0.6.1: the nation's own campaign divisions (the Fleet organization tab) instead of the host's: the list its last
+    // turn sent, pruned to its ships in this month. A player whose mod doesn't load them (hello `div` 0) gets an empty
+    // list: its game would look the nation's ships up among the host's nation (nil ships) and show the host's divisions.
+    nplay::HostPutDivisions(b, p.nation, p.divLevel >= 1, "month");
     KV h;
     h["seq"] = std::to_string(g_seq);
     h["nation"] = std::to_string(p.nation);
@@ -2251,6 +2259,7 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
         h["humans"] = humans;
     }
     h["intel"] = "1";  // per-player intelligence: the player's turn carries its own (0.4.0 peers ignore the key)
+    if (p.divLevel >= 1) h["divs"] = "1";  // 0.6.1: the .off holds the nation's own divisions (see above)
     {
         // The player's economy rules the host ran for this nation (economy.cpp; older clients ignore the keys): their
         // messages since the last state (sent once) and the nation's army offensive months (its budget's x 0.9).
@@ -2290,6 +2299,51 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     Log("state seq %d -> %s (nation %d, %u bytes)", g_seq, p.name.c_str(), p.nation, (unsigned)b.TotalBytes());
 }
 
+// 0.6.1 (host): the tension between two nations people play above the game's war line (the strategic screen's tension
+// panel: a bar crosses its WarLine at Tension 11; in single player a nation that far above it declares war soon). Wars
+// between players are declared only by the players (the game's rules see the nations people play, reserved ones
+// included, as players), so both players are told once each time the pair's tension crosses the line: checked as each
+// month goes out; the first time after hosting, the pairs above it already.
+static const int kWarLineTension = 11;
+static std::map<std::pair<int, int>, bool> g_warLineAbove;  // pair (a < b) -> above the line at the last check
+
+static int WarLineNews() {
+    std::vector<int> people;
+    for (int j = 0; j <= 8 && j < game::NationCount(); j++)
+        if (j == 0 || hookcb::WarOnlyByPlayers(j)) people.push_back(j);
+    int told = 0;
+    for (size_t x = 0; x < people.size(); x++)
+        for (size_t y = x + 1; y < people.size(); y++) {
+            int a = people[x], b = people[y], t = game::Tension(a, b);
+            bool above = t >= kWarLineTension && t <= 40;
+            bool& was = g_warLineAbove[{a, b}];
+            bool tell = above && !was;
+            was = above;
+            if (!tell) continue;
+            std::string line = "Tension between " + CampaignNationName(a) + " and " + CampaignNationName(b) + " is " +
+                               std::to_string(t) + ", above the war line. Wars between players are declared only by "
+                               "the players (Multiplayer window, Diplomacy); the game will not declare one.";
+            std::string to;
+            for (int s : {a, b}) {
+                if (s == 0) {
+                    AddLocalChat("* " + line);
+                    if (g_onNotice) g_onNotice(line);
+                    to += " the host";
+                    continue;
+                }
+                for (auto& kv : g_players) {
+                    Player& p = kv.second;
+                    if (!p.connected || !p.welcomed || p.nation != s) continue;
+                    NoticeTo(p, line);
+                    to += " nation " + std::to_string(s);
+                }
+            }
+            told++;
+            Log("war line: %s (told:%s)", line.c_str(), to.c_str());
+        }
+    return told;
+}
+
 static void BroadcastState() {
     HostArmsTreatyCheck("the month going out");  // also a resent month and a campaign hosted again
     if (!game::SaveGame()) {
@@ -2317,6 +2371,7 @@ static void BroadcastState() {
     BroadcastLobby();
     BroadcastStatus("Planning " + DateStr(y, m) + ": make your decisions, then press Turn / Submit.");
     AddChat("* New month: " + DateStr(y, m));
+    WarLineNews();
     // News about each player's design studies goes to that player only (after the month, so it is the last line).
     for (auto& kv : g_players) {
         Player& p = kv.second;
@@ -2430,8 +2485,16 @@ static void SendBattle(BattleReq& r) {
         BattleFallback(r, "cannot package the game: " + err);
         return;
     }
+    // 0.6.1: the battle is generated on the player's PC in a copy where its nation is the player (MakeNationPlayer
+    // keeps the divisions whose ships are all the nation's), so its own campaign divisions go in for every mod version.
+    // The game uses campaign divisions for its player's side only: the other side of a battle between two joined
+    // players is a computer nation in that copy, and a live battle of the host's own nation, generated by the host's
+    // game, uses the host's divisions (the joined nation is a computer nation there); both stay as they are.
+    nplay::HostAttach(dir, CampaignKey());
+    nplay::HostPutDivisions(b, r.human, true, "battle");
     KV h;
     h["id"] = std::to_string(r.id);
+    h["divs"] = "1";
     h["nation"] = std::to_string(r.human);
     h["opp"] = std::to_string(r.opp);
     h["a"] = std::to_string(r.a);
@@ -2864,6 +2927,7 @@ static void RunHostTurn() {
         if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err)) {
             merged++;
             nplay::HostTakeSubmission(s.second, it->second.nation);  // its own intelligence spending and reports
+            nplay::HostTakeDivisions(s.second, it->second.nation);   // 0.6.1: its own campaign divisions
         } else {
             Log("host turn: %s's turn NOT applied: %s", it->second.name.c_str(), err.c_str());
             AddChat("* Could not apply " + it->second.name + "'s turn: " + err);
@@ -3252,8 +3316,10 @@ static void HostOnMessage(net::Msg& m) {
             p->mod = KVStr(kv, "mod").substr(0, 24);
             p->relLevel = std::max(0, KVInt(kv, "rel"));  // relations v2 (older clients: none)
             p->genLevel = std::max(0, KVInt(kv, "gen"));  // 0.6.0: the player's battle generator (older clients: none)
-            Log("%s: mod %s, live-battle engine %d (this host: %d), player's relation rules %d, battle generator %d",
-                name.c_str(), p->mod.c_str(), p->lsLevel, MP_LS_LEVEL, p->relLevel, p->genLevel);
+            p->divLevel = std::max(0, KVInt(kv, "div"));  // 0.6.1: the nation's own divisions (older clients: none)
+            Log("%s: mod %s, live-battle engine %d (this host: %d), player's relation rules %d, battle generator %d, "
+                "campaign divisions %d",
+                name.c_str(), p->mod.c_str(), p->lsLevel, MP_LS_LEVEL, p->relLevel, p->genLevel, p->divLevel);
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -3420,6 +3486,21 @@ static void HostOnMessage(net::Msg& m) {
 // ---------------------------------------------------------------------------------------------
 // Client helpers
 
+// 0.6.1, a month from an older host (it sends the host's own divisions): this nation's own campaign divisions as this
+// PC's game last saved them in the slot, if the slot holds this nation's game of this campaign (the nation stored there
+// last and a month at most one before the new one). Returns the divisions of other nations left out (those of a 0.6.0
+// month), -1 if the slot holds none of this game.
+static int OwnSlotDivisions(const std::wstring& dir, int nation, int year, int month, std::vector<std::string>& lines) {
+    std::string pi;
+    int y = 0, m = 0, foreign = 0;
+    if (!ReadFileBytes(dir + L"rtw3mp_player.ini", pi) || KVInt(KVDecode(pi), "nation", -1) != nation) return -1;
+    if (!saveio::ReadDate(dir, g_clientSlot, y, m)) return -1;
+    int gap = year * 12 + month - (y * 12 + m);
+    if (gap < 0 || gap > 1) return -1;
+    if (!saveio::OwnDivisionLines(dir, g_clientSlot, nation, lines, foreign)) return -1;
+    return foreign;
+}
+
 static void ClientApplyPendingState() {
     if (g_pendingState.empty() || game::IsBusy() || game::BattleActive()) return;
     if (g_cb.fighting || g_cb.starting || !g_battleIn.empty()) return;  // a battle slot is in use (see below)
@@ -3437,9 +3518,36 @@ static void ClientApplyPendingState() {
     int seq = KVInt(h, "seq");
     std::string err;
     std::wstring dir = game::SaveDir(g_clientSlot);
+    // 0.6.1: the nation's own campaign divisions (Fleet organization). A host that keeps them sends them in the month's
+    // .off (`divs`); an older host sends its own (its nation's ships): this PC keeps its own from the slot instead.
+    bool hostDivs = KVInt(h, "divs", 0) == 1;
+    std::vector<std::string> ownDivs;
+    int ownForeign = -1;
+    // Without the division hook (DivisionsAvailable) the load would resolve the nation's ship ids against nation 0 (nil
+    // ships the Fleet organization dereferences): then an empty list, as a host sends to a client without `div`.
+    if (!hostDivs && nation > 0 && !dir.empty() && game::DivisionsAvailable())
+        ownForeign = OwnSlotDivisions(dir, nation, KVInt(h, "year"), KVInt(h, "month"), ownDivs);
     if (dir.empty() || !saveio::ApplyStateBundle(b, dir, g_clientSlot, err)) {
         Notice("Cannot store the received game: " + err);
         return;
+    }
+    if (nation > 0) {
+        int n = 0;
+        std::string sum, derr;
+        std::vector<std::string> got;
+        std::vector<saveio::CampDiv> mine;
+        if (hostDivs) {
+            if (saveio::OwnDivisionLines(dir, g_clientSlot, nation, got, n) && saveio::ParseDivisions(got, mine, false, derr))
+                Log("divisions: the month holds nation %d's own %d (kept by the host; %d with other ships)", nation,
+                    (int)mine.size(), n);
+        } else if (saveio::PutSlotDivisions(dir, g_clientSlot, nation, ownForeign >= 0 ? &ownDivs : nullptr, n, sum, derr)) {
+            std::string from = ownForeign < 0 ? std::string("none of this game in the slot")
+                                              : std::to_string(ownForeign) + " of other nations left out";
+            Log("divisions: an older host sends its own; nation %d's own %d from this slot written instead (%s; %s)",
+                nation, n, from.c_str(), sum.c_str());
+        } else {
+            Log("divisions: an older host sends its own; nation %d's own NOT written: %s", nation, derr.c_str());
+        }
     }
     {
         KV mk;  // which nation this slot is played as (for "Copy game", also after leaving the session)
@@ -3453,6 +3561,7 @@ static void ClientApplyPendingState() {
     // hosts don't: their treaty stays here as they have it).
     game::SetHostEndsArmsTreaty(KVInt(h, "armstreaty", 0) == 1);
     // Relations v2, B3: the host runs the player's rules for this nation; its relation routines run here this month.
+    g_relRulesHost = h.find("rel") != h.end() || h.find("kvp") != h.end();
     g_relTurnSeq = KVInt(h, "rel", 0) >= 1 && game::PlayerTurnAvailable() ? seq : -1;
     if (g_relTurnSeq >= 0) {
         game::PlayerTurnSetup s;
@@ -3597,6 +3706,23 @@ static void ClientDropBattle() {
     g_battleInId = -1;
 }
 
+// 0.6.1: an older host sends its own divisions with a battle (its nation's ships; MakeNationPlayer drops them): the
+// battle slot gets this nation's own instead, as this PC's game saved them in its slot (a 0.6.1 host sends them: `divs`).
+// Never fails the battle.
+static bool BattleSlotDivisions(const KV& h, const std::wstring& dir, int K) {
+    if (h.find("divs") != h.end()) return true;
+    std::vector<std::string> own;
+    int foreign = 0, n = 0;
+    std::string sum, err;
+    bool have = saveio::OwnDivisionLines(game::SaveDir(g_clientSlot), g_clientSlot, K, own, foreign);
+    if (saveio::PutSlotDivisions(dir, g_battleSlot, K, have ? &own : nullptr, n, sum, err))
+        Log("battle: an older host sends its own divisions; nation %d's own %d from its slot instead (%s)", K, n,
+            sum.c_str());
+    else
+        Log("battle: an older host sends its own divisions; nation %d's own NOT written: %s", K, err.c_str());
+    return true;
+}
+
 static void ClientStartBattle() {
     std::string payload;
     payload.swap(g_battleIn);
@@ -3621,7 +3747,7 @@ static void ClientStartBattle() {
     }
     std::wstring dir = game::SaveDir(g_battleSlot);
     std::string err, summary;
-    if (dir.empty() || !saveio::ApplyStateBundle(b, dir, g_battleSlot, err) ||
+    if (dir.empty() || !saveio::ApplyStateBundle(b, dir, g_battleSlot, err) || !BattleSlotDivisions(h, dir, K) ||
         !saveio::MakeNationPlayer(dir, g_battleSlot, K, {}, summary, err, game::OwnWarCounter()) ||
         !ReadFileBytes(dir + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", g_cb.before)) {
         SendBattleResult(id, "failed", "cannot prepare the battle slot: " + err, nullptr, "");
@@ -4373,6 +4499,9 @@ static void ClientOnMessage(net::Msg& m) {
             kv["gen"] = !game::BattleReplayAvailable() ? "0"
                         : game::SurpriseAvailable()    ? "2"   // 0.6.0 piece 2: surprise attacks and takeovers too
                                                        : "1";  // 0.6.0: replays the player's battle generator
+            // 0.6.1: this PC loads its nation's own campaign divisions (game.cpp d_LoadDivisions) and sends them with
+            // its turn; the host then sends them back with the month instead of the host's own (else: an empty list)
+            kv["div"] = game::DivisionsAvailable() ? "1" : "0";
             kv["cpu"] = x87::CpuVendor();  // (logged by both sides: a live battle's diagnostics name differing vendors)
             if (datafiles::Ready()) kv["dh"] = datafiles::Combined();  // the game data files (logged; checked at a start)
             net::Send(0, net::MSG_HELLO, KVEncode(kv));
@@ -4857,6 +4986,8 @@ void Leave() {
     g_kEnemies.clear();
     g_kRelMonth.clear();
     g_relTurnSeq = -1;
+    g_relRulesHost = false;
+    g_warLineAbove.clear();
     g_kPeaceMonth.clear();  // relations v2, B4
     g_lastHostPeace.clear();
     g_peaceHost = false;
@@ -5307,6 +5438,26 @@ std::string DebugRelRules(const std::vector<std::string>& args) {
     for (int K = 1; K <= 8 && K < game::NationCount(); K++)
         if (hookcb::PlayerRulesNation(K)) now += std::to_string(K) + ",";
     return "ok rules=" + now + " forced=" + list(g_relForced) + " saved=" + list(g_relNations);
+}
+
+std::string DebugWarLine(const std::vector<std::string>& args) {
+    if (g_role == Role::None) return "error not in a session";
+    std::string sub = args.size() >= 2 ? args[1] : "", out;
+    if (sub == "forget" || sub == "check") {
+        if (g_role != Role::Host) return "error host only";
+        if (sub == "forget") {
+            g_warLineAbove.clear();
+            Log("war line: memory cleared by a test");
+        } else {
+            out += " told=" + std::to_string(WarLineNews());
+        }
+    }
+    std::string people, above;
+    for (int j = 0; j <= 8 && j < game::NationCount(); j++)
+        if (hookcb::WarOnlyByPlayers(j)) people += std::to_string(j) + ",";
+    for (auto& kv : g_warLineAbove)
+        if (kv.second) above += std::to_string(kv.first.first) + "-" + std::to_string(kv.first.second) + ",";
+    return "ok people=" + people + " above=" + above + out;
 }
 
 void DebugRelTurn() {  // client: the player's relation routines now (tests; normally once a month after the event roll)
@@ -5821,6 +5972,20 @@ bool PlayerRulesNation(int idx) {
 int KWarCounter(int idx) {
     if (idx < 1 || idx > 8 || !IsHumanRemoteNation(idx)) return game::WarCounter();
     return mp::KWar(idx);
+}
+
+bool WarOnlyByPlayers(int idx) {
+    using namespace mp;
+    if (idx < 0 || idx > 8) return false;
+    // The host: a nation reserved or claimed by a player, connected or not (as a joined player's PC sees the header's
+    // `humans` and the lobby's); its own CheckForWar sees those nations as players (game.cpp MaskAsPlayer).
+    if (g_role == Role::Host) return idx > 0 && IsHumanRemoteNation(idx);
+    if (g_role != Role::Client || !g_relRulesHost || g_myNation < 1 || idx == g_myNation) return false;
+    if (idx == 0) return true;
+    bool human[9];
+    for (int j = 0; j < 9; j++) human[j] = g_relSetup.human[j];
+    MarkLobbyHumans(human);
+    return human[idx];
 }
 
 void CreditWarVP(int gainer, int loser, int vp, const char* why) {

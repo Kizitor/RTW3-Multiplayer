@@ -2713,6 +2713,10 @@ static struct Session {
     // Air strikes (engine level 7)
     bool autoStrike = false;   // the host's option: the computer flies both sides' carrier strikes (start message)
     bool autoStrikeNoted = false;  // the strike dialog said so once
+    // The battle preference Realism (0.6.1; A's on both PCs) decides whether the game offers Fire torpedoes
+    bool aSaysRealism = false;  // B: A's start message says that A tells both players the battle's Realism (`rz=1`)
+    bool realismSaid = false;   // B: the battle's Realism is in this PC's chat
+    bool torpOffNoted = false;  // a division report showed Fire torpedoes off for the Realism: said once in this battle
     int launchK[2] = {0, 0};   // per side: the next offset of a side-partitioned AFId (launches from the screen)
     int launches = 0, launchReplays = 0, launchFailed = 0, launchSorts = 0;  // this PC's launches, replays (ls airlist)
     // Rejoin (engine level 8)
@@ -7736,6 +7740,52 @@ static void ChatBoth(const std::string& s) {
     SendInfo(s);
 }
 
+// The battle preference Realism and manual torpedo fire (0.6.1). The game offers Fire torpedoes only with Realism above
+// its second level, Captain's mode (TdlgDivisionReport.FormShow 0xae22ca: `cmp [prefs+0x56], 1; setg dl` ->
+// bnTorps.Enabled), and its own default is Rear admiral's mode (TdlgPrefs.LoadPrefs reads RealismSetting with the default
+// 1). A live battle uses A's level on both PCs (kPrefs), so under the default neither player could fire torpedoes and
+// nothing said why (the 0.6.0 report "torpedoes can't be manually fired player vs player combat"). Both players now
+// read the level at the start, and once per battle when a division report shows Fire torpedoes off.
+static int BattleRealism() { return E.prefs ? *(int*)(E.prefs + 0x56) : -1; }
+static std::string RealismName(int r) {
+    switch (r) {
+        case 0: return "Admiral's mode";
+        case 1: return "Rear admiral's mode";
+        case 2: return "Captain's mode";
+    }
+    return "an unknown level (" + std::to_string(r) + ")";
+}
+// The start's line about the battle's Realism, for A (aName empty) or for B (aName: A's player name).
+static std::string RealismLine(const std::string& aName) {
+    int r = BattleRealism();
+    bool a = aName.empty();
+    std::string s = "Realism: " + RealismName(r) + " (" + (a ? std::string("your") : aName + "'s") +
+                    " battle preference, for both players" + (a ? "" : "; yours isn't used") + "). ";
+    if (r > 1) return s + "Fire torpedoes in the division report works while the battle is paused.";
+    return s + "Fire torpedoes in the division report needs Captain's mode, which " +
+           (a ? std::string("you can choose") : aName + " can choose") +
+           " in the Preferences before the next battle. Your ships still fire torpedoes on their own.";
+}
+// Once per battle (Tick): a division report on screen with Fire torpedoes off for the battle's Realism says why.
+static void TorpOffNotice() {
+    if (S.torpOffNoted || S.st != St::Running || !E.prefs || BattleRealism() > 1) return;
+    static const int fBn = dl::Field("TdlgDivisionReport", "bnTorps"), fEnabled = dl::Field("TControl", "FEnabled");
+    void* report = DialogForm("TdlgDivisionReport");
+    if (!report || fBn <= 0 || fEnabled < 0 || !game::FormVisible(report)) return;
+    void* bn = dl::At<void*>(report, fBn);
+    if (!bn || dl::At<uint8_t>(bn, fEnabled)) return;
+    S.torpOffNoted = true;
+    std::string mode = RealismName(BattleRealism());
+    Log("lockstep: a division report shows Fire torpedoes off (the battle's RealismSetting %d)", BattleRealism());
+    Chat(S.isA ? "Fire torpedoes is off: it needs the battle preference Realism at Captain's mode, and this battle uses "
+                 "yours, " + mode + ". Your ships still fire torpedoes on their own; choose Captain's mode in the "
+                 "Preferences before the next battle to fire them yourself."
+               : "Fire torpedoes is off: it needs the battle preference Realism at Captain's mode, and this battle uses " +
+                 S.peerName + "'s, " + mode + " (yours isn't used). Your ships still fire torpedoes on their own; " +
+                 S.peerName + " can choose Captain's mode in the Preferences before the next battle.");
+    if (g_hooks.notice) g_hooks.notice("Live battle: Fire torpedoes needs Realism at Captain's mode (see the chat)");
+}
+
 // A: a game text of the running minute (a box or a picture message): the first player's lines into this chat, each
 // player's lines kept as the reason of a break at the minute's end (OnBoundary sends the second player theirs).
 static void OnGameText(const std::wstring& text, bool proposal, int siteSide) {
@@ -8536,6 +8586,7 @@ static bool StartTransfer(bool resync, std::string& err) {
     h["lv"] = std::to_string(AnnouncedLsLevel());  // B refuses another live-battle engine (0.3.x sends none: level 1)
     h["prefs"] = PrefsHex();
     h["st"] = TypeFlagsHex();  // engine level 17: the ship-type flags the identification reads (B uses A's)
+    h["rz"] = "1";             // (0.6.1) A tells both players the battle's Realism at the start (B: no line of its own)
     h["gd"] = W2U(GameDir());
     h["cw"] = std::to_string(S.cw0);
     // Engine level 16: the transcendental maths in software on both PCs (x87.cpp; TEST: RTW3MP_TEST_X87SOFT=0 keeps each
@@ -8642,6 +8693,10 @@ static void ACheckReady() {
                  " and End act for both players; both players' orders apply from the next minute.");
     } else {
         ChatBoth("The battle is synchronised again (minute " + std::to_string(S.boundary) + ").");
+    }
+    if (first) {  // (0.6.1) the battle's Realism, A's, which decides whether Fire torpedoes works (B: `rz=1`)
+        if (!S.rejoin) Chat(RealismLine(""));
+        SendInfo(RealismLine(S.myName.empty() ? "the first player" : S.myName));
     }
     if (first && dl::ListCount(List(E.airVar)) > 0)
         ChatBoth(S.autoStrike ? std::string("Air strikes: the computer flies both sides' carrier and airfield strikes (the "
@@ -8909,6 +8964,7 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
     S.clockFastest = S.startFastest;
     S.prefsA = KVStr(h, "prefs");
     S.typesA = KVStr(h, "st");
+    S.aSaysRealism = KVInt(h, "rz") != 0;  // (0.6.1; A on 0.6.0 sends none: B says the battle's Realism itself)
     S.gameDirA = KVStr(h, "gd");
     S.cw0 = (unsigned)KVInt(h, "cw");
     S.softMath = KVInt(h, "sm") != 0 && x87::Installed();  // engine level 16: A decides; B can (checked above)
@@ -9065,6 +9121,10 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
         S.boundary = Minute();
         if (KVInt(h, "n", -1) != S.boundary) Log("lockstep: go at minute %s, here %d", KVStr(h, "n").c_str(), S.boundary);
         Log("lockstep: battle %d epoch %d running at minute %d", S.bid, S.epoch, S.boundary);
+        if (!S.realismSaid) {  // (0.6.1) the battle's Realism (A's; this PC's record holds it since the load)
+            S.realismSaid = true;
+            if (!S.aSaysRealism) Chat(RealismLine(S.peerName.empty() ? "the first player" : S.peerName));
+        }
     } else if (t == "rel") {
         if (S.st != St::Running) return;
         S.runLeft = KVInt(h, "left");
@@ -9817,6 +9877,7 @@ void Tick() {
     }
     Watchdog(now);
     if (!S.on || S.st == St::Ended) return;
+    TorpOffNotice();
     void* m = BattleForm();
     // The battle's end is final: its result screens take as long as the player wants (no timeouts from here).
     bool over = g_results > 0 || (m && dl::At<uint8_t>(m, E.fEndGame));
@@ -10988,6 +11049,16 @@ std::string Debug(const std::vector<std::string>& a) {
         for (auto& ch : out)
             if (ch == '\n') ch = ' ';
         return out;
+    }
+    if (c == "realism") {  // ls realism (0.6.1): the battle preference Realism in this PC's record now (B: A's during a
+                           // live battle), whether the game offers Fire torpedoes by it, and this battle's notices
+        int r = BattleRealism();
+        std::string name = RealismName(r);
+        for (auto& ch : name)
+            if (ch == ' ') ch = '_';
+        return "ok realism=" + std::to_string(r) + " name=" + name + " torps=" + (r > 1 ? "1" : "0") +
+               " said=" + (S.isA ? (S.everRunning ? "1" : "0") : (S.realismSaid ? "1" : "0")) +
+               " a_says=" + (S.aSaysRealism ? "1" : "0") + " noted=" + (S.torpOffNoted ? "1" : "0");
     }
     if (c == "prefs") {  // ls prefs: the battle preferences of this PC's record now (engine level 15: the ones the
                          // simulation uses), and this PC's own kept for after a live battle

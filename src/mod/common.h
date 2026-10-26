@@ -14,7 +14,7 @@
 #include <deque>
 #include <functional>
 
-#define MP_MOD_VERSION "0.6.0"
+#define MP_MOD_VERSION "0.6.1"
 #define MP_PROTOCOL 3
 // The live-battle engine level (lockstep.cpp): a live battle is fought only between two PCs with the same level, while
 // the rest of the session stays compatible within MP_PROTOCOL. A client announces it in its hello (`ls=<level>`;
@@ -58,8 +58,11 @@
 // `cpu=`, `cw=` in the ready message; `diag=` in the desync message). 17 = the campaign's ship-type flags (0.4.1: a
 // battleship, a battlecruiser, a carrier exists; only a processed month sets them, so a joined player's game had 0 and
 // identified ships otherwise than the host's): the start's `st=` carries A's, B uses them for the battle, and they are
-// in the state hash; the leak check covers the simulation's identification.
-#define MP_LS_LEVEL 17
+// in the state hash; the leak check covers the simulation's identification. 18 = the game's temporary files (0.6.1):
+// the data files' hash leaves out the names starting with "tmp" (the ship designer rewrites Data\tmpShip.ttp whenever it
+// is used: a player who designed a ship lost every live battle to "game data files differ"); the combined hash is not
+// level 17's, so a 0.6.0 PC and a 0.6.1 PC are told apart by their levels, not by a data-file difference.
+#define MP_LS_LEVEL 18
 // The level this copy announces (hello `ls=`, the start's, ready's and rejoin's `lv=`): MP_LS_LEVEL. TEST ONLY: env
 // RTW3MP_TEST_LS_LEVEL (read once) announces another level, so one build can play a peer of another mod version; this
 // copy's own checks keep MP_LS_LEVEL.

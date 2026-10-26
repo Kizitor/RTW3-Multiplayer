@@ -54,7 +54,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 ## Install
 Every player:
 1. Close the game.
-2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.6.0-win32.zip`) from the
+2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.6.1-win32.zip`) from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract all its files into the
    game folder, next to `RTW3.exe`. When you update, replace the older files.
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
@@ -147,7 +147,7 @@ examples.
    affect the multiplayer session. (This also works after you leave the session, as long as slot 77 still holds the
    multiplayer game.)
    - You keep your nation, its fleet, designs, possessions, budget, research, relations and wars.
-   - The host's officers come with the copy, unassigned; their divisions don't.
+   - The host's officers come with the copy, unassigned. The host's divisions don't; your own do (0.6.1 or newer).
    - Tech-sharing deals start over.
 6. If you leave or lose the connection, join again with the same name: you get your nation back, and your ships if
    your live battle is still going on (see
@@ -163,11 +163,15 @@ Your screen shows your own nation's side of the campaign:
 - **Trade protection and foreign stations:** the budget panel shows your nation's trade protection requirement,
   **Submit** asks the game's questions (step 4), and the host's month gives your nation the game's warnings and
   their consequences (for example lost prestige), which you get as notices with the new month.
+- **Divisions:** the *Fleet organization* tab shows your own nation's divisions. Make and change them as in single
+  player: they go to the host with your turn, come back with every new month, and the game sets up your side of your
+  battles against computer nations with them. (Before 0.6.1 the tab showed the host's divisions, and yours were lost
+  every month.)
 
 Your relations on the screen need 0.4.1 or newer on your PC, and your own months at war need 0.5.0 or newer on your PC
-and on the host; your intelligence and the month's warnings need 0.4.1 or newer on the host too (see
-[Upgrading from an older version](#upgrading-from-an-older-version)). What still comes from the host or the computer:
-see [Known limitations](#known-limitations).
+and on the host; your intelligence and the month's warnings need 0.4.1 or newer on the host too, and your own
+divisions 0.6.1 or newer on your PC (see [Upgrading from an older version](#upgrading-from-an-older-version)). What
+still comes from the host or the computer: see [Known limitations](#known-limitations).
 
 To test on one PC, run two copies of the game and join `127.0.0.1` (`RTW3MP_SecondCopy.bat` from the release starts
 the second copy). Both copies share one settings file, so the joining copy gets a numbered name (e.g. "Friend 2").
@@ -311,10 +315,18 @@ relation, the tension value of the relation bar, and anything pending. Select a 
 - The relation bar keeps moving as in single player: the joined players' relation routines, the host's and the events
   still raise and lower the tension between players. But a joined player's nation that follows the player's rules
   (0.5.0 or newer on the host and on that player's PC) never goes to war with another player's nation by itself:
-  such a war starts only with **Declare war**. Under an older host, or with an older version on the joined player's
-  PC, the nation keeps the computer's rules, and the game can still start a war between it and another player's
-  nation on its own (rising tension, or an ally being drawn into a war). Those wars can be ended with **Propose
-  peace** too.
+  such a war starts only with **Declare war**.
+- **The war line:** the bar between two players' nations can therefore rise far above the tension panel's war line,
+  where a computer nation would soon declare war, and stay there: the game never starts that war. Since 0.6.1 the
+  bar's tooltip says so ("Tension with Germany is 25 - played by a person: wars between players are declared only in
+  the Multiplayer window (Diplomacy), never by the game"), and each time the tension between two players' nations
+  rises to 11 or more (the bar crosses the line), a host on 0.6.1 tells both players once in the chat: "* Tension
+  between Great Britain and Germany is 25, above the war line. Wars between players are declared only by the players
+  (Multiplayer window, Diplomacy); the game will not declare one."
+- Under an older host, or with an older version on the joined player's PC, the nation keeps the computer's rules, and
+  the game can still start a war between it and another player's nation on its own (rising tension, or an ally being
+  drawn into a war). With 0.6.1 on the host, the host's game never declares one between the host's nation and a
+  player's nation, also while that player isn't connected. Those wars can be ended with **Propose peace** too.
 - Computer nations can join a war between players on either side, as other nations join the player's wars in single
   player (the host is told, for example, "Spain has entered the war against you on Germany's side!").
 - Computer nations get no buttons, except **Propose peace** in the rows of the computer's nations at war with a
@@ -372,8 +384,9 @@ computer, as in single player.
 - After the month, before the new month is sent, the host sends each player their battles, one at a time. The host's
   screen shows "Battles in progress" and is locked until they are done.
 - On your PC the battle opens as in single player, with the game's questions (for example on the map) and its battle
-  preview. Fight it to its end, close the results, and the result goes back to the host: damage, sinkings, crew
-  experience, victory points and prestige. Then your own game loads again, and the new month follows.
+  preview, and since 0.6.1 with your side set up from your own divisions. Fight it to its end, close the results, and
+  the result goes back to the host: damage, sinkings, crew experience, victory points and prestige. Then your own game
+  loads again, and the new month follows.
 - **Declining:** with 0.6.0 on the host and on your PC, a battle you decline (on the map or in the preview) counts as
   in single player: the enemy gets its points, and after the game's warnings repeated declines cost prestige or fleet
   morale. The host keeps your nation's own count of declined battles. Everyone's chat shows it ("* Captain declined
@@ -382,7 +395,8 @@ computer, as in single player.
 - If you leave the battle before its end, disconnect, or don't finish within the time limit (30 minutes per battle),
   a battle of the player's rules is dropped: no battle for you that month ("* No battle of Germany this month
   (...)"). A battle of the computer's rules is resolved by the game the old way; from a host on 0.6.0 its messages
-  come in the chat and in your turn report.
+  come in the chat and in your turn report. With 0.6.1 on the host it is no battle when your nation or the enemy no
+  longer has a ship there that can fight (for example after another battle of the month).
 - If the computer's navy declines the battle ("The ... navy declines battle! You gain N VP!"), there is no battle and
   you keep the points, as in single player (with 0.4.1 or newer on the host and on your PC; otherwise the game
   resolves the battle as one between computer nations).
@@ -400,12 +414,12 @@ players in the battle need **Fight my battles** on (the host's own box makes no 
 joining a session). If it is off, the host fights its battle against that nation's ships under computer control, and a
 battle between two joined players' nations is resolved by the game.
 - **Same live-battle engine:** a live battle needs the same live-battle engine on both players' PCs. 0.4.1, 0.5.0 and
-  0.6.0 have the same one, older versions others. A host on 0.4.0 or newer checks it for every live battle: its own
-  battle against a player with another engine is fought against the computer, and a battle between two joined players
-  is resolved by the game unless both have the host's engine. The chat and the players' notices say why, naming both
-  versions (from a host on 0.5.0 or newer, for example "live battles need the same live-battle engine on both PCs: the
-  host has 0.6.0 (engine 17), you have 0.4.0 (engine 14)"; older hosts say "the same mod version"), and the month goes
-  on. A
+  0.6.0 have the same one (17), 0.6.1 a new one (18), older versions others. A host on 0.4.0 or newer checks it for
+  every live battle: its own battle against a player with another engine is fought against the computer, and a battle
+  between two joined players is resolved by the game unless both have the host's engine. The chat and the players'
+  notices say why, naming both versions (from a host on 0.5.0 or newer, for example "live battles need the same
+  live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0 (engine 17)"; older hosts say "the
+  same mod version"), and the month goes on. A
   host on 0.3.x checks no versions: when it fights its own battle against a player on 0.4.0 or newer, the player's
   game refuses the battle with a notice, its chat naming both live-battle levels, and the host's computer fights the
   player's side. Two joined players with the same engine (0.4.0 or newer) fight their battle against each other live
@@ -413,7 +427,10 @@ battle between two joined players' nations is resolved by the game.
   (see [Known limitations](#known-limitations)).
 - **Same game data files:** when a live battle starts, the two PCs compare the files of the game's `Data` folder
   (ship drawings aside). If one differs (a mod, an older or damaged install), the battle is fought against the
-  computer, and the chat and the notice name the files.
+  computer, and the chat and the notice name the files. Since 0.6.1 the game's temporary files (names starting with
+  `tmp`, such as `Data\tmpShip.ttp`, which the ship designer rewrites whenever you use it) don't count: from 0.4.1 to
+  0.6.0, once a player had used the ship designer, the chat said "... game data files differ ...: Data\tmpShip.ttp",
+  and their live battles were fought against the computer.
 - **How it works:** both PCs run the same battle, minute by minute, and exchange their orders. One PC leads: the
   host's in a battle against the host; in a battle between two joined players, the PC of the player who starts it
   (the other player's chat names them). That player is the *first player* below, and the other one the *second
@@ -449,7 +466,11 @@ Detaching ships, torpedo and missile salvoes and air strikes work only while the
   the water on both PCs when the next minute starts ("Torpedo salvo fired: ..."). The torpedo dialog closes then: its
   firing solutions hold only for that pause. As in single player, the game offers *Fire torpedoes* only with the
   battle preference *Realism* set to Captain's mode (its third setting); in a live battle the first player's
-  preference counts for both players. Not while your ships are on auto-run: the computer fires their torpedoes.
+  preference counts for both players. The game's default is Rear admiral's mode, so the first player chooses Captain's
+  mode in the *Preferences* before the battle. When the battle starts, both players' chat names its Realism and whose
+  preference it is ("Realism: Rear admiral's mode (...'s battle preference, for both players; ...)"), and the first
+  division report that shows *Fire torpedoes* greyed out says why. Below Captain's mode your ships still fire their
+  torpedoes on their own. Not while your ships are on auto-run: the computer fires their torpedoes.
 - **Air strikes:** the tool bar's *Order an airstrike* (it pauses a running battle) and the reports list's *Launch
   strike* open the game's strike dialog with your own squadrons; *Launch*, *Ready* and *Stand down* work as in single
   player. Strikes fly to the target set at launch: *Confirm target location when spotted* has no effect. The computer
@@ -490,8 +511,8 @@ game resolves the battle.
 again first if it stopped; if you are still connected, press *Leave*, then *Join game*). You get your nation back,
 the battle loads on your PC (also from the title screen), and you command your ships again from its next minute. The
 battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0 or
-newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one); otherwise the computer
-keeps your ships (a host on 0.4.0 or newer tells you why).
+newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1 a new one);
+otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
 
 **When the host's game stops** (it crashes or is closed) during its live battle against a joined player, the joined
 player's game leaves the battle and the session. To go on:
@@ -557,8 +578,12 @@ players' nations for the rest of that month. A battle between two joined players
   Officer messages and the other monthly messages also stay with the host, except the spying check's, the trade
   protection and foreign station warnings (see [Joining a session](#joining-a-session)), and the messages of the
   player's relation routines, money rules and war effects.
-- **Not transferred from joined players:** officers, divisions, and changes to air units (1920s+). Ships, designs,
-  budget, research, training, doctrine, deployments, forts and base improvements are transferred.
+- **Not transferred from joined players:** officers and changes to air units (1920s+). Ships, designs, budget,
+  research, training, doctrine, deployments, forts, base improvements and (since 0.6.1) divisions are transferred.
+- **Divisions of joined players** stay as the player's last turn sent them: battle experience and the host's monthly
+  division training don't change them. They don't shape a live battle against the host, or the second player's side
+  of a live battle between two joined players: the other player's game sets those battles up, and the player's nation
+  is a computer nation there.
 - **Your relations and intelligence on your screen** are your own nation's (see
   [Joining a session](#joining-a-session)). Unless the host and your PC have 0.5.0 or newer, the line under your
   nation's name names your enemy instead of the months at war, which the game keeps only for the host's nation. The
@@ -608,9 +633,9 @@ players' nations for the rest of that month. A battle between two joined players
 - **Resigning** is not possible during a session: leave the session first.
 - **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
   play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same live-battle
-  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one), and a host on 0.4.0 or newer pairs only
-  players with its own (see [Battles between players](#battles-between-players-live)). Joined players use save slot
-  77, and slot 87 for their battles.
+  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1 a new one), and a host on 0.4.0 or
+  newer pairs only players with its own (see [Battles between players](#battles-between-players-live)). Joined players
+  use save slot 77, and slot 87 for their battles.
 - **A host on 0.3.x** passes on the live battles between two joined players on 0.4.0, but can't start such a battle
   again for a player who dropped out: the computer keeps that player's ships to the end of the battle, although the
   other player's chat says they get them back by joining again. Update the host.
@@ -660,16 +685,21 @@ players' nations for the rest of that month. A battle between two joined players
   joined.
 - **"... your game data files differ ..." in the chat:** a file of the game's `Data` folder isn't the same on the two
   PCs (a mod, an older or damaged install), so the live battle is fought against the computer. The message names the
-  files: make them the same on both PCs (Steam's *Verify integrity of game files* puts back the original ones).
+  files: make them the same on both PCs (Steam's *Verify integrity of game files* puts back the original ones). If it
+  names only `Data\tmpShip.ttp` (the ship designer's temporary file, which 0.4.1 to 0.6.0 compared), update everyone
+  to 0.6.1, which leaves that file out.
 - **"... live battles need the same live-battle engine" in the chat** (from a host on 0.4.1 or older: "... the same
   mod version"): both players of a live battle need versions with the same live-battle engine (0.4.1, 0.5.0 and 0.6.0
-  have the same one), and a host on 0.4.0 or newer needs both on its own; until then, such battles are fought against
-  the computer or resolved by the game. See [Upgrading from an older version](#upgrading-from-an-older-version).
+  have the same one; 0.6.1 has a new one), and a host on 0.4.0 or newer needs both on its own; until then, such
+  battles are fought against the computer or resolved by the game. See
+  [Upgrading from an older version](#upgrading-from-an-older-version).
 - **The computer took over your ships in a live battle, or the host's game stopped during one:** see
   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops).
 - ***Fire torpedoes* is greyed out, or ships launch no search floatplanes, in a live battle:** the first player's
-  battle preferences count on both PCs. Manual torpedo fire needs *Realism* set to Captain's mode, and search
-  floatplanes need *Floatplane launch* on *Automatic*.
+  battle preferences count on both PCs. Manual torpedo fire needs *Realism* set to Captain's mode (the game's default
+  is Rear admiral's mode; the chat names the battle's Realism when it starts), and search floatplanes need *Floatplane
+  launch* on *Automatic*. The first player changes them in the *Preferences* before the battle; during a live battle
+  they stay as they are.
 - **"Out of memory" after a long session:** see *Memory over long sessions* in
   [Known limitations](#known-limitations).
 - **"Error in SaveBuildCampaign procedure! Access violation ..." after battles or after joining a session:** fixed in
@@ -679,8 +709,29 @@ players' nations for the rest of that month. A battle between two joined players
   (every month and every live battle) added another copy of every squadron. Update the host (0.3.3 or newer) and load
   the campaign again: it removes the copies. If the message stays, that carrier really carries more aircraft than it
   has room for: open its air group and move squadrons to the reserve.
+- **Every division shows two or more times, or a joined player's *Fleet organization* shows the host's divisions or
+  loses the player's own every month:** before 0.6.1 the divisions doubled each time multiplayer loaded the campaign
+  again, and a joined player's divisions never reached the host. Update the host and the joined players to 0.6.1 and
+  load the campaign again: it removes the copies (the first of each division stays). Divisions that a joined player
+  lost must be made again.
 
 ### Upgrading from an older version
+- **0.6.1** plays with 0.6.0, 0.5.0, 0.4.1, 0.4.0 and 0.3.x (protocol 3). Everyone must update for live battles, the
+  host too:
+  - 0.6.1 has a new live-battle engine (18): the check of the game data files leaves out the game's temporary files
+    (the ship designer's `Data\tmpShip.ttp`). A player on 0.6.0 or older can't fight a live battle with a host or
+    player on 0.6.1: the chat says why ("live battles need the same live-battle engine on both PCs: the host has
+    0.6.1 (engine 18), you have 0.6.0 (engine 17)"), and the battle is fought against the computer or resolved by the
+    game.
+  - Your own divisions need 0.6.1 on your PC. Under a host on 0.6.0 they stay from month to month but never reach the
+    host, and the host's own divisions still double. A player on 0.6.0 under a host on 0.6.1 no longer sees the
+    host's divisions, and their own still never reach the host.
+  - The divisions that a joined player made with 0.6.0 never reached the host and can't be brought back: make them
+    again. A campaign whose divisions 0.6.0 doubled is repaired the first time 0.6.1 loads it: the first of each
+    division stays.
+  - The tension bar's tooltip about wars between players needs 0.6.1 on the PC that shows it. The war line's chat
+    line, and the rule that the host's game declares no war on a player's nation while that player isn't connected,
+    need 0.6.1 on the host.
 - **0.6.0** plays with 0.5.0, 0.4.1, 0.4.0 and 0.3.x (protocol 3). Everyone should update, the host too:
   - Blockades, the raider and submarine war, war weariness, the wartime build rules, the end of a disarmament treaty
     for a joined nation's war and the conference that sees those wars need 0.6.0 on the host; a player on 0.5.0 gets

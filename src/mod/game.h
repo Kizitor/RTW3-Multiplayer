@@ -65,6 +65,13 @@ void SetDesignReadyForBuild(int nationIdx, int i, int months);
 int IntelReportCount(int* unique = nullptr);
 // Air units in the game's global list (all nations); -1 if the list was not found. A load drops the units from before it.
 int AirUnitCount();
+// Campaign divisions (the Fleet organization tab; TfrmBuildCamp.CampaignDivisions, the player's list). A load replaces
+// the list (the game's own load appends to it) and drops repeated divisions and ships the nation doesn't have; a joined
+// player's own slot (LoadCampaign with playerIdx > 0) loads them against the player's nation. False if unavailable.
+bool DivisionsAvailable();
+// The bridge's `divs` (read only): "ok n=<count> nation=<PlayerNation's index> list=<CDivId>:<name>:<ship count>:
+// <ship ids joined by '.'>|..." ('|' and ':' in names become '_').
+std::string CampaignDivisionsInfo();
 
 // Doctrine (Doctrine button): training priorities and the missile storage policy change only after a number of
 // months (Pending* values). The game's monthly ReduceTimeLimits applies them for the host's nation only.
@@ -135,6 +142,8 @@ bool BattlesAvailable();
 void SetBattleSlotMode(bool on);  // a battle slot: the battle screen's close doesn't run the rest of a month
 bool BattleSlotMode();
 bool BattleAftermathSeen();       // the battle ended with the game's aftermath (VP, prestige) in battle slot mode
+// countA/countB: the ships when the battle was found (logged); the routine gets both nations' ships that can fight in
+// the area now, and is not called (false, no battle) if either has none.
 bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& area,
                      std::vector<std::wstring>* texts = nullptr);  // texts: its result box, captured (not shown)
 bool StartPlayerBattle(int attacker, int defender, const std::wstring& area);  // area "": the game picks one
@@ -449,4 +458,9 @@ void OnStrategicTurnRuns();      // DoStrategicTurn runs (outside a battle slot)
 void OnCampaignLoading();        // LoadBuildCampaign is about to load a campaign
 bool InSession();                // a multiplayer session is up on this PC (hosting or joined)
 bool JoinedPlayerPC();           // this PC plays a joined nation in a session: its campaign is the host's copy
+// 0.6.1: nation idx (a real index) is played by a person and the game never declares a war between it and this PC's
+// nation (relations v2: wars between players come only from the players). Host: a joined nation under the player's
+// rules; a joined player's PC: the host's nation and the other nations people play, while the host runs the player's
+// rules for this PC's nation.
+bool WarOnlyByPlayers(int idx);
 }  // namespace hookcb

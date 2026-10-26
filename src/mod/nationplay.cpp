@@ -318,6 +318,8 @@ struct Rec {
     int effort[kNations] = {};
     std::vector<std::string> reports;  // as the game's list holds them: "<Mon yyyy>  <nation> - <text>"
     int fsWarned = 0;                  // the game's LeaderWarnedAboutForeignStations, for this nation
+    bool hasDivisions = false;         // 0.6.1: the nation's campaign divisions from its last turn that sent them
+    std::vector<std::string> divisions;  // ... as [CampaignDivisions] lines (validated, renumbered)
 };
 static std::map<int, Rec> g_recs;
 static std::wstring g_file;
@@ -371,6 +373,7 @@ static void HostSave() {
         d.Set(sec, "IntelEffort", Join(r.second.effort));
         d.Set(sec, "ForeignStationsWarned", std::to_string(r.second.fsWarned));
         PutReports(d, sec + "IntelReports", r.second.reports);
+        if (r.second.hasDivisions) d.sections.push_back({sec + "Divisions", r.second.divisions});
     }
     if (!WriteFileBytes(g_file, WriteIni(d))) Log("nations file: write FAILED (%s)", W2U(g_file).c_str());
 }
@@ -397,6 +400,11 @@ void HostAttach(const std::wstring& slotDir, const std::string& campaignKey) {
         SplitInts(d.Get(sec, "IntelEffort"), r.effort);
         r.fsWarned = atoi(d.Get(sec, "ForeignStationsWarned", "0").c_str());
         r.reports = ReportLines(d.Find(sec + "IntelReports"));
+        if (const IniSection* ds = d.Find(sec + "Divisions")) {
+            r.hasDivisions = true;
+            for (auto& l : ds->lines)
+                if (!l.empty()) r.divisions.push_back(l);
+        }
     }
     Log("nations file: %d joined nations' records loaded", (int)g_recs.size());
 }
@@ -470,6 +478,77 @@ void HostTakeIntelEvent(const KV& kv, int K, std::string& applied) {
     }
     HostSave();
     applied += " intel: " + std::to_string(added) + " reports, effort " + Join(r.effort);
+}
+
+// Campaign divisions. A joined player's game loads the divisions of its slot against its nation (game.cpp,
+// d_LoadDivisions), saves them with its turn, and the host keeps them for the nation: the host's own month only ever
+// sees (and changes) the host's divisions.
+void HostTakeDivisions(const Bundle& sub, int K) {
+    if (!g_attached || K < 1 || K > 8) return;
+    const std::string* f = sub.Get("divisions.ini");
+    if (!f) return;  // a player's mod that doesn't send them (0.6.0 and older): the stored list stays
+    IniDoc d = ParseIni(*f);
+    const IniSection* s = d.Find("CampaignDivisions");
+    std::vector<saveio::CampDiv> divs;
+    std::string err = "no [CampaignDivisions]";
+    if (!s || !saveio::ParseDivisions(s->lines, divs, true, err)) {
+        Log("divisions of nation %d: the turn's list rejected (%s); the stored one stays", K, err.c_str());
+        return;
+    }
+    saveio::DivPrune pr = saveio::PruneDivisions(divs, nullptr);
+    Rec& r = RecOf(K);
+    r.divisions = saveio::DivisionLines(divs);
+    r.hasDivisions = true;
+    HostSave();
+    Log("divisions of nation %d: %d stored (repeats dropped: %d divisions, %d ship ids; %d lead divisions reset)", K,
+        (int)divs.size(), pr.divisions, pr.ships, pr.leads);
+}
+
+int HostPutDivisions(Bundle& b, int K, bool own, const char* what) {
+    if (K < 1 || K > 8) return -1;
+    std::string* off = nullptr;
+    const std::string* bcs = nullptr;
+    for (auto& f : b.files) {
+        if (f.first == "RTWGame{S}.off") off = &f.second;
+        if (f.first == "RTWGame{S}.bcs") bcs = &f.second;
+    }
+    if (!off || !bcs) {
+        Log("divisions of nation %d: the %s has no .off; left as it is", K, what);
+        return -1;
+    }
+    auto it = g_recs.find(K);
+    bool stored = own && g_attached && it != g_recs.end() && it->second.hasDivisions;
+    std::vector<saveio::CampDiv> divs;
+    std::string err, summary;
+    if (stored) saveio::ParseDivisions(it->second.divisions, divs, false, err);
+    int n = saveio::PutDivisions(*off, *bcs, K, divs, summary);
+    if (!own)
+        Log("divisions of nation %d: an empty list in its %s (the player's mod can't load the nation's own)", K, what);
+    else
+        Log("divisions of nation %d: %d in its %s (%s)", K, n, what, stored ? summary.c_str() : "none stored yet");
+    return n;
+}
+
+static std::string DivisionListText(const std::vector<saveio::CampDiv>& divs) {
+    std::string s;
+    for (size_t i = 0; i < divs.size(); i++) {
+        std::string name = divs[i].Get("Name");
+        for (char& c : name)
+            if (c == '|' || c == ':') c = '_';
+        std::string ids;
+        for (size_t j = 0; j < divs[i].ships.size(); j++) ids += (j ? "." : "") + divs[i].ships[j];
+        s += (i ? "|" : "") + divs[i].Get("CDivId") + ":" + name + ":" + std::to_string(divs[i].ships.size()) + ":" + ids;
+    }
+    return s;
+}
+
+std::string HostDivisionsInfo(int K) {
+    if (!g_attached) return "error the joined nations' records are not loaded (host only)";
+    auto it = g_recs.find(K);
+    std::vector<saveio::CampDiv> divs;
+    std::string err;
+    if (it != g_recs.end() && it->second.hasDivisions) saveio::ParseDivisions(it->second.divisions, divs, false, err);
+    return "ok n=" + std::to_string(divs.size()) + " list=" + DivisionListText(divs);
 }
 
 static bool HostIntelCost(int K, int& cost) {

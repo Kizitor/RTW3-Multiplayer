@@ -12,6 +12,7 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
 - [Relations, wars and battles: nation 0's and the others'](#relations-wars-and-battles-nation-0s-and-the-others)
 - [Research speed and the missile era](#research-speed-and-the-missile-era)
 - [Intelligence, trade protection and foreign stations](#intelligence-trade-protection-and-foreign-stations)
+- [Campaign divisions (the Fleet organization tab)](#campaign-divisions-the-fleet-organization-tab)
 - [Tactical battles](#tactical-battles)
   - [Battle commands](#battle-commands)
 
@@ -63,7 +64,9 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   - `frmBuildCamp` (the strategic screen) is the global at `[0xf53000]`; `PlayerNation` is at form +0x3204;
     `BuilderNations` (a TList) at +0xae4.
   - Nation 0 is the save's player. The game mixes "PlayerNation" and "BuilderNations[0]": the Research button used
-    index 0 (fixed in 0.2.8 by hooking `TfrmResearch.Execute`).
+    index 0 (fixed in 0.2.8 by hooking `TfrmResearch.Execute`). A load resolves the officers and the campaign
+    divisions against `PlayerNation` = `BuilderNations[0]`
+    ([Campaign divisions](#campaign-divisions-the-fleet-organization-tab)).
   - Relations: `Tension`/`Allied`/`TechSharing` = the relation with nation 0, `AITension<j>`/`AIAlliance<j>` =
     between nations 1..8, war = tension > 40.
   - Globals: the war counter (`[General] War`) at 0xf52ff4; `EnemyVP` at form +0x4a63.
@@ -78,8 +81,9 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   `DesignFiles<i>.des`. The `.bcs` and `MapData` files are UTF-8 INI with CRLF (the `.bcs` with a BOM), and the `.off`
   file is INI as well; `IniDoc` in `saveio.cpp` keeps their lines intact. `DesignFiles<i>.des` is positional text
   (the mod moves it as a whole file).
-- **Loading a campaign twice in one process.** The game always loads into a fresh process (title screen), and two of
-  `LoadBuildCampaign`'s lists are appended to, not replaced: the intel reports (0.2.2) and the **air units**:
+- **Loading a campaign twice in one process.** The game always loads into a fresh process (title screen), and three of
+  `LoadBuildCampaign`'s lists are appended to, not replaced: the intel reports (0.2.2), the campaign divisions (0.6.1,
+  [below](#campaign-divisions-the-fleet-organization-tab)) and the **air units**:
   `TfrmBuildCamp.LoadAircraftData` (0xd1d420, called only by `LoadBuildCampaign`) creates a `TAirUnit` per
   `[AirUnits]` entry and `TList.Add`s it to the global list (cell 0xf27a88) without clearing it; the game's own
   `ClearAirData` (0xd26700: frees the units and the aircraft types) is called only by the quick battle; the aircraft
@@ -139,8 +143,8 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
     copy), *Move all to reserve*, `RemoveAllAirUnitsFromShip` (scrapping, reparations, a lost possession),
     `ClearAirGroup` and the AI's air group growth and cuts (`AIAddAircraftToAirGroup`,
     `CheckOneShipsOrBaseHasAircraft`).
-  - *Every copy, each with its own random draws:* the month's air routine (0xeaa6ec, from `DoTurn` and
-    `DoStrategicTurn`: training, replacements from the aircraft type's stock, upgrades, roles, elite loss, the AI's
+  - *Every copy, each with its own random draws:* the month's air routine (0xeaa6ec, from `DoStrategicTurn` and the
+    unused `DoTurn`; training, replacements from the aircraft type's stock, upgrades, roles, elite loss, the AI's
     disbanding of reserve units), `MoraleLoss`, `DoPurge`, the upkeep (`GetTotalNavalAirCost`) and the counts per
     nation.
   - So the first copy carries a unit's battle record and strength, the later copies the latest orders made through
@@ -157,7 +161,8 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   and also credits blockades: while the war counter (0xf52ff4) is above 0, for each nation 1..8 with `Tension` > 40,
   `PlayerNation.VP` (+0x175) += (Random(3) + FleetSize) * 20 when that nation is blockaded, `EnemyVP` (+0x4a63) += the
   same when PlayerNation is (FleetSize: `[General] FleetSize`, the global 0xf4c914; 3 in the 1900 test campaign, so
-  60, 80 or 100 a blockade). Its other callers are the month's `DoTurn` (0xce0f87) and `DoStrategicTurn` (0xce1bb9).
+  60, 80 or 100 a blockade). Its other callers are the month's `DoStrategicTurn` (0xce1bb9) and `DoTurn` (0xce0f87),
+  which no code calls.
   `TBuilderNation.IsBlockaded` (0xc618e8) ignores its argument: `CheckBlockade` of the nation's `BuildArea` or
   `BlockadeArea`, true when a nation at war with it has a `GetBlockadeStrength` (its active ships in the area times its
   `BlockadeModifier` (+0x206), plus allies at war) above `GetMinimumBlockadeStrength` (FleetSize * 8 + 16) and above the
@@ -201,6 +206,17 @@ The game is written for one player, nation 0; it runs every other nation, a join
   disarmament treaty ends; [the treaty](#the-disarmament-treaty-and-the-submarine-ban)) and zeroes every nation's
   DisplacementLimit and BuildConstraint. Since 0.4.1 a PC whose PlayerNation is nation
   K > 0 shows K's relations (the relations view, ARCHITECTURE).
+- **The tension bars and the war line** (static, 2026-10-25, 1.01.44; live: `relview`): the panel `pnTension` (DFM
+  Height 251) holds a static TShape `WarLine` (form +0x4b8, Top 43, Width 396; no code touches it) and one bar
+  `Tension<i>` per slot. `ShowOneTensionLevel` sets the bar's Height to Tension x 20 (`TControl.SetHeight` 0x980f90)
+  and its Top to the panel's height minus that (`SetTop` 0x980f24): the bars grow upward, cross the war line at
+  Tension 11 (above 10.4) and fill the panel at about 12.6; its colour is `GetTensionColor` 0xd10c80 (< 4 green
+  0x8000, 4-6 olive 0x8080, 7-9 yellow 0xffff, 10-20 orange 0x80ff, 21 and more red 0xff) and its hint "Tension with
+  X is t" (above 40 "You are at war with X"). The line only marks where a computer nation's war gets likely
+  (`CheckForWar` below: a declaration at 13 plus the nations at war with the player, 12 with chances); the game
+  reads no line. Between two nations people play the mod never lets the game declare a war, so 0.6.1 adds to their
+  bars' hints that wars between players come only from the players, and tells both players once in the chat when their
+  tension crosses the line (ARCHITECTURE, [each joined nation's relations](ARCHITECTURE.md#each-joined-nations-relations-relations-v2)).
 - **The war counter** `[General] War` (global 0xf52ff4; `0xccd5fc` = War > 0) is nation 0's: months at war (> 0) or
   at peace (<= 0); `WarStartsWithNation` 0xd333bc sets 1 when it was <= 0, DoStrategicTurn (0xce1f69) adds 1 at war and
   subtracts 1 at peace (at -2 a clean-up 0xd26fc8 runs), `DoPeace` ends the war (War := 0, every nation's
@@ -281,6 +297,28 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   both in the area, Random(10) < the counts, then a size-based chance) -> `DoBattleBetweenAINations` (resolved without
   a battle screen; the mod defers a joined nation's battle to its battle phase). A joined nation with a low index
   usually attacks.
+- **`DoBattleBetweenAINations` needs a ship of each side that can fight in the area** (2026-10-26, static and live,
+  for 0.6.1). `DoBattleBetweenAINations(NationA, NationB, ShipCountA, ShipCountB, anArea)` 0xd32104 (rva 0x502104)
+  plays n + 1 rounds: n = min(ShipCountA, ShipCountB) (3 when above 6), -1 (50 %) or +1 (25 %) at random, +1 when
+  exactly one nation's +0x1ea byte is set (no round when n < 0); each round picks one side's ship (50 %) with the
+  nested picker 0xd31f78: up to 11 times `GetRandomShipInArea(anArea, nation, [ssActive, ssTradeProtection, ssRaider,
+  ssColonies])` (0xd10d60; the set word 0x0059 at 0xd31fbc) and then `TCampaignShip.IsOperational` on the pick
+  **without a nil check** (0xd31fa4). `GetRandomShipInArea` makes 31 passes
+  over the nation's ships (`LocationArea` +0x82 = anArea, `IsOperational`, `Status` in the set; taken when
+  Random(100) < 3 * pass, pass 1..31) and returns nil when the nation has no such ship: `IsOperational` 0xd53d64
+  starts with `movzx edx, byte ptr [eax+0xac]` (`Status`), so the AV reads address 0xAC, and the routine's except
+  handler (0xd3270a) shows "Error in DoBattleBetweenAINations procedure!" with the message, a modal TMessageForm on the
+  main thread. When the picks happen to take only the side that has ships, the battle "is fought" against a fleet that
+  is not there. Its only caller, `CheckAivsAIBattleInArea`, calls it only when `CountShipsInArea(stAll, anArea, [same
+  set])` (0xc5d958; `IsOperational` and the status test too) is above 0 for both nations, with those counts; neither
+  sets anything else (no `BattleArea`/`BattlePossession`). `IsOperational`: `Status` not 7 (ssInterned) or 9
+  (ssMuseum), `RepairTime` (+0x25) 0, `InPlay` (+0x41). TShipStatus: ssActive, ssRes, ssMB, ssTradeProtection,
+  ssRaider, ssToRaider, ssColonies, ssInterned, ssSunk, ssMuseum, ssWorkingUp, ssTraining. The mod's
+  `ResolveAIBattle` counts both sides the same way and calls nothing when either is 0 (MODLOG 2026-10-26).
+- **An address in a game error box is absolute.** RTW3.exe has ASLR (the analysis image is at 0x830000, the game's
+  preferred base is 0x400000, a run may have another): the RVA is the address minus that run's base. The mod's start
+  lines print absolute addresses of routines whose RVA is known, e.g. `random=000E7834` (RVA 0x7834): base 0xE0000,
+  so the box's 00603D64 was RVA 0x523D64, `TCampaignShip.IsOperational` (0xd53d64 in the image).
 - **`AIDeclinesBattle`** 0xcd2188 (from `CheckAttackLocation`): when the AI side declines, "The <nation> navy declines
   battle! You gain N VP!" and PlayerNation's VP += N (`add [eax+0x175], edx`), before any preview (the battle setup
   `DoBattle` is not entered). The player's own decline in the preview gives the enemy VP ("Decline will give the enemy
@@ -386,8 +424,11 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   `CheckIntelligence`; else `RandomTensionChanges` (also after an intelligence report, 1 in 10 at war, 1 in 8 at peace);
   then at peace `TensionEffectOfPreviousWars` (War < -6: per nation, months since the last war with it from the month
   records, form+0x795f.. per year 0x4B0 / month 100: opponents and outcome, via `CheckWarsWithNation` 0xd4ddc4; -1 with
-  "because of previous war." and similar). `CheckForWar` runs from `DoTurn` and from `DoEndOfTurn` (after
-  `ShowTurnMessages`). `ShowTurnMessages` 0xc8e3c8 shows the form's `TurnMessages` (+0x3208, a TStringList) in
+  "because of previous war." and similar). `CheckForWar` runs once a month, after these: from `DoEndOfTurn` (0xcfcdb3,
+  after `ShowTurnMessages`, unless `GameOver` +0xa05). The month is `btbnTurnClick` → `DoTurn2` → `CheckForBattles2` →
+  `DoStrategicTurn` (`CheckTurnEvents` 0xce1e42, the war step, `WarHelpFromAllies` 0xce218f, `CheckBuildingShipsForWar`
+  0xce21c5) → `DoEndOfTurn` 0xce21f4 (a battle's end reaches `DoStrategicTurn` through `FormClose`); its other call
+  site, 0xce100c, is in `DoTurn` 0xce09f4, which no code calls. `ShowTurnMessages` 0xc8e3c8 shows the form's `TurnMessages` (+0x3208, a TStringList) in
   `dlgCampTurnRep` ("Turn messages", modal) when it is not empty, and leaves the list as it is.
 - **`CheckForWar` in detail** (per nation i with tension < 40): `CheckIfAlliedNationIsAtWar(i)` (i allied with both
   sides of a war of nation 0 picks one: "X cancels their alliance with us ..."), common enemy -1; at peace a surprise
@@ -402,6 +443,23 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   war on us in N months!"; else the plan dropped ("no longer considering war with us a risk"); then the volunteers
   (tension 0, not allied, nation 0 at war, 10 %); after the loop BudgetModifier +1 for everyone not at war when a war
   started, and `DoSurpriseAttack`.
+- **CheckForWar's decision for one nation, exactly** (static, 2026-10-25, 1.01.44; T = B_i's `Tension` +0x256, W =
+  `WillGoToWar` +0x1bd, War = nation 0's counter 0xf52ff4, n = `CountNationsAtWarWithPlayer` 0xcc402c): a nation at
+  T >= 40 is skipped altogether (0xc84f9c `cmp T,0x28; jge` the next nation: at war, or at exactly 40, it never
+  declares; the mod stops tension changes at 40). Otherwise, after the common-enemy -1 and the surprise landing:
+  W := max(0, W - 1); with W > 0 and T < 7, Random(12) > T raises T by 1; with W > 0 only the rumours ("Our diplomats
+  report that there are rumours in X about war with us!", Random(100) < 5 x IntelEffort + 20) and no declaration;
+  else at T >= 8, Random(180) < T and War < -48 the rumours (0xc85241) and no declaration; else the declaration
+  (0xc853d6: W := 0, T := 13, the message, `WarStartsWithNation`) when T >= 13 + n, or T = 12 (Random(100) < 3; < 6
+  with +0x179 > 0; < 50 when n < 2), or T >= 11 + n with War > 2 (Random(100) < 20 - n), or T >= 10 + n with War > 2
+  (Random(100) < 2 - n); else at War < -48, not at war with a computer nation, T >= 11 (10 with government 4 or 5): 5 %
+  a war plan W = 3 + Random(6) and the spy report ("Our spy in X reports that they plan to declare war on us in N
+  months!" or "According to our spy network in X, their government plans on war with us within the next six
+  months!"); else the plan dropped ("... is no longer considering war with us a risk!"). So far above the war line a
+  nation without a plan declares in the month (T >= 13 + n), unless a long peace (War < -48) turns it into rumours
+  (Random(180) < T); a plan delays the war to its end. Live (the 1900 campaign): a joined nation at 15 with a computer
+  nation got its war in its relation turn ("War has broken out between Germany and Russia" on 0.6.0, "Germany and
+  Russia are now at a state of war!" on 0.6.1-dev).
 - **CheckForWar's surprise landing and takeover in detail** (static, 2026-10-23, 1.01.44; live with B6 piece 2): for B_i
   with Tension < 40 (0xc84f9c) while War <= 0 (0xc84fa9) with the trait (+0x1f3) or GovernmentType 4, or 5 and
   Random(100) < 30, and (`WillGoToWar` = 1 or Tension >= 10 and Random(300) < Tension): Tension := 14 (0xc85014), then
@@ -796,6 +854,54 @@ Which routines act for nation 0 (the save's player) only: `CheckTurnEvents` and 
   PLAYER's spies: `SpySuccess`'s "<nation> is secretly spending an additional 10% on the navy above their official
   figures" adds a fifth of the target's budget to its Funds.
 
+## Campaign divisions (the Fleet organization tab)
+Static reading of 1.01.44 and live runs of 2026-10-25 on 0.6.0 and 0.6.1-dev
+([MODLOG](../MODLOG.md#fix-2026-10-25-campaign-divisions-of-joined-players-and-duplicated-divisions-v061)).
+
+- **The screen.** The strategic screen's tabs (`TabControl1`) are Map, Ships in service, Ships under construction,
+  Submarines, Coastal fortifications, Ships sunk or scrapped, Area overview, Base overview, Officers and Fleet
+  organization (index 9: the panel `pnDivisionEditor` with *New division* `bnNewDiv`, *Expand all*, *Collapse all*,
+  *Clear assignments*, a filter and the list view `lvDivisions`). `FillDivisionList2` (0xd39c14, called after every
+  change of a division) fills `lvDivisions` with every campaign division and its ships (`DoCampDivShipLine`). A row's
+  Data holds its division or ship; the rows' popup menu (*Add ships to division*, *Clear all ships from division*,
+  *Dissolve division*, *Rename division*, *Set division role*, *Move division*, *Schedule division training*, *Mobilize
+  division*, ...) works on the first selected row. *New division* and *Rename division* open `TdlgCreateDivision`
+  (type, name, abbreviation); *Add ships to division* (`AddShipToDivision`) opens `TdlgSelectShip` with PlayerNation's
+  ships of the division's type. *Ships in service* lists PlayerNation's ships with their division
+  (`GetCampaignDivisionForShip`). `TfrmCampOverview` ("Campaign force listing") is the Steam and Iron campaign's
+  (`TfrmCampaign.bnOverviewClick`), not the strategic game's.
+- **One list, the player's.** `TfrmBuildCamp.CampaignDivisions` (+0xaf0) is a `TList` of `TCampaignDivision`, made by
+  `FormCreate` (0xc795a3) and freed by `FormDestroy`; the game keeps no campaign divisions for the other nations. A
+  division holds `CDivId`, `Name`, `Ships` (a `TList` of `TCampaignShip`), `LeadDivision` (another division) and the
+  saved fields below. `TCampaignDivision.Create` (0xd60680) takes `CDivId` from the campaign's `[General] IDNo` counter
+  (0xd79de4, as a new air unit's `AirUnitId`), so it is unique in a campaign the game saved.
+- **The save.** The slot's `.off` (INI; the game's reader 0xab6fc8 takes the file, section, key and default),
+  `[CampaignDivisions]`: `CampDivNo=<n>`, then for each i < n `CampDiv<i>CDivId`, `Name`, `Abbreviation`,
+  `DivisionType` (e.g. CA 3, DD 9), `DivisionExperience`, `Training`, `Commander` (an officer id), `LeadDivision` (a
+  `CDivId`), `Role`, `ShipCount` and `ShipId<j>` (the ships' `CShipId`, the `.bcs`'s `Ship<n>Id`); -1 = none, booleans
+  0/1. `SaveBuildCampaign` (0xc8f20d) writes `[Officers]` from `PlayerNation.OfficerList` (+0x115), then the divisions.
+- **The load appends, against nation 0.** `LoadBuildCampaign` sets `PlayerNation := BuilderNations[0]` (0xc9a69d),
+  loads `[Officers]` into `PlayerNation.OfficerList`, runs `ConnectOfficersToShips`, then calls
+  `TfrmBuildCamp.LoadCampaignDivisions(CampaignDivisions, file, 'CampaignDivisions')` (0xd37054; Self in EAX, the list
+  in EDX, the file in ECX, the section name on the stack, `ret 4`). It never clears the list: for each of `CampDivNo` it
+  calls `TCampaignDivision.Create`, `TList.Add` and `LoadMe`, then sets the `LeadDivision` links with
+  `GetCampaignDivisionWithId` (the first match). `TCampaignDivision.LoadMe` (0xd607ac) takes the commander from
+  `PlayerNation.GetOfficerWithId` and adds `FindCShipWithId(PlayerNation, id)` to `Ships` without a nil check
+  (0xd60a96-0xd60aa0): an id the nation doesn't have (sunk, captured, another nation's) leaves a nil entry that the
+  *Fleet organization* dereferences. So a save's divisions are right only for nation 0 of the load, and every further
+  load in the same process adds them again; the next save writes every copy.
+- **Who uses them.** The *Fleet organization*, its dialogs, the ship list's division column and the month's question
+  "Some ships or divisions have no commander assigned. Do you want to have ship and division commanders assigned
+  automatically! ..." (Yes gave the copies of doubled divisions admirals, seen on 0.6.0) all work on the one list and
+  PlayerNation. The battle generator (the quick-battle unit, the callers of `GetRelatedDivision`) builds the player's
+  side of a battle from the campaign divisions, and only that side. Seen live 2026-10-25: in a joined player's battle
+  slot (its nation is nation 0 there) `ls forces div` listed its division "K Div 1" as side 0's division 0.
+- **What the mod does** (0.6.1; ARCHITECTURE,
+  [Each joined player's campaign divisions](ARCHITECTURE.md#each-joined-players-campaign-divisions-061)): the
+  `LoadBuildCampaign` hook takes the divisions out of the list before every load and frees them after a successful one
+  (the list view filled again first); a hook of `LoadCampaignDivisions` drops repeated `CDivId`s and nil ships after the
+  call and, for a joined player's own slot, makes `PlayerNation` the player's nation during the call.
+
 ## Tactical battles
 The battle facts, gathered since the battle investigation of 2026-10-14; the later findings carry their dates.
 
@@ -1090,7 +1196,13 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
   - *The UI path.* `TdlgDivisionReport.bnTorps` ("Fire torpedoes") is enabled by the report's `FormShow` (0xae22ca) only
     when the battle preference *Realism* is above its second level (`[0xf278b4]^+0x56` > 1, the record
     `TdlgPrefs.Execute` fills from `rgRealism.ItemIndex` at 0xe09143; one of the battle preferences a live battle's B
-    takes from A). `bnTorpsClick` (0xae1594): if the list view's selected ship has `FiredMountThisTurn` (+0xb1a), the
+    takes from A). The levels are the radio group's items: 0 "Admiral's mode", 1 "Rear admiral's mode", 2 "Captain's
+    mode". The game's default is 1: `TdlgPrefs.LoadPrefs` reads `RealismSetting` with the default 1 (`push 1` before
+    the `ReadInteger` call at 0xe0b698), so under the default the button stays off (2026-10-25, 0.6.1; nothing else in
+    the class writes the button: `FormShow` is the only access of +0x4bc). The automatic torpedo fire
+    (`CheckTorpedoTargetsForAllShips` and the routines it calls, 0xda7688..0xda9c00, `FireMount` with `Manual` = 0)
+    reads no preference, so ships fire their torpedoes on their own at every level. `bnTorpsClick` (0xae1594): if the
+    list view's selected ship has `FiredMountThisTurn` (+0xb1a), the
     message "Ship has fired mount this turn! Only one mount can be manually fired each turn." and nothing else; else
     `SelectedShip` (+0x7dc) := that ship or the division's flagship, `SelectingTorpedoTargetFromDivReport` (+0x7b1) :=
     1, `dlgTorpTargets` (`Missiles` +0x468 := 0, caption "Select torpedo target", `FillShipTargetList(ship, lbTargets,
@@ -1298,13 +1410,13 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     `IdentifyType`, `AttackShips` and `ShowMissileRanges`) and `IdentifyType` read three unit Booleans (0xf54935,
     0xf54936, 0xf54937: a battleship, a battlecruiser, a carrier (CV or CVL) exists; cells 0xf26dc8, 0xf27b34,
     0xf26df0). Only `TfrmBuildCamp.CheckShipTypesExist` (0xd4e314) writes them, from every nation's ships in play
-    (`CountShipsOfType(type, InPlay)` for nations 0..8), and only `ReduceTimeLimits` calls it (from `DoTurn` and
-    `DoStrategicTurn`: the month's processing). So they hold what this process's last processed month left: 0 in a
-    game that never processed a month (a joined player's, or the host's first battle after its game started), the
-    campaign's after one. The rules: a battleship whose roll says "mistaken" (Random(100) < 21) becomes a battlecruiser
-    if the year is before 1907 or a battlecruiser exists, else a heavy cruiser (no extra draw); a carrier or light
-    carrier becomes a heavy cruiser if no carrier exists; a ship identified as a battleship when none exists draws
-    another Random(100) (0xe49e36) for a pre-dreadnought or heavy cruiser. The 0.4.1 RC's lockstep_strike DESYNCs
+    (`CountShipsOfType(type, InPlay)` for nations 0..8), and only `ReduceTimeLimits` calls it (from `DoStrategicTurn`,
+    the month's processing, and from `DoTurn`, which no code calls). So they hold what this process's last processed
+    month left: 0 in a game that never processed a month (a joined player's, or the host's first battle after its game
+    started), the campaign's after one. The rules: a battleship whose roll says "mistaken" (Random(100) < 21) becomes a
+    battlecruiser if the year is before 1907 or a battlecruiser exists, else a heavy cruiser (no extra draw); a carrier
+    or light carrier becomes a heavy cruiser if no carrier exists; a ship identified as a battleship when none exists
+    draws another Random(100) (0xe49e36) for a pre-dreadnought or heavy cruiser. The 0.4.1 RC's lockstep_strike DESYNCs
     (minutes 53 and 74) parted exactly there: the host had processed 1935 months (flags 1), the joined player not (0);
     the identification differed silently from minute 47, and the epoch after the first resync parted at the same draw
     with the identification equal at its boundary. No display path wrote the identification (the display's only writer
@@ -1593,6 +1705,15 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     `Data\IDes\<n> in Coastal Battery.sdf`, the ensigns in `Flags\*.bmp`, and the battle's save files (slot 87 on B:
     `RTWGame<n>.sac/.bcs/.off/.sta`, `MapData<n>.dat`, `DesignFiles0-8.des`). The minutes open no game file (only the
     slot's files). At its start the game reads the other `Data` tables and 384 of `Data\Graphics`' drawings.
+  - *The game's temporary files in `Data`* (static, 2026-10-25;
+    [MODLOG](../MODLOG.md#fix-2026-10-25-the-ship-designers-temporary-file-no-longer-stops-live-battles-v061)): the
+    only `tmp` file name in the game is `'\Data\tmpShip.ttp'` (0xb17bb8). A `TfrmDesignMain2`
+    routine (0xb1765c, 25 callers, all the ship designer's own handlers: `FormShow`, `bnNewShipClick`, the turret and
+    torpedo mount buttons, ...) writes it (0xb02fa8: 4 callers, all designer handlers) and reads it back
+    (`LoadShipGraphic`): every use of the designer rewrites it, no battle opens it (the file-open probe of a live
+    battle on both copies, 2026-10-25). `Data\tmpMapData.dat` is named nowhere in the game's image or the launcher (a
+    file of the install, never written). On a PC used for three weeks of tests only `tmpShip.ttp` had a write date
+    after the install. The live battles' data-file check leaves `tmp*` out since engine level 18.
 
 ### Battle commands
 From a static reading of 1.01.44 on 2026-10-16 (no game run; summary and evidence in

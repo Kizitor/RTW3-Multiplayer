@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_test  # noqa: E402
 import rtw3ctl as ctl  # noqa: E402
 from e2e_test import dismiss_dialogs  # noqa: E402
-from ui_mp import IDS, mp_window, text, windows_of  # noqa: E402
+from ui_mp import IDS, combo_items, mp_window, text, windows_of  # noqa: E402
 
 H, C = 47701, 47702
 CLIENT_SLOT = 77
@@ -5163,7 +5163,8 @@ def scenario_battle_generator(ctx):
     replays its attempts in order (fought: merged); d) risk 4: a request of each kind (`battles injectgen`, `battles inject`)
     declined on the client is merged ("the player declined battle"), never resolved by the game (a preview without an
     enabled Decline is fought); e) `battles aitest 1 J area`: the game's resolution with its result box captured, no
-    box on the host. The war ends at the end."""
+    box on the host; e2) (0.6.1) `battles aitest` where nation J has no ship that can fight: no battle, the game's routine
+    not called (it read a nil ship: "Error in DoBattleBetweenAINations procedure!"). The war ends at the end."""
     K = 1
     for port, who in ((H, 'host'), (C, 'client')):
         ln = log_lines(log_since(port), r"Player's battle generator for joined nations")
@@ -5307,7 +5308,25 @@ def scenario_battle_generator(ctx):
           'fought) captured on the host (log "picture message captured"), none shown',
           m and (m[1] == '0' or int(m[2]) >= 1) and not any(e2e_test.class_name(w) == 'TdlgPictureMessage'
                                                            for w in top_windows(ctx.hp)),
-          dict(reply=r, log=log_lines(log_since(H, hm), r'picture message captured')))
+          dict(reply=r, log=log_lines(log_since(H, hm), r'picture message captured|ResolveAIBattle')))
+    # e2) 0.6.1: the game's routine picks each round's ship without a nil check; a side without a ship that can fight
+    # in the area is no battle, the routine is not called (before: the box "Error in DoBattleBetweenAINations
+    # procedure! Access violation ... Read of address 000000AC", which held the host's main thread)
+    theirs = fighting_ships_by_area(J)
+    empty = next((a for a, n in sorted(fighting_ships_by_area(K).items(), key=lambda x: -x[1])
+                  if theirs.get(a, 0) == 0), None)
+    if empty:
+        hm, t_e = log_mark(H), time.time()
+        r = cmd(H, f'battles aitest {K} {J} {empty}')
+        ln = log_lines(log_since(H, hm), r'ResolveAIBattle')
+        check(f'e2) `battles aitest {K} {J} {empty}` (nation {J} has no ship there that can fight): "ok fought=0 '
+              f'captured=0", host log "ResolveAIBattle {K}-{J} in {empty}: no battle (ships that can fight there: n/0; '
+              f'...)", no game error box',
+              r == 'ok fought=0 captured=0' and any(f'ResolveAIBattle {K}-{J} in {empty}: no battle (ships that can '
+                                                    f'fight there: ' in x and '/0;' in x for x in ln)
+              and not game_error_boxes(t_e), dict(reply=r, log=ln[-2:]))
+    else:
+        log(f'  e2) no area where nation {K} has ships and nation {J} none: not checked')
     peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() else 5)
 
 
@@ -5979,6 +5998,134 @@ def _arms_treaty(ctx):
                 cmd(port, f'nfield {n} TreatyTonnageLimit {v}')
 
 
+def scenario_relations_war(ctx):
+    """0.6.1: the tension bar above the war line (a 0.6.0 report: "The tension bar when exceeds the critical threshold
+    and no war is declared for non host"). a) nation 1 under the player's rules, a computer nation J at peace with
+    everyone and without a war plan against it, their tension 15 (+ nation 1's wars: CheckForWar declares at 13 + the
+    nations at war with the player) on both copies, nation 1's war counter -10 for the month (`kwar 1 -10`: at War < -48
+    CheckForWar's rumours (Random(180) < tension) may take the declaration's place): nation 1's relation turn of the
+    next month (RandomTensionChanges, TensionEffectOfPreviousWars, then CheckForWar once, as the game's month) declares
+    the war: war 1-J on both copies, the client's "relations for nation 1 sent: ... ran=...war" and the host's "war 1-J",
+    the game's war message among the client's boxes. b) the tension between the players 25 on both copies (the host's
+    war-line memory cleared first, `warline forget`): after the month the other player's tension bar on both PCs (host
+    slot 1, client slot 1 = the host's nation) says that wars between players are declared only by the players (`relview`),
+    no computer nation's bar does, `warline` lists the people's nations on both PCs, the chat line "* Tension between
+    <host's nation> and <nation 1> is N, above the war line. ..." once on each PC and not again (`warline check`: told=0),
+    no war 0-1; the stand-in's nation 2 (reserved, its player not connected) is a person's on both PCs too: its bar has
+    the hint while at peace with it, `warline` lists it (0.6.1: the host saw it as a computer nation before). Ends at
+    peace (`peacetest 100 2 1`), the tension 0-1 and nation 1's war counter as they were."""
+    hp, cp = ctx.hp, ctx.cp
+    K = 1
+    ver = build_version() or ''
+    if tuple(int(x) for x in re.findall(r'\d+', ver.split('-')[0])[:3]) < (0, 6, 1):
+        log(f'  relations_war: the build under test is {ver or "unknown"}; the war line\'s messages came with 0.6.1: '
+            f'skipped')
+        return
+    rr = relrules(H)
+    pl0 = peacelast(C)
+    check('start: nation 1 follows the player\'s rules (`relrules`) and the client has a B4 host (`peacelast` host=1)',
+          rr is not None and K in rr and pl0.get('host') == '1', dict(relrules=rr, client=pl0.get('raw', '')[:200]))
+    if not (rr and K in rr and pl0.get('host') == '1'):
+        return
+    cmd(H, 'mpwindow')
+    cmd(C, 'mpwindow')
+    nt = nation_table()
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    will = (re.search(r'will=([\d.]+)', cmd(C, 'rellast')) or [None, ''])[1].split('.')
+    cands = [j for j in range(3, 9) if j not in humans and j in nt and rel(K, j).get('war') == '0' and
+             rel(K, j).get('ally') == '0' and (len(will) != 9 or will[j] == '0') and
+             not any(rel(j, x).get('war') == '1' for x in range(9) if x != j)]
+    if not cands:
+        check('setup: a computer nation at peace with everyone, not allied with nation 1, no war plan against it', False,
+              dict(nations=nt, will=will))
+        return
+    J = cands[0]
+    nH, nK, nJ = nt[0]['name'], nt[K]['name'], nt[J]['name']
+    wars = [x for x in range(9) if x != K and rel(K, x).get('war') == '1']
+    t_kj = 15 + len(wars)
+    kw0 = (kwar_counters(H) or {}).get(K)
+    t01 = int(rel(0, K).get('tension', 5))
+    log(f'  relations_war: nation {K} {nK} and the computer nation {J} {nJ} (tension {t_kj}; nation {K}\'s wars {wars}, '
+        f'war counter {kw0}); the players {nH}-{nK} at {t01} -> 25')
+    for port in (H, C):
+        cmd(port, f'settension {K} {J} {t_kj}')
+        cmd(port, f'settension 0 {K} 25')
+    cmd(H, f'kwar {K} -10')
+    wf = cmd(H, 'warline forget')
+    hc0, cc0 = chat(hp), chat(cp)
+    n_box = len(BOX_SEEN)
+    hmark0, cmark0 = log_mark(H), log_mark(C)
+    run_month(ctx, 'relations_war M1')
+
+    # a) the computer nation's war, from nation 1's relation turn
+    hr, cr = rel(K, J), value(cmd(C, f'rel {K} {J}')) or ''
+    sent = [x.split('] ', 1)[-1] for x in log_lines(log_since(C, cmark0), r'relations for nation 1 sent: ')]
+    applied = [x.split('] ', 1)[-1] for x in log_lines(log_since(H, hmark0), r'relations of .*\(nation 1;')]
+    boxes = [t for _, w, _, t in BOX_SEEN[n_box:] if w == 'client' and nJ in t and re.search(
+        r'declared war on us|state of war|War has broken out between|joined the war against', t)]
+    check(f'a) nation {K}\'s relation turn ran CheckForWar after the tension routines and {nJ} went to war with it '
+          f'(tension {t_kj}): war {K}-{J} on both copies, the client\'s "ran=...war", the host\'s "war {K}-{J}", the game\'s '
+          f'war message on the client', hr.get('war') == '1' and 'war=1' in cr and
+          any(re.search(r'ran=(tension,)?previous wars,war', x) for x in sent) and
+          any(re.search(rf'war {K}-{J}(\D|$)', x) for x in applied) and bool(boxes),
+          dict(host=hr, client=cr, sent=[x[:300] for x in sent], applied=[x[:300] for x in applied], boxes=boxes[:3]))
+
+    # b) the players: the bars' hints, the chat line once, no war
+    tail = (' - played by a person: wars between players are declared only in the Multiplayer window (Diplomacy), '
+            'never by the game')
+    line_re = re.compile(rf'\* Tension between {re.escape(nH)} and {re.escape(nK)} is (\d+), above the war line\. Wars '
+                         r'between players are declared only by the players \(Multiplayer window, Diplomacy\); the game '
+                         r'will not declare one\.')
+    hc, cc = wait_month_chat(hp, hc0), wait_month_chat(cp, cc0)
+    hn, cn = len(line_re.findall(hc)) - len(line_re.findall(hc0)), len(line_re.findall(cc)) - len(line_re.findall(cc0))
+    told = [x.split('] ', 1)[-1] for x in log_lines(log_since(H, hmark0), r'war line: ')]
+    wc = cmd(H, 'warline check')
+    hc2, cc2 = chat(hp), wait_until(lambda: chat(cp), lambda t: len(line_re.findall(t)) > len(line_re.findall(cc)), 3)
+    check(f'b) the chat line "* Tension between {nH} and {nK} is N, above the war line. ..." once on each PC '
+          f'(got {hn}, {cn}) and not again (`warline check`: {wc})', wf.startswith('ok') and hn == 1 and cn == 1 and
+          'told=0' in wc and len(line_re.findall(hc2)) == len(line_re.findall(hc)) and
+          len(line_re.findall(cc2)) == len(line_re.findall(cc)),
+          dict(host=line_re.findall(hc)[-1:], client=line_re.findall(cc)[-1:], log=[x[:300] for x in told]))
+    hv, cv = relview(H), relview(C)
+    hs, cs = (hv or {}).get('slots', {}), (cv or {}).get('slots', {})
+    comp = [(who, i) for who, sl in (('host', hs), ('client', cs)) for i in range(1, 9)
+            if i != K and i != STANDIN and sl.get(i, {}).get('hint', '').endswith(tail)]
+    wh, wcl = cmd(H, 'warline'), cmd(C, 'warline')
+    check(f'b) the other player\'s bar says wars between players come only from the players: host slot {K} '
+          f'"Tension with {nK} is N{tail}", client slot {K} (the host\'s nation) "Tension with {nH} is N...", no '
+          f'computer nation\'s bar; `warline` people: host {K}, client 0', bool(hs) and bool(cs) and
+          hs.get(K, {}).get('hint', '').startswith(f'Tension with {nK} is ') and hs[K]['hint'].endswith(tail) and
+          cs.get(K, {}).get('hint', '').startswith(f'Tension with {nH} is ') and cs[K]['hint'].endswith(tail) and
+          not comp and re.search(rf'people=(\S*,)?{K},', wh) and re.search(r'people=0,', wcl),
+          dict(host=hs.get(K), client=cs.get(K), computer=comp, warline=(wh, wcl)))
+    if STANDIN in nt:  # 0.6.1: a nation reserved for a player who isn't connected is played by a person on both PCs
+        hsd, csd = rel(0, STANDIN), value(cmd(C, f'rel {K} {STANDIN}')) or ''
+        hh, ch = hs.get(STANDIN, {}).get('hint', ''), cs.get(STANDIN, {}).get('hint', '')
+        ph, pc = hsd.get('war') == '0', 'war=0' in csd
+        check(f'b) the stand-in\'s nation {STANDIN} {nt[STANDIN]["name"]} (reserved; players: '
+              f'{lsn(H).get("players")}) is played by a person on both PCs: its bar has the hint at peace (host '
+              f'{"at peace" if ph else "at war"} with it, client {"at peace" if pc else "at war"}), `warline` people '
+              f'lists it on both', hh.endswith(tail) == ph and ch.endswith(tail) == pc and
+              bool(re.search(rf'people=(\S*,)?{STANDIN},', wh)) and bool(re.search(rf'people=(\S*,)?{STANDIN},', wcl)),
+              dict(host=hh, client=ch, rel=(hsd, csd), warline=(wh, wcl)))
+    h01, c01 = rel(0, K), value(cmd(C, f'rel 0 {K}')) or ''
+    check(f'b) no war between the players ({nH}-{nK}: tension {h01.get("tension")} on the host)',
+          h01.get('war') == '0' and 'war=0' in c01 and int(h01.get('tension', 0)) >= 11, dict(host=h01, client=c01))
+
+    # ends at peace (the game's peace in nation 1's view), the players' tension and nation 1's war counter as they were
+    if any(rel(K, x).get('war') == '1' for x in range(1, 9) if x not in humans):
+        cmark, hmark = log_mark(C), log_mark(H)
+        r = cmd(C, 'peacetest 100 2 1')
+        wait_peace(ctx, cmark, hmark)
+        hr = rel(K, J)
+        check(f'end: peace {K}-{J} (peacetest 100 2 1): the war is over on the host', r == 'ok' and hr.get('war') == '0',
+              hr)
+    for port in (H, C):
+        cmd(port, f'settension 0 {K} {t01}')
+    if kw0 is not None and not any(rel(K, x).get('war') == '1' for x in range(9) if x != K):
+        cmd(H, f'kwar {K} {kw0}')
+
+
 def scenario_war_effects(ctx):
     """0.6.0 (B5): the player's war effects for nation 1 under the player's rules. A computer nation J at war with nation 1
     and a computer ally X of nation 1 at war with J (`settension`/`setally` on both copies), the host at peace.
@@ -6504,9 +6651,15 @@ def scenario_player_copy(ctx):
     check('f) client `load 78 0`: slot 78, playerIdx 0, campaign loaded (startBuild 2), no dialog',
           r == 'ok' and (st.get('slot'), st.get('playerIdx'), st.get('startBuild')) == ('78', '0', '2') and not boxes,
           f'{r}; {st}; {boxes}')
-    want_nat = {0: nat0[K], K: nat0[0], **{j: nat0[j] for j in nat0 if j not in (0, K)}}
+    # the others as slot 77 (the copy's source) has them: the client's memory may hold later changes of the session
+    # (relations_war's peace by `peacetest` on the client after slot 77's save: the game scraps the loser's ships, funds)
+    f77 = {j: int(float(b77.get(f'Nation{j}', {}).get('Funds', nat0[j]['funds']))) for j in nat0 if j not in (0, K)}
+    later = {j: (f77[j], nat0[j]['funds']) for j in f77 if f77[j] != nat0[j]['funds']}
+    if later:
+        log(f'  NOTE f): funds (slot 77, the client\'s memory) of nations changed after slot 77\'s save: {later}')
+    want_nat = {0: nat0[K], K: nat0[0], **{j: dict(nat0[j], funds=f77[j]) for j in f77}}
     check(f'f) `nations`: nation 0 = {me} with its session funds/ships {nat0[K]["funds"]}/{nat0[K]["ships"]}, nation '
-          f'{K} = {host} with {nat0[0]["funds"]}/{nat0[0]["ships"]}, the others unchanged', nat == want_nat,
+          f'{K} = {host} with {nat0[0]["funds"]}/{nat0[0]["ships"]}, the others as in slot 77', nat == want_nat,
           f'{nat} (want {want_nat})')
     rels = {j: dict(kv.split('=') for kv in (cmd(C, f'rel 0 {j}')[3:]).split()) for j in range(1, 9)}
     ai = {j: dict(kv.split('=') for kv in (cmd(C, f'rel {K} {j}')[3:]).split()) for j in range(2, 9)}
@@ -6630,6 +6783,10 @@ def _press(rec, top, h, what):
     if h is None or time.time() - _pressed.get(top, 0) < 1.5:
         return False
     bt = dialog_text(top)  # before the click closes it
+    if bt and (GAME_ERROR_RE.search(bt) or 'Missing ship' in bt):
+        # the game's error boxes of a joined player's battle count like the other answerers' (game_error_boxes; 0.6.1
+        # RC1's mixed run: a 0.6.0 player's "Error in CreateDivisionForBCBattle procedure! Access violation" boxes)
+        BOX_SEEN.append((time.time(), rec.get('who', 'client'), e2e_test.class_name(top), bt))
     u.PostMessageW(h, 0x00F5, 0, 0)  # BM_CLICK
     _pressed[top] = time.time()
     entry = f'{e2e_test.class_name(top)}:"{e2e_test.window_text(top)[:40]}"->{what}'
@@ -6754,6 +6911,19 @@ def log_secs(line):
     """Seconds of the day of a mod log line ('HH:MM:SS.mmm [tid] ...')."""
     m = re.match(r'^(\d\d):(\d\d):(\d\d)\.(\d{3})', line)
     return int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3]) + int(m[4]) / 1000 if m else None
+
+
+def fighting_ships_by_area(n):
+    """Nation n's ships that can fight a battle the game resolves (DoBattleBetweenAINations), by area, from the host's
+    save of the latest month: in play, not under repair, status active, trade protection, raider or colonies (the
+    game's CountShipsInArea(stAll, area, [ssActive, ssTradeProtection, ssRaider, ssColonies]))."""
+    bcs = read_save(save_path(HOST_SLOT)) or {}
+    out = {}
+    for f in ships_by_id(bcs.get(f'Nation{n}Ships')).values():
+        if f.get('Status') in ('0', '3', '4', '6') and f.get('RepairTime', '0') == '0' and f.get('InPlay') == '1':
+            a = f.get('LocationAreaName')
+            out[a] = out.get(a, 0) + 1
+    return out
 
 
 def battle_pairs(K):
@@ -7491,6 +7661,454 @@ def battle_timeout_checks(ctx, K, J, area, me, them, bid, drv):
     check(f'd) the month went on: the game resolved it ({fin}), the client plans the new month in slot {CLIENT_SLOT}, '
           f'slot mode off', fin and st.get('slot') == str(CLIENT_SLOT) and st.get('playerIdx') == str(K)
           and cs.get('slotMode') is False and cs.get('state') == 'none', f'{st}; {cs.get("raw")}')
+
+
+# ---------------------------------------------------------------- campaign divisions of a joined player (0.6.1)
+
+FO_TAB = 'Fleet organization'  # the strategic screen's tab of the division editor (TabControl1, index 9)
+FO_BUTTONS = ('New division', 'Expand all', 'Collapse all', 'Clear assignments')
+DIVS_RE = re.compile(r'^ok n=(\d+)(?: nation=(-?\d+))? list=(.*)$')
+DIV_ERR_RE = re.compile(r'(?i)\bexception\b|Access violation|Error in FillDivisionList2|Missing ship')
+DIV_HOST = (('RT Host Div A', 'RHA', 'CA'), ('RT Host Div B', 'RHB', 'BX'))  # (name, abbreviation, type) of the host's
+DIV_K = (('RT K Div 1', 'RK1', 'CA'), ('RT K Div 2', 'RK2', 'BX'))  # nation 1's; the second renamed DIV_K_RENAMED
+DIV_K_RENAMED = 'RT K Div 2R'
+
+
+def parse_divs(reply):
+    """`divs` (either copy: the divisions in memory) / `divstore <K>` (host: nation K's stored list) -> dict(n, nation
+    (PlayerNation's index; None for divstore), divs=[dict(id, name, ships, ids)], raw); None for an error or a malformed
+    reply. Entries '<CDivId>:<name>:<ship count>:<ship id.ship id...>' joined by '|' ('|' and ':' in names are '_', a
+    nil ship's id is 'nil', a nil division the entry 'nil')."""
+    m = DIVS_RE.match(reply or '')
+    if not m:
+        return None
+    out = []
+    for e in (x for x in m[3].split('|') if x):
+        if e == 'nil':
+            out.append(dict(id=None, name=None, ships=0, ids=[]))
+            continue
+        p = e.split(':')
+        if len(p) != 4 or not p[2].isdigit():
+            return None
+        out.append(dict(id=p[0], name=p[1], ships=int(p[2]), ids=[x for x in p[3].split('.') if x]))
+    if len(out) != int(m[1]):
+        return None
+    return dict(n=int(m[1]), nation=int(m[2]) if m[2] is not None else None, divs=out, raw=reply)
+
+
+def off_divisions(sec):
+    """[CampaignDivisions] of a parsed .off (read_save) -> dict(no=CampDivNo (None if missing), divs=[dict(id, name,
+    ids)]) (the entries CampDiv<i>... up to CampDivNo)."""
+    sec = sec or {}
+    no = sec.get('CampDivNo')
+    n = int(no) if (no or '').lstrip('-').isdigit() else None
+    divs = []
+    for i in range(max(0, n or 0)):
+        p = f'CampDiv{i}'
+        sc = sec.get(p + 'ShipCount', '0')
+        divs.append(dict(id=sec.get(p + 'CDivId'), name=sec.get(p + 'Name'),
+                         ids=[sec.get(f'{p}ShipId{j}') for j in range(int(sc) if sc.isdigit() else 0)]))
+    return dict(no=n, divs=divs)
+
+
+def slot_divisions(slot, fname=None):
+    """off_divisions of a slot's RTWGame<slot>.off (or another .off of the slot folder: Autosave.off); None without."""
+    s = read_save(os.path.join(slot_dir(slot), fname or f'RTWGame{slot}.off'))
+    return None if s is None else off_divisions(s.get('CampaignDivisions'))
+
+
+def nation_ships(n, slot=HOST_SLOT):
+    """Ship ids (strings) of nation n in a slot's .bcs."""
+    return set(ships_by_id((read_save(save_path(slot)) or {}).get(f'Nation{n}Ships')))
+
+
+def div_summary(d):
+    """'name[ids]; ...' of parse_divs / off_divisions results (a check's detail)."""
+    if not d:
+        return repr(d)
+    return '; '.join(f'{x["name"]}[{".".join(x["ids"])}]' for x in d['divs']) or '(none)'
+
+
+def fo_frm(pid):
+    return next((h for h in top_windows(pid) if e2e_test.class_name(h) == 'TfrmBuildCamp'), None)
+
+
+def fo_tabs(pid):
+    """(TabControl1, [tab texts]): the strategic screen's TTabControl with the most tabs (Map ... Fleet organization),
+    (None, []) without it."""
+    f = fo_frm(pid)
+    best = None
+    for h in children(f) if f else []:
+        if e2e_test.class_name(h) == 'TTabControl':
+            n = _u32.SendMessageW(h, 0x1304, 0, 0)  # TCM_GETITEMCOUNT
+            if n >= 9 and (best is None or n > best[1]):
+                best = (h, n)
+    if not best:
+        return None, []
+    texts = []
+    with RemoteBuf(pid) as rb:
+        for i in range(min(best[1], 24)):
+            rb.write(64, bytes(256))
+            rb.write(0, struct.pack('<IIIIiii', 1, 0, 0, rb.addr + 64, 120, 0, 0))  # TCITEMW, TCIF_TEXT
+            _u32.SendMessageW(best[0], 0x133C, i, rb.addr)  # TCM_GETITEMW
+            texts.append(rb.read(64, 240).decode('utf-16-le', 'replace').split('\x00')[0])
+    return best[0], texts
+
+
+def fo_set_tab(pid, want, refresh=False):
+    """Select a tab of TabControl1 (index or text) as a click does: TCM_SETCURFOCUS posted (the control sends
+    TCN_SELCHANGING / TCN_SELCHANGE: the screen's TabControl1Change fills the panel), posted arrow keys if it did not
+    move. refresh: already on it -> away and back, so the panel is filled anew. True when the tab is selected."""
+    tc, texts = fo_tabs(pid)
+    idx = want if isinstance(want, int) else (texts.index(want) if want in texts else None)
+    if not tc or idx is None:
+        return False
+
+    def cur():
+        return _u32.SendMessageW(tc, 0x130B, 0, 0)  # TCM_GETCURSEL
+
+    if cur() == idx and not refresh:
+        return True
+    if cur() == idx:
+        away = 0 if idx else 1
+        u.PostMessageW(tc, 0x1330, away, 0)  # TCM_SETCURFOCUS
+        wait_until(cur, lambda v: v == away, 6)
+        time.sleep(0.8)
+    u.PostMessageW(tc, 0x1330, idx, 0)
+    if wait_until(cur, lambda v: v == idx, 8) != idx:
+        for _ in range(14):
+            c = cur()
+            if c == idx:
+                break
+            vk = 0x27 if c < idx else 0x25  # VK_RIGHT / VK_LEFT
+            u.PostMessageW(tc, 0x0100, vk, 1)
+            u.PostMessageW(tc, 0x0101, vk, 0xC0000001 - (1 << 32))
+            time.sleep(0.5)
+    time.sleep(1.5)
+    return cur() == idx
+
+
+def fo_controls(pid):
+    """The division editor of the Fleet organization tab: its buttons (children of the panel of "New division") and
+    lvDivisions (the TListView beside that panel). dict(btn={caption: hwnd}, lv, shown)."""
+    f = fo_frm(pid)
+    ks = children(f) if f else []
+    nd = next((h for h in ks if e2e_test.class_name(h) == 'TButton' and caption(h) == 'New division'), None)
+    btn, lv = {}, None
+    if nd:
+        bar = u.GetParent(nd)
+        for h in ks:
+            if e2e_test.class_name(h) == 'TButton' and u.GetParent(h) == bar and caption(h) in FO_BUTTONS:
+                btn.setdefault(caption(h), h)
+        pan = u.GetParent(bar)
+        lv = next((h for h in ks if e2e_test.class_name(h) == 'TListView' and u.GetParent(h) == pan), None)
+    return dict(btn=btn, lv=lv, shown=bool(nd and u.IsWindowVisible(nd)))
+
+
+def fo_name_col(pid, lv):
+    """The "Name" column of lvDivisions (column 0 is the +/- marker)."""
+    cols = []
+    with RemoteBuf(pid) as rb:
+        for c in range(16):
+            rb.write(128, bytes(480))
+            rb.write(0, struct.pack('<IiiIiiiiiii', 0x4, 0, 0, rb.addr + 128, 200, 0, 0, 0, 0, 0, 0))  # LVCF_TEXT
+            if not _u32.SendMessageW(lv, 0x105F, c, rb.addr):  # LVM_GETCOLUMNW
+                break
+            cols.append(rb.read(128, 400).decode('utf-16-le', 'replace').split('\x00')[0])
+    return cols.index('Name') if 'Name' in cols else 1
+
+
+def fo_list(pid):
+    """lvDivisions as the player sees it (the tab selected): dict(divisions=[the division rows' names] (after Collapse
+    all), rows=['name | role/class | size'] (after Expand all, the state it is left in)); None without the list."""
+    if not fo_set_tab(pid, FO_TAB):
+        return None
+    d = fo_controls(pid)
+    lv = d['lv']
+    if not lv:
+        return None
+    nc = fo_name_col(pid, lv)
+    co, ex = d['btn'].get('Collapse all'), d['btn'].get('Expand all')
+    divs = None
+    if co:
+        u.PostMessageW(co, 0x00F5, 0, 0)  # BM_CLICK
+        time.sleep(1.2)
+        divs = [t[nc].strip() for _, _, t in lv_rows(pid, lv, nc + 1)]
+    if ex:
+        u.PostMessageW(ex, 0x00F5, 0, 0)
+        time.sleep(1.2)
+    return dict(divisions=divs, rows=[' | '.join(x.strip() for x in t[nc:nc + 3]) for _, _, t in lv_rows(pid, lv, nc + 3)])
+
+
+def fo_set_text(h, s):
+    b = ctypes.create_unicode_buffer(s)
+    _u32.SendMessageW(h, 0x000C, 0, ctypes.addressof(b))  # WM_SETTEXT
+    return text(h)
+
+
+def fo_division_dialog(pid, dlg, name, abbr=None, typ=None):
+    """Fill the game's TdlgCreateDivision (New division / Rename division): the type (CB_SETCURSEL and the parent's
+    CBN_SELCHANGE, so cbTypeChange runs and proposes a name), the name (the upper edit) and abbreviation, OK. Returns
+    dict(ok, ...) (Cancel when the dialog is not as expected)."""
+    ks = children(dlg)
+    edits = sorted((h for h in ks if e2e_test.class_name(h) == 'TEdit' and u.IsWindowVisible(h)), key=screen_top)
+    combo = next((h for h in ks if e2e_test.class_name(h) == 'TComboBox'), None)
+    b = dlg_buttons(dlg)
+    items = combo_items(combo)[0] if combo else []
+    out = dict(caption=caption(dlg), types=items, ok=False)
+    if not edits or 'ok' not in b or (typ is not None and typ not in items):
+        u.PostMessageW(b.get('cancel') or dlg, 0x00F5 if 'cancel' in b else 0x0010, 0, 0)
+        wait_window(pid, 'TdlgCreateDivision', 5, gone=True)
+        out['why'] = f'unexpected dialog: {len(edits)} edits, buttons {sorted(b)}'
+        return out
+    if typ is not None:
+        _u32.SendMessageW(combo, 0x014E, items.index(typ), 0)  # CB_SETCURSEL
+        u.PostMessageW(u.GetParent(combo), 0x0111, (1 << 16) | (u.GetDlgCtrlID(combo) & 0xFFFF), combo)  # CBN_SELCHANGE
+        time.sleep(0.8)
+    out['name'] = fo_set_text(edits[0], name)
+    if abbr is not None and len(edits) > 1:
+        out['abbr'] = fo_set_text(edits[1], abbr)
+    time.sleep(0.4)
+    u.PostMessageW(b['ok'], 0x00F5, 0, 0)
+    out['ok'] = bool(wait_window(pid, 'TdlgCreateDivision', 6, gone=True))
+    if not out['ok']:
+        b = dlg_buttons(dlg)
+        if 'cancel' in b:
+            u.PostMessageW(b['cancel'], 0x00F5, 0, 0)
+            wait_window(pid, 'TdlgCreateDivision', 4, gone=True)
+    time.sleep(1.0)
+    return out
+
+
+def fo_new_division(pid, name, abbr, typ):
+    """"New division" (BM_CLICK posted) -> the game's TdlgCreateDivision: type, name, abbreviation, OK."""
+    nd = fo_controls(pid)['btn'].get('New division')
+    if not (nd and u.IsWindowVisible(nd)):
+        return dict(ok=False, why='"New division" not shown')
+    u.PostMessageW(nd, 0x00F5, 0, 0)
+    dlg = wait_window(pid, 'TdlgCreateDivision', 8)
+    if not dlg:
+        return dict(ok=False, why=f'no TdlgCreateDivision; windows {describe_windows(pid)}')
+    return fo_division_dialog(pid, dlg, name, abbr, typ)
+
+
+def fo_row(pid, lv, name):
+    nc = fo_name_col(pid, lv)
+    names = [t[nc].strip() if len(t) > nc else '' for _, _, t in lv_rows(pid, lv, nc + 1)]
+    return names.index(name) if name in names else None
+
+
+def fo_popup(pid, lv, row_name, label):
+    """Pick `label` of the popup menu of lvDivisions's row `row_name`: only that row selected (the list is multi-select
+    and the menu's actions take the first selected row; LVM_SETITEMSTATE on item -1 clears it), then popup_pick."""
+    i = fo_row(pid, lv, row_name)
+    if i is None:
+        return f'no row {row_name!r}'
+    with RemoteBuf(pid) as rb:
+        rb.write(0, _lvitem(state=0, state_mask=0x3))
+        _u32.SendMessageW(lv, LVM_SETITEMSTATE, 0xFFFFFFFF, rb.addr)
+    time.sleep(0.2)
+    lv_select(pid, lv, i)
+    time.sleep(0.4)
+    return popup_pick(pid, lv, label, f' on row {i} {row_name!r}')
+
+
+def fo_lb_items(lb):
+    out = []
+    for i in range(max(0, min(u.SendMessageW(lb, 0x018B, 0, 0), 400))):  # LB_GETCOUNT
+        b = ctypes.create_unicode_buffer(max(u.SendMessageW(lb, 0x018A, i, 0), 0) + 2)  # LB_GETTEXTLEN
+        u.SendMessageW(lb, 0x0189, i, b)  # LB_GETTEXT
+        out.append(b.value)
+    return out
+
+
+def fo_add_ships(pid, lv, div, n=2):
+    """"Add ships to division" on the division's row -> the game's TdlgSelectShip (the player's ships of the division's
+    type): the first n offered selected (LB_SETSEL in its multi-select list box, else LB_SETCURSEL; LBN_SELCHANGE to
+    the dialog), OK. Returns dict(popup, items, picked)."""
+    out = dict(popup=fo_popup(pid, lv, div, 'Add ships to division'), items=[], picked=[])
+    if 'picked' not in out['popup']:
+        return out
+    dlg = wait_window(pid, 'TdlgSelectShip', 6)
+    if not dlg:
+        out['why'] = f'no TdlgSelectShip; windows {describe_windows(pid)}'
+        return out
+    lb = next((h for h in children(dlg) if e2e_test.class_name(h) == 'TListBox'), None)
+    b = dlg_buttons(dlg)
+    out['items'] = items = fo_lb_items(lb) if lb else []
+    pick = list(range(min(n, len(items))))
+    if not lb or not pick or 'ok' not in b:
+        u.PostMessageW(b.get('cancel') or dlg, 0x00F5 if 'cancel' in b else 0x0010, 0, 0)
+        wait_window(pid, 'TdlgSelectShip', 5, gone=True)
+        return out
+    if _u32w.GetWindowLongW(lb, -16) & 0x0808:  # LBS_MULTIPLESEL | LBS_EXTENDEDSEL
+        for k in pick:
+            u.SendMessageW(lb, 0x0185, 1, k)  # LB_SETSEL
+    else:
+        pick = pick[:1]
+        u.SendMessageW(lb, 0x0186, pick[0], 0)  # LB_SETCURSEL
+    u.PostMessageW(u.GetParent(lb), 0x0111, (1 << 16) | (u.GetDlgCtrlID(lb) & 0xFFFF), lb)  # LBN_SELCHANGE
+    time.sleep(0.6)
+    out['picked'] = [items[k] for k in pick]
+    u.PostMessageW(b['ok'], 0x00F5, 0, 0)
+    out['closed'] = bool(wait_window(pid, 'TdlgSelectShip', 6, gone=True))
+    time.sleep(1.0)
+    return out
+
+
+def fo_rename(pid, lv, old, new):
+    """"Rename division" on the division's row -> the game's TdlgCreateDivision: the name := new, OK."""
+    r = fo_popup(pid, lv, old, 'Rename division')
+    if 'picked' not in r:
+        return dict(ok=False, popup=r)
+    dlg = wait_window(pid, 'TdlgCreateDivision', 6)
+    if not dlg:
+        return dict(ok=False, popup=r, why=f'no TdlgCreateDivision; windows {describe_windows(pid)}')
+    return fo_division_dialog(pid, dlg, new)
+
+
+def fo_make(pid, who, specs, rename=None):
+    """New divisions on one copy's Fleet organization through the game's own dialogs: per (name, abbreviation, type) a
+    New division with the first two ships the game offers for it; rename: (old name, new name). Returns a record."""
+    rec = dict(tab=fo_set_tab(pid, FO_TAB, refresh=True))
+    lv = fo_controls(pid)['lv']
+    if not lv:
+        rec['error'] = 'lvDivisions not found'
+        return rec
+    for name, abbr, typ in specs:
+        rec[name] = dict(new=fo_new_division(pid, name, abbr, typ))
+        close_menus(pid)
+        rec[name]['ships'] = fo_add_ships(pid, lv, name)
+        close_menus(pid)
+    if rename:
+        rec['rename'] = fo_rename(pid, lv, *rename)
+        close_menus(pid)
+    drain(pid, 1, who)
+    return rec
+
+
+def division_lines(port, mark):
+    """The mod log's campaign-division lines since mark (without the time and thread)."""
+    return [ln.split('] ', 1)[-1] for ln in log_lines(log_since(port, mark), r'(?i)divisions')]
+
+
+def scenario_divisions(ctx):
+    """0.6.1: each joined player's own campaign divisions (the Fleet organization). The host and the client make two
+    divisions each through the game's own dialogs (New division, Add ships to division, one Rename division on the
+    client); then two processed months (the first with the Fleet organization shown on both copies: the list is filled
+    again inside the load; the second on the map). a) the client's hello "campaign divisions 1", `divs` on both;
+    b) the host's divisions never reach the client (`divs`, its Fleet organization list); c) the client's two (nation
+    1's ships only); after each month d) the client keeps exactly its own two (`divs`, the Fleet organization list, slot
+    77's .off), the host stored them (`divstore 1`, "divisions of nation 1: 2 stored" / "2 in its month", the client's
+    "the month holds nation 1's own 2"), the host keeps exactly its own two (`divs`, its list, slot 1's .off and
+    Autosave.off CampDivNo; no duplicates after its reload: "... from before the load dropped"); e) no exception, access
+    violation, "Error in FillDivisionList2" or "Missing ship" in either log or box. The divisions stay for the later
+    scenarios (the runner restores slot 1 after the run)."""
+    K = 1
+    m0h, m0c, t0 = log_mark(H), log_mark(C), time.time()
+    hello = log_lines(log_since(H), r'campaign divisions \d')
+    dh0, dc0 = parse_divs(cmd(H, 'divs')), parse_divs(cmd(C, 'divs'))
+    check('a) host log: the client\'s hello with "campaign divisions 1"; `divs` answers on both copies (host nation 0, '
+          f'client nation {K})', any(re.search(r'campaign divisions 1\b', x) for x in hello) and dh0 and dc0
+          and dh0['nation'] == 0 and dc0['nation'] == K, f'{hello[-1:]}; {dh0 and dh0["raw"]}; {dc0 and dc0["raw"]}')
+    if not (dh0 and dc0):
+        return
+    h_ids, k_ids = nation_ships(0), nation_ships(K)
+    check(f'a) the client\'s divisions at the start are nation {K}\'s own (none with a ship of another nation): '
+          f'{div_summary(dc0)}', all(set(d['ids']) <= k_ids for d in dc0['divs']), div_summary(dc0))
+
+    # b) the host's own: two new divisions through its Fleet organization
+    hrec = fo_make(ctx.hp, 'host', DIV_HOST)
+    dh1 = parse_divs(cmd(H, 'divs'))
+    hnew = [d for d in (dh1 or {}).get('divs', []) if d['name'] in {x[0] for x in DIV_HOST}]
+    host_names = sorted(d['name'] for d in (dh1 or {}).get('divs', []))
+    check('b) host: two new divisions made in its Fleet organization (New division, Add ships to division), each with '
+          f'ships of the host nation only: `divs` {dh0["n"]} -> {dh1 and dh1["n"]} ({div_summary(dh1)})',
+          dh1 and dh1['n'] == dh0['n'] + 2 and len(hnew) == 2 and all(d['ids'] and set(d['ids']) <= h_ids for d in hnew),
+          hrec)
+    dc1, fl = parse_divs(cmd(C, 'divs')), fo_list(ctx.cp)
+    check('b) client: none of the host\'s divisions or ships, neither in `divs` nor in its Fleet organization list '
+          f'({div_summary(dc1)}; list {fl and fl["divisions"]})',
+          dc1 and fl and fl['divisions'] is not None and not set(host_names) & ({d['name'] for d in dc1['divs']}
+                                                                             | set(fl['divisions']))
+          and not any(set(d['ids']) & h_ids for d in dc1['divs']), f'{dc1 and dc1["raw"]}; {fl}')
+
+    # c) the client's own two, one renamed
+    crec = fo_make(ctx.cp, 'client', DIV_K, rename=(DIV_K[1][0], DIV_K_RENAMED))
+    dc2 = parse_divs(cmd(C, 'divs'))
+    k_names = sorted([DIV_K[0][0], DIV_K_RENAMED])
+    knew = [d for d in (dc2 or {}).get('divs', []) if d['name'] in k_names]
+    check(f'c) client: two new divisions with nation {K}\'s ships ("{DIV_K[1][0]}" renamed "{DIV_K_RENAMED}"): `divs` '
+          f'{div_summary(dc2)}', dc2 and dc2['n'] == dc0['n'] + 2 and len(knew) == 2
+          and all(d['ids'] and set(d['ids']) <= k_ids for d in knew), crec)
+    if not (dh1 and dc2 and len(hnew) == 2 and len(knew) == 2):
+        return
+    want_k = {d['name']: sorted(d['ids']) for d in dc2['divs']}
+    want_h = {d['name']: sorted(d['ids']) for d in dh1['divs']}
+    k_all = sorted(want_k)
+
+    # d) two processed months
+    for m in (1, 2):
+        if m == 2:
+            for pid in (ctx.cp, ctx.hp):
+                fo_set_tab(pid, 0)  # the map (the screen's default)
+        hm, cm = log_mark(H), log_mark(C)
+        t_m = time.time()
+        run_month(ctx, f'divisions M{m}')
+        where = 'the Fleet organization shown' if m == 1 else 'on the map'
+        dc, dh, ds = parse_divs(cmd(C, 'divs')), parse_divs(cmd(H, 'divs')), parse_divs(cmd(H, f'divstore {K}'))
+        got_k = {d['name']: sorted(d['ids']) for d in (dc or {}).get('divs', [])}
+        got_h = {d['name']: sorted(d['ids']) for d in (dh or {}).get('divs', [])}
+        got_s = {d['name']: sorted(d['ids']) for d in (ds or {}).get('divs', [])}
+        check(f'd) M{m} ({where}): client `divs` = its own {len(want_k)} with the same ships, nation {K}, none twice '
+              f'({div_summary(dc)})', dc and dc['nation'] == K and dc['n'] == len(want_k) and got_k == want_k,
+              f'{dc and dc["raw"]}; want {want_k}')
+        check(f'd) M{m}: host `divstore {K}` = the client\'s {len(want_k)} ({div_summary(ds)})',
+              ds and ds['n'] == len(want_k) and got_s == want_k, f'{ds and ds["raw"]}; want {want_k}')
+        check(f'd) M{m}: host `divs` = its own {len(want_h)}, none twice, none of nation {K}\'s ({div_summary(dh)})',
+              dh and dh['nation'] == 0 and dh['n'] == len(want_h) and got_h == want_h,
+              f'{dh and dh["raw"]}; want {want_h}')
+        so, sa = slot_divisions(HOST_SLOT), slot_divisions(HOST_SLOT, 'Autosave.off')
+        sa_new = os.path.exists(os.path.join(slot_dir(HOST_SLOT), 'Autosave.off')) and \
+            os.path.getmtime(os.path.join(slot_dir(HOST_SLOT), 'Autosave.off')) >= t_m
+        sk = slot_divisions(CLIENT_SLOT)
+        check(f'd) M{m}: saved: slot {HOST_SLOT} .off CampDivNo {so and so["no"]} = {len(want_h)} (the host\'s; '
+              f'Autosave.off {sa and sa["no"]}{"" if sa_new else " (not written this month)"}), slot {CLIENT_SLOT} .off '
+              f'{sk and sk["no"]} = the client\'s {len(want_k)}',
+              so and so['no'] == len(want_h) and sorted(x['name'] for x in so['divs']) == sorted(want_h)
+              and (not sa_new or sa and sa['no'] == len(want_h)) and sk and sk['no'] == len(want_k)
+              and sorted(x['name'] for x in sk['divs']) == k_all, f'{so}; {sa}; {sk}')
+        hl, cl = division_lines(H, hm), division_lines(C, cm)
+        need_h = [rf'divisions of nation {K}: {len(want_k)} stored \(repeats dropped: 0 divisions, 0 ship ids',
+                  rf'divisions of nation {K}: {len(want_k)} in its month \(',
+                  rf'campaign divisions: {len(want_h)} loaded$',
+                  rf'campaign divisions: {len(want_h)} from before the load dropped; the campaign\'s {len(want_h)} kept']
+        need_c = [rf"divisions: the month holds nation {K}'s own {len(want_k)} \(kept by the host; 0 with other ships\)",
+                  rf'campaign divisions: {len(want_k)} of nation {K} loaded$',
+                  rf'campaign divisions: {len(want_k)} from before the load dropped; the campaign\'s {len(want_k)} kept']
+        if m == 1:
+            need_c.append(r'campaign divisions: the Fleet organization list filled again')
+        miss = [p for p in need_h if not any(re.search(p, x) for x in hl)] + \
+            [p for p in need_c if not any(re.search(p, x) for x in cl)]
+        check(f'd) M{m}: the logs: host "divisions of nation {K}: {len(want_k)} stored" / "... in its month", its reload '
+              f'"{len(want_h)} loaded" and "{len(want_h)} from before the load dropped"; client "the month holds nation '
+              f'{K}\'s own {len(want_k)}", "{len(want_k)} of nation {K} loaded", "... from before the load dropped"'
+              + (', "the Fleet organization list filled again"' if m == 1 else ''), not miss,
+              f'missing {miss}; host {hl[-8:]}; client {cl[-8:]}')
+        fc, fh = fo_list(ctx.cp), fo_list(ctx.hp)
+        check(f'd) M{m}: the Fleet organization lists: client {fc and fc["divisions"]} (its own only), host '
+              f'{fh and fh["divisions"]} (its own only)',
+              fc and fh and sorted(fc['divisions'] or []) == k_all and sorted(fh['divisions'] or []) == sorted(want_h),
+              f'client {fc}; host {fh}')
+    for pid in (ctx.cp, ctx.hp):
+        fo_set_tab(pid, 0)
+
+    # e) no errors
+    bad = [(w, x[:200]) for w, port, mk in (('host', H, m0h), ('client', C, m0c))
+           for x in log_since(port, mk).splitlines() if DIV_ERR_RE.search(x)]
+    boxes = [(w, t[:200]) for ts, w, _, t in BOX_SEEN if ts >= t0 and re.search(r'Error in \w*Division|Missing ship', t)]
+    check('e) no exception, access violation, "Error in FillDivisionList2" or "Missing ship" in either log, no such box '
+          f'(the scenario\'s {time.time() - t0:.0f} s)', not bad and not boxes, f'{bad[:4]}; {boxes[:4]}')
 
 
 # ---------------------------------------------------------------- live player-vs-player battles (lockstep)
@@ -10026,6 +10644,64 @@ def pvp_lines(hlog, bid):
     return log_lines(hlog, rf'battle (request )?{bid}[ :]|relay {bid} ')
 
 
+PVP_DIV_A = (('RT K Pvp', 'RKP', 'BX'),)  # lockstep_pvp: the client's division when it holds none (e.g. --only)
+PVP_DIV_B = (('RT Bot Div', 'RBD', 'BX'),)  # and the third copy's (nation 2)
+
+
+def pvp_divs_setup(ctx):
+    """lockstep_pvp (a docs question, no failing check): campaign divisions on both joined players' copies before the
+    war month (the client's from `divisions` in a full run, else one new; one new on the third copy) and a live hook
+    that records the battle's divisions (`ls divs`) and the campaign lists (`divs`) on both copies at the load of the
+    first live battle 1-2. Returns the record for pvp_divs_note."""
+    pd = dict(seen=[])
+    dc = parse_divs(cmd(C, 'divs'))
+    if not (dc and any(d['ships'] for d in dc['divs'])):
+        pd['madeA'] = fo_make(ctx.cp, 'client', PVP_DIV_A)
+        fo_set_tab(ctx.cp, 0)
+        dc = parse_divs(cmd(C, 'divs'))
+    pd['madeB'] = fo_make(k2_pid(), 'k2', PVP_DIV_B)
+    fo_set_tab(k2_pid(), 0)
+    dk = parse_divs(cmd(K2, 'divs'))
+    pd['camp'] = {p: [d['name'] for d in (x or {}).get('divs', []) if d['name'] and d['ships']]
+                  for p, x in ((C, dc), (K2, dk))}
+    log(f'  campaign divisions before the war month: client {div_summary(dc)}; third copy {div_summary(dk)}')
+
+    def hook(what, rec, A, B, r):
+        if what == 'load' and {A, B} == {C, K2} and not pd['seen']:
+            pd['seen'].append(dict(A=A, B=B, side={A: r['a0'].get('side'), B: r['b0'].get('side')},
+                                   bat={A: ls_divs(A), B: ls_divs(B)},
+                                   camp={p: div_summary(parse_divs(scmd(p, 'divs'))) for p in (A, B)}))
+    pd['hook'] = hook
+    return pd
+
+
+def pvp_divs_note(pd):
+    """lockstep_pvp: whose campaign divisions shape the relayed battle (set up on A's PC from its campaign): a NOTE
+    (CONFIRMED: A's campaign divisions on A's side, none of B's; REFUTED: B's in the battle; INCONCLUSIVE: none of
+    A's, e.g. their ships not in it) and one check that the battle's division list is the same on both copies."""
+    s = pd['seen'][0] if pd['seen'] else None
+    if not s:
+        log('  NOTE lockstep_pvp divisions: INCONCLUSIVE: no live battle 1-2 was loaded')
+        return
+    A, B = s['A'], s['B']
+
+    def where(port, names):
+        return {n: sorted({d['side'] for d in s['bat'][port] if n in d['name']}) for n in names
+                if any(n in d['name'] for d in s['bat'][port])}
+    fa, fb = {p: where(p, pd['camp'][A]) for p in (A, B)}, {p: where(p, pd['camp'][B]) for p in (A, B)}
+    sa = int(s['side'][A]) if str(s['side'][A]).isdigit() else None
+    a_own = {n for n, sides in fa[A].items() if sa in sides}
+    verdict = 'REFUTED' if fb[A] or fb[B] else 'CONFIRMED' if a_own else 'INCONCLUSIVE'
+    names = {p: [f'{d["i"]}:{d["side"]}:{d["name"]}:{d["ships"]}' for d in s['bat'][p]] for p in (A, B)}
+    log(f'  NOTE lockstep_pvp divisions: {verdict}: A={who_of(A)} side {s["side"][A]}, B={who_of(B)} side '
+        f'{s["side"][B]}; A\'s campaign divisions {pd["camp"][A]} in the battle (name: sides) on A {fa[A]}, on B '
+        f'{fa[B]}; B\'s {pd["camp"][B]} on A {fb[A]}, on B {fb[B]}; battle divisions on A {names[A]}; campaign lists '
+        f'at the load: A {s["camp"][A]} | B {s["camp"][B]}')
+    la, lb = ([(d['i'], d['side'], d['name']) for d in s['bat'][p]] for p in (A, B))
+    check(f'b) the battle\'s divisions (`ls divs` at the load: index, side, name) are the same on both players\' copies '
+          f'({len(la)} divisions)', bool(la) and la == lb, f'A {names[A][:14]} | B {names[B][:14]}')
+
+
 def scenario_lockstep_pvp(ctx):
     """Live battles between two joined players (three copies; from the research driver ls_pvp.py). a) a third copy
     joins as "Bot" and gets the reserved nation 2. b) war 1-2 (`settension 1 2 50`), `battles injectpvp 1 2 Northern
@@ -10036,7 +10712,9 @@ def scenario_lockstep_pvp(ctx):
     idea-1 battle of nation 1 against an AI nation injected into the same month (the host runs them one after the
     other). c) the result merged, the new month on all three copies, ship counts equal. f) the war score of 1-2
     (`warvp 1 2` before and after the month) rose by the VP of the month's merged live battles 1-2 plus the host's own
-    `war score 1-2` credits. d) peace, the third copy leaves (nation 2 stays reserved for Bot) and is closed."""
+    `war score 1-2` credits. d) peace, the third copy leaves (nation 2 stays reserved for Bot) and is closed. Campaign
+    divisions on both players' copies before the war month (pvp_divs_setup): the battle's division list equal on both
+    copies, and a NOTE whose campaign divisions shape the battle (pvp_divs_note)."""
     marks0 = {H: log_mark(H), C: log_mark(C)}
     stress = OPTS['stress']
     ls_ensure_session(ctx)
@@ -10048,6 +10726,7 @@ def scenario_lockstep_pvp(ctx):
           f'and {K2_NAME}({STANDIN},b,ls)', r == 'ok' and sent and st.get('playerIdx') == str(STANDIN)
           and 'Captain(1,b,ls)' in hs.get('players', '') and f'{K2_NAME}({STANDIN},b,ls)' in hs.get('players', ''),
           f'{r} {sent[:1]} {st.get("slot")}/{st.get("playerIdx")} {hs.get("players")}')
+    pvpd = pvp_divs_setup(ctx)
     t12 = rel(1, 2).get('tension', '5')
     cmd(H, 'settension 1 2 50')
     r12 = rel(1, 2)
@@ -10074,7 +10753,7 @@ def scenario_lockstep_pvp(ctx):
                 cmd(H, f'settension 1 {J} 50')
             ibid, _ = inject(1, J, area)
         ws0, wm = warvp(1, STANDIN), log_mark(H)  # f) the war score of 1-2 before the month
-        rec = ls_month(ctx, f'lockstep_pvp M{attempt}', modes=[mode], k2=True)
+        rec = ls_month(ctx, f'lockstep_pvp M{attempt}', modes=[mode], k2=True, live_hook=pvpd['hook'])
         hlog = log_since(H, hm)
         lives = [b for b in rec['live'] if b['A'] in (C, K2)]
         applied = {int(x) for x in re.findall(r'battle (\d+) applied: ', hlog)}
@@ -10089,6 +10768,7 @@ def scenario_lockstep_pvp(ctx):
           f'attempts: month, inject, live battles, merged ids, resolved by the game)', done, attempts)
     if done:
         pvp_checks(ctx, stress, *done)
+    pvp_divs_note(pvpd)
     cmd(H, f'settension 1 2 {t12}')
     if J is not None:
         cmd(H, f'settension 1 {J} {tJ}')
@@ -14293,11 +14973,19 @@ def limits_save(ctx, tag, camp, A=H, B=C):
               f'.sac {t0} -> {t1}')
 
 
-def limits_realism(ctx, tag, A=H, B=C):
+REALISM_NAMES = {0: "Admiral's mode", 1: "Rear admiral's mode", 2: "Captain's mode"}
+
+
+def limits_realism(ctx, tag, A=H, B=C, marks=None):
     """The realism requirement of manual torpedo salvoes: the division report's *Fire torpedoes* is enabled by the game
     only with the battle preference Realism above its second level, A's preference on both copies (B takes A's with
-    the start). With the run's RealismSetting the button is enabled (>= 2) or disabled (1) on both copies."""
+    the start). With the run's RealismSetting the button is enabled (>= 2) or disabled (1) on both copies. 0.6.1: with
+    the battle's start marks ({port: mark}) both copies' chat named the battle's Realism at the start (A "your battle
+    preference", B "<A>'s ...; yours isn't used"); below Captain's mode the first division report on screen said once
+    why Fire torpedoes is off (`ls realism` noted=1), at Captain's mode nothing of it."""
     want = '1' if (RUN['realism'] or 0) >= 2 else '0'
+    lvl = RUN['realism'] if RUN['realism'] is not None else 1  # (the game's default for a missing key)
+    mode = REALISM_NAMES.get(lvl, f'an unknown level ({lvl})')
     got = {}
     if want == '0':  # (engine level 12: the bridge's `ls torp` is refused like the button)
         d = next((x for x in torp_divs(B, 1)), None)
@@ -14306,15 +14994,43 @@ def limits_realism(ctx, tag, A=H, B=C):
         check(f'{tag}: with Realism 1 `ls torp` is refused like the division report\'s disabled Fire torpedoes: "error the '
               f'division report\'s Fire torpedoes is disabled (button=0: ...)", nothing queued', not res.get('queued')
               and "the division report's Fire torpedoes is disabled (button=0" in res['raw'], res['raw'][:160])
+    noted = {}
     for port, pid in ((A, ctx.hp), (B, ctx.cp)):
         d, how = open_divreport(pid)
+        if d and want == '0':  # (the mod's tick sees the report within 250 ms)
+            wait_until(lambda: kvs(scmd(port, 'ls realism')).get('noted'), lambda v: v == '1', 3)
         got[who_of(port)] = (bool(d), lsctl(port, 'TdlgDivisionReport', 'bnTorps'), how)
+        noted[who_of(port)] = scmd(port, 'ls realism')
         close_modeless(pid)
-    return check(f'{tag}: the realism requirement of manual torpedo salvoes: with the run\'s RealismSetting '
-                 f'{RUN["realism"]} (A\'s preference, B takes it with the start) the division report\'s "Fire torpedoes" is '
-                 f'{"enabled" if want == "1" else "disabled"} on both copies (`ls ctl TdlgDivisionReport bnTorps` enabled='
-                 f'{want})', all(v[0] and v[1].get('enabled') == want and v[1].get('visible') == '1' for v in got.values()),
-                 got)
+    ok = check(f'{tag}: the realism requirement of manual torpedo salvoes: with the run\'s RealismSetting '
+               f'{RUN["realism"]} (A\'s preference, B takes it with the start) the division report\'s "Fire torpedoes" is '
+               f'{"enabled" if want == "1" else "disabled"} on both copies (`ls ctl TdlgDivisionReport bnTorps` enabled='
+               f'{want})', all(v[0] and v[1].get('enabled') == want and v[1].get('visible') == '1' for v in got.values()),
+               got)
+    if marks:
+        m = re.escape(mode)
+        start = {who_of(A): ls_lines(A, marks[A], rf'lockstep: Realism: {m} \(your battle preference, for both players\)\. '),
+                 who_of(B): ls_lines(B, marks[B], rf"lockstep: Realism: {m} \(\S+'s battle preference, for both players; "
+                                                  rf"yours isn't used\)\. ")}
+        tail = ('Fire torpedoes in the division report works while the battle is paused.' if want == '1' else
+                'Fire torpedoes in the division report needs Captain\'s mode')
+        check(f'{tag}: 0.6.1: both copies\' chat named the battle\'s Realism once at the start: A "Realism: {mode} (your '
+              f'battle preference, for both players). {tail}...", B "Realism: {mode} (<A>\'s battle preference, for both '
+              f'players; yours isn\'t used). ..."', all(len(v) == 1 and tail in v[0] for v in start.values()), start)
+        off = {who_of(p): ls_lines(p, marks[p], r'lockstep: Fire torpedoes is off: it needs the battle preference Realism at '
+                                                r"Captain's mode, and this battle uses ") for p in (A, B)}
+        if want == '0':
+            check(f'{tag}: 0.6.1: below Captain\'s mode the first division report on screen said once on each copy why Fire '
+                  f'torpedoes is off ("Fire torpedoes is off: it needs ... Captain\'s mode, and this battle uses yours, '
+                  f'{mode}. ..." on A, "... uses <A>\'s, {mode} (yours isn\'t used). ..." on B; `ls realism` noted=1)',
+                  len(off[who_of(A)]) == 1 and f'uses yours, {mode}.' in off[who_of(A)][0]
+                  and len(off[who_of(B)]) == 1 and f"'s, {mode} (yours isn't used)." in off[who_of(B)][0]
+                  and all(kvs(v).get('noted') == '1' for v in noted.values()), f'{off} | {noted}')
+        else:
+            check(f'{tag}: 0.6.1: at Captain\'s mode no "Fire torpedoes is off" notice on either copy (`ls realism` '
+                  f'torps=1 noted=0)', not any(off.values()) and all(kvs(v).get('torps') == '1' and kvs(v).get('noted') == '0'
+                                                                      for v in noted.values()), f'{off} | {noted}')
+    return ok
 
 
 def limits_autorun(ctx, tag, A=H, B=C):
@@ -14553,6 +15269,109 @@ def limits_both_auto(ctx, tag, s, A=H, B=C):
     return dt
 
 
+# The scan of the game data files (datafiles.cpp, engine level 18): its file count, the game's temporary files it left
+# out and the combined hash.
+DATAFILES_SCAN_RE = re.compile(r"data files: (\d+) files of Data \(but Data\\Graphics and the game's temporary files "
+                               r"tmp\*: (.*)\) hashed in \d+ ms: ([0-9a-f]{16})")
+
+
+def parse_datafiles_scan(txt):
+    """The last scan line of a mod log -> dict(files, temporary (names, sorted, lower case), hash) or None."""
+    m = None
+    for m in DATAFILES_SCAN_RE.finditer(txt):
+        pass
+    if not m:
+        return None
+    names = [] if m.group(2) == 'none' else [x.strip() for x in m.group(2).split(', ') if x.strip()]
+    return dict(files=int(m.group(1)), temporary=sorted(x.lower() for x in names), hash=m.group(3))
+
+
+def game_data_temporary():
+    """The game folder's Data as datafiles.cpp sees it: (the temporary files, names starting with tmp at any level,
+    relative and lower case, sorted; the number of the other files), Data\\Graphics aside."""
+    tmp, other = [], 0
+    for d, dirs, files in os.walk(os.path.join(ctl.GAME, 'Data')):
+        rel = os.path.relpath(d, ctl.GAME)
+        dirs[:] = [x for x in dirs if os.path.join(rel, x).lower() != r'data\graphics']
+        for f in files:
+            if f.lower().startswith('tmp'):
+                tmp.append(os.path.join(rel, f).lower())
+            else:
+                other += 1
+    return sorted(tmp), other
+
+
+def scenario_lockstep_data(ctx):
+    """0.6.1 (engine level 18): the game's temporary files stay out of the live battles' data-file check (a 0.6.0 bug:
+    the ship designer rewrites Data\\tmpShip.ttp whenever it is used, so after one player designed a ship every live
+    battle of the session was fought against the computer: "game data files differ ...: Data\\tmpShip.ttp"). a) both
+    copies' scan line "data files: N files of Data (but Data\\Graphics and the game's temporary files tmp*: <names>)
+    hashed in .. ms: <hash>": the names are the game folder's tmp* files (any level of Data, Graphics aside), N the
+    other files, the same hash on both copies and in their `ls x87` (data=). b) B (the client) `ls testdatafile
+    Data\\tmpShip.ttp;Data\\IDes\\tmpProbe.sdf` (the test switch: those files as if they differed on B): B's hash
+    unchanged, its log "(not hashed, the game's temporary files: ...)"; a live test battle starts live (B: "the game
+    data files are the same on both PCs", no "differ" line on either copy), 4 minutes equal, the game ends it inside a
+    minute, no month. c) the control: B `ls testdatafile Data\\Gundata.dat` changes B's hash (engine level 16 would
+    refuse a battle), `ls testdatafile off` puts it back. A real difference (a game folder copy whose tmpShip.ttp
+    differs) is the developers' two-folder check (TESTING.md, the game's temporary files)."""
+    ver = build_version() or ''
+    if tuple(int(x) for x in re.findall(r'\d+', ver.split('-')[0])[:3]) < (0, 6, 1):
+        log(f'  lockstep_data: the build under test is {ver or "unknown"}; the temporary files are left out since '
+            f'0.6.1: skipped')
+        return
+    marks0 = {H: log_mark(H), C: log_mark(C)}
+    ls_ensure_session(ctx)
+    tmp, other = game_data_temporary()
+    sa, sb = parse_datafiles_scan(log_since(H)), parse_datafiles_scan(log_since(C))
+    xa, xb = kvs(scmd(H, 'ls x87')), kvs(scmd(C, 'ls x87'))
+    check(f'a) both copies\' scan left out the game\'s temporary files {tmp} and hashed the other {other} files of Data '
+          f'(but Data\\Graphics): the same hash on both, as `ls x87` data= says', bool(sa and sb) and
+          sa['temporary'] == sb['temporary'] == tmp and sa['files'] == sb['files'] == other and
+          sa['hash'] == sb['hash'] == xa.get('data') == xb.get('data'),
+          dict(host=sa, client=sb, x87=(xa.get('data'), xb.get('data'), xa.get('files'), xb.get('files'))))
+    x0 = xb.get('data')
+    names = r'Data\tmpShip.ttp;Data\IDes\tmpProbe.sdf'
+
+    def battle():
+        cm = log_mark(C)
+        r = kvs(scmd(C, f'ls testdatafile {names}'))
+        left = ls_lines(C, cm, r"TEST: data files: .* \(not hashed, the game's temporary files: [^)]*\)")
+        check(f'b) B `ls testdatafile {names}`: B\'s hash unchanged ({x0}), the log says both are not hashed (the game\'s '
+              f'temporary files)', bool(x0) and r.get('data') == x0 and bool(left) and
+              all(n in left[-1] for n in names.split(';')), f'{r} {left[-1:]}')
+        s = ls_start_test(ctx, 'lockstep_data')
+        same = ls_lines(C, s['cm'], r'lockstep: battle \d+: the game data files are the same on both PCs \(\d+ files, ')
+        differ = [ln for port, mk in ((H, s['hm']), (C, s['cm']))
+                  for ln in ls_lines(port, mk, r'data files differ|data files were not compared')]
+        check('b) the live test battle starts live with B\'s temporary files "different": B "the game data files are the '
+              'same on both PCs (N files, <hash>)", no "differ" or "not compared" line on either copy',
+              bool(same) and not differ, f'{same[:1]} {differ[:3]}')
+        ls_all_ai(H, C)
+        scmd(H, 'ls speed 5')
+        ran = ls_run_total(H, C, 2, H) + ls_run_total(H, C, 2, C)
+        hc = ls_compare(H, s['hm'], C, s['cm'], 'lockstep_data')
+        check(f'b) every minute\'s state hash equal on both copies ({hc["minutes"]} minutes compared of {ran})',
+              hc['minutes'] >= max(3, ran - 1) and not hc['differ'], hc)
+        ls_ans(ctx).view_results.update(('host', 'client'))
+        e = ls_drive_endsoon(H, C, until=0)
+        ls_wait(lambda: ls_client_back(ctx), 120, 'the client back in slot 77 after the battle\'s end')
+        closed = bool(ls_wait(lambda: not battle_up(ctx.hp), 120, 'the host\'s battle screen closed'))
+        ls_ans(ctx).view_results.clear()
+        hn = ls_wait(lambda: (lambda n: n if n.get('slotMode') == '0' else None)(lsn(H)), 30, 'slot mode off')
+        check(f'b) the end: the game ended it inside minute {e.get("minute")}, the client back in slot 77, the host\'s '
+              f'battle closed without a month', closed and hn.get('slotMode') == '0' and
+              'battle slot: DoStrategicTurn skipped' in log_since(H, s['hm']), hn)
+        return f'{ran} minutes'
+
+    ls_case(ctx, 'lockstep_data b): a live battle with B\'s temporary files different', battle)
+    ls_quiet(ctx)
+    r1 = kvs(scmd(C, r'ls testdatafile Data\Gundata.dat'))
+    r2 = kvs(scmd(C, 'ls testdatafile off'))
+    check(r'c) the control: B `ls testdatafile Data\Gundata.dat` changes its hash, `ls testdatafile off` puts it back',
+          bool(x0) and bool(r1.get('data')) and r1.get('data') != x0 and r2.get('data') == x0, f'{r1} {r2}')
+    ls_log_scan('lockstep_data', marks0)
+
+
 def scenario_lockstep_limits(ctx):
     """The live-battle limits lifted in 0.4.0 (engine level 11), the default run's quick checks in one 1900 test battle
     (`pocbattle 1 0`: host A side 0, client B side 1). a) the start (as lockstep b)), the engine level of this source
@@ -14565,7 +15384,9 @@ def scenario_lockstep_limits(ctx):
     (`ls testclock 744`): both copies keep the campaign's own date. d) battle turn-aways from A alone, from B alone, the
     cooldown refusal, both at one boundary 15 minutes later. e) Save as the host's checkpoint: `ls save` from A and from
     B (the slot, the chats, the marker of slot 1). f) the realism requirement of torpedo salvoes: *Fire torpedoes*
-    enabled only above Realism level 1 (the run's preference, on both copies). (g) the division report's speed write
+    enabled only above Realism level 1 (the run's preference, on both copies); 0.6.1: both chats named the battle's
+    Realism at the start, and below Captain's mode the first division report said once why the button is off. (g) the
+    division report's speed write
     (a5861e7) is lockstep_ui k), on both copies.) h) auto-run per player through the bridge: B on and off, A on (PlayerSide 2),
     a resync with A on auto-run, A off, B "home". i) a killed client restarted: A drops it and remembers the battle, runs
     alone, the client joins again and gets nation 1 and its ships back (rejoin, engine level 8), as after every rejoin
@@ -14604,7 +15425,7 @@ def scenario_lockstep_limits(ctx):
             ll_part('c) a resync with orders pending, dated later', limits_resync_pending, ctx, 'c)', F[0], F[1], camp)
             ll_part('d) battle turn-aways', limits_turnaway, ctx, 'd)', F[0])
         ll_part('e) Save', limits_save, ctx, 'e)', camp)
-        ll_part('f) the realism requirement', limits_realism, ctx, 'f)')
+        ll_part('f) the realism requirement', limits_realism, ctx, 'f)', H, C, {H: s['hm'], C: s['cm']})
         ll_part('h) auto-run per player', limits_autorun, ctx, 'h)')
         ll_part('i) a killed client restarted', limits_rejoin, ctx, 'i)', state)
         limits_both_auto(ctx, 'j)', s)
@@ -15422,7 +16243,8 @@ def scenario_lockstep_torpedo(ctx):
     the run, the game enables *Fire torpedoes* only above Realism level 1, and puts the user's Preferences back after it;
     lockstep_limits f) checks the requirement at the PC's own setting). One 1900 test battle, every division on the AI
     until the fleets are in torpedo range: a) the realism requirement met: *Fire torpedoes* enabled on both copies (B
-    takes A's preferences). b)-e) one boundary after the other (2 minutes apart, up to 60), as the firing solutions come:
+    takes A's preferences; 0.6.1: both chats named the battle's Realism, Captain's mode, at the start, and no "Fire
+    torpedoes is off" notice). b)-e) one boundary after the other (2 minutes apart, up to 60), as the firing solutions come:
     b) a salvo of B alone (`ls torp`: the division report, Fire torpedoes, the target and mount lists, Fire): ordered, a
     second order for that mount not queued (the mod's "... ordered already", or the dialog's "No solution" after the
     first order), released on both copies alike, its chat, the mount's torpedoes and reload equal on both. c) a salvo of
@@ -15445,8 +16267,8 @@ def scenario_lockstep_torpedo(ctx):
     ls_ensure_session(ctx)
 
     def battle():
-        ls_start_test(ctx, 'lockstep_torpedo')
-        limits_realism(ctx, 'a)')
+        s = ls_start_test(ctx, 'lockstep_torpedo')
+        limits_realism(ctx, 'a)', marks={H: s['hm'], C: s['cm']})
         n_ai = ls_all_ai(H, C)
         scmd(H, 'ls speed 3')
         log(f'  {n_ai} divisions on the AI: the fleets close in')
@@ -16912,6 +17734,15 @@ SCENARIOS = [  # name, months processed, what it guards, function
                    'emulated older host (`battles hostgen 0`) and one left past `battles timeout 20` are resolved by the '
                    'game (late answer ignored); a client that joined with `fightbattles 0` gets nothing deferred (one '
                    'more month if the game finds no battle; the war ends afterwards)', scenario_battles),
+    ('divisions', 2, '0.6.1: each joined player\'s own campaign divisions (Fleet organization): the host and the client '
+                     'make two divisions each through the game\'s dialogs (New division, Add ships to division, Rename '
+                     'division); the host\'s never reach the client (`divs`, its list); after each of two months (the '
+                     'first with the Fleet organization shown: the list filled again inside the load) the client keeps '
+                     'exactly its own (`divs`, list, slot 77 .off), the host stored them (`divstore 1`, "divisions of '
+                     'nation 1: 2 stored" / "in its month") and keeps exactly its own (`divs`, list, slot 1 .off and '
+                     'Autosave.off CampDivNo: no duplicates after its reload); no exception, "Error in '
+                     'FillDivisionList2" or "Missing ship"; the divisions stay for the later scenarios',
+     scenario_divisions),
     ('victory_points', 1, 'joined players\' victory points (0.2.6): a host battle against a joined nation credits '
                           'it (battlevp = the game\'s HandleBattleAftermath), EnemyVP outside battles (enemyvpadd) is '
                           'shared among the host\'s enemies at month end (1 enemy, 2 enemies 51/50, a drop shares '
@@ -16969,6 +17800,12 @@ SCENARIOS = [  # name, months processed, what it guards, function
                            'branches of DoSurpriseAttack in the view), both directions played in the battle slot with '
                            'the game\'s CheckSurpriseAttack (`battles injectsa`, `battles saretry`): a battle or a clean '
                            'no-battle, never resolved by the game', scenario_battle_surprise),
+    ('relations_war', 1, '0.6.1: the tension bar above the war line: nation 1 at tension 15 with a computer nation -> its '
+                         'war from nation 1\'s relation turn (CheckForWar after the tension routines, once, as the game\'s '
+                         'month); the players at tension 25 -> the other player\'s bar hint on both PCs (relview: wars '
+                         'between players only by the players), the war-line chat line once on each PC (warline '
+                         'forget/check), no war 0-1; the stand-in\'s reserved nation 2 a person\'s on both PCs (its bar\'s '
+                         'hint at peace, warline people); ends at peace', scenario_relations_war),
     ('player_copy', 1, 'a joined player\'s "Copy game" (0.2.7): the client\'s copy (copygame = the game\'s '
                        'CopyGameToOtherSlot through the hook) is its own campaign (its nation is nation 0, the host\'s '
                        'nation AI nation 1; relations, sections, numbers, war state, cooldowns, map, divisions, designs '
@@ -17009,6 +17846,12 @@ SCENARIOS = [  # name, months processed, what it guards, function
                            'killed client restarted rejoins; both players on auto-run to the game\'s end; every minute\'s '
                            'date= the campaign\'s own and ident= equal (c9b74b9)',
      scenario_lockstep_limits),
+    ('lockstep_data', 0, '0.6.1 (engine level 18): the game\'s temporary files (Data\\tmpShip.ttp, which the ship '
+                              'designer rewrites) stay out of the live battles\' data-file check: both scans name them and '
+                              'hash the other files of Data alike; B\'s test switch on two tmp* names leaves its hash '
+                              'unchanged and a live test battle starts live, 4 minutes equal; Data\\Gundata.dat on the '
+                              'switch changes the hash (the control)',
+     scenario_lockstep_data),
     ('lockstep_pvp', 1, 'live battle between two joined players (a third copy joins as "Bot", nation 2, slot 76): war '
                         '1-2, `battles injectpvp`, months (up to 3) until the battle phase fights it live (attacker A, '
                         'defender B, the host relays), equal hashes, an order of B; default: 10 live minutes, then A '
@@ -17102,15 +17945,16 @@ SCENARIOS = [  # name, months processed, what it guards, function
 STRESS_ONLY = ('lockstep_stress', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_strike',
                'lockstep_missiles')  # not in the default run: --stress, --group or --only
 GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), in the suite's order
-    'limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_air'),
+    'limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_data', 'lockstep_air'),
     'rejoin': ('lockstep_rejoin', 'lockstep_resume'),
     'air': ('air_units', 'lockstep_air', 'lockstep_strike'),
     'airunits': ('air_units',),
     'torpedo': ('lockstep_torpedo',),
     'missiles': ('lockstep_missiles',),
-    'live-limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo',
-                    'lockstep_air', 'lockstep_strike', 'lockstep_missiles'),
-    'relations': ('relations_peace', 'war_effects', 'arms_treaty', 'battle_generator', 'battle_surprise'),
+    'live-limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_data', 'lockstep_rejoin', 'lockstep_resume',
+                    'lockstep_torpedo', 'lockstep_air', 'lockstep_strike', 'lockstep_missiles'),
+    'relations': ('relations_peace', 'war_effects', 'arms_treaty', 'battle_generator', 'battle_surprise',
+                  'relations_war'),
     'battlegen': ('battle_generator', 'battle_surprise'),
     'twopc': ('twopc',),
 }
@@ -17123,8 +17967,10 @@ EST = dict(session=14, intel_reports=1, file_lock=4, events=4, merge=17, researc
            lockstep_limits=175, lockstep_pvp=72, lockstep_month=109, lockstep_rejoin=565, lockstep_resume=380,
            lockstep_torpedo=470, lockstep_stress=1310, lockstep_air=265, air_units=65, lockstep_strike=420,
            lockstep_missiles=330, twopc=175, relations_peace=40, war_effects=220, arms_treaty=150,
-           battle_generator=150, battle_surprise=60)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s);
+           battle_generator=150, battle_surprise=60, relations_war=40, lockstep_data=15, divisions=90)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s);
+# divisions: dist_fd_2, 2026-10-25 (90 s, two months)
 # battles: dist_b6_5, 2026-10-23 (180 s with c2), one more month; battle_surprise: dist_b6_7, 2026-10-23 (57 s, one fought battle)
+# relations_war: dist_fw_1, 2026-10-25 (37 s); lockstep_data: dist_i61_1, 2026-10-25 (13 s)
 # their long variants (--stress; dist_ll_16, twopc on dist_tp_1)
 EST_STRESS = dict(lockstep_pvp=235, lockstep_month=710, twopc=200)
 

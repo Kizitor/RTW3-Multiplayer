@@ -9,6 +9,89 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.6.1 (2026-10-26)
+Fixes of the bugs that players reported on 0.6.0: a joined player's divisions and the host's doubled divisions, the
+tension bar between two players above the war line, *Fire torpedoes* greyed out in live battles, and live battles
+between two PCs that fell back to the computer after a player had used the ship designer. Also fixed: an error box of
+the host's game when it resolved a joined player's battle that wasn't fought. **Everyone must update for
+live battles:** 0.6.1 has a new live-battle engine (18), so a player on 0.6.0 or older fights no live battle with a
+host or player on 0.6.1: such battles are fought against the computer or resolved by the game, and the chat says why.
+The protocol is still 3: players on 0.6.0 and 0.6.1 can still play a campaign together.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.6.1)
+
+### Fixed
+- **A joined player's divisions:** the strategic screen's *Fleet organization* tab showed the host's divisions with
+  the host's ships, and the divisions that the player made there never reached the host and were gone after a month.
+  Now every player has their own divisions: a joined player's go to the host with each turn and come back with every
+  new month, and the game sets up the player's side of their battles against computer nations from them, as in
+  single player. Divisions made with 0.6.0 are lost: make them again.
+- **The host's divisions doubled with every reload** (2, then 4, then 8): the game adds a campaign's divisions to the
+  ones it already holds whenever it loads the campaign, and multiplayer loads it again every month and around
+  battles. The game's question at the turn, "Some ships or divisions have no commander assigned. ...", then gave the
+  copies admirals. Every load now replaces the divisions, and a campaign whose divisions were doubled is repaired the
+  first time 0.6.1 loads it: the first of each division stays.
+- **The tension bar between two players' nations** could rise far above the tension panel's war line, where a
+  computer nation would soon declare war, and nothing said why no war came. Wars between players are declared only
+  by the players, with **Declare war** in the Multiplayer window, and that stays. Now the bar's tooltip says so
+  ("Tension with Germany is 25 - played by a person: wars between players are declared only in the Multiplayer window
+  (Diplomacy), never by the game"), and each time the tension between two players' nations rises to 11 or more (the
+  bar crosses the war line), both players get one line in the chat: "* Tension between Great Britain and Germany is
+  25, above the war line. Wars between players are declared only by the players (Multiplayer window, Diplomacy); the
+  game will not declare one."
+- **A war from the host's game on a player's nation:** the host's game treated a nation kept for a player who wasn't
+  connected as a computer nation in its own relations when that player hadn't played it with 0.5.0 or newer, and
+  could declare a war between the host's nation and it. On the host, every nation reserved or claimed by a player now
+  counts as a player's, connected or not: the host's game declares no war on it, and its bar gets the tooltip above.
+- ***Fire torpedoes* greyed out in live battles:** the game offers manual torpedo salvoes only with the battle
+  preference *Realism* at Captain's mode, in single player too; in a live battle the first player's preference counts
+  on both PCs, and the game's default is Rear admiral's mode. Nothing told the players. Now both players' chat names
+  the battle's Realism when it starts, whose preference it is and what it means for torpedoes (for example
+  "Realism: Rear admiral's mode (your battle preference, for both players). Fire torpedoes in the division report
+  needs Captain's mode, which you can choose in the Preferences before the next battle. Your ships still fire
+  torpedoes on their own."), and the first division report of the battle that shows *Fire torpedoes* greyed out
+  explains why, in the chat and in a notice. The rule stays: the first player chooses Captain's mode in the
+  *Preferences* before the battle. At every level your ships fire their torpedoes on their own.
+- **Live battles between two PCs fell back to the computer** after a player had used the ship designer (since 0.4.1):
+  the designer rewrites the game's temporary file `Data\tmpShip.ttp`, and the check of the game data files compared
+  it, so the chat said "... game data files differ ...: Data\tmpShip.ttp" and the battle was fought against the
+  computer. The check now leaves out the game's temporary files (names starting with `tmp` in `Data`).
+- **The host's game error box "Error in DoBattleBetweenAINations procedure! Access violation ...":** a joined player's
+  battle against a computer nation that wasn't fought (past the time limit, declined by a player on an older version,
+  no battle on the player's PC, the player gone) is resolved by the host's game after the battles. Since 0.3.0, when
+  one side no longer had a ship there that could fight (sunk or damaged in another battle of the month, for example),
+  the game's routine stopped with this box on the host, and the host's game waited until someone answered it, or, by
+  chance, the other side lost ships to a fleet that wasn't there. Now such a battle is no battle, as in the game's own
+  monthly check, which never starts a battle without ships of both sides in the area.
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0, 0.6.0 and 0.6.1 can join each other's hosts and play the campaign
+  together.
+- 0.6.1 has a new live-battle engine (18). A player on 0.6.0 (engine 17) or older can't fight a live battle with a
+  host or player on 0.6.1: the host's own battle against them is fought against the computer, a battle between two
+  joined players is resolved by the game unless both have the host's engine, and the chat and the notices name both
+  versions ("live battles need the same live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have
+  0.6.0 (engine 17)"). Update the host and every player.
+- A joined player's own divisions need 0.6.1 on the player's PC:
+  - a host on 0.6.1 and a player on 0.6.0: the player no longer sees the host's divisions, and their own still never
+    reach the host;
+  - a host on 0.6.0 and a player on 0.6.1: the player keeps their divisions from month to month and in their battles
+    against computer nations, but they never reach the host, and the host's own divisions still double.
+- The tension bar's tooltip needs 0.6.1 on the PC that shows it. The war line's chat line, and no war from the host's
+  game on a player's nation while that player isn't connected, need 0.6.1 on the host; so does the end of the
+  DoBattleBetweenAINations box (the host resolves the battles that weren't fought).
+- Existing campaigns go on from where they are. A campaign whose divisions 0.6.0 doubled is repaired the first time
+  0.6.1 loads it; a joined player's divisions that 0.6.0 lost can't be brought back.
+
+### Known issues
+- A joined player's divisions stay as the player's last turn sent them: their battle experience and the host's
+  monthly division training don't change them.
+- A joined player's divisions don't shape a live battle against the host, or the second player's side of a live
+  battle between two joined players: the other player's game sets those battles up, and the player's nation is a
+  computer nation there.
+- The host's tension bars may not be redrawn after a joined player's monthly event changes a tension (seen with an
+  intelligence event of a player on 0.6.0); the change itself is in the campaign.
+- The known issues of 0.6.0 remain.
+
 ## 0.6.0 (2026-10-23)
 After 0.5.0 gave each joined player's nation the player's relations, peace and money, 0.6.0 gives it the effects of
 its wars and its battles as the player's nation gets them in single player: blockades, the help of allies, war
