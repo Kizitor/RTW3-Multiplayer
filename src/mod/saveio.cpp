@@ -239,7 +239,7 @@ bool ApplyStateBundle(const Bundle& b, const std::wstring& slotDir, int slot, st
 static const char* kNationSections[] = {"Nation%d", "Nation%dShips", "Nation%dCoastalArtillery", "Nation%dSubmarines"};
 
 bool BuildSubmission(const std::wstring& slotDir, int slot, int nationIdx, long long idStart, Bundle& out,
-                     std::string& err) {
+                     std::string& err, bool legacy) {
     out.files.clear();
     std::string bcs;
     std::wstring s = SlotStr(slot);
@@ -255,6 +255,7 @@ bool BuildSubmission(const std::wstring& slotDir, int slot, int nationIdx, long 
     mini.Set("General", "MPNation", std::to_string(nationIdx));
     mini.Set("General", "Year", d.Get("General", "Year"));
     mini.Set("General", "Month", d.Get("General", "Month"));
+    if (legacy) mini.Set("General", "MPLegacy", "1");
     for (const char* fmt : kNationSections) {
         char name[64];
         snprintf(name, sizeof(name), fmt, nationIdx);
@@ -336,6 +337,8 @@ static bool IsHostOwnedKey(const std::string& line) {
 }
 
 static int DropForeignShips(IniDoc& host, int nationIdx);
+static bool ShipKey(const std::string& line, int& n, std::string& field);
+static std::set<std::string> ShipIdsOf(const IniDoc& d, int K);
 
 bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const Bundle& sub, std::string& err) {
     std::wstring s = SlotStr(slot);
@@ -362,6 +365,9 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
         return false;
     }
     int replaced = 0;
+    const bool legacy = cli.Get("General", "MPLegacy") == "1";
+    std::set<std::string> oldIds;  // a legacy turn: the ships of K's (generated) fleet the host holds now
+    if (legacy) oldIds = ShipIdsOf(host, nationIdx);
     for (const char* fmt : kNationSections) {
         char name[64];
         snprintf(name, sizeof(name), fmt, nationIdx);
@@ -382,6 +388,15 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
         }
     }
     int dropped = DropForeignShips(host, nationIdx);
+    std::string legacyNote;
+    if (legacy) {  // the legacy fleet replaced the generated one: K's air units on the generated ships go with them
+        std::set<std::string> gone, now = ShipIdsOf(host, nationIdx);
+        for (auto& id : oldIds)
+            if (!now.count(id)) gone.insert(id);
+        int au = DropAirUnitsOn(host, nationIdx, gone);
+        legacyNote = ", legacy fleet: " + std::to_string(oldIds.size()) + " ship(s) -> " + std::to_string(now.size()) +
+                     ", " + std::to_string(au) + " air unit(s) of removed ships dropped";
+    }
     long long hostId = atoll(host.Get("General", "IDNo", "0").c_str());
     long long cliId = atoll(cli.Get("General", "IDNo", "0").c_str());
     long long cliStart = atoll(cli.Get("General", "IDNoStart", "0").c_str());
@@ -427,9 +442,143 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
         Log("merge nation %d rejected: %s", nationIdx, err.c_str());
         return false;
     }
-    Log("merge nation %d: %d sections, %d possession fields, IDNo %lld/%lld%s", nationIdx, replaced, poss, hostId, cliId,
-        dropped ? (", " + std::to_string(dropped) + " ship(s) of other nations dropped").c_str() : "");
+    Log("merge nation %d: %d sections, %d possession fields, IDNo %lld/%lld%s%s", nationIdx, replaced, poss, hostId,
+        cliId, dropped ? (", " + std::to_string(dropped) + " ship(s) of other nations dropped").c_str() : "",
+        legacyNote.c_str());
     return replaced > 0;
+}
+
+bool IsLegacySubmission(const Bundle& sub) {
+    const std::string* nb = sub.Get("nation.bcs");
+    return nb && ParseIni(*nb).Get("General", "MPLegacy") == "1";
+}
+
+// The ids of nation K's ships ([NationKShips] Ship<n>Id).
+static std::set<std::string> ShipIdsOf(const IniDoc& d, int K) {
+    std::set<std::string> ids;
+    const IniSection* s = d.Find("Nation" + std::to_string(K) + "Ships");
+    if (!s) return ids;
+    for (auto& l : s->lines) {
+        int n;
+        std::string field;  // "Field=value"
+        if (ShipKey(l, n, field) && field.compare(0, 3, "Id=") == 0) ids.insert(field.substr(3));
+    }
+    return ids;
+}
+
+int DropAirUnitsOn(IniDoc& d, int K, const std::set<std::string>& ids) {
+    IniSection* s = d.Find("AirUnits");
+    if (!s || ids.empty()) return 0;
+    // AU<n><Field>=value; other lines (AirUnitNo) stay first, the units follow in their order, renumbered.
+    std::map<int, std::vector<std::pair<std::string, std::string>>> units;
+    std::vector<std::string> other;
+    for (auto& l : s->lines) {
+        size_t eq = l.find('=');
+        size_t p = 2;
+        while (eq != std::string::npos && p < eq && isdigit((unsigned char)l[p])) p++;
+        if (eq == std::string::npos || l.compare(0, 2, "AU") != 0 || p == 2 || p >= eq) {
+            other.push_back(l);
+            continue;
+        }
+        units[atoi(l.substr(2, p - 2).c_str())].push_back({l.substr(p, eq - p), l.substr(eq + 1)});
+    }
+    int dropped = 0;
+    std::vector<std::string> out;
+    int next = 0;
+    std::vector<std::vector<std::pair<std::string, std::string>>*> kept;
+    for (auto& u : units) {
+        std::string nation, home;
+        for (auto& f : u.second) {
+            if (f.first == "Nation") nation = f.second;
+            if (f.first == "HomeBase") home = f.second;
+        }
+        if (atoi(nation.c_str()) == K && !nation.empty() && ids.count(home)) {
+            dropped++;
+            continue;
+        }
+        kept.push_back(&u.second);
+    }
+    if (!dropped) return 0;
+    for (auto& l : other) {
+        if (KeyIs(l, "AirUnitNo")) l = "AirUnitNo=" + std::to_string(kept.size());
+        out.push_back(l);
+    }
+    for (auto* u : kept) {
+        for (auto& f : *u) out.push_back("AU" + std::to_string(next) + f.first + "=" + f.second);
+        next++;
+    }
+    s->lines = out;
+    return dropped;
+}
+
+bool ClearNationFleet(const std::wstring& slotDir, int slot, int K, std::string& summary, std::string& err) {
+    std::wstring s = SlotStr(slot);
+    std::wstring bcsPath = slotDir + L"RTWGame" + s + L".bcs";
+    std::wstring desPath = slotDir + L"DesignFiles" + std::to_wstring(K) + L".des";
+    std::string bytes, des;
+    if (!ReadFileBytes(bcsPath, bytes)) {
+        err = "cannot read the save";
+        return false;
+    }
+    IniDoc d = ParseIni(bytes);
+    std::string sec = "Nation" + std::to_string(K);
+    IniSection* ships = d.Find(sec + "Ships");
+    if (K < 1 || K > 8 || !ships || d.Get(sec, "ShipCount").empty()) {
+        err = "no ship list of nation " + std::to_string(K);
+        return false;
+    }
+    std::set<std::string> ids = ShipIdsOf(d, K);
+    int count = atoi(d.Get(sec, "ShipCount").c_str());
+    ships->lines.clear();
+    d.Set(sec, "ShipCount", "0");
+    int au = DropAirUnitsOn(d, K, ids);
+    // DesignFilesK.des: the version line, the design count, then the designs; no designs is "<version>\r\n0\r\n".
+    int designs = 0;
+    std::string newDes;
+    if (ReadFileBytes(desPath, des)) {
+        size_t p = des.size() >= 3 && des.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
+        size_t e1 = des.find('\n', p);
+        if (e1 == std::string::npos) {
+            err = "unreadable design file";
+            return false;
+        }
+        size_t e2 = des.find('\n', e1 + 1);
+        designs = atoi(des.substr(e1 + 1, e2 == std::string::npos ? std::string::npos : e2 - e1 - 1).c_str());
+        std::string ver = des.substr(p, e1 - p);
+        if (!ver.empty() && ver.back() == '\r') ver.pop_back();
+        newDes = des.substr(0, p) + ver + "\r\n0\r\n";
+    }
+    // 0.6.1: the slot's .off holds the nation's own campaign divisions; they name the ships just removed (and the
+    // host's division store keeps only what the legacy turn sends, see nplay::HostTakeDivisions): an empty list.
+    std::wstring offPath = slotDir + L"RTWGame" + s + L".off";
+    std::string off, newOff;
+    std::vector<std::string> divLines;
+    int divs = 0;
+    if (ReadFileBytes(offPath, off) && OffDivisionLines(off, divLines)) {
+        std::vector<CampDiv> old;
+        std::string perr;
+        ParseDivisions(divLines, old, false, perr);
+        divs = (int)old.size();
+        newOff = WithDivisionLines(off, DivisionLines({}));
+    }
+    if (!WriteFileBytes(bcsPath, WriteIni(d))) {
+        err = "cannot write the save";
+        return false;
+    }
+    if (!newDes.empty() && !WriteFileBytes(desPath, newDes)) {
+        WriteFileBytes(bcsPath, bytes);
+        err = "cannot write the design file";
+        return false;
+    }
+    if (!newOff.empty() && newOff != off && !WriteFileBytes(offPath, newOff)) {
+        WriteFileBytes(bcsPath, bytes);
+        if (!newDes.empty()) WriteFileBytes(desPath, des);
+        err = "cannot write the officers file";
+        return false;
+    }
+    summary = std::to_string(count) + " ship(s), " + std::to_string(designs) + " design(s), " + std::to_string(au) +
+              " air unit(s), " + std::to_string(divs) + " campaign division(s) removed";
+    return true;
 }
 
 bool ReadDate(const std::wstring& slotDir, int slot, int& year, int& month) {
@@ -932,7 +1081,7 @@ static bool IntelField(const std::string& f) {
 static std::string FieldKey(const std::string& f) { return f.substr(0, f.find('=')); }
 
 bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J, const Bundle& result,
-                       const std::vector<int>& allowed, std::string& summary, std::string& err) {
+                       const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed) {
     IniDoc sent = ParseIni(sentBcs);
     IniDoc host = hostOut;  // committed only if everything applies
     std::vector<std::pair<std::string, const std::string*>> secs;
@@ -1008,7 +1157,7 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
             for (auto& f : r->second->fields) {
                 std::string key = FieldKey(f);
                 auto w = was.find(key);
-                if ((w != was.end() && w->second == f) || IntelField(f)) continue;
+                if ((w != was.end() && w->second == f) || IntelField(f) || (keepUsed && key == "Used")) continue;
                 bool set = false;
                 for (auto& hf : nb.fields)
                     if (FieldKey(hf) == key) {

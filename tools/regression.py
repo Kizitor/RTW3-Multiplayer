@@ -5173,8 +5173,8 @@ def scenario_battle_generator(ctx):
     check('a) host log "Player\'s battle generator: its error box in a joined nation\'s view goes to the log" (decision 3: '
           'the ShowMessage of CheckForBattles2\'s except handler hooked)', any('goes to the log' in x for x in ln), ln[:1])
     hl = log_lines(log_since(H), r'battle generator \d')
-    check('a) the host logged the client\'s hello with "battle generator 1" (or 2: also surprise attacks, B6 piece 2)',
-          any(re.search(r'battle generator [12]\b', x) for x in hl), hl[:2])
+    check('a) the host logged the client\'s hello with "battle generator 1" (or 2: also surprise attacks, B6 piece 2; 3: '
+          'also raider checks, 0.7.0; 4: also invasions, 0.7.0)', any(re.search(r'battle generator [1234]\b', x) for x in hl), hl[:2])
     rr = relrules(H)
     if rr is None or K not in rr:
         log('  nation 1 not under the player\'s rules: forced', cmd(H, f'relrules {K} 1'))
@@ -5388,11 +5388,11 @@ def scenario_battle_surprise(ctx):
     if not cstate().get('fight'):
         log('  the client does not fight its battles: joins again with fightbattles 1', rejoin(ctx, K, True)[0])
     hl = log_lines(log_since(H), r'battle generator \d')
-    check('a) the host logged the client\'s hello with "battle generator 2"', any('battle generator 2' in x for x in hl),
-          hl[-2:])
+    check('a) the host logged the client\'s hello with "battle generator 2" (3 since 0.7.0: also raider checks; 4: '
+          'invasions)', any(re.search(r'battle generator [234]\b', x) for x in hl), hl[-2:])
     cs = cstate()
-    check('a) the client\'s `battles state`: hostgen=2 (the host\'s welcome `gen` 2: surprise attacks and takeovers)',
-          cs.get('hostgen') == 2, cs.get('raw'))
+    check('a) the client\'s `battles state`: hostgen=2 (the host\'s welcome `gen` 2: surprise attacks and takeovers; 3 '
+          'since 0.7.0; 4 with invasions)', cs.get('hostgen') in (2, 3, 4), cs.get('raw'))
     humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
     nt = nation_table()
     J = 5 if 5 not in humans and 5 in nt else next((j for j in range(3, 9) if j not in humans and j in nt), None)
@@ -5498,6 +5498,687 @@ def scenario_battle_surprise(ctx):
 # The host's log when a ship a joined nation's peace hands over is not that nation's on the host (game.cpp HandOverShip).
 PEACE_SHIP_SKIPPED = r"relations v2: peace of nation {K}: ship (\d+) \(.*?\) skipped: not among nation {K}'s ships"
 
+
+def raider_merge_check(drv, bid, K, J, tag, forced_line):
+    """0.7.0: a raider battle's result in the host's save. Every field of nation K's and J's ships that the battle slot
+    changed (relative to the host's save at the battle phase's start; intel fields, BuildingNationIdx and Used excluded:
+    a raider battle's merge keeps the host's Used marks) has the slot's value in the merged save, sunk ships are gone;
+    the two ships the test put in place (`battles testraid`) have their own status and area back (unless sunk)."""
+    s0, g87, s1 = drv.s0, drv.g87.get(bid), drv.s1.get(bid)
+    if not check(f'{tag}: the saves for the merge check (phase start, battle slot, merged)', s0 and g87 and s1,
+                 dict(s0=bool(s0), g87=bool(g87), s1=bool(s1))):
+        return
+    skip = ('PlayerIntel', 'EnemyClassName', 'EnemySpeed', 'EnemyBelt', 'BuildingNationIdx', 'Used')
+    bad, changed, sunk = [], 0, 0
+    for slot_n, host_n in ((0, K), (J, J)):
+        before = ships_by_id(s0.get(f'Nation{host_n}Ships'))
+        after = ships_by_id(g87.get(f'Nation{slot_n}Ships'))
+        merged = ships_by_id(s1.get(f'Nation{host_n}Ships'))
+        for sid, f0 in before.items():
+            fa = after.get(sid)
+            if fa is None or fa.get('Status') == '8':
+                sunk += 1
+                if sid in merged and merged[sid].get('Status') != '8':
+                    bad.append((host_n, sid, 'sunk in the battle slot, afloat in the merged save'))
+                continue
+            for k, v in fa.items():
+                if k in skip or f0.get(k) == v:
+                    continue
+                changed += 1
+                if merged.get(sid, {}).get(k) != v:
+                    bad.append((host_n, sid, k, v, merged.get(sid, {}).get(k)))
+    check(f'{tag}: merged on the host: every ship field of nations {K} and {J} the battle changed ({changed}) has the '
+          f'battle slot\'s value, sunk ships ({sunk}) gone (the Used marks stay the host\'s)', not bad, bad[:5])
+    m = re.search(r'raider (.+?) \(status (\d+)\) and patrol (.+?) \(status (\d+)\) in (.+)$', forced_line or '')
+    if not m:
+        return
+    leak = []
+    for name in (m[1], m[3]):
+        for host_n in (K, J):
+            f0 = next((f for f in ships_by_id(s0.get(f'Nation{host_n}Ships')).values() if f.get('Name') == name), None)
+            f1 = next((f for f in ships_by_id(s1.get(f'Nation{host_n}Ships')).values() if f.get('Name') == name), None)
+            if f0 and f1 and f1.get('Status') != '8' and (f0.get('Status'), f0.get('LocationAreaName')) != \
+                    (f1.get('Status'), f1.get('LocationAreaName')):
+                leak.append((host_n, name, f0.get('Status'), f1.get('Status'), f0.get('LocationAreaName'),
+                             f1.get('LocationAreaName')))
+    check(f'{tag}: the test\'s own setup did not reach the host (the raider {m[1]} and the patrol {m[3]}: status and '
+          f'sea area in the merged save as sent, unless sunk)', not leak, leak)
+
+
+def scenario_battle_raider(ctx):
+    """0.7.0: raiders against patrols for nation 1 under the player's rules, at war with a computer nation J. a) both logs
+    "Raiders against patrols for joined nations: ok", the client's hello "battle generator 3", its `battles state`
+    hostgen=3 testraid=off; b) `battles gen 1` x20 (dry runs): the game's raider checks recorded in nation 1's view
+    ("raider check" attempts: up to two a month, each after Random(100) < 30), the host's relations unchanged; c) four
+    months, each with a request of one raider check (`battles injectraid 1`) and the client's `battles testraid <side> J`
+    (the next raider check: the pair put in place in the battle slot, CheckRaiderInterceptions' draws 0): side 0 (our
+    raider intercepted) and side 1 (our patrol intercepts), each fought (RaiderBattleDialog "Fight Battle") and
+    auto-resolved ("Auto resolve": QuickResolveRaiderBattle): the game's CheckRaiderVsPatrols found the interception
+    with its "thwarts" lines; outcome fought, merged on the host ("; a raider battle[, auto-resolved]"), the merge
+    cross-checked, the test's setup not merged; the "thwarts" lines in nation 1's news (the client's chat with the new
+    month), not in the host's chat; the host unchanged (nation 0's ships as at the phase start, no raider box on the
+    host); the host's chat line. The war ends at the end."""
+    K = 1
+    for port, who in ((H, 'host'), (C, 'client')):
+        ln = log_lines(log_since(port), r'Raiders against patrols for joined nations')
+        check(f'a) {who} log "Raiders against patrols for joined nations: ok"', any(': ok' in x for x in ln), ln[:1])
+    hl = log_lines(log_since(H), r'battle generator \d')
+    check('a) the host logged the client\'s hello with "battle generator 3" (raider checks, 0.7.0; 4: also invasions)',
+          any(re.search(r'battle generator [34]\b', x) for x in hl), hl[-1:])
+    rr = relrules(H)
+    if rr is None or K not in rr:
+        log('  nation 1 not under the player\'s rules: forced', cmd(H, f'relrules {K} 1'))
+    if not cstate().get('fight'):
+        log('  the client does not fight its battles: joins again with fightbattles 1', rejoin(ctx, K, True)[0])
+    cs = cstate()
+    check('a) the client\'s `battles state`: hostgen=3 (the host\'s welcome `gen` 3; 4 with invasions), testraid=off',
+          cs.get('hostgen') in (3, 4) and cs.get('testraid') == 'off', cs.get('raw'))
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    cands = [c for c in battle_pairs(K) if c[2] not in humans]
+    if not check(f'setup: a computer nation with a possession in a sea area where nation {K} has >= 4 ships', cands,
+                 cands[:3]):
+        return
+    _, _, J, _ = cands[0]
+    nt = nation_table()
+    t0 = rel(K, J).get('tension', '5')
+    hr, cr = peace_war(K, J)
+    check(f'setup: nation {K} at war with computer nation {J} on both copies (was {t0})',
+          hr.get('war') == '1' and 'war=1' in (cr or ''), dict(host=hr, client=cr))
+    pairs = [(a, b) for a in range(9) for b in range(a + 1, 9)]
+    before = {p: rel(*p).get('tension') for p in pairs}
+    reps = [cmd(H, f'battles gen {K}') for _ in range(20)]
+    runs = sum(1 for r in reps if 'raider check' in r)
+    check(f'b) `battles gen {K}` x20: all ok; the game\'s raider checks recorded in nation {K}\'s view as attempts '
+          f'({sum(r.count("raider check") for r in reps)} in {runs} of 20 runs; at most 2 a run)',
+          all(r.startswith('ok') for r in reps) and runs >= 1 and all(r.count('raider check') <= 2 for r in reps),
+          [r[:160] for r in reps if 'raider check' in r][:2] or reps[:2])
+    after = {p: rel(*p).get('tension') for p in pairs}
+    check('b) the host\'s relations unchanged by the dry runs', before == after,
+          [p for p in pairs if before[p] != after[p]][:6])
+    names = {0: 'our raider intercepted', 1: 'our patrol intercepts'}
+    cmd(H, 'mpwindow')
+    cmd(C, 'mpwindow')
+    for side, action in ((0, 'fight'), (0, 'quick'), (1, 'fight'), (1, 'quick')):
+        tag = f'c) side {side} ({names[side]}), {"fought" if action == "fight" else "auto-resolved"}'
+        if rel(K, J).get('war') != '1':
+            log('  the war had ended:', peace_war(K, J))
+        rt = cmd(C, f'battles testraid {side} {J}')
+        r1 = cmd(H, f'battles injectraid {K}')
+        bid = int(r1.split()[1]) if r1.startswith('ok ') else None
+        if not check(f'{tag}: `battles testraid {side} {J}` (client), `battles injectraid {K}` (host)',
+                     rt == f'ok testraid={side}:{J}' and bid, dict(testraid=rt, inject=r1)):
+            continue
+        hm, cm, hc0, cc0, t_b = log_mark(H), log_mark(C), chat(ctx.hp), chat(ctx.cp), time.time()
+        drv = BattleDriver(ctx, {bid: action}, K, J)
+        drv.label = f'battleraid {side}{action[0]}'
+        run_month(ctx, drv.label, driver=drv)
+        hlog, clog = log_since(H, hm), log_since(C, cm)
+        rec = drv.rec.get(bid, {})
+        forced = log_lines(clog, rf'StartRaiderCheck: TEST: forced interception \(side {side}, nation {J}\): raider ')
+        res = log_lines(clog, r'StartRaiderCheck: True, interception yes')
+        nmsg = re.search(r', (\d+) new turn message', res[-1]) if res else None
+        check(f'{tag}: the client put the pair in place and the game\'s CheckRaiderVsPatrols found the interception '
+              f'(nation {J}, side {side}) with its "thwarts" lines (new turn messages)',
+              forced and res and f'(nation {J}, side {side},' in res[-1] and nmsg and int(nmsg[1]) >= 1,
+              dict(forced=[x.split('] ', 1)[-1][-150:] for x in forced[-1:]], res=[x.split('] ', 1)[-1] for x in res[-1:]]))
+        want = 'auto-resolved' if action == 'quick' else 'fought'
+        att = log_lines(clog, rf'battle {bid}: attempt 0 \(raider check\): ')
+        check(f'{tag}: battle {bid}: the raider battle {want} on the client (RaiderBattleDialog answered '
+              f'"{"Auto resolve" if action == "quick" else "Fight Battle"}"), sent as fought',
+              att and f'({want})' in att[-1] and rec.get('outcome') == 'fought' and rec.get('raider_dialog'),
+              dict(att=[x.split('] ', 1)[-1] for x in att[-1:]], outcome=rec.get('outcome'), answers=rec.get('answers')))
+        applied = log_lines(hlog, rf'battle {bid} applied: ')
+        tail = 'a raider battle, auto-resolved' if action == 'quick' else 'a raider battle'
+        check(f'{tag}: the host merged it ("battle {bid} applied: ...; {tail}")',
+              applied and applied[-1].rstrip().endswith(tail), [x.split('] ', 1)[-1] for x in applied[-1:]])
+        raider_merge_check(drv, bid, K, J, tag, forced[-1] if forced else None)
+        thwart = [x.split(f'news for nation {K}: ', 1)[1] for x in log_lines(hlog, rf'battle {bid}: news for nation {K}: ')]
+        cc1, hc1 = chat(ctx.cp), chat(ctx.hp)
+        check(f'{tag}: the "thwarts" lines in nation {K}\'s news (host log; the client\'s chat with the new month), not '
+              f'in the host\'s chat', thwart and any(' thwarts ' in t for t in thwart) and
+              not new_chat_missing(cc0, cc1, ['* ' + t for t in thwart]) and not any(t in hc1 for t in thwart),
+              dict(news=thwart[:3], missing=new_chat_missing(cc0, cc1, ['* ' + t for t in thwart])[:2]))
+        s0, s1 = drv.s0, drv.s1.get(bid)
+        host_boxes = [b[2:] for b in BOX_SEEN if b[0] >= t_b and b[1] == 'host' and
+                      (b[2] == 'TdlgMapMessage' or 'raider' in b[3].lower() or 'intercept' in b[3].lower())]
+        check(f'{tag}: the host unchanged: nation 0\'s ships in the merged save as at the phase start; no raider dialog '
+              f'or box on the host; no game error box', s0 and s1 and s0.get('Nation0Ships') == s1.get('Nation0Ships')
+              and not host_boxes and not game_error_boxes(t_b), dict(boxes=host_boxes[:3], errors=game_error_boxes(t_b)))
+        pat = (rf'\* The raider battle of {re.escape(nt[K]["name"])} against {re.escape(nt[J]["name"])}.* was '
+               rf'{want} by ')
+        check(f'{tag}: the host\'s chat "* The raider battle of ... was {want} by ..."',
+              not new_chat_missing(hc0, hc1, [], pat), pat)
+    natural = log_lines(log_since(H), r"battle request \d+ \(the player's generator\): .*raider check")
+    log(f'  natural requests with raider checks this run: {len(natural)}; the client\'s raider checks without an '
+        f'interception: {len(log_lines(log_since(C), r"attempt \d+ \(raider check\) found no interception"))}')
+    peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() else 5)
+
+
+def scenario_battle_invasion(ctx):
+    """0.7.0: invasions for nation 1 under the player's rules (hello `gen` 4), at war with a computer nation J. a) both
+    logs "Invasions for joined nations: ok", the client's hello "battle generator 4", `inv form` hostgen=4; b) month 1:
+    the client's invasion target (`inv pick`, the form's InvasionTarget as the game's button sets it) on the host's
+    possession -> refused ("a person plays its owner"); nation 1 invading J's possession p1 (`inv set p1 1 2`) with the
+    routine's own draws low (`inv rnd 1`) -> CheckRebellionAndInvasions in nation 1's view after the month: its texts in
+    nation 1's news (host log, the client's turn report), p1 captured (owner 1) or the invasion defeated (not invaded), the
+    host's own call hid it (once, logged); the host's own invasion of J's possession q begun this month (`inv set q 0 1
+    itt`) kept across the turn's reload (InvadedThisTurn: "kept across the reload: 1 of 1") and skipped by the host's
+    routine (still invaded, the mark consumed); c) month 2: the client's target t (J's, value < 10) taken (count 0), J
+    invading nation 1's possession kp (`inv set kp J 0`), draws low: kp repelled or taken by J; the plan's months or its
+    start in the news; the target's cost in nation 1's month ("invasion target -N"); the client's form holds nation
+    1's plan after the load; the host's relations unchanged; no box on the host. e) P3, invasion battles in nation 1's
+    battle slot (`battles injectinv 1`, client `battles testinv 1`: a plain check): e1) its own battle at J's t2 where it
+    has ships (pending 1), fought, merged, the slot's state back = the host's; e2) J's pending landing at nation 1's
+    possession where it has most ships, declined in the preview (or fought): the outcome's state back and applied; e3)
+    fix-afb: its own battle at J's possession where J is the strongest against its ships, the setup as an intelligence
+    coup's ambush (client `battles testcoup 1`): the game's reinforcements of its side get its nation, no
+    AdjustForcesForBattle box, declined (env RTW3_INV_COUP=2, diagnosis: the game's own path, its box). f) P5: its peace with J
+    (`peacetest 100 2 1`) ends its invasions with J and its plan; g) P4: `battles testsa J2 land` and a month: J2's
+    surprise landing in its possession recorded (`kland`) and applied (invaded, marked); h) P7: `inv escort J2` (+80
+    for its invasion, the escort's points for its possession in J2's plan) and a month's AI calls; i) i1 a computer
+    start in its month, i2 its capture of J's possession, i3 the host's `inv hostcheck` refusal; j) the host's
+    DoPeace (`inv hostpeace`) leaves its invasions."""
+    K = 1
+    for port, who in ((H, 'host'), (C, 'client')):
+        ln = log_lines(log_since(port), r'Invasions for joined nations')
+        check(f'a) {who} log "Invasions for joined nations: ok"', any(': ok' in x for x in ln), ln[:1])
+    rr = relrules(H)
+    if rr is None or K not in rr:
+        log('  nation 1 not under the player\'s rules: forced', cmd(H, f'relrules {K} 1'))
+    if not cstate().get('fight'):
+        log('  the client does not fight its battles: joins again with fightbattles 1', rejoin(ctx, K, True)[0])
+    hl = log_lines(log_since(H), r'battle generator \d')
+    check('a) the host logged the client\'s hello with "battle generator 4" (invasions)',
+          any(re.search(r'battle generator 4\b', x) for x in hl), hl[-1:])
+    f0 = cmd(C, 'inv form')
+    check('a) the client\'s `inv form`: hostgen=4 (the host\'s welcome `gen` 4)', 'hostgen=4' in f0, f0)
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    J, small = None, []
+    for j in range(1, 9):
+        if j in humans:
+            continue
+        pl = [p for p in (poss_list(H, f'possessions {j}') or []) if 0 < p['value'] < 10]
+        if len(pl) >= 3:
+            J, small = j, pl
+            break
+    kp = [p for p in (poss_list(H, f'possessions {K}') or []) if p['value'] < 200]
+    hp = poss_list(H, 'possessions 0') or []
+    if not check('setup: a computer nation J with 3 possessions of value 1..9, nation 1 and the host with possessions',
+                 J and kp and hp, dict(J=J, kp=len(kp), hp=len(hp))):
+        return
+    u = lambda n: n.replace(' ', '_')
+    p1, q = small[0]['name'], small[1]['name']
+    t = next((p['name'] for p in small[2:] if p['area'] != small[0]['area']), small[2]['name'])
+    k1 = kp[0]['name']
+    t0 = rel(K, J).get('tension', '5')
+    hr, cr = peace_war(K, J)
+    check(f'setup: nation {K} at war with computer nation {J} on both copies (was {t0})',
+          hr.get('war') == '1' and 'war=1' in (cr or ''), dict(host=hr, client=cr))
+    pairs = [(a, b) for a in range(9) for b in range(a + 1, 9)]
+
+    def owner_of(name):
+        for n in range(9):
+            if any(p['name'] == name for p in (poss_list(H, f'possessions {n}') or [])):
+                return n
+        return -1
+
+    def inv_of(name):
+        m = re.search(rf';{re.escape(name)}:(-?\d+):(-?\d+):(-?\d+)(:itt)?;', ';' + cmd(H, 'inv state').split(' all=', 1)[-1])
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), bool(m.group(4))) if m else None
+
+    def inv_box(text):  # a box with nation 1's invasion texts (the host's own month shows its own boxes)
+        return any(n in text for n in (p1, k1, t)) or 'nvasion' in text or 'troops' in text
+
+    # b) month 1
+    rp = cmd(C, f'inv pick {u(hp[0]["name"])}')
+    r1 = cmd(H, f'inv set {u(p1)} {K} 2')
+    r2 = cmd(H, f'inv set {u(q)} 0 1 itt')
+    r3 = cmd(H, 'inv rnd 1')
+    check('b) setup: client `inv pick` (the host\'s possession), host `inv set` p1 (nation 1 invades, support 2), q (the '
+          'host invades, marked this month), `inv rnd 1`', all(x.startswith('ok') for x in (rp, r1, r2, r3)),
+          dict(pick=rp[:120], p1=r1[-200:], q=r2[-120:], rnd=r3))
+    before = {p: rel(*p).get('tension') for p in pairs}
+    hm, cm, hc0, cc0, t_b = log_mark(H), log_mark(C), chat(ctx.hp), chat(ctx.cp), time.time()
+    run_month(ctx, 'invasion 1', driver=BattleDriver(ctx, {}, K, J))  # (its invasion battles: declined or fought)
+    cmd(H, 'inv rnd 0')
+    hlog, clog, hc1, cc1 = log_since(H, hm), log_since(C, cm), chat(ctx.hp), chat(ctx.cp)
+    ref = log_lines(hlog, rf'invasions: nation {K}\'s target {re.escape(hp[0]["name"])} refused \(a person plays its owner')
+    check(f'b) the host\'s possession as nation 1\'s target refused ("a person plays its owner")', ref, ref)
+    kept = log_lines(hlog, r'host turn: invaded this month kept across the reload: \d+ of \d+')
+    marks = cmd(H, 'inv marks')
+    check('b) the host\'s own invasion of q begun this month: its InvadedThisTurn set again after the turn\'s reload ("1 '
+          'of 1": the load had cleared it) and still set after the month (`inv marks`; the host at peace: the game '
+          'cancels the invasion, not the mark)', kept and re.search(r': 1 of 1', kept[0]) and f'{q}/' in marks and
+          inv_of(q) is None, dict(kept=kept, marks=marks, q=inv_of(q)))
+    cmd(H, f'inv set {u(q)} -1 0')
+    hid = log_lines(hlog, r'invasions: the host\'s own routines and the joined nations\' invasions this month: ')
+    check('b) the host\'s own CheckRebellionAndInvasions hid nation 1\'s invasion (logged once this month)',
+          len(hid) == 1 and re.search(r'CheckRebellionAndInvasions 1x \([1-9]\d* hidden\)', hid[0]), hid)
+    run = log_lines(hlog, rf'invasions of nation {K} \(war counter -?\d+\): ')
+    news = [m.group(1) for m in (re.search(rf'invasions of nation {K}: "(.*)"$', x) for x in hlog.splitlines()) if m]
+    o1, i1 = owner_of(p1), inv_of(p1)
+    took = o1 == K and log_lines(hlog, rf'invasions: nation {K}\'s month: {re.escape(p1)} passes from nation {J} to nation {K}')
+    lost = o1 == J and (i1 is None or i1[1] == -1) and any('defeated' in n for n in news)
+    check(f'b) nation {K}\'s month resolution ran in its view: p1 {p1} taken (owner {K}, the game\'s ChangePossessionOwner) '
+          f'or the invasion defeated; its texts in nation {K}\'s news', run and news and (took or lost or
+          (o1 == J and i1 and i1[1] == K)), dict(run=run[:1], news=news[:4], owner=o1, inv=i1))
+    shown = [int(m.group(1)) for m in (re.search(r'economy: showing (\d+) message\(s\)', x) for x in clog.splitlines()) if m]
+    check('b) the news shown in the client\'s turn report with the new month ("economy: showing N message(s)", N >= the '
+          'invasion texts)', news and shown and max(shown) >= len(news), dict(shown=shown, news=len(news)))
+    hbox = [b[2:] for b in BOX_SEEN if b[0] >= t_b and b[1] == 'host' and inv_box(b[3])]
+    check('b) no invasion box on the host (the routine\'s pictures and turn messages went to nation 1; the host\'s own '
+          'month shows its own)', not hbox, hbox[:3])
+    # c) month 2
+    rp = cmd(C, f'inv pick {u(t)}')
+    r1 = cmd(H, f'inv set {u(k1)} {J} 0')
+    cmd(H, 'inv rnd 2')  # high: the plan's gate Random(20) > Value passes; the fights neither repelled nor lost
+    hm, cm, cc0 = log_mark(H), log_mark(C), chat(ctx.cp)
+    run_month(ctx, 'invasion 2', driver=BattleDriver(ctx, {}, K, J))  # (its invasion battles: declined or fought)
+    cmd(H, 'inv rnd 0')
+    hlog, clog, cc1 = log_since(H, hm), log_since(C, cm), chat(ctx.cp)
+    st = cmd(H, f'inv state {K}')
+    taken = log_lines(hlog, rf'invasions: nation {K}\'s target - -> {re.escape(t)}$')
+    check(f'c) the client\'s target t {t} (J\'s, value < 10) taken by the host with its turn', rp.startswith('ok') and taken,
+          dict(pick=rp[:100], log=taken, state=st[:200]))
+    news = [m.group(1) for m in (re.search(rf'invasions of nation {K}: "(.*)"$', x) for x in hlog.splitlines()) if m]
+    plan = [n for n in news if t in n]
+    check(f'c) nation {K}\'s plan resolved in its month (the game\'s texts about {t}: delayed, invaded or a battle next '
+          f'month)', plan or 'pending=1' in st or re.search(rf'(?:=|;){re.escape(t)}:{J}:{K}:', st), dict(plan=plan[:2], state=st[:200]))
+    ok2, ik = owner_of(k1), inv_of(k1)
+    check(f'c) J\'s invasion of nation {K}\'s possession kp {k1}: repelled, taken by J (owner {J}) or still fought, in '
+          f'nation {K}\'s news', any(k1 in n for n in news) and (ok2 == J or (ok2 == K and (ik is None or ik[1] == J))),
+          dict(news=[n for n in news if k1 in n][:2], owner=ok2, inv=ik))
+    cost = log_lines(hlog, r'invasion target -\d+')
+    check(f'c) the target\'s monthly cost in nation {K}\'s month ("invasion target -N", N > 0)',
+          any(re.search(r'invasion target -[1-9]\d*', x) for x in cost), cost[:1])
+    form = log_lines(clog, rf'invasions: nation {K}\'s plan in the form \(the month\'s load\): ')
+    f1 = cmd(C, 'inv form')
+    tgt = re.search(r' target=([^ ]*(?: [^ =]+)*) count=', st)
+    check('c) the client\'s form holds nation 1\'s plan after the load (`inv form` = the host\'s `inv state` target)',
+          form and tgt and f1.startswith(f'ok target={tgt.group(1)} '), dict(form=form[:1], inv_form=f1, state=st[:160]))
+    # d) nation 1's month resolution now (`inv run`), draws high: the host's relations and boxes unchanged
+    if not taken:
+        cmd(H, f'inv target {K} {u(t)}')
+    before = {p: rel(*p).get('tension') for p in pairs}
+    cmd(H, 'inv rnd 2')
+    t_b, s0 = time.time(), cmd(H, f'inv state {K}')
+    rr = cmd(H, f'inv run {K}')
+    cmd(H, 'inv rnd 0')
+    hbox = [b[2:] for b in BOX_SEEN if b[0] >= t_b and b[1] == 'host' and inv_box(b[3])]
+    check(f'd) `inv run {K}`: the routine ran in nation {K}\'s view (its plan: a text about {t} or its months +1), the '
+          f'host\'s relations unchanged, no box on the host', rr.startswith('ok') and (t in rr or 'plan ' + t + '/' in rr)
+          and before == {p: rel(*p).get('tension') for p in pairs} and not hbox,
+          dict(run=rr[:300], before=s0[:120], boxes=hbox[:2], changed=[p for p in pairs if before[p] != rel(*p).get('tension')][:4]))
+    # e) P3: invasion battles in nation 1's battle slot (the game's CheckForInvasionBattles, `battles injectinv`), each
+    #    check plain (client `battles testinv 1`: the computer does not decline, the player is not caught out)
+    nt = nation_table()
+    cmd(H, 'mpwindow')  # (the chat lines are read from the window)
+
+    def clear_k():
+        for e in (cmd(H, f'inv state {K}').split(' poss=', 1)[-1].split(' cost=', 1)[0]).split(';'):
+            if e.count(':') >= 3:
+                cmd(H, f'inv set {u(e.split(":")[0])} -1 0')
+
+    def inv_battle(tag, plan_cmds, action, poss):
+        clear_k()
+        for port, c in plan_cmds:
+            log(f'  {c}:', cmd(port, c))
+        ti = cmd(C, 'battles testinv 1')
+        r1 = cmd(H, f'battles injectinv {K}')
+        bid = int(r1.split()[1]) if r1.startswith('ok ') else None
+        if not check(f'{tag}: client `battles testinv 1`, host `battles injectinv {K}` (a request with the invasion check)',
+                     bid and ti == 'ok testinv=1', dict(inject=r1, testinv=ti)):
+            return None
+        hm, cm, t_b = log_mark(H), log_mark(C), time.time()
+        drv = BattleDriver(ctx, {bid: action}, K, J)
+        drv.label = f'invbattle {action}'
+        run_month(ctx, drv.label, driver=drv)
+        hlog, clog = log_since(H, hm), log_since(C, cm)
+        g = lambda txt, pat: [x.split('] ', 1)[-1] for x in log_lines(txt, pat)]
+        hbox = [b[2:] for b in BOX_SEEN if b[0] >= t_b and b[1] == 'host' and (poss in b[3] or 'nvasion' in b[3])]
+        return dict(bid=bid, rec=drv.rec.get(bid, {}), hlog=hlog, hbox=hbox, errors=game_error_boxes(t_b),
+                    put=g(clog, rf'battle {bid}: the nation\'s invasions in the battle slot: '),
+                    att=g(clog, rf'battle {bid}: attempt 0 \(invasion check\)'),
+                    back=g(clog, rf'battle {bid}: the nation\'s invasions after it: '),
+                    took=g(hlog, rf'battle {bid}: nation {K}\'s invasions after it: '),
+                    appl=g(hlog, rf'battle phase: nation {K}\'s invasions after its battles: '),
+                    applied=g(hlog, rf'battle {bid} applied: '),
+                    setup=g(clog, r'battle setup: '))
+
+    # e1) nation 1's own invasion battle at a possession t2 of J where nation 1 has ships (a battle pending for it:
+    #     `inv plan 1 0 - 1`), fought
+    jp = poss_list(H, f'possessions {J}') or []
+    areas = [c[3] for c in battle_pairs(K) if c[2] == J]
+    t2 = next((p['name'] for a in areas for p in jp if p['area'] == a and 0 < p['value'] < 16), t)
+
+    def same_state(e, name, who):
+        """The client's state after the battle (its log) = what the host took for the battle (its log)."""
+        mc = re.search(r'invasions after it: plan (.*?), enemy plan (.*?), (\d+) invasion', e['back'][-1]) if e['back'] else None
+        mh = re.search(r'invasions after it(?: \(unchanged\))?: plan (.*?), enemy plan (.*?), (\d+) mark', e['took'][-1]) \
+            if e['took'] else None
+        return mc and mh and mc.group(1) == mh.group(1) and mc.group(2) == mh.group(2)
+
+    e1 = inv_battle('e1) nation 1\'s invasion battle', [(C, f'inv pick {u(t2)}'), (H, f'inv target {K} {u(t2)}'),
+                                                     (H, f'inv plan {K} 0 - {K}')], 'fight', t2)
+    if e1:
+        s1 = cmd(H, f'inv state {K}')
+        check(f'e1) the client put nation {K}\'s plan in its battle slot (target {t2}, its own battle pending; the save\'s '
+              f'invasions cleared); the game\'s CheckForInvasionBattles (plain) set up the battle at {t2} against nation '
+              f'{J} (our invasion)', e1['put'] and f'plan {t2}/0, enemy plan -/{K}' in e1['put'][-1] and e1['att'] and
+              'TEST: plain' in e1['att'][-1] and f'at {t2} (' in e1['att'][-1] and
+              f'against nation {J} (our invasion)' in e1['att'][-1],
+              dict(put=e1['put'][-1:], att=e1['att'][-1:], areas=areas[:3]))
+        check(f'e1) battle {e1["bid"]}: fought on the client (the preview accepted), merged on the host; the host\'s '
+              f'chat "The invasion battle of ... was fought by"', e1['rec'].get('outcome') == 'fought' and
+              e1['applied'] and re.search(rf'\* The invasion battle of {re.escape(nt[K]["name"])} against '
+                                          rf'{re.escape(nt[J]["name"])}.* was fought by ', chat(ctx.hp)),
+              dict(outcome=e1['rec'].get('outcome'), answers=e1['rec'].get('answers'), applied=e1['applied'][-1:]))
+        landed = re.search(rf'(?:=|;){re.escape(t2)}:{J}:{K}:', s1)
+        check(f'e1) the battle slot\'s invasions came back with the result (the game\'s HandleInvasionResults) and the '
+              f'host took the same plan and applied them: the battle pending no more; {t2} invaded by nation {K} after a '
+              f'won battle (else not) on the host as on the client', e1['back'] and same_state(e1, t2, 'e1') and
+              'pending=-1' in s1 and (landed is not None) == (f'{t2} {K}/' in e1['took'][-1]) and
+              (not landed or f'{t2} new: invader {K}' in ''.join(e1['appl'])),
+              dict(back=e1['back'][-1:], took=e1['took'][-1:], appl=e1['appl'][-1:], state=s1[:240]))
+        check('e1) no invasion box on the host, no game error box', not e1['hbox'] and not e1['errors'],
+              dict(boxes=e1['hbox'][:2], errors=e1['errors']))
+    # e2) the enemy's invasion of nation 1's possession kp2 where nation 1 has ships (pending: `inv plan 1 0 kp2 J`),
+    #     declined at the preview if the game lets the defender decline (DoPlayerDecline: J lands, marked this month),
+    #     else fought (HandleInvasionResults: averted or landed); the outcome merged on the host either way
+    bcs = read_save(save_path(HOST_SLOT)) or {}
+    kships = {}
+    for f in ships_by_id(bcs.get(f'Nation{K}Ships')).values():
+        kships[f.get('LocationAreaName')] = kships.get(f.get('LocationAreaName'), 0) + 1
+    own = sorted((p for p in (poss_list(H, f'possessions {K}') or []) if 0 < p['value'] < 200),
+                 key=lambda p: -kships.get(p['area'], 0))
+    kp2 = own[0]['name'] if own else None
+    if check('e2) setup: a possession of nation 1 (the one in the sea area with most of its ships)', kp2,
+             [(p['name'], p['area'], kships.get(p['area'], 0)) for p in own[:3]]):
+        for e2try in range(3):
+            e2 = inv_battle('e2) the enemy\'s invasion battle', [(C, 'inv pick -'), (H, f'inv target {K} -'),
+                                                                (H, f'inv plan {K} 0 {u(kp2)} {J}')], 'decline', kp2)
+            # The game drops an enemy's pending battle when the player is much stronger in the area (Random(100) < 40)
+            # or the area is out of the enemy's mission range (GAME-INTERNALS, CheckForInvasionBattles): no battle.
+            dropped = bool(e2 and e2['att'] and 'gave no battle' in e2['att'][-1] and e2['back'] and
+                           f'enemy plan {kp2}/-1, 0 invasion(s)' in e2['back'][-1])
+            if not dropped:
+                break
+            log(f'  e2) attempt {e2try + 1}: the game dropped the enemy\'s pending battle at {kp2} (no battle, the plan '
+                f'over): {e2["att"][-1]}')
+        if dropped:
+            log(f'  SKIP-note e2) the game dropped the enemy\'s pending battle at {kp2} in all 3 attempts (the player '
+                f'much stronger in the area: Random(100) < 40)')
+            e2 = None
+        if e2:
+            s2, i2 = cmd(H, f'inv state {K}'), inv_of(kp2)
+            check(f'e2) the client put the enemy\'s plan in its battle slot (nation {J} pending at {kp2}); the game\'s '
+                  f'CheckForInvasionBattles (plain) played it: a possession battle at {kp2} against nation {J} (the '
+                  f'enemy\'s invasion)', e2['put'] and f'enemy plan {kp2}/{J}' in e2['put'][-1] and e2['att'] and
+                  'TEST: plain' in e2['att'][-1] and f'possession battles: {kp2} ({J} attacks 0)' in e2['att'][-1],
+                  dict(put=e2['put'][-1:], att=e2['att'][-1:], answers=e2['rec'].get('answers'),
+                       buttons=e2['rec'].get('map_buttons')))
+            landed = i2 is not None and i2[0] == K and i2[1] == J
+            check(f'e2) battle {e2["bid"]}: {e2["rec"].get("outcome")}; the slot\'s invasions came back (the enemy\'s '
+                  f'plan over) and the host took the same plan; {kp2} invaded by nation {J} on the host iff the client '
+                  f'reported it (the landing applied by name)', e2['rec'].get('outcome') in ('fought', 'declined') and
+                  e2['applied'] and same_state(e2, kp2, 'e2') and 'enemy plan -/-1' in e2['back'][-1] and
+                  landed == (f'{kp2} {J}/' in e2['took'][-1]) and
+                  (not landed or f'{kp2} new: invader {J}' in ''.join(e2['appl'])),
+                  dict(outcome=e2['rec'].get('outcome'), answers=e2['rec'].get('answers'), applied=e2['applied'][-1:],
+                       back=e2['back'][-1:], took=e2['took'][-1:], appl=e2['appl'][-1:], inv=i2, state=s2[:200]))
+            check('e2) no invasion box on the host, no game error box', not e2['hbox'] and not e2['errors'],
+                  dict(boxes=e2['hbox'][:2], errors=e2['errors']))
+    clear_k()
+    # e3) fix-afb: nation 1's own invasion battle at J's possession in the sea area where J is the strongest against
+    #     nation 1's ships there, its setup an intelligence coup's ambush that finds nation 1's side the weaker (client
+    #     `battles testcoup 1`: the ambush's flag, side 1's count + 1000 for the routine's own calls): J's extra divisions
+    #     go and the game's reinforcements of nation 1's side get its nation; no AdjustForcesForBattle box; declined in
+    #     the preview. Diagnosis (env RTW3_INV_COUP=2): without the mod's nation, the game's own path, its box.
+    coup = os.environ.get('RTW3_INV_COUP') if os.environ.get('RTW3_INV_COUP') in ('1', '2') else '1'
+    bcs = read_save(save_path(HOST_SLOT)) or {}
+
+    def locs(n):
+        out = {}
+        for f in ships_by_id(bcs.get(f'Nation{n}Ships')).values():
+            out[f.get('LocationAreaName')] = out.get(f.get('LocationAreaName'), 0) + 1
+        return out
+
+    kl, jl = locs(K), locs(J)
+    weak = sorted(((jl.get(p['area'], 0) - kl.get(p['area'], 0), p['name'], p['area'], jl.get(p['area'], 0),
+                    kl.get(p['area'], 0)) for p in (poss_list(H, f'possessions {J}') or [])
+                   if 0 < p['value'] < 16 and kl.get(p['area'], 0) >= 1), reverse=True)
+    want = os.environ.get('RTW3_INV_E3_TARGET')  # diagnosis: that candidate first (e.g. "Northern Russia")
+    if want and any(w[1] == want for w in weak):
+        weak = [w for w in weak if w[1] == want] + [w for w in weak if w[1] != want]
+    if check('e3) setup: a possession of J in the sea area where J is the strongest against nation 1\'s ships there '
+             '(nation 1 has ships there)', weak, weak[:3]):
+        t3 = weak[0][1]
+        on = cmd(C, f'battles testcoup {coup}')
+        e3 = inv_battle('e3) nation 1\'s invasion battle, its setup as an intelligence coup\'s ambush',
+                        [(C, f'inv pick {u(t3)}'), (H, f'inv target {K} {u(t3)}'), (H, f'inv plan {K} 0 - {K}')],
+                        'decline', t3)
+        off = cmd(C, 'battles testcoup 0')
+        if e3:
+            runs = [int(m.group(1)) if m else -1 for m in (re.search(r' forced=(\d+)', x) for x in (on, off))]
+            amb = runs[0] >= 0 and runs[1] == runs[0] + 1
+            rein = [x for x in e3['setup'] if 'reinforcements of side 0' in x]
+            afb = [b for b in e3['errors'] if 'AdjustForcesForBattle' in b[1]]
+            if coup == '2':
+                check(f'e3) DIAGNOSIS (RTW3_INV_COUP=2): battle {e3["bid"]} at {t3} as an ambush without the mod\'s '
+                      f'nation for its reinforcements: the game\'s AdjustForcesForBattle box (0.7.0 RC1: Read of address '
+                      f'02EBC02F)', amb and rein and afb,
+                      dict(testcoup=(on, off), att=e3['att'][-1:], setup=e3['setup'][-2:], boxes=afb,
+                           answers=e3['rec'].get('answers')))
+            else:
+                e3what = (f'e3) battle {e3["bid"]} at {t3} ({weak[0][3]} ships of J, {weak[0][4]} of nation 1 in '
+                          f'{weak[0][2]}), its setup an intelligence coup\'s ambush (`battles testcoup 1`: forced=+1)')
+                e3ok = amb and not afb and e3['rec'].get('outcome') in ('declined', 'fought')
+                e3ev = dict(testcoup=(on, off), att=e3['att'][-1:], setup=e3['setup'][-2:], boxes=afb,
+                            answers=e3['rec'].get('answers'))
+                if rein or weak[0][0] > 0:
+                    check(f'{e3what}: the reinforcements of nation 1\'s side got its nation ("had no nation ... gave '
+                          f'them nation 0"), no AdjustForcesForBattle box, {e3["rec"].get("outcome")}',
+                          e3ok and rein and 'gave them nation 0' in rein[-1], e3ev)
+                else:
+                    # nation 1 not outnumbered in the area (0.7.0 RC2: the default run's only candidate Northern Russia,
+                    # 9 v 16 in Northern Europe, and `--only battle_invasion` with RTW3_INV_E3_TARGET there, 14 v 33:
+                    # forced +1, no line, no box): the reinforcement step meets no unset nation there, so the fix's path
+                    # is not exercised: the battle still checks for the box
+                    check(f'{e3what}: no AdjustForcesForBattle box, {e3["rec"].get("outcome")}', e3ok, e3ev)
+                    log(f'  SKIP-note e3) no "battle setup: the ambush\'s reinforcements" line at {t3}: nation 1 is not '
+                        f'outnumbered there ({weak[0][3]} ships of J, {weak[0][4]} of nation 1 in {weak[0][2]}; the '
+                        f'candidates {weak[:3]}), so the reinforcement step met no unset nation: the fix\'s path is '
+                        f'not exercised in this battle')
+        clear_k()
+    # f) P5: nation 1's peace with J (client `peacetest 100 2 1`: the game's DoPeace in its view, B4's peace part) ends
+    #    its invasions with J (the possessions' war state, `ptaken`) and its invasion plan (the host resets it)
+    if rel(K, J).get('war') != '1':
+        peace_war(K, J)
+    jpf = [p['name'] for p in (poss_list(H, f'possessions {J}') or []) if 0 < p['value'] < 10]
+    kpf = [p['name'] for p in (poss_list(H, f'possessions {K}') or []) if 0 < p['value'] < 200]
+    if check('f) setup: a possession of J and two of nation 1', len(jpf) >= 1 and len(kpf) >= 2, dict(J=jpf[:3], K=kpf[:3])):
+        pf, kf, ke = jpf[0], kpf[0], kpf[1]
+        for port in (H, C):  # (both copies: the client's peace reads its own)
+            cmd(port, f'inv set {u(pf)} {K} 1')
+            cmd(port, f'inv set {u(kf)} {J} 0')
+        cmd(C, f'inv pick {u(pf)}')
+        cmd(H, f'inv target {K} {u(pf)}')
+        cmd(H, f'inv plan {K} 1 {u(ke)} -1')
+        cmark, hmark = log_mark(C), log_mark(H)
+        r = cmd(C, 'peacetest 100 2 1')
+        rec = wait_peace(ctx, cmark, hmark)
+        pc, hl = peacelast(C), log_since(H, hmark)
+        reset = log_lines(hl, rf'invasions: nation {K}\'s peace ends its invasion plan \(target {re.escape(pf)}/1, enemy '
+                              rf'target {re.escape(ke)}/-1')
+        sf = cmd(H, f'inv state {K}')
+        check(f'f) the client\'s peace with J accepted (peacetest 100 2 1) and applied once on the host; the host reset '
+              f'nation {K}\'s invasion plan ("peace ends its invasion plan": target {pf}, enemy target {ke}) and its '
+              f'invasions with J are over on the host ({pf}, {kf}: the possessions\' war state from the client\'s DoPeace)',
+              r == 'ok' and pc.get('accepted') == '1' and len(rec['host']) == 1 and reset and
+              ' target= count=0 enemy= pending=-1 itt= ' in sf and inv_of(pf) is None and inv_of(kf) is None,
+              dict(reply=r, accepted=pc.get('accepted'), host=rec['host'], reset=reset, state=sf[:200],
+                   pf=inv_of(pf), kf=inv_of(kf)))
+        f1 = cmd(C, 'inv form')
+        check('f) the client\'s form: no invasion target after its peace (the game\'s DoPeace in its view)',
+              f1.startswith('ok target= '), f1)
+    # g) P4: a surprise landing in nation 1's possession at a war's start (client `battles testsa J2 land`: J2 plans its
+    #    war with the SurpriseAttack trait; the landing's pick and strength test forced): recorded in nation 1's relation
+    #    turn (`kland`) and applied by name on the host (invaded by J2, marked this month)
+    humans2 = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    J2 = 5 if 5 not in humans2 and 5 in nt else next((j for j in range(3, 9) if j not in humans2 and j in nt and j != J), None)
+    for j in range(9):  # the landing block needs nation 1 at peace (its war counter <= 0 at the relation turn)
+        if j != K and rel(K, j).get('war') == '1':
+            log(f'  peace {K}-{j} first:', peace_war(K, j, 5))
+    kw = (kwar_counters(H) or {}).get(K)
+    if kw is not None and kw > 0:
+        log(f'  nation {K}\'s war counter {kw} -> 0 (at peace now):', cmd(H, f'kwar {K} 0'))
+    t2j = rel(K, J2).get('tension', '5') if J2 else '5'
+    rt = cmd(C, f'battles testsa {J2} land') if J2 else 'no J2'
+    if check(f'g) `battles testsa {J2} land` on the client (nation {J2}\'s war on nation {K} with a surprise and its landing)',
+             rt.startswith(f'ok testsa={J2} land'), rt):
+        hm, cm = log_mark(H), log_mark(C)
+        run_month(ctx, 'invasion landing', driver=BattleDriver(ctx, {}, K, J2))
+        hlog, clog = log_since(H, hm), log_since(C, cm)
+        pick = log_lines(clog, r'relations v2: surprise move: the landing pick (.+) \(value \d+\) \(TEST: forced')
+        land = log_lines(clog, rf'relations v2: surprise move: nation {J2}\'s troops landed in (.+) \(nation {K}\'s; recorded')
+        sent = log_lines(clog, rf'relations for nation {K} sent: ')
+        lp = re.search(rf"troops landed in (.+?) \(nation {K}'s", land[-1])[1] if land else None
+        if not pick and not land:
+            log(f'  SKIP-note g) the landing: the game\'s CheckForWar skipped its landing/takeover step this time (with '
+                f'the trait 95 %; no "the landing pick" line)')
+        else:
+            app = log_lines(hlog, rf'invasions: surprise landing of nation {K}\'s turn: nation {J2} invades {re.escape(lp or "?")} '
+                                  rf'\(marked this month\)')
+            sg, ig = cmd(H, f'inv state {K}'), inv_of(lp) if lp else None
+            check(f'g) nation {K}\'s relation turn: nation {J2}\'s surprise landing in {lp} (the pick and its strength '
+                  f'test forced) recorded and sent ("kland=1"); the host applied it by name: {lp} invaded by {J2}, '
+                  f'support 0, marked this month (nation {K}\'s `itt`)', land and sent and 'kland=1' in sent[-1] and app
+                  and ig and ig[0] == K and ig[1] == J2 and f'itt={lp}/' in sg,
+                  dict(pick=pick[-1:], land=land[-1:], sent=[x.split('] ', 1)[-1][-120:] for x in sent[-1:]], app=app,
+                       inv=ig, state=sg[:200]))
+            if lp:
+                cmd(H, f'inv set {u(lp)} -1 0')
+    J2war = J2 and rel(K, J2).get('war') == '1'
+    # h) P7: the computer's fleets: nation J2's most important area (GetMostImportantArea, host `inv escort J2`, the
+    #    same draws with and without): nation 1's invasion of J2's possession counts as the player's (+80 "is invaded by
+    #    player"), nation 1's possession J2's side plans to invade as the form's target (the escort's points)
+    if J2 and not J2war:
+        peace_war(K, J2)
+    j2p = [p for p in (poss_list(H, f'possessions {J2}') or []) if 0 < p['value']] if J2 else []
+    k2p = [p for p in (poss_list(H, f'possessions {K}') or []) if 0 < p['value'] < 200]
+    if check(f'h) setup: nation {K} at war with {J2}, a possession of each', J2 and rel(K, J2).get('war') == '1' and j2p
+             and k2p, dict(J2=J2, war=rel(K, J2) if J2 else None, j2=[p['name'] for p in j2p[:2]])):
+        clear_k()
+        pa, ka = j2p[0], next((p for p in k2p if p['area'] != j2p[0]['area']), k2p[0])
+
+        def esc(tag):
+            r = cmd(H, f'inv escort {J2}')
+            pts = lambda which: {a: int(v) for a, v in re.findall(r'([^,=]+?):(-?\d+)', (re.search(
+                rf'points\({which}\)=(.*?)(?: points| draws|$)', r) or [None, ''])[1])}
+            return r, pts('without'), pts('with')
+
+        cmd(H, f'inv set {u(pa["name"])} {K} 1')
+        ra, wa, ha = esc('a')
+        check(f'h) nation {K}\'s invasion of {J2}\'s {pa["name"]} shown to {J2}\'s call as the player\'s: {pa["area"]} '
+              f'+80 points with it (the same draws), nothing shown without', 'draws=same' in ra and 'shown=1' in ra and
+              ha.get(pa['area'], 0) - wa.get(pa['area'], 0) >= 80, dict(reply=ra[:300]))
+        cmd(H, f'inv set {u(pa["name"])} -1 0')
+        cmd(H, f'inv plan {K} 0 {u(ka["name"])} -1')
+        rc, wc, hc = esc('c')
+        check(f'h) nation {K}\'s possession {ka["name"]} as the computer\'s planned invasion target: {J2}\'s escort '
+              f'points for {ka["area"]} (" If at War. Enemy invasion area": more with it; the draws after it differ)',
+              'shown=1' in rc and hc.get(ka['area'], 0) > wc.get(ka['area'], 0), dict(reply=rc[:300]))
+        cmd(H, f'inv plan {K} 0 - -1')
+        # the month's AI moves see them (the host's month-end hide log counts the calls)
+        cmd(H, f'inv set {u(pa["name"])} {K} 1')
+        hm = log_mark(H)
+        run_month(ctx, 'invasion escorts', driver=BattleDriver(ctx, {}, K, J2))
+        hid = log_lines(log_since(H, hm), r"GetMostImportantArea: joined nations' invasions shown \d+x")
+        check(f'h) the month\'s computer decisions saw nation {K}\'s invasion ("GetMostImportantArea: joined nations\' '
+              f'invasions shown Nx" in the host\'s month-end log)', hid, hid[-1:])
+    # i) the cases (nation 1 at war with J alone): i1) J starts an invasion of nation 1's possession in nation 1's month
+    #    (`inv run`, draws high: the start's gates are the fleets' strengths in the area, Kiautschou Bay against J's
+    #    Pacific squadron in the fixture); i2) nation 1 captures a possession (support 50); i3) the host's own invasion
+    #    check refuses a battle at nation 1's invasion (host `inv hostcheck`)
+    clear_k()
+    for j in range(9):
+        if j != K and rel(K, j).get('war') == '1':
+            peace_war(K, j, 5)
+    peace_war(K, J)
+    start, runs = None, []
+    for mode in [2] * 6 + [0] * 10:  # (draws high, then the game's)
+        cmd(H, f'inv rnd {mode}')
+        rr = cmd(H, f'inv run {K}')
+        runs.append(rr[:220])
+        if re.search(r'troops have invaded our possession|enemy plan [^-][^/]*/' + str(J), rr):
+            start = rr
+            break
+    cmd(H, 'inv rnd 0')
+    if start:
+        check(f'i1) nation {K}\'s month (`inv run`): computer nation {J} starts an invasion of nation {K}\'s possession '
+              f'(its landing "troops have invaded our possession" or its battle planned: the enemy plan)', start, runs[-1:])
+    else:  # the start's gates are the fleets' strengths in the area (the enemy's over 2 G + 1 and 1.1 x the nation's)
+        log(f'  SKIP-note i1) no start of computer nation {J} in {len(runs)} runs of nation {K}\'s month: {runs[-1:]}')
+    clear_k()
+    cmd(H, f'inv plan {K} 0 - -1')
+    jcap = [p for p in (poss_list(H, f'possessions {J}') or []) if 0 < p['value'] < 16]
+    areas_k = [c[3] for c in battle_pairs(K) if c[2] == J]
+    pc2 = next((p['name'] for a in areas_k for p in jcap if p['area'] == a), None)
+    if check(f'i2) setup: a possession of J where nation {K} has ships', pc2, dict(areas=areas_k, J=[p['name'] for p in jcap[:3]])):
+        took, runs = False, []
+        for mode in (1, 0, 0, 0):  # (draws low, then the game's: the fortifications' test)
+            cmd(H, f'inv rnd {mode}')
+            cmd(H, f'inv set {u(pc2)} {K} 50')
+            hm = log_mark(H)
+            rr = cmd(H, f'inv run {K}')
+            runs.append(rr[:200])
+            if log_lines(log_since(H, hm), rf'invasions: nation {K}\'s month: {re.escape(pc2)} passes from nation {J} to '
+                                            rf'nation {K}'):
+                took = 'taken control' in rr
+                break
+        cmd(H, 'inv rnd 0')
+        check(f'i2) nation {K} captures {pc2} in its month (support 50, draws low then the game\'s: "Our forces have taken control of", '
+              f'ChangePossessionOwner {J} -> {K})', took, runs[-2:])
+    clear_k()
+    jp3 = [p['name'] for p in (poss_list(H, f'possessions {J}') or []) if 0 < p['value'] < 10]
+    if jp3:
+        cmd(H, f'inv set {u(jp3[0])} {K} 1')
+        refused = None
+        for _ in range(8):
+            rh = cmd(H, 'inv hostcheck')
+            if 'DoPossessionBattle refused' in rh:
+                refused = rh
+                break
+        hl = log_lines(log_since(H), rf'invasions: the host\'s invasion battles: none at {re.escape(jp3[0])} \(nation {K}\'s '
+                                     rf'invasion of nation {J}\'s possession\)')
+        check(f'i3) the host\'s own CheckForInvasionBattles picked nation {K}\'s invasion of {jp3[0]} (60 %) and gave no '
+              f'battle there ("the host\'s invasion battles: none at")', refused and hl, dict(reply=refused, log=hl[-1:]))
+    # j) P5: the host's own peace (its DoPeace, host `inv hostpeace`) leaves nation 1's invasions alone and clears its own
+    clear_k()
+    jp4 = [p['name'] for p in (poss_list(H, f'possessions {J}') or []) if 0 < p['value'] < 10]
+    kp4 = [p['name'] for p in (poss_list(H, f'possessions {K}') or []) if 0 < p['value'] < 200]
+    if check('j) setup: two possessions of J, one of nation 1', len(jp4) >= 2 and kp4, dict(J=jp4[:3], K=kp4[:2])):
+        cmd(H, f'inv set {u(jp4[0])} {K} 1')
+        cmd(H, f'inv set {u(kp4[0])} {J} 0')
+        cmd(H, f'inv set {u(jp4[1])} 0 1')
+        hm = log_mark(H)
+        rp = cmd(H, 'inv hostpeace')
+        drain(ctx.hp, 4)
+        ran = log_lines(log_since(H, hm), r'invasions: TEST: the host\'s DoPeace ran: ')
+        a0, a1, a2 = inv_of(jp4[0]), inv_of(kp4[0]), inv_of(jp4[1])
+        check(f'j) the host\'s DoPeace ran (its own invasion of {jp4[1]} over) and left nation {K}\'s invasions: '
+              f'{jp4[0]} invaded by {K}, {kp4[0]} by {J} (support kept)', rp == 'ok' and ran and a2 is None and
+              a0 and a0[1] == K and a0[2] == 1 and a1 and a1[1] == J, dict(ran=ran[-1:], a0=a0, a1=a1, a2=a2))
+    clear_k()
+    cmd(H, f'inv plan {K} 0 - -1')
+    cmd(C, 'inv pick -')
+    cmd(H, f'inv target {K} -')
+    for n in (p1, q, k1):
+        if inv_of(n) and inv_of(n)[1] != -1:
+            cmd(H, f'inv set {u(n)} -1 0')
+    if J2 and rel(K, J2).get('war') == '1':
+        peace_war(K, J2, int(t2j) if str(t2j).lstrip('-').isdigit() else 5)
+    peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() else 5)
 
 def scenario_relations_peace(ctx):
     """Relations v2 (B4): peace with the computer's nations for a joined nation under the player's rules (nation 1).
@@ -6827,7 +7508,15 @@ def battle_dialogs(pid, action, rec):
             _press(rec, top, b.get('cancel'), 'Cancel')
         elif k == 'TdlgMapMessage':
             rec['map'] = rec.get('map') or time.time()
-            _press(rec, top, b.get('accept') or first, 'Accept')
+            if 'fight battle' in b or 'auto resolve' in b:  # 0.7.0: a raider battle's dialog (RaiderBattleDialog)
+                rec['raider_dialog'] = rec.get('raider_dialog') or dialog_text(top) or '?'
+                if action in ('quick', 'decline') and 'auto resolve' in b:
+                    _press(rec, top, b['auto resolve'], 'Auto resolve')
+                else:
+                    _press(rec, top, b.get('fight battle') or first, 'Fight Battle')
+            else:  # (1.01.44's MapMessageDialog hides its Decline: one button, "Generate battle")
+                rec['map_buttons'] = rec.get('map_buttons') or sorted(b)
+                _press(rec, top, b.get('accept') or first, 'Accept')
         elif k == 'TdlgBattlePreview':
             rec['preview_t'] = rec.get('preview_t') or time.time()
             rec['preview_buttons'] = sorted(b)
@@ -6881,15 +7570,16 @@ def battles_list():
 
 
 def cstate():
-    """Client `battles state` -> dict(state, id, nation, opp, area, slot, slotMode, aftermath, fight, hostgen, raw)."""
+    """Client `battles state` -> dict(state, id, nation, opp, area, slot, slotMode, aftermath, fight, hostgen, raider,
+    testraid, raw)."""
     r = cmd(C, 'battles state')
     m = re.match(r'^ok state=(\S+) id=(-?\d+) nation=(-?\d+) opp=(-?\d+) area=(.*) slot=(\d+) slotMode=(\d) '
-                 r'aftermath=(\d) fight=(\d)(?: hostgen=(\d+))?$', r)
+                 r'aftermath=(\d) fight=(\d)(?: hostgen=(\d+))?(?: raider=(\d) testraid=(\S+))?$', r)
     if not m:
         return dict(raw=r)
     return dict(state=m[1], id=int(m[2]), nation=int(m[3]), opp=int(m[4]), area=m[5], slot=int(m[6]),
                 slotMode=m[7] == '1', aftermath=m[8] == '1', fight=m[9] == '1',
-                hostgen=int(m[10]) if m[10] else None, raw=r)
+                hostgen=int(m[10]) if m[10] else None, raider=int(m[11]) if m[11] else None, testraid=m[12], raw=r)
 
 
 def ships_by_id(sec):
@@ -6926,12 +7616,12 @@ def fighting_ships_by_area(n):
     return out
 
 
-def battle_pairs(K):
+def battle_pairs(K, slot=HOST_SLOT, exclude=(STANDIN,)):
     """Candidates (J's ships there, K's ships there, J, area) for an injected battle, best first: an AI nation J with
     a possession in a sea area where nation K has at least 4 ships (the game's CheckAttackLocation: a possession
     battle needs a possession of the defender in the area and the attacker's strength there > 3; a home-area battle
-    a home area of both). From the host's save of the latest month and `possessions`."""
-    bcs = read_save(save_path(HOST_SLOT)) or {}
+    a home area of both). From the host's save of the latest month (slot) and `possessions`; not the nations in exclude."""
+    bcs = read_save(save_path(slot)) or {}
 
     def locs(n):
         out = {}
@@ -6942,7 +7632,7 @@ def battle_pairs(K):
 
     mine, cands = locs(K), []
     for j in range(1, 9):
-        if j in (K, STANDIN):
+        if j == K or j in exclude:
             continue
         theirs = locs(j)
         for area in sorted({p['area'] for p in poss_list(H, f'possessions {j}') or []}):
@@ -17491,9 +18181,17 @@ AIR_BAD_RE = (r'WARNING: air unit list not found|WARNING: air units: the list ch
 CAPACITY_BOX = 'aircraft capacity exceeded'  # the game's Turn check "CV <name> aircraft capacity exceeded!"
 
 
-def airunits(port):
-    """`airunits` (0.3.3): the air units in a copy's global list (all nations), or None."""
-    m = re.match(r'^ok count=(-?\d+)', scmd(port, 'airunits'))
+def airunits(port, pid=None, who='client', busy_wait=20):
+    """`airunits` (0.3.3): the air units in a copy's global list (all nations), or None. With `pid`: a dialog that makes
+    the bridge refuse (EVENT_BUSY; the game's news of a new month can still be up after the event roll, 0.7.0 RC2:
+    "The Italian Duce holds a belligerent speech!") is answered and the read tried again for up to `busy_wait` s."""
+    t0 = time.time()
+    r = scmd(port, 'airunits')
+    while pid and r == EVENT_BUSY and time.time() - t0 < busy_wait:
+        answer_dialogs(pid, who)
+        time.sleep(0.7)
+        r = scmd(port, 'airunits')
+    m = re.match(r'^ok count=(-?\d+)', r)
     return int(m[1]) if m else None
 
 
@@ -17649,7 +18347,7 @@ def scenario_air_units(ctx):
               and s.get('slot') == str(CLIENT_SLOT), 120, f'the client plans {nameK} in slot {CLIENT_SLOT}',
               pids=(ctx.hp, ctx.cp))
     wait_event_roll(ctx, cm)
-    hs, cs, ah, ac = saved_airunits(AIR_SLOT), saved_airunits(CLIENT_SLOT), airunits(H), airunits(C)
+    hs, cs, ah, ac = saved_airunits(AIR_SLOT), saved_airunits(CLIENT_SLOT), airunits(H), airunits(C, ctx.cp)
     check(f'd) a session on the copy: the host hosts ({rh}), the client joins ({rj}), claims {nameK} ({rc}) and plans '
           f'nation {K} in slot {CLIENT_SLOT} ({st.get("date")}); `airunits` host {ah} = client {ac} = the saved counts '
           f'of slot {AIR_SLOT} and slot {CLIENT_SLOT} = {n}', rh == rj == rc == 'ok' and ah == ac == n
@@ -17688,6 +18386,411 @@ def scenario_air_units(ctx):
     bad = {who_of(p): ls_lines(p, m, AIR_BAD_RE) for p, m in marks0.items()}
     check('f) no air-unit WARNING or failure in either log ("air unit list not found", "the list changed during the '
           'load", "exception dropping the air units", "the load failed")', not any(bad.values()), bad)
+
+
+LEGACY_SLOT = 46  # legacy_fleet's throwaway copy of the legacy test campaign (a host hosts slots 1-49; air_units has 49,
+# the missile fixture 48)
+LEGACY_FIXTURE = os.environ.get('RTW3_LEGACY_FIXTURE')  # --legacy-fixture: the 1900 test campaign's Game<n> folder
+LEGACY_K, LEGACY_NAME = 1, 'Germany'
+LEGACY_PLAN = (('DD', 'Wespe', 3), ('CL', 'Gazelle', 2), ('CA', 'Prinz', 2))  # type prefix, class, ships (sbBuild)
+LEGACY_UC = ('Prinz', 1)  # laid down in the "ships under construction" step
+LEGACY_DIV = (('RT Legacy Div', 'RLD', 'CA'),)  # (name, abbreviation, type): a division of the hand-built ships
+LEGACY_HOST_KEYS = re.compile(r'^(Tension|Allied|VP|IntelligenceSpending|IntelEffort|AITension\d|AIAlliance\d)=')
+
+
+def legacy_fixture(folder=None):
+    """(ok, why, folder, slot number) of the legacy test campaign: a new 1900 campaign never played (TESTING.md "The
+    legacy test campaign"), nation 1 Germany."""
+    d = folder or LEGACY_FIXTURE
+    if not d or not os.path.isdir(d):
+        return False, 'no legacy test campaign (--legacy-fixture or RTW3_LEGACY_FIXTURE: its Game<n> folder)', d, None
+    m = next((re.fullmatch(r'RTWGame(\d+)\.bcs', f) for f in os.listdir(d) if re.fullmatch(r'RTWGame\d+\.bcs', f)),
+             None)
+    g = (read_save(os.path.join(d, m[0])) or {}).get('General', {}) if m else {}
+    n1 = (read_save(os.path.join(d, m[0])) or {}).get(f'Nation{LEGACY_K}', {}) if m else {}
+    if not m or g.get('Year') != '1900' or g.get('Month') != '1' or g.get('CampaignStartYear') != '1900' or \
+            n1.get('Name') != LEGACY_NAME:
+        return False, f'{d} is not a January 1900 campaign with nation {LEGACY_K} {LEGACY_NAME}', d, None
+    return True, '', d, int(m[1])
+
+
+def legacy_copy(src, n, dst):
+    """The fixture folder (slot n's files) copied to save slot dst, the slot number in the file names changed."""
+    d = slot_dir(dst)
+    os.makedirs(d)
+    for fn in os.listdir(src):
+        m = re.fullmatch(rf'(RTWGame|MapData){n}(\.\w+)', fn)
+        shutil.copyfile(os.path.join(src, fn), os.path.join(d, f'{m[1]}{dst}{m[2]}' if m else fn))
+
+
+def save_sections(raw):
+    """{section: [lines]} of a save's bytes (the order kept, for exact comparisons)."""
+    out, cur = {}, None
+    for ln in raw.decode('utf-8-sig', 'replace').splitlines():
+        if ln.startswith('[') and ln.endswith(']'):
+            cur = ln[1:-1]
+            out[cur] = []
+        elif cur is not None:
+            out[cur].append(ln)
+    return out
+
+
+def vcl(port, form, field='-'):
+    """The bridge's `vcl`: where a form's published control is (its window, or its parent's and its rectangle)."""
+    r = cmd(port, f'vcl {form} {field}')
+    if not r.startswith('ok'):
+        return None
+    d = dict(t.split('=', 1) for t in r.split()[1:] if '=' in t)
+    return {k: int(v) if k in ('hwnd', 'parent', 'x', 'y', 'w', 'h', 'visible', 'enabled') else v for k, v in d.items()}
+
+
+def vcl_click(port, form, field):
+    """BM_CLICK on a windowed control, else a posted click at the middle of its rectangle in its parent."""
+    d = vcl(port, form, field)
+    if not d:
+        return False
+    if d['hwnd']:
+        u.PostMessageW(d['hwnd'], 0x00F5, 0, 0)
+    else:
+        post_click(d['parent'], d['x'] + d['w'] // 2, d['y'] + d['h'] // 2)
+    return True
+
+
+def vcl_shown(port, form):
+    d = vcl(port, form)
+    return bool(d and d['visible'] and d['hwnd'] and u.IsWindowVisible(d['hwnd']))
+
+
+def answer_only(pid, classes, prefer=('yes', 'ok')):
+    """Answer the visible dialogs of these classes only (the build dialog's OK would build again): [(class, text, button)]."""
+    done = []
+    for t in top_windows(pid):
+        k = e2e_test.class_name(t)
+        if k not in classes:
+            continue
+        bts = dlg_buttons(t)
+        p = next((p for p in prefer if p in bts), None)
+        if p:
+            txt = box_text(t) if k == 'TMessageForm' else e2e_test.window_text(t)
+            u.PostMessageW(bts[p], 0x00F5, 0, 0)
+            done.append((k, (txt or '')[:160], p))
+            log(f'  client dialog answered: {k}:"{(txt or "")[:100]}"->{p}')
+    return done
+
+
+def until(pred, timeout, pid, classes=(), prefer=('yes', 'ok')):
+    """Wait for pred, answering the given dialog classes meanwhile; returns the answers."""
+    got, end = [], time.time() + timeout
+    while time.time() < end:
+        if classes:
+            got += answer_only(pid, classes, prefer)
+        try:
+            if pred():
+                return got
+        except Exception:
+            pass
+        time.sleep(0.6)
+    return got + [('TIMEOUT', '', '')]
+
+
+def legacy_design(ctx, prefix, name):
+    """The game's designer from the strategic screen: a new class of the type, its Auto design, the class name, Save and
+    finish, the design report OK and "go to the build dialog?" Yes. -> the answers (ends with the build dialog open)."""
+    vcl_click(C, 'TfrmBuildCamp', 'btbnDesign')
+    if until(lambda: vcl_shown(C, 'TfrmDesignMain2'), 30, ctx.cp)[-1:] == [('TIMEOUT', '', '')]:
+        return [('TIMEOUT', 'designer', '')]
+    time.sleep(1.5)
+    cb = vcl(C, 'TfrmDesignMain2', 'cbType')['hwnd']
+    n = u.SendMessageW(cb, 0x0146, 0, 0)  # CB_GETCOUNT
+    items = []
+    for i in range(max(0, n)):
+        b = ctypes.create_unicode_buffer(max(1, u.SendMessageW(cb, 0x0149, i, 0)) + 2)
+        _u32p.SendMessageW(cb, 0x0148, i, ctypes.addressof(b))
+        items.append(b.value)
+    idx = next((i for i, t in enumerate(items) if t.startswith(prefix + ' ')), -1)
+    u.SendMessageW(cb, 0x014E, idx, 0)  # CB_SETCURSEL, then CBN_SELCHANGE to the parent (VCL's OnChange)
+    u.PostMessageW(u.GetParent(cb), 0x0111, (1 << 16) | (u.GetDlgCtrlID(cb) & 0xFFFF), cb)
+    time.sleep(1.5)
+    vcl_click(C, 'TfrmDesignMain2', 'sbAutoBuild')  # the game asks "Auto design ship of type ...?"
+    asked = until(lambda: False, 4, ctx.cp, ('TMessageForm',), ('ok', 'yes'))
+    time.sleep(2)
+    ed = vcl(C, 'TfrmDesignMain2', 'edName')['hwnd']
+    b = ctypes.create_unicode_buffer(name)
+    _u32p.SendMessageW(ed, 0x000C, 0, ctypes.addressof(b))  # WM_SETTEXT
+    time.sleep(0.5)
+    vcl_click(C, 'TfrmDesignMain2', 'btbnFinish')
+    return [a for a in asked if a[0] != 'TIMEOUT'] + until(lambda: vcl_shown(C, 'TdlgBuildShip'), 40, ctx.cp,
+                                                           ('TdlgTotalLog', 'TMessageForm'))
+
+
+def legacy_build(ctx, name, count):
+    """The game's build dialog: the class selected, a suggested name, the number of ships, OK. -> (row found, answers)."""
+    if not vcl_shown(C, 'TdlgBuildShip'):
+        vcl_click(C, 'TfrmBuildCamp', 'btbnBuildShip')
+        until(lambda: vcl_shown(C, 'TdlgBuildShip'), 30, ctx.cp)
+    time.sleep(1.5)
+    lv = vcl(C, 'TdlgBuildShip', 'lvDesigns')['hwnd']
+    rows = lv_rows(ctx.cp, lv, 3)
+    i = next((k for k, r in enumerate(rows) if name in r[2]), None)
+    if i is None:
+        return False, [('no row', str([r[2] for r in rows]), '')]
+    lv_select(ctx.cp, lv, i)
+    time.sleep(1)
+    vcl_click(C, 'TdlgBuildShip', 'bnSuggestName')
+    time.sleep(0.7)
+    se = vcl(C, 'TdlgBuildShip', 'seNumber')['hwnd']
+    b = ctypes.create_unicode_buffer(str(count))
+    _u32p.SendMessageW(se, 0x000C, 0, ctypes.addressof(b))
+    time.sleep(0.7)
+    vcl_click(C, 'TdlgBuildShip', 'bnOK')
+    return True, until(lambda: not vcl_shown(C, 'TdlgBuildShip'), 30, ctx.cp, ('TMessageForm',))
+
+
+def legacy_state(port=C):
+    """`legacystate` -> {available, active, nation, phase, ships, funds, prestige}."""
+    r = cmd(port, 'legacystate')
+    m = re.match(r'ok available=(\d) active=(\d) nation (\d+) phase (\d+) ships (\d+) funds (-?\d+) prestige (-?\d+)', r)
+    return dict(zip(('available', 'active', 'nation', 'phase', 'ships', 'funds', 'prestige'), map(int, m.groups()))) \
+        if m else {'raw': r}
+
+
+def scenario_legacy_fleet(ctx):
+    """0.7.0: a joined player builds the legacy (starting) fleet of the nation by hand in a new campaign's first month,
+    as the game's "Manual build of legacy fleet" does for the player nation. On the legacy test campaign (a new 1900
+    campaign made with the game's title screen, copied to the throwaway slot 46; skipped without it), a new session:
+    the client chooses `legacy 1` before joining and claims Germany. a) the first month offers it: the client clears
+    Germany's 43 generated ships, its designs and its campaign divisions (none: CampDivNo=0, `divs` n=0) before the
+    load and starts the game's manual build (prestige -1, the budget 4 x the monthly budget x 0.9 x IFM / 10, StartBuild
+    0), the host gets the notice; b) the client designs and
+    builds through the game's own screens (designer: type, Auto design, name, Save and finish; build dialog: class,
+    suggested name, number, OK); c) the game's Continue: funds over (FleetSize+1) x 3000 lost, the computer's initial
+    fleets skipped, then one ship under construction (cost / 20) and Continue again: normal play, the notice, the
+    month's event roll after it; no divisions after the build, then one of the hand-built ships (Fleet organization);
+    d) the turn: the host's merged save holds exactly the player's sections and designs
+    for Germany, every other section as sent (but IDNo and relation values), the merge line, klegacy, the host's stored
+    division list = the client's one; e) February: not offered again, the fleet on both PCs, the division back on the
+    client; f) a battle of Germany against an AI nation fought on the client with the hand-built ships (up to 3
+    months)."""
+    ok, why, fdir, fslot = legacy_fixture()
+    if not ok:
+        SKIPPED['legacy_fleet'] = why
+        log(f'SKIP legacy_fleet: {why}. Make it as docs/TESTING.md describes ("The legacy test campaign").')
+        return
+    K, me = LEGACY_K, LEGACY_NAME
+    ls_quiet(ctx)
+    if lss(H).get('on') == '1':
+        scmd(H, 'ls drop')
+        time.sleep(3)
+    for pid in (ctx.hp, ctx.cp):
+        close_modeless(pid)
+    if battle_up(ctx.hp):  # the battle the scenario before left open (lockstep_air's goes on against the computer)
+        ls_finish_host(ctx)
+        ls_quiet(ctx)
+    scmd(C, 'leave')
+    time.sleep(1.5)
+    scmd(H, 'leave')
+    time.sleep(1.5)
+    legacy_copy(fdir, fslot, LEGACY_SLOT)
+    fx = save_sections(open(save_path(LEGACY_SLOT), 'rb').read())
+    gen_ids = {l.split('=', 1)[1] for l in fx[f'Nation{K}Ships'] if re.match(r'^Ship\d+Id=', l)}
+    fleet_size = int(next(l for l in fx['General'] if l.startswith('FleetSize=')).split('=')[1])
+    r = cmd(H, f'load {LEGACY_SLOT} 0')
+    wait(H, lambda s: s.get('slot') == str(LEGACY_SLOT) and s.get('startBuild') == '2', 120,
+         f'the host loads slot {LEGACY_SLOT}', pids=(ctx.hp,))
+    cm, hm = log_mark(C), log_mark(H)
+    rw = cmd(C, 'legacy 1')
+    cmd(C, 'fightbattles 1')  # (`battles` ends with the client joined with fightbattles 0)
+    rh = cmd(H, f'host {HOST_NAME} {MP_PORT} 0')
+    rj = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {MP_PORT}')
+    time.sleep(3)
+    rc = cmd(C, f'claim {me}')
+    time.sleep(2)
+    cmd(H, 'start')
+    st = wait(C, lambda s: s.get('phase') == 'planning' and s.get('playerIdx') == str(K), 120,
+              'the client plans the first month', pids=(ctx.hp,))  # (the client's picture message is checked below)
+    ls0 = legacy_state()
+    clog = log_since(C, cm)
+    cl = log_lines(clog, r'legacy fleet: nation \d+ cleared')
+    bl = log_lines(clog, r'legacy fleet: build started')
+    m = re.search(r'budget (\d+) x4 x0\.9 x IFM (\d+)/10 = funds (\d+) \(were \d+\), prestige (\d+) -> (\d+)',
+                  bl[0] if bl else '')
+    want = (round(4 * int(m[1]) * 0.9) * int(m[2]) // 10) if m else None
+    check(f'a) a session on the legacy copy (slot {LEGACY_SLOT}): `legacy 1` ({rw}), host ({rh}), join ({rj}), claim '
+          f'{me} ({rc}); the client plans January 1900 as nation {K}', st and rw == 'ok wanted=1', st)
+    check(f'a) the client cleared {me}\'s generated fleet before the load: "{len(gen_ids)} ship(s), <n> design(s), 0 air '
+          f'unit(s), 0 campaign division(s) removed"', cl and f': {len(gen_ids)} ship(s), ' in cl[0] and
+          ', 0 air unit(s), 0 campaign division(s) removed' in cl[0], cl)
+    check('a) the game\'s manual build runs: `legacystate` active=1 phase 0, no ships, funds = round(4 x budget x 0.9) x '
+          'IFM / 10 (the log\'s figures), prestige -1',
+          ls0.get('active') == 1 and ls0.get('phase') == 0 and ls0.get('ships') == 0 and m and
+          ls0.get('funds') == int(m[3]) == want and ls0.get('prestige') == int(m[5]) == int(m[4]) - 1, f'{ls0}; {bl}')
+    check('a) the host\'s notice: "* <player> builds the legacy fleet of Germany by hand"',
+          until(lambda: f'builds the legacy fleet of {me} by hand' in chat(ctx.cp), 20, ctx.cp) == [], chat(ctx.cp)[-300:])
+    pre = until(lambda: any(e2e_test.class_name(t) == 'TdlgPictureMessage' for t in top_windows(ctx.cp)), 20, ctx.cp,
+                ('TdlgCampTurnRep',), ('close', 'ok'))
+    pic = [a for a in pre if a[0] != 'TdlgCampTurnRep']
+    if len(pic) < len(pre):  # the month's turn report first: messages the host still held for nation K (`econnews`)
+        log(f'  NOTE a) the month\'s turn report came before the build\'s picture message (answered): {pre[:2]}')
+    answer_only(ctx.cp, ('TdlgPictureMessage',), ('ok',))
+    check('a) the game\'s picture message on the client ("Build your existing fleet")', pic == [], pic)
+    dc0, od0 = parse_divs(cmd(C, 'divs')), slot_divisions(CLIENT_SLOT)
+    check(f'a) the build starts without campaign divisions: client `divs` n=0, slot {CLIENT_SLOT}\'s .off CampDivNo=0',
+          dc0 and dc0['n'] == 0 and dc0['nation'] == K and od0 and od0['no'] == 0,
+          f'{dc0 and dc0["raw"]}; {od0}')
+
+    # b) the game's own designer and build dialog
+    built = 0
+    for prefix, cls, n in LEGACY_PLAN:
+        dans = legacy_design(ctx, prefix, cls)
+        found, bans = legacy_build(ctx, cls, n)
+        s = legacy_state()
+        built += n
+        check(f'b) designer: a {prefix} class "{cls}" (Auto design, Save and finish: the report, "go to the build '
+              f'dialog?"); build dialog: {n} ship(s) -> {built} ships', found and s.get('ships') == built and
+              ('TIMEOUT', '', '') not in dans + bans, f'{s}; designer {dans}; build {bans}')
+    funds_b = legacy_state().get('funds')
+
+    # c) the game's Continue steps
+    m1 = log_mark(C)
+    vcl_click(C, 'TfrmBuildCamp', 'btbnTurn')
+    a1 = until(lambda: legacy_state().get('phase') == 1 and not any(
+        e2e_test.class_name(t) in ('TMessageForm', 'TdlgPictureMessage') for t in top_windows(ctx.cp)),
+        40, ctx.cp, ('TMessageForm', 'TdlgPictureMessage'))
+    s1 = legacy_state()
+    cap = (fleet_size + 1) * 3000
+    skips = log_lines(log_since(C, m1), r'legacy fleet: (AIBuildInitialFleet|AssignOfficersToUncommandedShips) skipped')
+    check(f'c) Continue: "Are you finished building your initial fleet?", "Remaining funds over {cap} will be lost" '
+          f'(FleetSize {fleet_size}), the picture message; phase 1, funds {min(funds_b, cap)}',
+          s1.get('phase') == 1 and s1.get('funds') == min(funds_b, cap) and ('TIMEOUT', '', '') not in a1, f'{s1}; {a1}')
+    check('c) the computer\'s initial fleets (nations 1-8) and the officers skipped while it runs',
+          len([x for x in skips if 'AIBuildInitialFleet' in x]) == 8 and any('Officers' in x for x in skips), skips)
+    found, bans = legacy_build(ctx, *LEGACY_UC)
+    s2 = legacy_state()
+    check(f'c) a ship under construction ({LEGACY_UC[0]}) costs a twentieth', found and s2.get('ships') == built + 1 and
+          0 < s1['funds'] - s2['funds'] < s1['funds'], f'{s1} -> {s2}; {bans}')
+    m2 = log_mark(C)
+    vcl_click(C, 'TfrmBuildCamp', 'btbnTurn')
+    until(lambda: log_lines(log_since(C, m2), r'legacy fleet: built: '), 40, ctx.cp, ('TMessageForm',))
+    end = time.time() + 40  # the month's event roll follows at once (its dialog refuses most bridge commands)
+    while time.time() < end and 'raw' in legacy_state():
+        answer_dialogs(ctx.cp, 'client')
+        time.sleep(1)
+    s3 = legacy_state()
+    done = log_lines(log_since(C, m2), r'legacy fleet: built: ')
+    check(f'c) Continue again: normal play (phase 2), "legacy fleet: built: {built + 1} ship(s), funds {s2.get("funds")}"',
+          s3.get('phase') == 2 and s3.get('active') == 0 and done and
+          done[0].endswith(f'built: {built + 1} ship(s), funds {s2.get("funds")}'), f'{s3}; {done}')
+    check('c) the host\'s notice: "* <player> finished the legacy fleet of Germany"',
+          until(lambda: f'finished the legacy fleet of {me}: {built + 1} ship(s)' in chat(ctx.cp), 20, ctx.cp) == [],
+          chat(ctx.cp)[-300:])
+    # (0.6.1's divisions) the build makes none; one division of the hand-built ships through the Fleet organization,
+    # once the month's turn report (it follows the event roll) is closed
+    drain(ctx.cp, 3, 'client')
+    end = time.time() + 20
+    while time.time() < end and any(e2e_test.class_name(t) in ('TdlgCampTurnRep', 'TdlgEventAnswer', 'TMessageForm',
+                                                               'TdlgPictureMessage') for t in top_windows(ctx.cp)):
+        answer_dialogs(ctx.cp, 'client')
+        time.sleep(1)
+    dcb = parse_divs(cmd(C, 'divs'))
+    drec = fo_make(ctx.cp, 'client', LEGACY_DIV)
+    fo_set_tab(ctx.cp, 0)
+    dcl = parse_divs(cmd(C, 'divs'))
+    ldiv = next((d for d in (dcl or {}).get('divs', []) if d['name'] == LEGACY_DIV[0][0]), None)
+    check(f'c) no campaign divisions after the build; "{LEGACY_DIV[0][0]}" made with hand-built ships (New division, Add '
+          f'ships to division): `divs` {div_summary(dcl)}', dcb and dcb['n'] == 0 and dcl and dcl['n'] == 1 and ldiv
+          and ldiv['ids'] and not set(ldiv['ids']) & gen_ids, f'{dcb and dcb["raw"]}; {drec}')
+
+    # d) the turn: the merged save is captured as the merge writes it (the month then runs and saves again)
+    sent = save_sections(open(save_path(LEGACY_SLOT), 'rb').read())
+    snap, hm2 = {}, log_mark(H)
+
+    def watch():
+        end = time.time() + 600
+        while time.time() < end and 'bcs' not in snap:
+            if re.search(rf'merge nation {K}: ', log_since(H, hm2)):
+                with open(save_path(LEGACY_SLOT), 'rb') as f:
+                    snap['bcs'] = f.read()
+                with open(os.path.join(slot_dir(LEGACY_SLOT), f'DesignFiles{K}.des'), 'rb') as f:
+                    snap['des'] = f.read()
+            time.sleep(0.15)
+
+    th = threading.Thread(target=watch, daemon=True)
+    th.start()
+    run_month(ctx, 'legacy_fleet 1', slot=LEGACY_SLOT, checks=False)
+    th.join(5)
+    mer = save_sections(snap['bcs']) if 'bcs' in snap else {}
+    mline = log_lines(log_since(H, hm2), rf'merge nation {K}: ')
+    k_ids = [l.split('=', 1)[1] for l in mer.get(f'Nation{K}Ships', []) if re.match(r'^Ship\d+Id=', l)]
+    check(f'd) the merge: "legacy fleet: {len(gen_ids)} ship(s) -> {built + 1}, 0 air unit(s) of removed ships dropped"',
+          mline and f'legacy fleet: {len(gen_ids)} ship(s) -> {built + 1}, 0 air unit(s)' in mline[0], mline)
+    check(f'd) the host\'s merged save: {me} has exactly the {built + 1} hand-built ships (none of the {len(gen_ids)} '
+          f'generated ids)', len(k_ids) == built + 1 and not set(k_ids) & gen_ids, k_ids)
+    other = []
+    for s in sent:
+        if re.fullmatch(rf'Nation{K}(Ships|CoastalArtillery|Submarines|Losses)?|General', s):
+            continue
+        a = [l for l in sent[s] if not LEGACY_HOST_KEYS.match(l)]
+        b = [l for l in mer.get(s, []) if not LEGACY_HOST_KEYS.match(l)]
+        if a != b:
+            other.append(s)
+    check('d) every other nation\'s sections (and the rest of the save but [General]) as sent, but relation values',
+          mer and not other, other[:6])
+    des_ok = snap.get('des', b'').startswith(b'\xef\xbb\xbfv') and b'Wespe' in snap.get('des', b'')
+    check(f'd) the host\'s DesignFiles{K}.des is the player\'s (its classes), not the generated one', des_ok,
+          snap.get('des', b'')[:60])
+    sess = read_save(os.path.join(slot_dir(LEGACY_SLOT), 'rtw3mp_session.ini')) or {}
+    kl = (sess.get('', {}) or {}).get('klegacy', '') if sess else ''
+    if not kl:
+        try:
+            kl = next((l.split('=', 1)[1] for l in open(os.path.join(slot_dir(LEGACY_SLOT), 'rtw3mp_session.ini'),
+                                                         encoding='utf-8', errors='replace') if l.startswith('klegacy=')),
+                      '')
+        except OSError:
+            kl = ''
+    check(f'd) rtw3mp_session.ini: klegacy={K}, (a resent first month offers no second build); the chat line "... '
+          f'hand-built legacy fleet of {me} is in the campaign."', kl.startswith(f'{K},') and
+          f'hand-built legacy fleet of {me} is in the campaign' in chat(ctx.cp), kl)
+    ds = parse_divs(cmd(H, f'divstore {K}'))
+    dl = log_lines(log_since(H, hm2), rf'divisions of nation {K}: ')
+    sdiv = ((ds or {}).get('divs') or [{}])[0]
+    check(f'd) the host stores the legacy fleet\'s division for {me}: `divstore {K}` = the client\'s '
+          f'({div_summary(ds)}), its ships among the merged ones; "divisions of nation {K}: 1 stored for its legacy '
+          'fleet"', ds and ldiv and ds['n'] == 1 and sdiv.get('ids') == ldiv['ids'] and set(ldiv['ids']) <= set(k_ids)
+          and any('1 stored for its legacy fleet' in x for x in dl), dl)
+
+    # e) February: no second offer; the fleet on both PCs
+    s4, nat = legacy_state(), nation_table(H)
+    off = log_lines(log_since(C, m2), r'legacy fleet: (offered|nation \d+ cleared)')
+    check(f'e) February: not offered again (no "offered"/"cleared" line), `legacystate` active=0; the host\'s {me} has '
+          f'{built + 1} ships, the client too', not off and s4.get('active') == 0 and s4.get('ships') == built + 1 and
+          nat.get(K, {}).get('ships') == built + 1, f'{off}; {s4}; {nat.get(K)}')
+    dcf = parse_divs(cmd(C, 'divs'))
+    fdiv = next((d for d in (dcf or {}).get('divs', []) if d['name'] == LEGACY_DIV[0][0]), None)
+    check(f'e) February: the client\'s divisions are its legacy fleet\'s one, from the host ({div_summary(dcf)})',
+          dcf and dcf['n'] == 1 and fdiv and ldiv and fdiv['ids'] == ldiv['ids'], dcf and dcf['raw'])
+
+    # f) a battle of the hand-built fleet against an AI nation (the joined players' battle phase, BattleDriver)
+    cands = battle_pairs(K, LEGACY_SLOT, ())
+    log('  battle candidates (J ships, K ships, J, area):', cands[:4])
+    if not check(f'f) an AI nation with a possession where {me}\'s hand-built ships are', cands, cands):
+        return
+    _, _, J, area = cands[0]
+    fought = None
+    for attempt in range(1, 4):
+        cmd(H, f'settension {K} {J} 50')
+        ids = [inject(K, J, area) for _ in range(2)]
+        log(f'  inject {K} {J} {area}: {ids}')
+        drv = BattleDriver(ctx, {b: 'fight' for b, _ in ids if b is not None}, K, J, fight_any=True)
+        drv.label = f'legacy_fleet battle {attempt}'
+        run_month(ctx, drv.label, driver=drv, slot=LEGACY_SLOT, checks=False)
+        if drv.fought() is not None:
+            fought = drv.fought()
+            break
+    bcs = save_sections(open(save_path(LEGACY_SLOT), 'rb').read())
+    now_ids = {l.split('=', 1)[1] for l in bcs.get(f'Nation{K}Ships', []) if re.match(r'^Ship\d+Id=', l)}
+    check(f'f) a battle of {me} against AI nation {J} in {area} fought on the client (up to 3 months), with the '
+          f'hand-built ships: none of the generated ids came back', fought is not None and now_ids and
+          not now_ids & gen_ids and now_ids <= set(k_ids), f'battle {fought}; ships {sorted(now_ids)[:14]}')
 
 
 SCENARIOS = [  # name, months processed, what it guards, function
@@ -17800,6 +18903,19 @@ SCENARIOS = [  # name, months processed, what it guards, function
                            'branches of DoSurpriseAttack in the view), both directions played in the battle slot with '
                            'the game\'s CheckSurpriseAttack (`battles injectsa`, `battles saretry`): a battle or a clean '
                            'no-battle, never resolved by the game', scenario_battle_surprise),
+    ('battle_raider', 4, '0.7.0: raiders against patrols for nation 1 (hello `gen` 3): the raider checks recorded in its '
+                         'view (`battles gen`), four forced months (`battles injectraid`, the client\'s `battles '
+                         'testraid`): our raider intercepted and our patrol intercepting, each fought and '
+                         'auto-resolved in the battle slot with the game\'s CheckRaiderVsPatrols; merged on the host '
+                         '(cross-checked), the "thwarts" lines in nation 1\'s news, the host unchanged',
+     scenario_battle_raider),
+    ('battle_invasion', 6, '0.7.0: invasions for nation 1 (hello `gen` 4): its target from its turn (a person\'s possession '
+                           'refused), its month resolution in its view after the month (forced draws): nation 1 invading '
+                           'and invaded, the texts in its news, the target\'s cost; the host\'s own invasion\'s mark kept '
+                           'across the turn\'s reload; the host\'s routine hides nation 1\'s invasions; its invasion '
+                           'battles in its battle slot (its own, the enemy\'s landing), merged; its peace; a surprise '
+                           'landing at a war\'s start; the computer\'s fleets; a start, a capture, the host\'s refusal and '
+                           'peace', scenario_battle_invasion),
     ('relations_war', 1, '0.6.1: the tension bar above the war line: nation 1 at tension 15 with a computer nation -> its '
                          'war from nation 1\'s relation turn (CheckForWar after the tension routines, once, as the game\'s '
                          'month); the players at tension 25 -> the other player\'s bar hint on both PCs (relview: wars '
@@ -17941,6 +19057,15 @@ SCENARIOS = [  # name, months processed, what it guards, function
                              'each player\'s own Fire at will, manual salvoes from A, B and both, the panel showing your '
                              'own side, a resync with a pending heavy-missile target',
      scenario_lockstep_missiles),
+    ('legacy_fleet', 3, 'group legacy (0.7.0; the legacy test campaign given with --legacy-fixture or '
+                        'RTW3_LEGACY_FIXTURE, copied to the throwaway slot 46; SKIP without it): a joined player builds '
+                        'the starting fleet of Germany by hand in a new 1900 campaign\'s first month (`legacy 1`): the '
+                        'generated fleet, designs and campaign divisions cleared, the game\'s manual build (budget, '
+                        'prestige, its designer and build dialog, Continue twice, funds cap, the computer\'s initial '
+                        'fleets skipped), a division of the hand-built ships stored by the host and back in February, '
+                        'the host\'s merged save exactly the player\'s sections, the others as sent, no second offer, a '
+                        'battle with the hand-built ships. Runs last: the session stays on the copy',
+     scenario_legacy_fleet),
 ]
 STRESS_ONLY = ('lockstep_stress', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_strike',
                'lockstep_missiles')  # not in the default run: --stress, --group or --only
@@ -17954,9 +19079,10 @@ GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), i
     'live-limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_data', 'lockstep_rejoin', 'lockstep_resume',
                     'lockstep_torpedo', 'lockstep_air', 'lockstep_strike', 'lockstep_missiles'),
     'relations': ('relations_peace', 'war_effects', 'arms_treaty', 'battle_generator', 'battle_surprise',
-                  'relations_war'),
-    'battlegen': ('battle_generator', 'battle_surprise'),
+                  'battle_raider', 'relations_war'),
+    'battlegen': ('battle_generator', 'battle_surprise', 'battle_raider', 'battle_invasion'),
     'twopc': ('twopc',),
+    'legacy': ('legacy_fleet',),
 }
 # Game time per scenario in seconds: measured in the dist_ll_7 default run (the 0.3.2-era scenarios) and on the 0.4.0
 # release candidate dist_ll_16 (2026-10-18: the default run 1528 s with lockstep_ui 213, lockstep_limits 175, air_units
@@ -17967,7 +19093,8 @@ EST = dict(session=14, intel_reports=1, file_lock=4, events=4, merge=17, researc
            lockstep_limits=175, lockstep_pvp=72, lockstep_month=109, lockstep_rejoin=565, lockstep_resume=380,
            lockstep_torpedo=470, lockstep_stress=1310, lockstep_air=265, air_units=65, lockstep_strike=420,
            lockstep_missiles=330, twopc=175, relations_peace=40, war_effects=220, arms_treaty=150,
-           battle_generator=150, battle_surprise=60, relations_war=40, lockstep_data=15, divisions=90)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s);
+           battle_generator=150, battle_surprise=60, battle_raider=300, battle_invasion=600, relations_war=40, lockstep_data=15, divisions=90,
+           legacy_fleet=420)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s);
 # divisions: dist_fd_2, 2026-10-25 (90 s, two months)
 # battles: dist_b6_5, 2026-10-23 (180 s with c2), one more month; battle_surprise: dist_b6_7, 2026-10-23 (57 s, one fought battle)
 # relations_war: dist_fw_1, 2026-10-25 (37 s); lockstep_data: dist_i61_1, 2026-10-25 (13 s)
@@ -18465,6 +19592,9 @@ def main(argv=None):
     ap.add_argument('--missile-mission', default=os.environ.get('RTW3_MISSILE_MISSION'),
                     help='lockstep_missiles: the mission of `pocbattle <opponent> <mission> [area]` (default 1; env '
                          'RTW3_MISSILE_MISSION)')
+    ap.add_argument('--legacy-fixture', default=os.environ.get('RTW3_LEGACY_FIXTURE'),
+                    help='legacy_fleet: the legacy test campaign\'s Game<n> folder (a new 1900 campaign, TESTING.md), '
+                         f'copied into the throwaway slot {LEGACY_SLOT} for the run (env RTW3_LEGACY_FIXTURE)')
     ap.add_argument('--missile-area', default=os.environ.get('RTW3_MISSILE_AREA'),
                     help='lockstep_missiles: the map area index of `pocbattle` (default 1 with the default nations: The '
                          'Mediterranean; "-" for none; env RTW3_MISSILE_AREA)')
@@ -18508,6 +19638,10 @@ def main(argv=None):
     torpedo = 'lockstep_torpedo' in names
     twopc = 'twopc' in names
     air_slots = (AIR_SLOT,) if 'air_units' in names else ()
+    if 'legacy_fleet' in names and legacy_fixture(a.legacy_fixture)[0]:  # its throwaway copy: must not exist, deleted after
+        global LEGACY_FIXTURE
+        LEGACY_FIXTURE = a.legacy_fixture
+        air_slots += (LEGACY_SLOT,)
     problems = preflight(g1, COPY_SLOTS if copy_slots else (), k2_slots, dry=a.dry_run, prefs=torpedo, missile=plan,
                          air_slots=air_slots, proxy_port=TWOPC_PROXY_PORT if twopc else None)
     if a.dry_run:

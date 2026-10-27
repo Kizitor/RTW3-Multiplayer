@@ -483,16 +483,24 @@ void HostTakeIntelEvent(const KV& kv, int K, std::string& applied) {
 // Campaign divisions. A joined player's game loads the divisions of its slot against its nation (game.cpp,
 // d_LoadDivisions), saves them with its turn, and the host keeps them for the nation: the host's own month only ever
 // sees (and changes) the host's divisions.
-void HostTakeDivisions(const Bundle& sub, int K) {
+void HostTakeDivisions(const Bundle& sub, int K, bool fresh) {
     if (!g_attached || K < 1 || K > 8) return;
     const std::string* f = sub.Get("divisions.ini");
-    if (!f) return;  // a player's mod that doesn't send them (0.6.0 and older): the stored list stays
-    IniDoc d = ParseIni(*f);
-    const IniSection* s = d.Find("CampaignDivisions");
+    IniDoc d = f ? ParseIni(*f) : IniDoc();
+    const IniSection* s = f ? d.Find("CampaignDivisions") : nullptr;
     std::vector<saveio::CampDiv> divs;
-    std::string err = "no [CampaignDivisions]";
+    std::string err = f ? "no [CampaignDivisions]" : "none sent";
     if (!s || !saveio::ParseDivisions(s->lines, divs, true, err)) {
-        Log("divisions of nation %d: the turn's list rejected (%s); the stored one stays", K, err.c_str());
+        if (fresh) {  // a legacy turn: the stored list names the replaced fleet's ships
+            Rec& r = RecOf(K);
+            r.divisions = saveio::DivisionLines({});
+            r.hasDivisions = true;
+            HostSave();
+            Log("divisions of nation %d: the legacy turn's list unusable (%s); none stored", K, err.c_str());
+            return;
+        }
+        // (no list: a player's mod that doesn't send them, 0.6.0 and older)
+        if (f) Log("divisions of nation %d: the turn's list rejected (%s); the stored one stays", K, err.c_str());
         return;
     }
     saveio::DivPrune pr = saveio::PruneDivisions(divs, nullptr);
@@ -500,8 +508,8 @@ void HostTakeDivisions(const Bundle& sub, int K) {
     r.divisions = saveio::DivisionLines(divs);
     r.hasDivisions = true;
     HostSave();
-    Log("divisions of nation %d: %d stored (repeats dropped: %d divisions, %d ship ids; %d lead divisions reset)", K,
-        (int)divs.size(), pr.divisions, pr.ships, pr.leads);
+    Log("divisions of nation %d: %d stored%s (repeats dropped: %d divisions, %d ship ids; %d lead divisions reset)", K,
+        (int)divs.size(), fresh ? " for its legacy fleet" : "", pr.divisions, pr.ships, pr.leads);
 }
 
 int HostPutDivisions(Bundle& b, int K, bool own, const char* what) {

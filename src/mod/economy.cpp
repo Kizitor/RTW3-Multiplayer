@@ -55,6 +55,7 @@
 // the budget figures follow K's army offensive (session.cpp). Each joined nation's month is logged after the month's
 // CheckForWar (DoEndOfTurn): `economy: nation K ...`; the bridge's `econ K` shows it.
 #include "economy.h"
+#include "invasion.h"
 #include "delphi.h"
 #include "game.h"
 #include "../../third_party/minhook/include/MinHook.h"
@@ -182,6 +183,7 @@ struct Month {
     int subsidy = 0, brFloor = 0, brDecay = 0;                         // what the computer's part would have done
     int n[rRules] = {};   // how often each rule was left out (preeminence, preeminence+: the player's branch, its +1s)
     int spyFunds = 0;     // what the left-out spy findings would have paid
+    int invCost = 0;      // 0.7.0: the invasion target's monthly cost (in the balance, as the player's)
     int warStarts = 0, warGame = 0, warPlayer = 0;  // the host's wars with K: the computer's BM increments, the player's
     int shared = 0;       // AdvanceShipConstruction's change of Funds (rules every nation shares: delays, the reclaim)
     // The arms-control conference after ComputeExpenses (CreateArmsControlTreaty, a rule every nation shares): its change of
@@ -256,8 +258,8 @@ std::string Line(int K, const Month& r) {
     else
         snprintf(b, sizeof(b), "; the player's money rules: not run");
     s += b;
-    snprintf(b, sizeof(b), "; treaty cut %d; army offensive %d month(s) (budget -%d), ParliamentDelay %d; ", r.n[rTreatyCut],
-             r.kao, r.aoCut, r.kpd);
+    snprintf(b, sizeof(b), "; treaty cut %d; army offensive %d month(s) (budget -%d), ParliamentDelay %d; invasion target -%d; ",
+             r.n[rTreatyCut], r.kao, r.aoCut, r.kpd, r.invCost);
     s += b;
     if (r.treatyRuns) {
         snprintf(b, sizeof(b), "arms-control conference %d (funds %+d, BM %+d); ", r.treatyRuns, r.treatyFunds, r.treatyBM);
@@ -486,6 +488,10 @@ int Expenses(int K, void* n) {
     int sub = 25 * fs;
     if (P && ModBudget(n) < ModBudget(P) && Field(n, fTension) > 6) sub += 25 * fs;
     r.subsidy += sub;
+    // 0.7.0: an invasion target costs the player GetInvasionTargetCost a month (GetMonthlyBalance, PlayerNation only)
+    const int ic = inv::Available() && !inv::State(K).target.empty() ? inv::TargetCost(n) : 0;
+    bal -= ic;
+    r.invCost = ic;
     int& funds = Field(n, fFunds);
     r.fundsBefore = funds;
     funds += bal;
@@ -1916,12 +1922,12 @@ std::string RecordKV(const Month& r) {
              " ran=%d kwar=%d debt=%d debtPrestige=%d morale=%d corruption=%d hoard=%d loan=%d complaint=%d "
              "complaintPrestige=%d budget=%d budgetBM=%d tensionEdits=%s notice=%d treatyCut=%d ruleFunds=%d ruleBM=%d "
              "rulePrestige=%d news=%d kao=%d kpd=%d aoCut=%d ended=%d fundsEnd=%d otherFunds=%d asw=%d techPartner=%d "
-             "shipBuyer=%d amcKept=%d china=%d",
+             "shipBuyer=%d amcKept=%d china=%d invCost=%d",
              r.rules ? 1 : 0, r.kwar, r.debt, r.debtPrestige, r.morale ? 1 : 0, r.corruption, r.hoard, r.loan, r.complaint,
              r.complaintPrestige, r.budget, r.budgetBM, r.tension.empty() ? "-" : r.tension.c_str(), r.notice,
              r.n[rTreatyCut], r.ruleFunds, r.ruleBM, r.rulePrestige, r.news, r.kao, r.kpd, r.aoCut, r.ended ? 1 : 0,
              r.fundsEnd, r.ended && r.expenses ? r.fundsEnd - r.fundsAfter - r.ruleFunds - r.treatyFunds : 0, r.n[rASW],
-             r.n[rTechPartner], r.n[rShipBuyer], r.n[rAMC], r.n[rChina]);
+             r.n[rTechPartner], r.n[rShipBuyer], r.n[rAMC], r.n[rChina], r.invCost);
     s += b;
     // the arms-control conference after ComputeExpenses (a rule every nation shares; in the money check's sum)
     snprintf(b, sizeof(b), " treaty=%d treatyBM=%d conference=%d", r.treatyFunds, r.treatyBM, r.treatyRuns);

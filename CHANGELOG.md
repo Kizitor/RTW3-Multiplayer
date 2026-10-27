@@ -9,6 +9,122 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.7.0 (2026-10-26)
+Joined players get three things of single player that their nations didn't have: the manual build of the legacy
+fleet in a new campaign, the battles between raiders and patrols, and invasions. Also fixed: the host's own
+invasions, which went on a month early, and a game error box before some battles after an intelligence coup. **Update
+the host and the joined players:** the new features need 0.7.0 on
+the host and on the player's PC. The protocol is still 3, and 0.7.0 keeps the live-battle engine of 0.6.1 (18):
+players on 0.6.1 and 0.7.0 play a campaign and fight their live battles together.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.7.0)
+
+### New for joined players
+- **The legacy fleet built by hand** (a player's request). In a new campaign's first month, a joined player can build
+  their nation's starting ("legacy") fleet by hand, as the game's **Manual build of legacy fleet** lets the player do
+  in single player. The host allows it with **Manual legacy fleets** in the Multiplayer window (on by default); the
+  player asks for it with **Build my legacy fleet by hand (a new campaign's first month)** before the first month
+  comes (off by default). The player's PC then removes the fleet that the game generated for the nation, with its
+  ship designs and divisions, and runs the game's own manual build with the rules of single player: the manual
+  build's budget (cut by 10 %), one point of prestige less, and the money over the game's limit lost at the first
+  **Continue**. The player designs and builds the ships, chooses the ships under construction, plans the month and
+  submits it, and the host replaces the nation's fleet with the hand-built one. The chat follows the build, from
+  "* Captain builds the legacy fleet of Germany by hand (the computer's starting fleet of Germany is replaced when
+  the turn is merged)." to "* Captain's hand-built legacy fleet of Germany is in the campaign.". A hand-built fleet
+  starts without divisions: make them in the *Fleet organization* tab. If the host starts the month during the build
+  (its time limit or **Advance turn now**), the fleet is submitted as it is.
+- **Raider battles,** in both directions. With **Fight my battles** on, your patrols (ships on trade protection or on
+  a foreign station) can intercept a computer enemy's raider, and its patrols can intercept yours, with the game's
+  chances of single player: the month's battle search checks the raiders, and an interception is the month's battle.
+  You play it with your battles after the month, where the game's dialog lets you *Fight Battle* or *Auto resolve* it.
+  The host merges the result (sunk and damaged ships, victory points), and its chat names it ("* The raider battle of
+  Germany against Spain in The Mediterranean was auto-resolved by Captain."). The game's lines "Patrolling ship ...
+  thwarts ... raider ... attack on merchant shipping in ...!" come in your chat with the new month. Raider battles
+  are fought only against computer nations, never against a player's nation.
+- **Invasions,** in your wars with computer nations, as the player has them in single player:
+  - your own invasion target, picked with the game's button (a computer enemy's possession worth less than 10, within
+    your invasion range) and sent with your turn, and its monthly cost in your money. The host's chat says when it
+    can't take a target ("* Captain's invasion target ... was not taken: a person plays its owner (invasions between
+    players are not supported).");
+  - the game's monthly invasion check for your nation, which the host runs in your nation's view after the month's
+    battles: the months of preparation, landings, the fighting on land, captures, and the computer's invasions of
+    your possessions, with their messages in your turn report;
+  - invasion battles, with your battles after the month: your own landing ("Our troops are embarking for the
+    invasion of ...!"), the enemy's ("The enemy is preparing to invade ...!") and the battles in support of the
+    fighting on land. As in single player, a battle that you decline, or that your ships can't fight, lets the enemy
+    land;
+  - an enemy's surprise landing in one of your possessions when a computer nation starts a war on you;
+  - your peace with a computer nation ends your invasions in that war and your invasion plan;
+  - the computer's fleets defend their possessions that you invade and escort their own landings in yours, as they
+    do against the player.
+
+### Fixed
+- **The host's invasions went on a month early:** the game marks the possessions invaded in the month, and their
+  invasions wait a month before the game resolves them. It doesn't save that mark, and the mod loads the host's
+  campaign again when it merges the joined players' turns and after their battles, so the host's new invasions, and
+  the enemy's new landings in the host's possessions, were resolved a month earlier than in single player. The mod
+  now keeps the mark across these loads.
+- **A game error box before the preview of a battle after an intelligence coup:** "Error in AdjustForcesForBattle
+  procedure! Access violation ... Read of address 02EBC02F". A bug of the game itself, single player has it too: when
+  an intelligence coup lets the player ambush the enemy ("Due to an intelligence coup, we can ambush an enemy force!")
+  and the player's side is still the weaker after the game sent away the enemy's extra divisions, the game adds ships
+  to the player's side without telling that step whose ships they are. Joined players met it in their invasion
+  battles (and once in 0.4.1). The mod now gives that step the player's nation: no box, and the ambush gets its
+  reinforcements, as the game intends.
+- **Old turn messages in a new campaign:** messages that the host kept for a joined nation's next month (its
+  invasions, for example) stayed when the session ended or the host loaded another campaign, and showed in that
+  nation's first month there. The host now drops them.
+- **An error box after a live battle went on against the computer:** "Error in AIDetermineTacticalStance2
+  procedure!" could show on the host when the computer judged a destroyer division whose lead division had just lost
+  its last ship (for example after the other player left the battle or used auto-run). The game's computer reads that
+  lead division's flagship before the game clears the reference at the end of the minute. The mod now treats such a
+  lead or target division as gone, as the game does a moment later.
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1 and 0.7.0 can join each other's hosts and play the
+  campaign together.
+- 0.7.0 keeps the live-battle engine of 0.6.1 (18): players on 0.6.1 and 0.7.0 fight their live battles live, with
+  each other and under a host on either version. A player on 0.6.0 (engine 17) or older can't fight a live battle
+  with a host or player on 0.7.0, as with 0.6.1.
+- The new features need 0.7.0 on the host and on the player's PC:
+  - a host on 0.7.0 and a player on 0.6.1 or older: the player isn't offered the manual build (their nation keeps the
+    fleet that the game generated), and their nation has no raider battles and no invasions, as before;
+  - a host on 0.6.1 or older and a player on 0.7.0: the same. The invasion target on the player's screen is cleared
+    at every month's load: the month's save holds the host's own target, and the host wouldn't carry out the
+    player's.
+- The fix of the host's invasion month needs 0.7.0 on the host only, with players on any version. The fix of the
+  intelligence coup's box works on each PC with 0.7.0 for the battles it sets up (a joined player's PC for the
+  player's battles, the host for its own); the old turn messages are the host's.
+- Existing campaigns go on from where they are. The manual build of the legacy fleet comes only in a new campaign's
+  first month; raider battles and invasions of joined nations work from the first month that a host on 0.7.0 runs.
+
+### Known issues
+- **A legacy fleet built by hand** differs from single player: the computer's nations built their fleets with the
+  campaign and don't answer it (in single player they add a few cruisers when the player's fleet has many), its ships
+  have no commanders (like every joined nation's ships), and in a 1920 or 1935 campaign its finished carriers start
+  without air groups. Carriers laid down later get their first air groups from the game when they are launched.
+- **Raider battles:** a raider that a patrol thwarts still sinks merchant ships that month: the host's month counts
+  the raiders' sinkings before the battles. When the time limit drops a raider battle, its "thwarts" lines are lost
+  with it.
+- **Invasions of joined nations:**
+  - they wait in a month when their player isn't connected;
+  - one invasion per possession: a newer one replaces the older one;
+  - with several computer enemies, the points of "Enemy fleets dominate the seas around ... Lose N VP!" go to the
+    first of them in the game's list of nations;
+  - the host's battles may change the support of a joined nation's invasion, as an ally's battles would;
+  - after a declined invasion battle the month brings no other battle (single player's search may find a second
+    one);
+  - the nation's base expansions are completed without their message, and the game's rule that a base expansion
+    worries a neighbour (tension) doesn't apply to it;
+  - no invasions between players' nations: a player's possession can't be a target, but in a war with the host's
+    nation the host's game may still let the joined nation invade the host's possessions, as it lets a computer
+    nation;
+  - a computer nation starting an invasion of a joined nation's possession in the monthly invasion check was not seen
+    in the tests (its chances depend on the fleets in the area).
+- Raider battles and invasion battles need **Fight my battles**: without it, a joined nation has neither, and an
+  invasion battle that its month's invasions bring is dropped.
+- The known issues of 0.6.1 remain, except the missing invasions and raider battles of joined nations (0.6.0's "Not
+  built yet").
+
 ## 0.6.1 (2026-10-26)
 Fixes of the bugs that players reported on 0.6.0: a joined player's divisions and the host's doubled divisions, the
 tension bar between two players above the war line, *Fire torpedoes* greyed out in live battles, and live battles

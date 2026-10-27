@@ -1,10 +1,12 @@
 #include "game.h"
 #include "economy.h"
+#include "invasion.h"
 #include "nationplay.h"
 #include "lockstep.h"
 #include "../../third_party/minhook/include/MinHook.h"
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <intrin.h>
 #include <random>
 
@@ -133,6 +135,7 @@ static bool g_noDefer = false;         // ResolveAIBattle: the game's own resolu
 static bool g_battleSlotMode = false;  // this PC fights a joined player's battle in its battle slot
 static bool g_battleAftermath = false; // HandleBattleAftermath ran in battle slot mode
 static int g_ownWar = INT_MIN;          // a joined player's PC: its own nation's war counter from the host (or unknown)
+static volatile bool g_legacySkip = false;  // a joined player's legacy build runs on this PC (EnterLegacyBuild)
 extern "C" int __stdcall CB_SkipCampaignStep(int which);
 
 #define REQ_FIELD(dst, cls, name)                              \
@@ -631,6 +634,37 @@ void* Application() {
 }
 
 HWND FormHwnd(void* form) { return form ? dl::At<HWND>(form, A.fHandle) : nullptr; }
+
+// Tests (bridge `vcl`, read only): a published control of the first live form of a class: its own window, or for a
+// windowless control (TLabel, TSpeedButton) its parent's window and its rectangle there, to post clicks to.
+std::string DescribeControl(const char* formCls, const char* field) {
+    static void* last = nullptr;
+    static std::string lastCls;
+    void* form = lastCls == formCls && StillValid(last, formCls) ? last : ScanHeapFor(formCls);
+    if (!form) return "error no form " + std::string(formCls);
+    last = form;
+    lastCls = formCls;
+    void* c = form;
+    if (strcmp(field, "-")) {
+        int off = dl::Field(formCls, field);
+        if (off < 0) return "error no field " + std::string(field);
+        c = dl::At<void*>(form, off);
+    }
+    if (!c) return "error nil";
+    static int fParent = dl::Field("TControl", "FParent"), fLeft = dl::Field("TControl", "FLeft"),
+               fTop = dl::Field("TControl", "FTop"), fW = dl::Field("TControl", "FWidth"),
+               fH = dl::Field("TControl", "FHeight"), fVis = dl::Field("TControl", "FVisible"),
+               fEn = dl::Field("TControl", "FEnabled");
+    if (fParent < 0 || fLeft < 0 || fVis < 0 || fEn < 0) return "error no TControl fields";
+    bool windowed = dl::IsInstanceOf(c, "TWinControl");
+    void* parent = dl::At<void*>(c, fParent);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "ok class=%s hwnd=%u parent=%u x=%d y=%d w=%d h=%d visible=%d enabled=%d",
+             dl::ClassNameOf(c), windowed ? (unsigned)(uintptr_t)FormHwnd(c) : 0u,
+             parent ? (unsigned)(uintptr_t)FormHwnd(parent) : 0u, dl::At<int>(c, fLeft), dl::At<int>(c, fTop),
+             dl::At<int>(c, fW), dl::At<int>(c, fH), dl::At<uint8_t>(c, fVis), dl::At<uint8_t>(c, fEn));
+    return buf;
+}
 
 bool FormVisible(void* form) {
     HWND h = FormHwnd(form);
@@ -1763,6 +1797,7 @@ extern "C" void __stdcall CB_AfterVP(int slot) {
 extern "C" void* o_BattleAftermath = nullptr;
 extern "C" void* o_AIBattle = nullptr;
 extern "C" void* o_RaiderBattle = nullptr;
+static volatile long g_quickRaid = 0;  // 0.7.0: QuickResolveRaiderBattle calls (a raider battle's auto resolution)
 
 // Register-convention methods with stack arguments (removed by the callee): report the registers and keep the
 // returned slot in a local, call the game's routine with a copy of the stack arguments, report the slot, then
@@ -1823,6 +1858,7 @@ extern "C" __declspec(naked) void d_AIBattle() {  // (Self, NationA, NationB, Sh
 
 extern "C" __declspec(naked) void d_RaiderBattle() {  // (Self, InterceptingShip, InterceptedShip, SideIntercepted)
     __asm {
+        lock inc dword ptr [g_quickRaid]
         sub esp, 4
         push eax
         push ecx
@@ -2207,6 +2243,183 @@ std::string DebugRelView() {
 int StartBuildPhase() {
     void* f = BuildCamp();
     return f ? dl::At<uint8_t>(f, A.fStartBuild) : -1;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The legacy fleet of a joined player (0.7.0). The game's "Manual build of legacy fleet" (the title screen's
+// cbManualFleetBuild) is a branch of the new-game routine for PlayerNation (prestige -1, the fleet budget, the
+// strategic screen in StartBuild 0 = sbBuild with "Construct initial fleet", the build year 1899 and the picture
+// message); the player then designs and builds with the normal screens, and btbnTurnClick's "Continue" leads through
+// StartBuild 1 (ships under construction) back to normal play (2). EnterLegacyBuild repeats that branch on a loaded
+// campaign for its PlayerNation (a joined player's nation K); the skips above keep "Continue" from building the
+// computer's fleets. MODLOG "Feature 2026-10-25: the legacy fleet for joined players".
+static struct {
+    bool resolved = false, ok = false;
+    int fLbWar = -1, fIFM = -1, fCbManual = -1, fCbState = -1;
+    void *mBudget = nullptr, *mSetTextBuf = nullptr, *mShowCtl = nullptr, *mPicMsg = nullptr, *mButtonsNormal = nullptr;
+    int* buildYear = nullptr;       // LayDownShip's build year of a legacy ship (the manual branch sets 1899)
+    int* fleetSize = nullptr;       // [General] FleetSize
+    uint32_t picCell = 0;           // the cell holding the address of the dlgPictureMessage variable
+    bool active = false;
+    uint8_t oldCbState = 0;
+} L;
+
+static void* LegacyCheckBox() {
+    void* sf = StartForm();
+    return sf && L.fCbManual >= 0 ? dl::At<void*>(sf, L.fCbManual) : nullptr;
+}
+
+static bool LegacyResolve() {
+    if (L.resolved) return L.ok;
+    L.resolved = true;
+    L.fLbWar = dl::Field("TfrmBuildCamp", "lbWar");
+    L.fIFM = dl::Field("TBuilderNation", "InitialFleetModifier");
+    L.fCbManual = dl::Field("TfrmSelectNation2", "cbManualFleetBuild");
+    L.fCbState = dl::Field("TCustomCheckBox", "FState");
+    L.mBudget = dl::Method("TBuilderNation", "GetModifiedBudget");
+    L.mSetTextBuf = dl::Method("TControl", "SetTextBuf");
+    L.mShowCtl = dl::Method("TControl", "Show");
+    L.mPicMsg = dl::Method("TdlgPictureMessage", "ShowPicMessage");
+    L.mButtonsNormal = dl::Method("TfrmBuildCamp", "SetButtonsToNormal");
+    // LayDownShip: `mov eax,[buildYear]; mov [esi+0xe4],eax` (a new class's design year, the legacy ships' year)
+    if (void* lay = dl::Method("TfrmBuildCamp", "LayDownShip"))
+        if (uint8_t* hit = dl::FindPattern((uint8_t*)lay, 0x400, {0xA1, -1, -1, -1, -1, 0x89, 0x86, 0xE4, 0x00, 0x00, 0x00}))
+            if (InImage(*(uint32_t*)(hit + 1))) L.buildYear = *(int**)(hit + 1);
+    // btbnTurnClick: `mov eax,[cell]; mov eax,[eax]; mov ecx,'Hull.jpg'; mov edx,...; call ShowPicMessage`
+    if (L.mPicMsg && A.mTurnClick) {
+        uint8_t* p = (uint8_t*)A.mTurnClick;
+        for (size_t i = 17; i < 0x500 && !L.picCell; i++)
+            if (p[i] == 0xE8 && p + i + 5 + *(int32_t*)(p + i + 1) == (uint8_t*)L.mPicMsg && p[i - 17] == 0xA1 &&
+                p[i - 12] == 0x8B && p[i - 11] == 0x00 && p[i - 10] == 0xB9 && p[i - 5] == 0xBA &&
+                InImage(*(uint32_t*)(p + i - 16)))
+                L.picCell = *(uint32_t*)(p + i - 16);
+    }
+    // btbnTurnClick's funds cap: `mov eax,[FleetSize]; inc eax; imul esi,eax,3000`
+    if (A.mTurnClick)
+        if (uint8_t* hit = dl::FindPattern((uint8_t*)A.mTurnClick, 0x200, {0xA1, -1, -1, -1, -1, 0x40, 0x69, 0xF0, 0xB8, 0x0B, 0x00, 0x00}))
+            if (InImage(*(uint32_t*)(hit + 1))) L.fleetSize = *(int**)(hit + 1);
+    L.ok = L.fLbWar >= 0 && L.fIFM >= 0 && L.fCbManual >= 0 && L.fCbState >= 0 && L.mBudget && L.mSetTextBuf &&
+           L.mShowCtl && L.mPicMsg && L.mButtonsNormal && L.buildYear && L.fleetSize && L.picCell && A.fStartBuild >= 0 &&
+           A.fPlayerNation >= 0 && A.fFunds >= 0 && A.fPrestige >= 0 && A.mUpdateUIValues && A.mFillMapTree;
+    Log("legacy fleet: %s (lbWar %d, IFM %d, cb %d/%d, budget %p, text %p, show %p, pic %p/%08x, normal %p, year %p)",
+        L.ok ? "available" : "UNAVAILABLE", L.fLbWar, L.fIFM, L.fCbManual, L.fCbState, L.mBudget, L.mSetTextBuf,
+        L.mShowCtl, L.mPicMsg, L.picCell, L.mButtonsNormal, (void*)L.buildYear);
+    return L.ok;
+}
+
+bool LegacyAvailable() { return LegacyResolve() && LegacyCheckBox(); }
+bool LegacyActive() { return L.active; }
+
+static void SetLabel(void* ctl, const wchar_t* text) {
+    if (ctl) dl::Call(L.mSetTextBuf, (uint32_t)(uintptr_t)ctl, (uint32_t)(uintptr_t)text);
+}
+
+// The game's manual-build branch (new-game routine, 1.01.44 0xbc9de7) for the loaded campaign's PlayerNation. The
+// strategic screen must be open in normal play (StartBuild 2). Returns false (and changes nothing) if unavailable.
+bool EnterLegacyBuild(std::string& info) {
+    void* f = BuildCamp();
+    if (!LegacyResolve() || !f || L.active || StartBuildPhase() != 2) {
+        info = !L.ok ? "unavailable" : !f ? "no campaign" : L.active ? "already active" : "not in normal play";
+        return false;
+    }
+    void* pn = dl::At<void*>(f, A.fPlayerNation);
+    void* cb = LegacyCheckBox();
+    if (!pn || !cb) {
+        info = !pn ? "no player nation" : "no title screen checkbox";
+        return false;
+    }
+    uint32_t self = (uint32_t)(uintptr_t)f;
+    // The fleet budget as at the campaign start: four months of the nation's budget (the new-game routine's Funds), less
+    // 10 % (x 0.9, rounded as the game's Round), times the nation's InitialFleetModifier / 10 (integer division).
+    int budget = (int)dl::Call(L.mBudget, (uint32_t)(uintptr_t)pn);
+    int ifm = dl::At<int>(pn, L.fIFM);
+    long long f0 = 4LL * budget;
+    long long r = (long long)nearbyint((double)f0 * 0.9);
+    int funds = (int)(r * ifm / 10);
+    int oldFunds = dl::At<int>(pn, A.fFunds), oldPrestige = dl::At<int>(pn, A.fPrestige);
+    dl::At<int>(pn, A.fPrestige) = oldPrestige - 1;
+    dl::At<int>(pn, A.fFunds) = funds;
+    // IsManualFleetBuild (LayDownShip's funds checks) reads the title screen's checkbox: ticked while the build runs.
+    L.oldCbState = dl::At<uint8_t>(cb, L.fCbState);
+    dl::At<uint8_t>(cb, L.fCbState) = 1;  // cbChecked
+    dl::At<uint8_t>(f, A.fStartBuild) = 0;  // sbBuild
+    *L.buildYear = 1899;
+    L.active = true;
+    g_legacySkip = true;
+    dl::Call(A.mUpdateUIValues, self, 1, 0);
+    SetTurnButtonCaption(L"Continue");
+    void* lb = dl::At<void*>(f, L.fLbWar);
+    SetLabel(lb, L"Construct initial fleet");
+    if (lb) dl::Call(L.mShowCtl, (uint32_t)(uintptr_t)lb);
+    dl::Call(A.mFillMapTree, self);
+    dl::Call(A.mUpdateUIValues, self, 1, 0);
+    char buf[200];
+    snprintf(buf, sizeof(buf), "budget %d x4 x0.9 x IFM %d/10 = funds %d (were %d), prestige %d -> %d", budget, ifm,
+             funds, oldFunds, oldPrestige, oldPrestige - 1);
+    info = buf;
+    Log("legacy fleet: build started for nation %d: %s", NationIndex(pn), buf);
+    return true;
+}
+
+// The game's picture message of the manual branch (modal: call it from the main thread when the game is idle).
+void LegacyShowStartMessage() {
+    if (!L.active || !L.picCell) return;
+    void* var = *(void**)(uintptr_t)L.picCell;
+    void* dlg = var ? *(void**)var : nullptr;
+    if (!dlg) return;
+    dl::ConstUStr msg(L"Build your existing fleet"), pic(L"ShipConstruction.jpg");
+    uint32_t st[1] = {1};
+    dl::Call(L.mPicMsg, (uint32_t)(uintptr_t)dlg, msg.ptr(), pic.ptr(), 1, st);
+}
+
+// The build is over once the game is back in normal play (its own "Continue" steps, or FinishLegacyBuild).
+bool LegacyCheckDone(int* ships, int* funds) {
+    if (!L.active || StartBuildPhase() != 2) return false;
+    L.active = false;
+    g_legacySkip = false;
+    if (void* cb = LegacyCheckBox()) dl::At<uint8_t>(cb, L.fCbState) = L.oldCbState;
+    void* f = BuildCamp();
+    void* pn = f ? dl::At<void*>(f, A.fPlayerNation) : nullptr;
+    if (ships) *ships = pn ? ShipCount(pn) : 0;
+    if (funds) *funds = pn ? dl::At<int>(pn, A.fFunds) : 0;
+    Log("legacy fleet: build finished (%s)", LegacyFleetInfo().c_str());
+    return true;
+}
+
+// A month loaded during the build, or the session left: the build state ends here (the game's own state is the
+// loaded campaign's, normal play).
+void LegacyAbort() {
+    if (!L.active) return;
+    L.active = false;
+    g_legacySkip = false;
+    if (void* cb = LegacyCheckBox()) dl::At<uint8_t>(cb, L.fCbState) = L.oldCbState;
+    Log("legacy fleet: build abandoned (StartBuild %d)", StartBuildPhase());
+}
+
+// Ends the build at once, without the game's questions (a forced submit): the funds over (FleetSize+1) x 3000 are lost
+// as after the game's first "Continue"; no ships under construction are added.
+bool FinishLegacyBuild(int* ships, int* funds) {
+    void* f = BuildCamp();
+    if (!L.active || !f) return false;
+    void* pn = dl::At<void*>(f, A.fPlayerNation);
+    int cap = (*L.fleetSize + 1) * 3000;
+    if (pn && dl::At<int>(pn, A.fFunds) > cap) dl::At<int>(pn, A.fFunds) = cap;
+    dl::At<uint8_t>(f, A.fStartBuild) = 2;
+    if (void* lb = dl::At<void*>(f, L.fLbWar)) SetLabel(lb, L"");
+    dl::Call(L.mButtonsNormal, (uint32_t)(uintptr_t)f);
+    dl::Call(A.mUpdateUIValues, (uint32_t)(uintptr_t)f, 1, 0);
+    return LegacyCheckDone(ships, funds);
+}
+
+// "phase <StartBuild> ships <n> funds <f> prestige <p>" of the PlayerNation (also when no build runs).
+std::string LegacyFleetInfo() {
+    void* f = BuildCamp();
+    void* pn = f ? dl::At<void*>(f, A.fPlayerNation) : nullptr;
+    if (!pn) return "no campaign";
+    char buf[160];
+    snprintf(buf, sizeof(buf), "nation %d phase %d ships %d funds %d prestige %d%s", NationIndex(pn), StartBuildPhase(),
+             ShipCount(pn), dl::At<int>(pn, A.fFunds), dl::At<int>(pn, A.fPrestige), L.active ? " (building)" : "");
+    return buf;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2878,6 +3091,8 @@ extern "C" __declspec(naked) void d_ShowPeaceTreaty() {  // (Self, aPeaceReport)
 // battle request of kind 2). The landing pick runs and answers nil; a possession worth < 200 means no takeover for this
 // nation (single player's landing; its strength test is not evaluated: a guess that slightly under-counts takeovers),
 // else the takeover branch runs and its ChangePossessionOwner is recorded (the host moves the possession by name).
+// 0.7.0 (P4), a host with welcome `gen` 4 (it keeps K's invasions): the pick's answer is returned, so the landing runs as
+// in single player (the game's strength test; when it fails, the takeovers), and RunPlayerTurn records it (`kland`).
 // Each detour acts only on the call sites in CheckForWar (found at start-up); elsewhere in the view they keep B3's nil.
 static uintptr_t g_retInArea = 0, g_retTake[3] = {}, g_retTakeOwner = 0;
 static bool g_testTakeover = false;  // tests: the takeover takes the area's first unowned possession (no landing pick)
@@ -2917,6 +3132,85 @@ static void LogTestPick(void* p) {
     Log("relations v2: surprise move: test: the takeover picks %s", p ? W2U(PossName(p)).c_str() : "(none in the area)");
 }
 
+// 0.7.0 (P4): with a gen 4 host the surprise landing in K's possession runs as in single player (the pick, the game's
+// strength test, Invaded := the attacker, InvadedThisTurn); RunPlayerTurn records it for the host. TEST ONLY
+// (testLanding): the pick is K's first possession worth < 200 in the area, and the strength test passes (CheckForWar's
+// two GetStrengthInArea calls after the pick: the attacker's answers 1000, K's 0).
+static bool g_pvLandings = false;
+static volatile bool g_testLandNow = false;
+extern "C" void* o_StrengthInArea = nullptr;
+extern "C" uintptr_t g_retStrB = 0, g_retStrP = 0;
+extern "C" volatile long g_testLandHits = 0;
+
+extern "C" __declspec(naked) void d_StrengthInArea() {
+    __asm {
+        cmp byte ptr [g_testLandNow], 0
+        je orig
+        push eax
+        mov eax, [esp + 4]
+        cmp eax, [g_retStrB]
+        je strong
+        cmp eax, [g_retStrP]
+        je weak
+        pop eax
+    orig:
+        jmp dword ptr [o_StrengthInArea]
+    strong:
+        pop eax
+        lock inc dword ptr [g_testLandHits]
+        mov eax, 1000
+        ret 8
+    weak:
+        pop eax
+        lock inc dword ptr [g_testLandHits]
+        xor eax, eax
+        ret 8
+    }
+}
+
+static bool Hook(void* target, void* detour, void** orig, const char* name);
+static bool TestLandingHooks() {  // on the first test's use (main thread), never in normal play
+    static int state = 0;
+    if (state) return state > 0;
+    state = -1;
+    void* gs = dl::Method("TBuilderNation", "GetStrengthInArea");
+    std::vector<uintptr_t> sites = CallSitesTo(A.mCheckForWar, gs, 0x1800);
+    std::vector<uintptr_t> after;
+    for (uintptr_t s : sites)
+        if (g_retInArea && s > g_retInArea && s < g_retInArea + 0x60) after.push_back(s);
+    if (after.size() != 2 || !Hook(gs, (void*)&d_StrengthInArea, &o_StrengthInArea, "GetStrengthInArea (tests)")) {
+        Log("tests: the landing's strength test cannot be forced (%d call site(s) after the pick)", (int)after.size());
+        return false;
+    }
+    if (MH_EnableHook(gs) != MH_OK) {
+        MH_RemoveHook(gs);
+        o_StrengthInArea = nullptr;
+        return false;
+    }
+    g_retStrB = after[0];
+    g_retStrP = after[1];
+    state = 1;
+    return true;
+}
+
+static void* FirstOwnPossIn(void* owner, void* area) {
+    void* found = nullptr;
+    void* any = nullptr;  // (tests: a possession elsewhere when the nation has none in the area)
+    ForEachPossession([&](void* a, void* ps) {
+        if (dl::At<void*>(ps, A.fPossOwner) != owner || dl::At<int>(ps, A.fPossValue) >= 200) return;
+        if (!found && a == area) found = ps;
+        if (!any) any = ps;
+    });
+    if (!found && any) Log("relations v2: surprise move: test: none of the nation's possessions in the area; %s instead",
+                           W2U(PossName(any)).c_str());
+    return found ? found : any;
+}
+
+static void LogLandingPick(void* p) {
+    Log("relations v2: surprise move: the landing pick %s (value %d)%s", W2U(PossName(p)).c_str(),
+        dl::At<int>(p, A.fPossValue), g_testLandNow ? " (TEST: forced, its strength test passes)" : "");
+}
+
 static void* FirstUnownedIn(void* area) {  // tests
     void* found = nullptr;
     ForEachPossession([&](void* a, void* ps) {
@@ -2940,6 +3234,13 @@ extern "C" void* __stdcall CB_RandPossArea(void* self, void* area, uintptr_t ret
     __try {
         g_saNoTakeover = false;
         if (g_testTakeover) return nullptr;
+        if (g_pvLandings) {  // 0.7.0 (P4): single player's landing pick (RunPlayerTurn records a landing)
+            void* p = g_testLandNow ? FirstOwnPossIn(self, area)
+                                    : (void*)(uintptr_t)dl::Call(o_RandPossArea, (uint32_t)(uintptr_t)self,
+                                                                 (uint32_t)(uintptr_t)area);
+            if (p) LogLandingPick(p);
+            return p;
+        }
         void* p = (void*)(uintptr_t)dl::Call(o_RandPossArea, (uint32_t)(uintptr_t)self, (uint32_t)(uintptr_t)area);
         if (p && dl::At<int>(p, A.fPossValue) < 200) {
             g_saNoTakeover = true;
@@ -3634,6 +3935,15 @@ PlayerTurnResult RunPlayerTurn(const PlayerTurnSetup& s) {
     }
     g_saRec = surprise ? &res.surprise : nullptr;
     g_takeRec = surprise ? &res.takeovers : nullptr;
+    // 0.7.0 (P4): the landings in K's possessions (a gen 4 host): K's possessions' Invaded before the routines
+    g_pvLandings = surprise && s.landings && A.fInvaded >= 0;
+    g_testLandNow = g_pvLandings && s.testLanding && TestLandingHooks();
+    long landHits0 = g_testLandHits;
+    std::map<void*, int> invBefore;
+    if (g_pvLandings)
+        ForEachPossession([&](void*, void* ps) {
+            if (dl::At<void*>(ps, A.fPossOwner) == g_pv.obj[K]) invBefore[ps] = dl::At<int>(ps, A.fInvaded);
+        });
 
     PvEnter();
     if (s.allyHelp && AllyHelpAvailable()) AllyHelpPart(f, s, res);  // B5 (d): before CheckForWar, as in the game's month
@@ -3646,6 +3956,23 @@ PlayerTurnResult RunPlayerTurn(const PlayerTurnSetup& s) {
     g_saRec = nullptr;
     g_takeRec = nullptr;
     g_testTakeover = false;
+    const bool landOn = g_pvLandings, landTest = g_testLandNow;
+    g_pvLandings = false;
+    g_testLandNow = false;
+    if (landOn) {  // a landing: Invaded -1 -> a computer nation (the view's index of B_i is its real one)
+        for (auto& e : invBefore) {
+            int now = dl::At<int>(e.first, A.fInvaded);
+            if (e.second != -1 || now < 1 || now > 8 || now == K) continue;
+            PeaceLand l;
+            l.name = PossName(e.first);
+            l.from = K;
+            l.to = now;
+            res.landings.push_back(l);
+            Log("relations v2: surprise move: nation %d's troops landed in %s (nation %d's; recorded for the host)%s", now,
+                W2U(l.name).c_str(), K,
+                landTest ? (" (TEST: " + std::to_string(g_testLandHits - landHits0) + " strength answer(s))").c_str() : "");
+        }
+    }
     int budgetPre[9];  // after the relation routines: the peace part's budget changes are its own (res.peace.delta)
     for (int r = 0; r < 9; r++) budgetPre[r] = dl::At<int>(g_pv.obj[r], A.fBudget);
     if (s.peace.run && PeaceAvailable()) PeacePart(f, s, res.peace);
@@ -3750,6 +4077,11 @@ PlayerTurnResult RunPlayerTurn(const PlayerTurnSetup& s) {
         sum += "; takeovers:";
         for (auto& l : res.takeovers) sum += " " + W2U(l.name) + " " + std::to_string(l.from) + ">" + std::to_string(l.to);
         if (res.takeovers.empty()) sum += " none";
+        if (s.landings) {  // 0.7.0 (P4)
+            sum += "; landings:";
+            for (auto& l : res.landings) sum += " " + W2U(l.name) + " by " + std::to_string(l.to);
+            if (res.landings.empty()) sum += " none";
+        }
     }
     if (res.peace.ran) {
         const PeaceResult& p = res.peace;
@@ -4618,12 +4950,24 @@ extern "C" void __stdcall CB_AfterDoPeace() {
     }
 }
 
+// 0.7.0: the host's own peace leaves the joined nations' invasions alone (DoPeace clears every possession's).
+extern "C" void __stdcall CB_DoPeaceGuarded(void* form) {
+    const bool hide = !g_peaceOn;
+    if (hide) inv::HostHide("DoPeace", true);
+    __try {
+        dl::Call(o_DoPeace, (uint32_t)(uintptr_t)form);
+    } __finally {
+        if (hide) inv::HostUnhide();
+    }
+}
+
 extern "C" __declspec(naked) void d_DoPeace() {  // (Self)
     __asm {
         push eax
         call CB_BeforeDoPeace
         pop eax
-        call dword ptr [o_DoPeace]
+        push eax
+        call CB_DoPeaceGuarded
         call CB_AfterDoPeace
         ret
     }
@@ -5155,11 +5499,18 @@ static const MonthFields& MF() {
     return m;
 }
 
+static int PendingRaiderField();
+
 std::string PrepareBattleSlotMonth() {
     void* f = BuildCamp();
     if (!f) return "no campaign";
     std::string out, flags = RefreshShipTypeFlags();
     out = "ship-type flags " + (flags.empty() ? std::string("unavailable") : flags);
+    std::string raid;
+    if (PendingRaiderField() > 0) {  // 0.7.0: DoTurn2's PendingRaiderBattle := 0 (an older raider battle on this PC)
+        raid = ", pending raider battle " + std::to_string(dl::At<uint8_t>(f, PendingRaiderField())) + " -> 0";
+        dl::At<uint8_t>(f, PendingRaiderField()) = 0;
+    }
     if (ResolveMonthResetVars()) {
         out += ", surprise attack " + std::to_string(*g_surpriseFlag) + " -> 0, possession battle " +
                std::to_string(*g_possessionFlag) + " -> 0";
@@ -5175,7 +5526,7 @@ std::string PrepareBattleSlotMonth() {
         dl::At<uint8_t>(f, m.loss) = 0;
         dl::At<uint8_t>(f, m.convoy) = 0;
     }
-    return out;
+    return out + raid;
 }
 
 std::string MonthStateText(bool setForTest) {
@@ -5249,6 +5600,383 @@ extern "C" __declspec(naked) void d_CheckAttack() {
     }
 }
 
+// 0.7.0: raiders against patrols for K. The generator's raider check (CheckRaiderVsPatrols, at most twice a month, each
+// after Random(100) < 30) is recorded in the view as an attempt of its own when K's PC replays it (hello `gen` 3) and
+// answers False like a check that found no interception; K's PC runs the game's check in its battle slot
+// (StartRaiderCheck). Otherwise it answers False unrecorded, as in 0.6.x.
+static volatile bool g_b6Raid = false;
+static int g_b6K = -1;
+
+extern "C" int __stdcall CB_B6Raid() {
+    try {
+        BattleAttempt t;
+        t.type = 1;
+        t.a = g_b6K;
+        g_b6Attempts.push_back(t);
+    } catch (...) {
+        return 1;
+    }
+    return g_b6Attempts.size() >= kMaxAttempts ? 1 : 0;
+}
+
+// CheckRaiderVsPatrols(Self=EAX): Boolean. In the view: recorded (0.7.0) or skipped, False either way.
+extern "C" __declspec(naked) void d_RaiderVsPatrols() {
+    __asm {
+        cmp byte ptr [g_b6View], 0
+        jne view
+        jmp dword ptr [o_RaiderVsPatrols]
+    view:
+        cmp byte ptr [g_b6Raid], 0
+        je skip
+        call CB_B6Raid
+        ret
+    skip:
+        xor eax, eax
+        ret
+    }
+}
+
+// 0.7.0 (invasions, P3): the generator's invasion check (CheckForInvasionBattles, at war, before everything else) reads
+// the host player's plan and invasions. For K it is recorded in the view as an attempt of its own when K's PC replays it
+// (hello `gen` 4) and K has invasions or a plan, and answers False; K's PC runs the game's check in its battle slot
+// with K's invasions (StartInvasionCheck). Otherwise it answers False unrecorded, as in 0.6.x.
+static volatile bool g_b6Inv = false;
+
+extern "C" int __stdcall CB_B6Inv() {
+    try {
+        BattleAttempt t;
+        t.type = 2;
+        t.a = g_b6K;
+        g_b6Attempts.push_back(t);
+    } catch (...) {
+        return 1;
+    }
+    return g_b6Attempts.size() >= kMaxAttempts ? 1 : 0;
+}
+
+// CheckForInvasionBattles(Self=EAX): Boolean. In the view: recorded or skipped, False either way.
+extern "C" __declspec(naked) void d_InvasionBattles() {
+    __asm {
+        cmp byte ptr [g_b6View], 0
+        jne view
+        jmp dword ptr [o_InvasionBattles]
+    view:
+        cmp byte ptr [g_b6Inv], 0
+        je skip
+        call CB_B6Inv
+        ret
+    skip:
+        xor eax, eax
+        ret
+    }
+}
+
+// The form's PendingRaiderBattle record (1.01.44): +0 the flag, +1 the player's ship, +5 the enemy's ship, +9 the enemy
+// nation (BuilderNations index), +0xd the sea area (MapAreas index), +0x12 the caption, +0x16 the side (0 the player's
+// raider intercepted, 1 the player's patrol intercepts). Checked against CheckRaiderInterceptions' writes.
+static int PendingRaiderField() {
+    static int f = -2;
+    if (f != -2) return f;
+    f = -1;
+    int prb = dl::Field("TfrmBuildCamp", "PendingRaiderBattle");
+    uint8_t* ci = (uint8_t*)dl::Method("TfrmBuildCamp", "CheckRaiderInterceptions");
+    if (prb > 0 && ci) {  // mov byte ptr [eax+prb], 1 ... mov [eax+prb+1], esi ... mov dword ptr [eax+prb+0x16], 1
+        std::vector<int> p1 = {0xC6, 0x80}, p2 = {0x89, 0xB0}, p3 = {0xC7, 0x80};
+        for (int i = 0; i < 4; i++) {
+            p1.push_back((prb >> (8 * i)) & 0xFF);
+            p2.push_back(((prb + 1) >> (8 * i)) & 0xFF);
+            p3.push_back(((prb + 0x16) >> (8 * i)) & 0xFF);
+        }
+        p1.push_back(1);
+        for (int b : {1, 0, 0, 0}) p3.push_back(b);
+        if (dl::FindPattern(ci, 0x800, p1) && dl::FindPattern(ci, 0x800, p2) && dl::FindPattern(ci, 0x800, p3)) f = prb;
+    }
+    return f;
+}
+
+bool RaiderReplayAvailable() {
+    return BattleReplayAvailable() && o_RaiderVsPatrols && o_RaiderBattle && PendingRaiderField() > 0 &&
+           A.fTurnMessages >= 0 && A.fMapAreas >= 0 && A.fTension >= 0;
+}
+int QuickRaiderCalls() { return (int)g_quickRaid; }
+
+// TEST ONLY (session `battles testraid`): a forced interception. Two of the battle slot's ships are put in place for the
+// game's CheckRaiderInterceptions (the raiding nation's ship on raiding duty, Status 4, in the sea area of an operational
+// ship of the defending nation of type 3/4 over 1000 t; the player's patrol on trade protection, Status 3) and the
+// random draws of CheckRaiderInterceptions answer 0 (Random's rand32 procedure swapped for calls from that routine only,
+// during the check), so the game's own routine records the interception and its "thwarts" lines. Status and area are
+// put back after the check (the result keeps the game's own changes only).
+static uint32_t* g_randCell = nullptr;  // Random(n): push eax; call [cell]; pop edx; mul edx; mov eax, edx
+extern "C" uintptr_t g_randOrig = 0, g_ciStart = 0, g_ciEnd = 0;
+extern "C" __declspec(naked) void TestRand32() {
+    __asm {
+        mov edx, [esp + 8]  // Random's caller
+        cmp edx, [g_ciStart]
+        jb orig
+        cmp edx, [g_ciEnd]
+        jae orig
+        xor eax, eax
+        ret
+    orig:
+        jmp dword ptr [g_randOrig]
+    }
+}
+
+struct ShipPut {
+    void* nation = nullptr;
+    void* ship = nullptr;
+    uint8_t status = 0, forced = 0;
+    void* area = nullptr;
+};
+static uint8_t* g_testBlk = nullptr;  // the defender's Blockaded flag, lifted for a forced check
+static uint8_t g_testBlkWas = 0;
+
+static bool ShipStillListed(void* nation, void* ship) {
+    for (int i = 0, n = ShipCount(nation); i < n; i++)
+        if (Ship(nation, i) == ship) return true;
+    return false;
+}
+
+static std::string TestRaidSetup(int side, int enemy, std::vector<ShipPut>& put) {
+    static int fSt = dl::Field("TCampaignShip", "Status"), fLoc = dl::Field("TCampaignShip", "LocationArea"),
+               fType = dl::Field("TCampaignShip", "ShipType"), fDisp = dl::Field("TCampaignShip", "Displacement");
+    static void* mOp = dl::Method("TCampaignShip", "IsOperational");
+    uint8_t* ci = (uint8_t*)dl::Method("TfrmBuildCamp", "CheckRaiderInterceptions");
+    if (!g_randCell && ci) {  // mov eax, 100; call Random
+        uint8_t* p = dl::FindPattern(ci, 0x800, {0xB8, 0x64, 0, 0, 0, 0xE8});
+        uint8_t* r = p ? (uint8_t*)CallTarget(p + 5) : nullptr;
+        if (r && InImage((uintptr_t)r) && r[0] == 0x50 && r[1] == 0xFF && r[2] == 0x15) g_randCell = *(uint32_t**)(r + 3);
+    }
+    void* raiding = Nation(side == 0 ? 0 : enemy);
+    void* defending = Nation(side == 0 ? enemy : 0);
+    if (fSt < 0 || fLoc < 0 || fType < 0 || fDisp < 0 || !mOp || !ci || !g_randCell || !raiding || !defending)
+        return "unavailable";
+    auto op = [](void* s) { return s && (dl::Call(mOp, (uint32_t)(uintptr_t)s) & 0xFF) != 0; };
+    auto cruiser = [](void* s) {
+        uint8_t t = dl::At<uint8_t>(s, fType);
+        return (t == 3 || t == 4) && dl::At<int>(s, fDisp) > 1000;
+    };
+    void* patrol = nullptr;
+    void* raider = nullptr;
+    for (int i = 0, n = ShipCount(defending); i < n && !patrol; i++) {
+        void* s = Ship(defending, i);
+        if (op(s) && cruiser(s) && dl::At<void*>(s, fLoc) && dl::At<uint8_t>(s, fSt) != 4) patrol = s;
+    }
+    for (int pass = 0; pass < 2 && !raider; pass++)  // a raider of the nation, else a cruiser, else any ship
+        for (int i = 0, n = ShipCount(raiding); i < n && !raider; i++) {
+            void* s = Ship(raiding, i);
+            if (op(s) && (pass == 0 ? dl::At<uint8_t>(s, fSt) == 4 || cruiser(s) : true)) raider = s;
+        }
+    if (!patrol || !raider) return "no ships for it";
+    void* area = dl::At<void*>(patrol, fLoc);
+    for (void* s : {raider, patrol}) {
+        ShipPut sp;
+        sp.nation = s == raider ? raiding : defending;
+        sp.ship = s;
+        sp.status = dl::At<uint8_t>(s, fSt);
+        sp.area = dl::At<void*>(s, fLoc);
+        sp.forced = s == raider ? 4 : side == 1 ? 3 : sp.status;
+        dl::At<uint8_t>(s, fSt) = sp.forced;
+        if (s == raider) dl::At<void*>(s, fLoc) = area;
+        put.push_back(sp);
+    }
+    g_ciStart = (uintptr_t)ci;
+    g_ciEnd = (uintptr_t)ci + 0x7c8;  // the routine's code (string literals follow it)
+    // The game skips a blockaded defender (its merchants stay at home: loop 1 tests the enemy, loop 2 the player)
+    static int fBlk = dl::Field("TBuilderNation", "Blockaded");
+    std::string blk;
+    if (fBlk > 0 && dl::At<uint8_t>(defending, fBlk)) {
+        g_testBlk = &dl::At<uint8_t>(defending, fBlk);
+        g_testBlkWas = *g_testBlk;
+        *g_testBlk = 0;
+        blk = " (the defender's blockade flag lifted for the check)";
+    }
+    auto name = [](void* s) {
+        return A.fCShipName >= 0 ? W2U(dl::ReadUStr(dl::At<void*>(s, A.fCShipName))) : std::string("?");
+    };
+    return "raider " + name(raider) + " (status " + std::to_string(put[0].status) + ") and patrol " + name(patrol) +
+           " (status " + std::to_string(put[1].status) + ") in " + W2U(AreaNameOf(area)) + blk;
+}
+
+static void TestRaidRestore(std::vector<ShipPut>& put) {
+    static int fSt = dl::Field("TCampaignShip", "Status"), fLoc = dl::Field("TCampaignShip", "LocationArea");
+    if (g_testBlk) {
+        *g_testBlk = g_testBlkWas;
+        g_testBlk = nullptr;
+    }
+    for (auto& sp : put) {
+        if (!ShipStillListed(sp.nation, sp.ship) || dl::At<uint8_t>(sp.ship, fSt) != sp.forced) continue;
+        dl::At<uint8_t>(sp.ship, fSt) = sp.status;
+        dl::At<void*>(sp.ship, fLoc) = sp.area;
+    }
+    put.clear();
+}
+
+RaiderCheck StartRaiderCheck(const std::vector<int>& mask, int testSide, int testEnemy) {
+    RaiderCheck rc;
+    void* f = BuildCamp();
+    int prb = PendingRaiderField();
+    if (!f || prb <= 0 || !RaiderReplayAvailable() || EventActive() || !g_battleSlotMode) {
+        Log("StartRaiderCheck: not possible");
+        return rc;
+    }
+    void* msgs = dl::At<void*>(f, A.fTurnMessages);
+    size_t m0 = msgs ? ReadStringList(msgs).size() : 0;
+    std::vector<std::pair<void*, int>> masked;  // the nations people play: no war seen with them (as in the host's view)
+    for (int v : mask) {
+        void* rec = v >= 1 && v <= 8 && v < NationCount() ? Nation(v) : nullptr;
+        if (rec && RelCellAt(rec, 0) > 40) {
+            masked.push_back({rec, RelCellAt(rec, 0)});
+            RelCellAt(rec, 0) = 40;
+        }
+    }
+    dl::At<uint8_t>(f, prb) = 0;  // no interception yet (DoTurn2 clears it in single player)
+    std::vector<ShipPut> put;
+    if (testSide == 0 || testSide == 1) {
+        rc.test = TestRaidSetup(testSide, testEnemy, put);
+        Log("StartRaiderCheck: TEST: forced interception (side %d, nation %d): %s", testSide, testEnemy, rc.test.c_str());
+    }
+    bool forced = !put.empty();
+    if (forced) {
+        g_randOrig = *g_randCell;
+        *g_randCell = (uint32_t)(uintptr_t)&TestRand32;
+    }
+    long q0 = g_quickRaid;
+    int ok = 0;
+    uint32_t r = GuardedCall(o_RaiderVsPatrols, (uint32_t)(uintptr_t)f, 0, 0, 0, nullptr, &ok);
+    if (forced) *g_randCell = (uint32_t)g_randOrig;
+    TestRaidRestore(put);
+    for (auto& m : masked) RelCellAt(m.first, 0) = m.second;
+    rc.ran = ok != 0;
+    rc.result = ok && (r & 0xFF) != 0;
+    rc.quick = g_quickRaid != q0;
+    if (dl::At<uint8_t>(f, prb)) {
+        rc.pending = true;
+        rc.enemy = dl::At<int>(f, prb + 9);
+        rc.side = dl::At<int>(f, prb + 0x16);
+        rc.area = AreaNameOf(dl::ListItem(dl::At<void*>(f, A.fMapAreas), dl::At<int>(f, prb + 0xd)));
+        rc.caption = dl::ReadUStr(dl::At<void*>(f, prb + 0x12));
+    }
+    std::vector<std::wstring> ml = msgs ? ReadStringList(msgs) : std::vector<std::wstring>();
+    for (size_t i = m0; i < ml.size(); i++) rc.news.push_back(ml[i]);
+    Log("StartRaiderCheck: %s, interception %s (nation %d, side %d, %s: \"%s\"), %s, %d new turn message(s)",
+        !ok ? "exception" : rc.result ? "True" : "False", rc.pending ? "yes" : "no", rc.enemy, rc.side,
+        W2U(rc.area).c_str(), W2U(rc.caption).c_str(), rc.quick ? "auto-resolved" : "not auto-resolved",
+        (int)rc.news.size());
+    return rc;
+}
+
+bool InvasionReplayAvailable() {
+    return BattleReplayAvailable() && o_InvasionBattles && A.fTurnMessages >= 0 && A.fTension >= 0;
+}
+
+// TEST ONLY (host `inv hostcheck`): the game's CheckForInvasionBattles for the host's own nation, as its month runs it.
+int RunHostInvasionCheck() {
+    void* f = BuildCamp();
+    if (!f || !o_InvasionBattles || g_b6View || g_battleSlotMode || EventActive()) return -2;
+    int ok = 0;
+    uint32_t r = GuardedCall(o_InvasionBattles, (uint32_t)(uintptr_t)f, 0, 0, 0, nullptr, &ok);
+    return !ok ? -1 : (r & 0xFF) != 0 ? 1 : 0;
+}
+
+// TEST ONLY (session `battles testinv 1`): the next invasion check is a plain one: the computer does not decline the
+// battle (AIDeclinesBattle answers False) and the player is not caught out (CheckCaughtOut False: the question offers
+// its Decline). Only while StartInvasionCheck runs.
+static volatile bool g_testInvPlain = false, g_invPlainNow = false;
+extern "C" void* o_AIDeclines = nullptr;
+extern "C" void* o_CaughtOut = nullptr;
+extern "C" volatile long g_invPlainHits = 0;
+
+// AIDeclinesBattle(Self, anAINation, anArea, aMission, Implement, aPenalty, AIdefender, RealBattleTitle): Boolean, ret 0x14
+extern "C" __declspec(naked) void d_AIDeclines() {
+    __asm {
+        cmp byte ptr [g_invPlainNow], 0
+        jne plain
+        jmp dword ptr [o_AIDeclines]
+    plain:
+        lock inc dword ptr [g_invPlainHits]
+        xor eax, eax
+        ret 0x14
+    }
+}
+
+// CheckCaughtOut(Self, anEnemy): Boolean
+extern "C" __declspec(naked) void d_CaughtOut() {
+    __asm {
+        cmp byte ptr [g_invPlainNow], 0
+        jne plain
+        jmp dword ptr [o_CaughtOut]
+    plain:
+        lock inc dword ptr [g_invPlainHits]
+        xor eax, eax
+        ret
+    }
+}
+
+// Installed on the switch's first use (main thread), never in normal play.
+static bool Hook(void* target, void* detour, void** orig, const char* name);
+bool SetTestInvasionPlain(bool on) {
+    static bool tried = false;
+    if (on && !tried && InvasionReplayAvailable()) {
+        tried = true;
+        void* ad = dl::Method("TfrmBuildCamp", "AIDeclinesBattle");
+        void* co = dl::Method("TfrmBuildCamp", "CheckCaughtOut");
+        bool h1 = ad && co && Hook(ad, (void*)&d_AIDeclines, &o_AIDeclines, "AIDeclinesBattle");
+        bool h2 = h1 && Hook(co, (void*)&d_CaughtOut, &o_CaughtOut, "CheckCaughtOut");
+        if (h2 && (MH_EnableHook(ad) != MH_OK || MH_EnableHook(co) != MH_OK)) {  // (Hook only creates them)
+            MH_DisableHook(co);
+            MH_RemoveHook(co);
+            h2 = false;
+        }
+        if (h1 && !h2) {
+            MH_DisableHook(ad);
+            MH_RemoveHook(ad);
+        }
+        if (!h2) o_AIDeclines = o_CaughtOut = nullptr;
+    }
+    if (on && (!o_AIDeclines || !o_CaughtOut)) return false;
+    g_testInvPlain = on;
+    return true;
+}
+
+InvasionCheck StartInvasionCheck(const std::vector<int>& mask) {
+    InvasionCheck ic;
+    void* f = BuildCamp();
+    if (!f || !InvasionReplayAvailable() || EventActive() || !g_battleSlotMode) {
+        Log("StartInvasionCheck: not possible");
+        return ic;
+    }
+    void* msgs = dl::At<void*>(f, A.fTurnMessages);
+    size_t m0 = msgs ? ReadStringList(msgs).size() : 0;
+    std::vector<std::pair<void*, int>> masked;  // the nations people play: no war seen with them (as in the host's view)
+    for (int v : mask) {
+        void* rec = v >= 1 && v <= 8 && v < NationCount() ? Nation(v) : nullptr;
+        if (rec && RelCellAt(rec, 0) > 40) {
+            masked.push_back({rec, RelCellAt(rec, 0)});
+            RelCellAt(rec, 0) = 40;
+        }
+    }
+    int ok = 0;
+    bool plain = g_testInvPlain;
+    g_testInvPlain = false;
+    long hits0 = g_invPlainHits;
+    g_invPlainNow = plain;
+    uint32_t r = GuardedCall(o_InvasionBattles, (uint32_t)(uintptr_t)f, 0, 0, 0, nullptr, &ok);
+    g_invPlainNow = false;
+    for (auto& m : masked) RelCellAt(m.first, 0) = m.second;
+    ic.ran = ok != 0;
+    ic.result = ok && (r & 0xFF) != 0;
+    if (plain) ic.plain = (int)(g_invPlainHits - hits0);
+    std::vector<std::wstring> ml = msgs ? ReadStringList(msgs) : std::vector<std::wstring>();
+    for (size_t i = m0; i < ml.size(); i++) ic.news.push_back(ml[i]);
+    Log("StartInvasionCheck: %s, %d new turn message(s)%s", !ok ? "exception" : ic.result ? "True" : "False",
+        (int)ic.news.size(),
+        plain ? (", TEST: plain (the computer's decline and the caught-out test answered False " +
+                 std::to_string(g_invPlainHits - hits0) + "x)").c_str()
+              : "");
+    return ic;
+}
+
 // DoPlayerDecline(Self=EAX, aPossession=EDX): the player declined a battle (the battle's question or its preview).
 extern "C" __declspec(naked) void d_PlayerDecline() {
     __asm {
@@ -5267,9 +5995,20 @@ extern "C" void __stdcall CB_B6Box(const void* text) {
 }
 
 // ShowMessage(Msg=EAX): recorded in B6's view (the generator's error box), shown elsewhere.
+static volatile bool g_boxCap = false;  // 0.7.0: a joined nation's invasion month runs (invasion.cpp)
+
+std::wstring SetBoxCapture(bool on) {
+    std::wstring t = on ? std::wstring() : g_b6Error;
+    g_b6Error.clear();
+    g_boxCap = on;
+    return t;
+}
+
 extern "C" __declspec(naked) void d_ShowMessage() {
     __asm {
         cmp byte ptr [g_b6View], 0
+        jne record
+        cmp byte ptr [g_boxCap], 0
         jne record
         jmp dword ptr [o_ShowMessage]
     record:
@@ -5352,7 +6091,8 @@ void HostViewLeave() {
     PvLeave();
 }
 
-bool RunBattleGenerator(int K, int war, const bool human[9], std::vector<BattleAttempt>& out, std::string& err) {
+bool RunBattleGenerator(int K, int war, const bool human[9], std::vector<BattleAttempt>& out, std::string& err,
+                        bool raiders, bool invasions) {
     out.clear();
     void* f = BuildCamp();
     void* list = NationList();
@@ -5364,9 +6104,14 @@ bool RunBattleGenerator(int K, int war, const bool human[9], std::vector<BattleA
     }
     g_b6Attempts.clear();
     g_b6Error.clear();
+    g_b6K = K;
+    g_b6Raid = raiders;
+    g_b6Inv = invasions;
     g_b6View = true;
     int ok = CallGenerator(f);
     g_b6View = false;
+    g_b6Raid = false;
+    g_b6Inv = false;
     g_b6Fault = false;
     HostViewLeave();
     out = g_b6Attempts;
@@ -5872,11 +6617,24 @@ static SkipSpec g_skips[] = {
     {"TBuilderNation", "MaybeSendHomeShipInColonies", 0, false, 0, nullptr},
     {"TBuilderNation", "PutShipOnASWPatrol", 0, false, 0, nullptr},
     {"TfrmBuildCamp", "CheckOneShipsOrBaseHasAircraft", 2, true, 0, nullptr},
+    // The legacy fleet of a joined player (0.7.0): while the player builds it on this PC, the game's own "Continue"
+    // steps would build the computer's initial fleets of nations 1-8 (K among them: the list is not swapped), their
+    // ships under construction, and give the copy's officers (the host's) to K's new ships. All skipped while active.
+    {"TfrmBuildCamp", "AIBuildInitialFleet", 2, false, 0, nullptr},
+    {"TBuilderNation", "AssignOfficersToUncommandedShips", 0, false, 0, nullptr},
 };
 
 extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
     try {
         const SkipSpec& s = g_skips[idx];
+        if (g_legacySkip && StartBuildPhase() != 2 &&
+            (!strcmp(s.method, "AIBuildInitialFleet") || !strcmp(s.method, "AIMonthlyBuild") ||
+             !strcmp(s.method, "AssignOfficersToUncommandedShips"))) {
+            Log("legacy fleet: %s skipped (nation %d)", s.method, NationIndex((void*)(uintptr_t)arg));
+            return 1;
+        }
+        if (!strcmp(s.method, "AIBuildInitialFleet") || !strcmp(s.method, "AssignOfficersToUncommandedShips"))
+            return 0;  // (only for the legacy build)
         int nation = s.isIndex ? (int)arg : NationIndex((void*)(uintptr_t)arg);
         if (nation > 0 && hookcb::IsHumanRemoteNation(nation)) {
             Log("AI suppressed: %s for nation %d", s.method, nation);
@@ -5939,6 +6697,220 @@ static bool Hook(void* target, void* detour, void** orig, const char* name) {
     Log("hook %s at rva %#x", name, (unsigned)((uintptr_t)target - dl::g_base));
     return true;
 }
+
+// ---------------------------------------------------------------------------------------------
+// 0.7.0 (fix-afb): a bug of the game's battle setup (single player has it too). AdjustForcesForBattle (unnamed; its
+// box "Error in AdjustForcesForBattle procedure!") runs before the battle preview. After an intelligence coup (the flag
+// DoPossessionBattle sets: "Due to an intelligence coup, we can ambush an enemy force!") it removes the enemy's extra
+// divisions and, while the player's side is still the weaker, calls its nested reinforcement routine for side 0. That
+// routine takes the side's nation from a local of AdjustForcesForBattle which only the sibling routine of the random
+// reinforcements sets (side 0: PlayerNation, side 1: the nation of BattleOpponentIdx). On the ambush's path it is never
+// set and holds the return address the setup's previous call left on the stack: the routine takes code for the nation,
+// the new ship's name reads NationName from code bytes (33 C0 EB 02) and _UStrCatN faults ("Access violation at
+// <image base + 0xC748> ... Read of address 02EBC02F" on every PC); the battle goes on without the reinforcements. The
+// mod gives the routine at those two calls the nation the sibling routine would give.
+extern "C" {
+void* o_AfbReinforce = nullptr;          // the nested reinforcement routine
+uintptr_t g_afbRet1 = 0, g_afbRet2 = 0;  // AdjustForcesForBattle's two calls of it on the ambush's path (returns)
+void* o_AfbEntry = nullptr;              // TEST ONLY: AdjustForcesForBattle itself (hooked on `battles testcoup`)
+uint8_t* g_afbFlag = nullptr;            // the coup's ambush flag (AdjustForcesForBattle's `cmp byte ptr [flag], 0`)
+volatile uint8_t g_afbForce = 0;         // TEST ONLY: the next call runs as an ambush (1, 2: without the mod's nation)
+volatile uint8_t g_afbFixOff = 0;        // TEST ONLY: this call keeps the game's own local (the box)
+volatile uint8_t g_afbWeaker = 0;        // TEST ONLY: this call finds side 0 the weaker (side 1's count + 1000)
+volatile long g_afbForcedRuns = 0;       // TEST ONLY: the calls run as an ambush by the switch
+void* o_AfbCount = nullptr;              // TEST ONLY: the battle's ship count of a side
+uintptr_t g_afbBodyStart = 0, g_afbBodyEnd = 0;  // AdjustForcesForBattle's code up to its except handler
+}
+static void* g_afbFn = nullptr;
+static bool g_afbOk = false;
+
+extern "C" void __stdcall CB_AfbReinforce(int side, uint8_t* frame) {
+    try {
+        void** slot = (void**)(frame - 4);  // the parent's local (its frame is live: the routine's caller)
+        void* was = *slot;
+        if (NationIndex(was) >= 0) return;  // a nation already: nothing to do
+        char what[48] = "";
+        if (InImage((uintptr_t)was))
+            snprintf(what, sizeof(what), ": the game's code, rva %#x", (unsigned)((uintptr_t)was - dl::g_base));
+        if (g_afbFixOff) {
+            Log("battle setup: TEST: the ambush's reinforcements of side %d keep the game's local (%p%s, no nation)",
+                side, was, what);
+            return;
+        }
+        void* f = BuildCamp();
+        void* n = nullptr;
+        if (f && side == 0) {
+            n = dl::At<void*>(f, A.fPlayerNation);
+        } else if (f) {
+            int o = dl::At<int>(f, A.fBattleOpponentIdx);
+            n = o >= 0 && o < NationCount() ? Nation(o) : nullptr;
+        }
+        int idx = NationIndex(n);
+        if (idx < 0) return;
+        *slot = n;
+        Log("battle setup: the ambush's reinforcements of side %d had no nation (AdjustForcesForBattle's unset local "
+            "held %p%s); the mod gave them nation %d (%s), as the game's other reinforcements have it",
+            side, was, what, idx, W2U(NationName(idx)).c_str());
+    } catch (...) {
+    }
+}
+
+// The nested routine (AL = ship type, EDX = side, the parent's frame pushed; plain ret): only the two calls above.
+extern "C" __declspec(naked) void d_AfbReinforce() {
+    __asm {
+        mov ecx, [esp]
+        cmp ecx, [g_afbRet1]
+        je fix
+        cmp ecx, [g_afbRet2]
+        jne pass
+    fix:
+        push eax
+        push edx
+        push dword ptr [esp + 12]  // the parent's frame
+        push edx                   // the side
+        call CB_AfbReinforce
+        pop edx
+        pop eax
+    pass:
+        jmp dword ptr [o_AfbReinforce]
+    }
+}
+
+// TEST ONLY: AdjustForcesForBattle's start. Nothing goes on the stack here: the routine's unset local is whatever the
+// setup's previous call left below its stack pointer, as without the hook (ECX is not one of its arguments).
+extern "C" __declspec(naked) void d_AfbEntry() {
+    __asm {
+        cmp byte ptr [g_afbForce], 0
+        jne force
+        mov byte ptr [g_afbFixOff], 0
+        mov byte ptr [g_afbWeaker], 0
+        jmp dword ptr [o_AfbEntry]
+    force:
+        mov ecx, dword ptr [g_afbFlag]
+        mov byte ptr [ecx], 1
+        cmp byte ptr [g_afbForce], 2
+        sete cl
+        mov byte ptr [g_afbFixOff], cl
+        mov byte ptr [g_afbWeaker], 1
+        mov byte ptr [g_afbForce], 0
+        lock inc dword ptr [g_afbForcedRuns]
+        jmp dword ptr [o_AfbEntry]
+    }
+}
+
+// TEST ONLY: the battle's ship count of a side (EAX side, DL ship type, CL, one stack argument; ret 4) as
+// AdjustForcesForBattle's own calls see it in a forced ambush: side 1's + 1000, so the routine removes side 1's extra
+// divisions and reinforces side 0 (the path of the box) whatever the forces are.
+extern "C" __declspec(naked) void d_AfbCount() {
+    __asm {
+        cmp byte ptr [g_afbWeaker], 0
+        jne weaker
+        jmp dword ptr [o_AfbCount]
+    weaker:
+        push eax
+        push dword ptr [esp + 8]
+        call dword ptr [o_AfbCount]
+        pop ecx
+        cmp ecx, 1
+        jne done
+        mov ecx, [esp]
+        cmp ecx, [g_afbBodyStart]
+        jb done
+        cmp ecx, [g_afbBodyEnd]
+        jae done
+        add eax, 1000
+    done:
+        ret 4
+    }
+}
+
+static bool AfbCodeIs(const uint8_t* p, std::initializer_list<int> b) {
+    for (int v : b) {
+        if (v >= 0 && *p != (uint8_t)v) return false;
+        p++;
+    }
+    return true;
+}
+
+// Found from the routine's error text (1.01.44: the handler's `mov edx, <text>` at +0x3fc, the ambush's calls at +0x289
+// and +0x2af). Hook() only creates the hook (InstallHooks enables them all).
+static bool InstallAfbFix() {
+    const wchar_t* text = L"Error in AdjustForcesForBattle procedure!";
+    std::vector<int> pat = {0xB0, 0x04, 0x02, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, -1, -1, 0x00, 0x00};
+    for (const wchar_t* c = text; *c; c++) {
+        pat.push_back(*c & 0xFF);
+        pat.push_back((*c >> 8) & 0xFF);
+    }
+    uint8_t* lit = dl::FindPattern((uint8_t*)dl::g_base + 0x1000, dl::g_size - 0x1000, pat);
+    if (!lit) return false;
+    uint32_t chars = (uint32_t)(uintptr_t)(lit + 12);
+    std::vector<int> mov = {0xBA};
+    for (int i = 0; i < 4; i++) mov.push_back((chars >> (8 * i)) & 0xFF);
+    uint8_t* h = dl::FindPattern((uint8_t*)dl::g_base + 0x1000, dl::g_size - 0x1000, mov);
+    if (!h || h < (uint8_t*)dl::g_base + 0x1000 + 0x500) return false;
+    // push ebp; movzx eax, byte ptr [ebp-0x19]; xor edx, edx; call <routine>; pop ecx
+    std::vector<int> call = {0x55, 0x0F, 0xB6, 0x45, 0xE7, 0x33, 0xD2, 0xE8, -1, -1, -1, -1, 0x59};
+    uint8_t* c1 = dl::FindPattern(h - 0x400, 0x400, call);
+    uint8_t* c2 = c1 ? dl::FindPattern(c1 + 13, (size_t)(h - (c1 + 13)), call) : nullptr;
+    uint8_t* t = c1 ? (uint8_t*)CallTarget(c1 + 7) : nullptr;
+    if (!c2 || t != CallTarget(c2 + 7) || !InImage((uintptr_t)t)) return false;
+    // the routine: push ebp; mov ebp, esp; add esp, -0xc; push ebx; push esi; push edi; mov [ebp-8], edx;
+    // mov [ebp-1], al ... mov eax, [ebp+8]; mov edx, [eax-4] (the parent's local: the nation)
+    if (!AfbCodeIs(t, {0x55, 0x8B, 0xEC, 0x83, 0xC4, 0xF4, 0x53, 0x56, 0x57, 0x89, 0x55, 0xF8, 0x88, 0x45, 0xFF}) ||
+        !dl::FindPattern(t, 0x200, {0x8B, 0x45, 0x08, 0x8B, 0x50, 0xFC, 0x8B, 0x45, 0xF8, 0xE8}))
+        return false;
+    // AdjustForcesForBattle's head: push ebp; mov ebp, esp; add esp, -0x20; push ebx; push esi; push edi; xor edx, edx;
+    // mov [ebp-0x20], edx; mov [ebp-8], eax; ... cmp byte ptr [flag], 0 (its first test)
+    std::vector<int> head = {0x55, 0x8B, 0xEC, 0x83, 0xC4, 0xE0, 0x53, 0x56, 0x57,
+                             0x33, 0xD2, 0x89, 0x55, 0xE0, 0x89, 0x45, 0xF8};
+    uint8_t* fn = dl::FindPattern(c1 - 0x400, 0x400, head);
+    if (fn && AfbCodeIs(fn + 0x2d, {0x80, 0x3D, -1, -1, -1, -1, 0x00}) && InImage(*(uint32_t*)(fn + 0x2f))) {
+        g_afbFn = fn;
+        g_afbFlag = *(uint8_t**)(fn + 0x2f);
+        g_afbBodyStart = (uintptr_t)fn;
+        g_afbBodyEnd = (uintptr_t)h;
+    }
+    g_afbRet1 = (uintptr_t)(c1 + 12);
+    g_afbRet2 = (uintptr_t)(c2 + 12);
+    return Hook(t, (void*)&d_AfbReinforce, &o_AfbReinforce, "AdjustForcesForBattle's reinforcements");
+}
+
+// TEST ONLY (`battles testcoup <0|1|2>`): the next AdjustForcesForBattle on this PC runs as an intelligence coup's
+// ambush that finds the player's side the weaker (its flag set at its start, side 1's count + 1000 for its own calls;
+// 2: the mod's nation off for it, the game's own path). The hooks on its start and on the count (its block's
+// `push 1; xor ecx, ecx; mov dl, 0x16; xor eax, eax; call <count>`, the count's head checked) are made on the first
+// use.
+bool SetTestCoup(int mode) {
+    static bool tried = false;
+    if (mode != 0 && !tried && g_afbOk && g_afbFn && g_afbFlag) {
+        tried = true;
+        uint8_t* hit = dl::FindPattern((uint8_t*)g_afbFn, g_afbBodyEnd - g_afbBodyStart,
+                                       {0x6A, 0x01, 0x33, 0xC9, 0xB2, 0x16, 0x33, 0xC0, 0xE8});
+        uint8_t* cnt = hit ? (uint8_t*)CallTarget(hit + 8) : nullptr;
+        bool ok = cnt && InImage((uintptr_t)cnt) &&
+                  AfbCodeIs(cnt, {0x55, 0x8B, 0xEC, 0x83, 0xC4, 0xE4, 0x53, 0x56, 0x57, 0x88, 0x4D, 0xFF, 0x8B, 0xDA,
+                                  0x8B, 0xF0}) &&
+                  Hook(cnt, (void*)&d_AfbCount, &o_AfbCount, "AdjustForcesForBattle's count (TEST)");
+        if (ok && MH_EnableHook(cnt) != MH_OK) {
+            MH_RemoveHook(cnt);
+            ok = false;
+        }
+        if (!ok) o_AfbCount = nullptr;
+        if (ok && Hook(g_afbFn, (void*)&d_AfbEntry, &o_AfbEntry, "AdjustForcesForBattle (TEST)") &&
+            MH_EnableHook(g_afbFn) != MH_OK) {
+            MH_RemoveHook(g_afbFn);
+            o_AfbEntry = nullptr;
+        }
+    }
+    if (mode != 0 && (!o_AfbEntry || !o_AfbCount)) return false;
+    g_afbForce = (uint8_t)(mode == 1 || mode == 2 ? mode : 0);
+    if (mode == 0) g_afbWeaker = 0;
+    if (mode == 0 && o_AfbEntry && g_afbFlag) *g_afbFlag = 0;  // (a forced ambush that could not even out the forces)
+    return true;
+}
+
+bool AmbushFixAvailable() { return g_afbOk; }
+long TestCoupRuns() { return g_afbForcedRuns; }
 
 // TEST ONLY (env RTW3MP_TEST_PREFS, docs/TESTING.md "Two-PC conditions"): this copy's own preferences without touching
 // the shared Preferences file. The game's reader (TdlgPrefs.LoadPrefs(Self, DoSetStyle), register arguments only) is
@@ -6109,11 +7081,9 @@ bool InstallHooks() {
     }
     // B6 (0.6.0): the player's battle generator for joined nations (the host runs CheckForBattles2 in K's view).
     if (A.playerTurn && A.battles && A.mCheckForBattles && A.mInvasionBattles && A.mRaiderVsPatrols && o_PlayerDecline) {
-        void* invThunk = EmitViewSkipThunk(&o_InvasionBattles, &g_b6View);
-        void* raidThunk = EmitViewSkipThunk(&o_RaiderVsPatrols, &g_b6View);
-        bool gen = invThunk && raidThunk && Hook(A.mCheckAttack, (void*)&d_CheckAttack, &o_CheckAttack, "CheckAttackLocation");
-        gen = gen && Hook(A.mInvasionBattles, invThunk, &o_InvasionBattles, "CheckForInvasionBattles") &&
-              Hook(A.mRaiderVsPatrols, raidThunk, &o_RaiderVsPatrols, "CheckRaiderVsPatrols") &&
+        bool gen = Hook(A.mCheckAttack, (void*)&d_CheckAttack, &o_CheckAttack, "CheckAttackLocation");
+        gen = gen && Hook(A.mInvasionBattles, (void*)&d_InvasionBattles, &o_InvasionBattles, "CheckForInvasionBattles") &&
+              Hook(A.mRaiderVsPatrols, (void*)&d_RaiderVsPatrols, &o_RaiderVsPatrols, "CheckRaiderVsPatrols") &&
               Hook(A.mCheckForBattles, (void*)&d_CheckForBattles, &o_CheckForBattles, "CheckForBattles2");
         if (!gen) {
             for (void* t : {A.mCheckAttack, A.mInvasionBattles, A.mRaiderVsPatrols, A.mCheckForBattles}) MH_RemoveHook(t);
@@ -6128,6 +7098,7 @@ bool InstallHooks() {
         }
     }
     Log("Player's battle generator for joined nations: %s", A.battleGen ? "ok" : "UNAVAILABLE");
+    Log("Raiders against patrols for joined nations: %s", A.battleGen && RaiderReplayAvailable() ? "ok" : "UNAVAILABLE");
     // Relations v2, B4: the records of a joined nation's peace in its view (elsewhere these routines run as they are).
     if (A.playerTurn && A.peace && o_DoPeace) {
         struct PeaceHook {
@@ -6192,6 +7163,12 @@ bool InstallHooks() {
                    A.fAreaName >= 0 && A.fPossName >= 0;
     Log("The last battle's area across a load: %s%s", A.battlePtrs ? "ok" : "UNAVAILABLE",
         KeepBattlePointersTest() ? " (TEST: kept, as the game does)" : "");
+    // 0.7.0 (fix-afb): the reinforcements of an intelligence coup's ambush get their side's nation (a game bug)
+    g_afbOk = A.fPlayerNation >= 0 && A.fBattleOpponentIdx >= 0 && InstallAfbFix();
+    Log("The ambush's reinforcements in the battle setup (AdjustForcesForBattle): %s (calls at rva %#x/%#x, flag %s)",
+        g_afbOk ? "ok" : "UNAVAILABLE (the game's own: its box after some intelligence coups)",
+        g_afbOk ? (unsigned)(g_afbRet1 - 5 - dl::g_base) : 0u, g_afbOk ? (unsigned)(g_afbRet2 - 5 - dl::g_base) : 0u,
+        g_afbFlag ? "found" : "not found");
     nplay::InstallHooks();
     if (lockstep::TestPrefsWanted()) {  // TEST ONLY
         Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");

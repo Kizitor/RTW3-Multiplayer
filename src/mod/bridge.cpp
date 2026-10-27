@@ -291,9 +291,23 @@ static std::string ExecuteOnMain(const std::string& line) {
             return "ok " + s;
         }
         if (cmd == "research") return game::DebugResearch(atoi(arg(1, "0").c_str()));  // research <nation>: pct and priorities
+        if (cmd == "inv") return mp::DebugInvasions(args);  // 0.7.0: joined nations' invasions (session.cpp)
         if (cmd == "battles") return mp::DebugBattles(args);  // joined players' battles (see session.cpp)
         if (cmd == "ls") return mp::DebugLockstep(args);      // live player-vs-player battles (see lockstep.cpp)
         if (cmd == "fightbattles") return mp::SetFightBattles(arg(1, "1") != "0"), "ok";  // before join
+    // 0.7.0, the legacy fleet: `legacy [0|1]` the joined player's choice (read when a new campaign's first month
+    // arrives); `legacyallow [0|1]` the host's option; `legacystate`: the build state of this PC's game (read only)
+    if (cmd == "legacy") {
+        if (!arg(1, "").empty()) mp::SetLegacyWanted(arg(1) != "0");
+        return std::string("ok wanted=") + (mp::LegacyWanted() ? "1" : "0");
+    }
+    if (cmd == "legacyallow") return mp::SetLegacyAllowed(arg(1, "1") != "0"), "ok";
+    if (cmd == "legacystate")
+        return std::string("ok available=") + (game::LegacyAvailable() ? "1" : "0") +
+               " active=" + (game::LegacyActive() ? "1" : "0") + " " + game::LegacyFleetInfo();
+    // vcl <form class> <control field | ->: where a form's published control is (tests drive the game's own screens
+    // with posted messages): its window, or its parent's window and its rectangle there (read only)
+    if (cmd == "vcl") return game::DescribeControl(arg(1).c_str(), arg(2, "-").c_str());
         if (cmd == "enemyvpadd")  // host: enemyvpadd <n>: the host's enemies gain n VP outside a battle (as a blockade)
             return game::ShowEnemyVP(game::EnemyVP() + atoi(arg(1, "0").c_str())), mp::DebugVPInfo();
         if (cmd == "battlevp")  // host: battlevp <opponent> <vp host> <vp opponent> [Major|Minor|Marginal]: end-of-battle routine

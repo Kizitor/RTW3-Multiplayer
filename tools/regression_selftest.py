@@ -995,6 +995,32 @@ def runner(sandbox):
         p = R.preflight(os.path.join(R.SAVE, 'Game1'), dry=True, air_slots=(R.AIR_SLOT,))
         check('preflight: air_units refuses an existing slot 49', any('save slot 49 exists' in x for x in p), p)
         shutil.rmtree(R.slot_dir(R.AIR_SLOT))
+        # legacy_fleet (0.7.0): the legacy test campaign's check and its copy into the throwaway slot 46
+        lg = os.path.join(sandbox, 'tmp', 'lg', 'Game3')
+        os.makedirs(lg)
+        bcs3 = '[General]\r\nYear=1900\r\nMonth=1\r\nCampaignStartYear=1900\r\nFleetSize=4\r\n[Nation1]\r\nName=Germany\r\n'
+        with open(os.path.join(lg, 'RTWGame3.bcs'), 'wb') as f:
+            f.write(b'\xef\xbb\xbf' + bcs3.encode('utf-8'))
+        write(os.path.join(lg, 'MapData3.dat'), '[MapAreas]\n')
+        write(os.path.join(lg, 'DesignFiles1.des'), 'v10139\n0\n')
+        good = R.legacy_fixture(lg)
+        with open(os.path.join(lg, 'RTWGame3.bcs'), 'wb') as f:
+            f.write(bcs3.replace('Month=1', 'Month=2').encode('utf-8'))
+        bad = R.legacy_fixture(lg)
+        check('legacy_fixture: a January 1900 campaign with nation 1 Germany accepted (slot 3), a February one refused; '
+              'none given: SKIP reason', good[:2] == (True, '') and good[3] == 3 and not bad[0] and 'January 1900' in bad[1]
+              and not R.legacy_fixture(os.path.join(sandbox, 'nowhere'))[0], (good, bad))
+        R.legacy_copy(lg, 3, R.LEGACY_SLOT)
+        check('legacy_copy: the files renamed into slot 46 (RTWGame46.bcs, MapData46.dat, the design files as they are)',
+              sorted(os.listdir(R.slot_dir(R.LEGACY_SLOT))) == ['DesignFiles1.des', 'MapData46.dat', 'RTWGame46.bcs'],
+              os.listdir(R.slot_dir(R.LEGACY_SLOT)))
+        sec = R.save_sections(open(R.save_path(R.LEGACY_SLOT), 'rb').read())
+        check('save_sections: the sections\' lines in order (BOM dropped)', sec.get('General', [])[:2] ==
+              ['Year=1900', 'Month=2'] and sec.get('Nation1') == ['Name=Germany'], sec)
+        p = R.preflight(os.path.join(R.SAVE, 'Game1'), dry=True, air_slots=(R.LEGACY_SLOT,))
+        check('preflight: legacy_fleet refuses an existing slot 46', any('save slot 46 exists' in x for x in p), p)
+        shutil.rmtree(R.slot_dir(R.LEGACY_SLOT))
+        shutil.rmtree(os.path.dirname(lg))
         check('no_doubling: the kept count within 25 % of the dropped one (0.3.2: x2)', R.no_doubling(232, 232)
               and R.no_doubling(232, 240) and not R.no_doubling(232, 464) and not R.no_doubling(0, 5))
         check('KEPT_LOG_RE: the kept logs of every restart tag, not the .prev log or the current one',

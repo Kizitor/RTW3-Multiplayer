@@ -13,6 +13,7 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
 - [Research speed and the missile era](#research-speed-and-the-missile-era)
 - [Intelligence, trade protection and foreign stations](#intelligence-trade-protection-and-foreign-stations)
 - [Campaign divisions (the Fleet organization tab)](#campaign-divisions-the-fleet-organization-tab)
+- [The legacy fleet: the manual build of the starting fleet](#the-legacy-fleet-the-manual-build-of-the-starting-fleet)
 - [Tactical battles](#tactical-battles)
   - [Battle commands](#battle-commands)
 
@@ -319,6 +320,27 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   preferred base is 0x400000, a run may have another): the RVA is the address minus that run's base. The mod's start
   lines print absolute addresses of routines whose RVA is known, e.g. `random=000E7834` (RVA 0x7834): base 0xE0000,
   so the box's 00603D64 was RVA 0x523D64, `TCampaignShip.IsOperational` (0xd53d64 in the image).
+- **`AdjustForcesForBattle` faults after some intelligence coups (a game bug, single player too)** (2026-10-26, static,
+  live for 0.7.0). The battle setup (0xbe2de0's routine, after its two force builds 0xbe7c18) calls the unnamed
+  `AdjustForcesForBattle` 0xbec828 (its box "Error in AdjustForcesForBattle procedure!", handler `mov edx` at +0x3fc)
+  before the preview. Two globals steer it: the coup flag 0xf4c5ea (cell 0xf26ee4) and the caught-out flag 0xf4c5eb
+  (cell 0xf27904). `DoPossessionBattle` clears both at its start (`DoHomeAreaBattle` the coup flag) and sets the coup
+  flag when the mission's type (`WarMissions[i]` +0x1f) is 2 or 3 and `Random(15)` < the enemy record's `IntelEffort`
+  (+0x1ac: the player's effort against it) + `GetCLScoutPenalty` (before 1935) +-1 (the two sides' aircraft of role
+  15 in the area); text "Due to an intelligence coup, we can ambush an enemy force!" (else `CheckCaughtOut`, which reads
+  the same `IntelEffort`, sets the other flag: "Unexpected battle!"). With the coup flag `AdjustForcesForBattle` removes
+  side 1's extra divisions (all but each force's first) while side 0 has fewer ships (the battle's ship count 0xbf7d20:
+  EAX side, DL ship type (0x16 all), CL, one stack argument), and while side 0 is still the
+  weaker it calls its nested reinforcement routine 0xbec424 (AL ship type, EDX side 0, the parent's frame pushed) at
+  0xbecab8 and 0xbecade; it clears the flag only once side 0 is not the weaker (it stays set for the next battle
+  otherwise). The routine reads the side's nation from the parent's local [ebp-4], which only the sibling routine of the
+  random reinforcements (0xbec62c, the path without the flag) sets: side 0 `PlayerNation`, side 1
+  `GetBNation(BattleOpponentIdx)`. On the coup's path it is unset and holds the return address of the setup's second
+  force build (0xbe3aa6): the routine takes code for the nation and the new ship's name reads `NationName` (+4) from the
+  code bytes `33 C0 EB 02`, so `_UStrCatN` (RVA 0xc748) faults with "Read of address 02EBC02F", the same on every PC
+  and run (the box's own address is the run's base + 0xC748; reproduced live, MODLOG 2026-10-26); the handler shows
+  the box and the battle goes on without the reinforcements. The mod gives the routine `PlayerNation` at those two
+  calls (game.cpp `InstallAfbFix`; MODLOG 2026-10-26).
 - **`AIDeclinesBattle`** 0xcd2188 (from `CheckAttackLocation`): when the AI side declines, "The <nation> navy declines
   battle! You gain N VP!" and PlayerNation's VP += N (`add [eax+0x175], edx`), before any preview (the battle setup
   `DoBattle` is not entered). The player's own decline in the preview gives the enemy VP ("Decline will give the enemy
@@ -330,7 +352,9 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   nation. Every candidate goes through `CheckAttackLocation(attacker, defender, area)` 0xced17c (ret 4; area nil at
   0xcecddf: it picks one), and the search stops at the first True: at most one battle a month; a False goes on.
   `CheckForInvasionBattles` 0xd10228 reads the form's invasion state (+0x4a8c..+0x4a98, nation 0's);
-  `CheckRaiderVsPatrols` 0xcce6bc the pending raider battle (+0x4a1b). `DoPlayerDecline` 0xd4927c (callers: the map
+  `CheckRaiderVsPatrols` 0xcce6bc the pending raider battle (+0x4a1b) and every raider and patrol of the player and its
+  enemies (0.7.0: recorded in the view as an attempt of its own and run on the joined player's PC; see *Raider vs
+  patrol battles* below). `DoPlayerDecline` 0xd4927c (callers: the map
   question's No in `DoPossessionBattle` 0xcedfcb, and TfrmQuickBattle) adds to EnemyVP (+0x4a63), counts declines
   (+0x32ec; "High command demands action", Prestige -1 +0x198, FleetMorale -1 +0x19c) and may let the enemy invade the
   possession (+0x75 := the enemy, +0x7d InvadedThisTurn := 1, form +0x4a94/+0x4a98). A decline in the battle preview
@@ -373,6 +397,49 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   never sets Invaded for an invasion between computer nations. So invasion state of a joined nation's possession set on
   the host would be resolved as the host player's (or cancelled at peace): a joined nation's invasions need their
   resolution in its own view.
+- **Invasions in detail** (static and live, 2026-10-26, 1.01.44; the mod's use: MODLOG "invasions for joined
+  nations"):
+  - The month routine above names itself in its except handler: "Error in CheckRebellionAndInvasions procedure!"
+    (0xcfa182). Besides invasions it counts every possession's base expansion down (+0x32e; the "base expansion"
+    message and its "worried" tension rule only for nation 0's) and, at its tail (0xcf9907..0xcfa144, `8B 06 8B 78
+    6D`), runs the rebellions of the possessions nation 0 does not own. The player's target (`InvasionTarget` +0x4a8c)
+    and the computer's starts are only looked at when `Random(20) > Value` and the area has no invasion (0xcf9206,
+    0xcf9219). The player's start: Invaded := 0, InvadedThisTurn, Support 1, the plan cleared, or
+    `InvasionBattlePending` := 0 (a battle next month), else "delayed" texts; the computer's: a 5:1 landing ("Taking
+    advantage of our naval weakness in ...") or `InvasionBattlePending` := its index with `EnemyInvasionTarget`, else
+    "Enemy fleets dominate the seas around <p>. Lose <20 x Value> VP!" (EnemyVP +0x4a63). `InvadedThisTurn` (+0x7d) is
+    never saved: a reload clears it.
+  - `DoStrategicTurn` sets `InvasionBattlePending` := -1 at its start (0xce1bf5), before the routine: a pending battle
+    lives from one month's resolution to the next month's battle search only.
+  - `CheckForInvasionBattles` 0xd10228 (from `CheckForBattles2`, War > 0, before the raider checks and the attack
+    locations): a pending battle of the enemy may be dropped (the player much stronger in the area: `Random(100) <
+    40`; the enemy's mission range); Pending 0 -> `DoPossessionBattle(P, Target.Owner, area, Target)`, Pending > 0 ->
+    `DoPossessionBattle(GetBNation(Pending), P, area, EnemyInvasionTarget)`; then every invaded possession with
+    `Random(100) < 60` (the target and the enemy's target 30 %): owner P -> the invader attacks P, else P attacks the
+    owner, without asking whose invasion it is. It returns `DoPossessionBattle`'s result; a False goes on to the next
+    possession, then to the rest of the battle search (two encounters a month are possible).
+  - `DoPossessionBattle` 0xced48c returns `DoBattle`'s result, False after a decline. Its texts "The enemy is
+    preparing to invade <p>!" / "Our troops are embarking for the invasion of <p>!" (Embarking.jpg), then the map
+    question: in 1.01.44 `MapMessageDialog` hides its Decline (0xc152ce `mov bl, 1`: one button, "Generate battle"),
+    so the player declines only in the battle preview (disabled when the player defends). `AIDeclinesBattle` (0xcede99,
+    Implement): the player's target -> Invaded := 0, InvadedThisTurn, Support 1, plan cleared, "Our invasion of <p>
+    goes ahead with no interference from the <X> navy!"; else an invasion of the player's gets Support + 2. Without
+    the player's ships in the area the battle setup gives "Friendly ships not available to oppose the enemy in the
+    area! Enemy gains N VP!" and, for the enemy's pending landing, "With our fleet unable to interfere, enemy troops
+    invade <p>!" (0xbe7040: Invaded := the enemy, Support -1, the plan cleared, no InvadedThisTurn).
+  - After a tactical battle the battle's end routine (TfrmMain, unnamed; call 0xdc6001) runs `HandleInvasionResults`
+    0xd29204 then `HandleBattleAftermath`: the result level `+0x4a9c` (set by that routine, 0xdc3f84..0xdc5ff4): the
+    player's battle at its target with Pending 0: level 0 "The result of the battle does not warrant a continuation
+    of our invasion attempt" (Target := nil), else the landing (Invaded := 0, InvadedThisTurn; level 2 Support 1);
+    the enemy's (Pending > 0, its target): level 0 "The enemy invasion has been averted!", else "Enemy troops have
+    landed" (Invaded := Pending, InvadedThisTurn; level 2 Support -1). Pending is not reset there.
+  - `DoPeace` clears every possession's Invaded, InvasionSupport and TakenFrom and the plan (EnemyInvasionTarget,
+    Pending 0xcbc78a; Target, Count 0xcbcdb4).
+  - `TBuilderNation.GetMostImportantArea(var aValue, ForSubs)` 0xc5e2ac (the computer's fleet priorities; areas'
+    `AIPriorityPoints` +0x172, reset at its start): its possession with Invaded 0 (the player invades it) +80 ("is
+    invaded by player"), its own invasion (Invaded = its index) "is invaded by nation", and for a nation at war with
+    the player (its Tension > 40, 0xc5ee1b) the area of the form's `EnemyInvasionTarget`: Random(15) + 6 (" If at
+    War. Enemy invasion area"; Random(8) + 2 without own possessions there).
 - **Nation 0's per-relation state lives in the other nations' records** (static, 2026-10-20): `Tension` +0x256 and
   `Allied` +0x29a (the relation), `WillGoToWar` +0x1bd (the nation's war plan against nation 0, counted down by
   CheckForWar; DoPeace clears it), `TechSharing` +0x29e (nation 0's tech-sharing deal), `IntelEffort` +0x1ac (nation 0's
@@ -902,6 +969,47 @@ Static reading of 1.01.44 and live runs of 2026-10-25 on 0.6.0 and 0.6.1-dev
   (the list view filled again first); a hook of `LoadCampaignDivisions` drops repeated `CDivId`s and nil ships after the
   call and, for a joined player's own slot, makes `PlayerNation` the player's nation during the call.
 
+## The legacy fleet: the manual build of the starting fleet
+The title screen's **Manual build of legacy fleet** (`TfrmSelectNation2.cbManualFleetBuild`, +0x4ac, unchecked by
+default; the label's `lbLegacyFleetClick` only toggles it) lets the player build nation 0's starting fleet by hand.
+Static reading of 1.01.44 (0.7.0 investigation), proven live for a joined player's nation (MODLOG
+[the legacy fleet for joined players](../MODLOG.md#feature-2026-10-25-the-legacy-fleet-for-joined-players-v070-dev)).
+
+- **The new-game routine** is unnamed (0xbc8f68, called from `bnSlotOKClick`). It gives every nation
+  `Funds = 4 x GetModifiedBudget()` (0xbc963c) and sets `TfrmBuildCamp.StartBuild` (+0x32f8, `TStartBuild`:
+  0 `sbBuild`, 1 `sbUnderConstruction`, 2 `sbNormal`) to 0. It then builds the batteries and (1920 and later) the
+  coastal submarines of every nation, and branches on the checkbox at 0xbc994f:
+  - **Automatic:** `AIBuildInitialFleet(StartYear, BNation[i])` for i = 0-8, StartBuild 1, `AIMonthlyBuild` for the
+    ships under construction (nation 0 too), `SetButtonsToNormal` (StartBuild 2).
+  - **Manual** (0xbc9de7), for `PlayerNation` only: Prestige - 1; `Funds = trunc(round(Funds x 0.9) x
+    InitialFleetModifier / 10)` (the IFM comes from the nation's data, `LoadMe` key `IFM`, and is not in the save);
+    `btbnTurn` "Continue", `lbWar` "Construct initial fleet" shown, the Turn, Design and Build buttons enabled (vmt
+    +0x9c = `TControl.SetEnabled`); the build-year global (the cell before LayDownShip's `mov [esi+0xe4],eax`) = 1899;
+    `TdlgPictureMessage.ShowPicMessage('Build your existing fleet', 'ShipConstruction.jpg')`. The routine returns to
+    the strategic screen: the AI fleets are not built yet.
+- **Building** uses the normal screens. The designer (`TfrmDesignMain2.ExecuteBC`) marks a start-build design and
+  skips the "largest ship in the world" check. `LayDownShip` (0xc8b3a8) in sbBuild makes the ship complete, built 1899
+  in a 1900 campaign (1889 in 1890, else the build-year global), and takes its cost from the owner's Funds. The funds
+  check ("You do not have the funds to build that ship!") applies only to `PlayerNation` while the title screen's
+  checkbox is ticked (0xd10e20 reads it). In sbUnderConstruction a ship is laid down "in StartYear - 1" for a
+  twentieth of its cost.
+- **Continue** (`btbnTurnClick`, 0xd57934, before the month's own code):
+  - **StartBuild 0:** "Are you finished building your initial fleet?". Then `cap = ([General] FleetSize + 1) x 3000`
+    (FleetSize global from `LoadBuildCampaign`, 0xf4c914), "Remaining funds over cap will be lost" and Funds = cap.
+    `PlayerNation.AssignOfficersToUncommandedShips`, officers to the pool, then `AIBuildInitialFleet` for **list
+    indices 1-8**, StartBuild 1, "Select ships under construction" (lbWar, picture message).
+  - **StartBuild 1:** "Are you finished selecting ships under construction?", then `AIMonthlyBuild` for indices 1-8
+    (x2, +1 if FleetSize > 3, +1 if > 6), StartBuild 2 and `SetButtonsToNormal`.
+- **The computer answers the manual fleet.** `AIBuildInitialFleet` (0xca3708) reads the checkbox: twice it builds one
+  extra light (and heavy) cruiser for each AI nation when the player built more than Random(FleetSize + 10) of them.
+  The AI's own budget: Funds x IFM / 10 (x2 or more in 1935, more in 1920).
+- **Not saved:** StartBuild is not in the save; `LoadBuildCampaign` calls `SetButtonsToNormal`, so a load ends a
+  start build.
+- **For another nation, later:** everything above uses `PlayerNation`, not nation 0, apart from the loops by list
+  index. So the mod repeats the manual branch on a loaded campaign for a joined player's K (the client's PlayerNation),
+  with the AI loops and the officers skipped, after clearing K's generated fleet and designs in the files
+  (ARCHITECTURE: [the legacy fleet](ARCHITECTURE.md#the-legacy-fleet-of-joined-players-070)).
+
 ## Tactical battles
 The battle facts, gathered since the battle investigation of 2026-10-14; the later findings carry their dates.
 
@@ -1170,6 +1278,27 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     StartMinute 0xdab6f8 → `AIDetermineTacticalStance2` 0xdc108c → one routine per ship type, 0xdb726c / 0xdba690 /
     0xdbd104 / 0xdc0010, then the course routine 0xd968e4; `CheckAllDivAfterMove` 0xdb0bb4 in EOTP;
     `MoveDivisionShips` 0xdb39cc copies it into each ship's `DivisionIsAIControlled` every minute).
+  - *References to divisions whose ships are gone* (fix 0.7.0). `AIDetermineTacticalStance2` (0xdc108c, a `TfrmMain`
+    method without an RTTI name: Self in EAX, the division in EDX; callers: the StartMinute loop 0xd95c68,
+    `DetachShip` 0xdac0e2 for the new division, `CheckAllDivAfterMove` 0xdb115d when a rescuer is more than 10100
+    yards from `myRescueShip` +0xd2) catches its own exceptions and shows "Error in AIDetermineTacticalStance2
+    procedure!" once per battle screen (`TfrmMain` +0x73d). Its stance routines read the flagship of the division's
+    `LeadDivision` (+0x3c) and `TargetDiv` (+0x27) without checking that division still has ships: the destroyer
+    routine, for `Role` drSupport (2) or drScreen (4), calls `LeadDivision.GetFlagship.IsBigShip` (0xdbddc4..0xdbddd6;
+    the other three routines read `LeadDivision.GetFlagship` unguarded too, e.g. 0xdb778d). `GetFlagship`
+    (0xe51468) is `Ships[0]`, nil for no ships; `TFightingShip.IsBigShip` (0xe3b5c0) reads `ShipType` +0x9d3 first:
+    the 0.7.0 RC1 box "Access violation at address 006EB5C0 ... Read of address 000009D3" (image base 0xe0000 in that
+    run). The game's invariant: sunk ships leave their division in `AllShipsCheckSinkings` (0xd93740 →
+    `TDivision.DeleteShip`, EOTP 0xdafa39), then `CheckAllDivAfterMove` (0xdafa41) walks the division list backwards:
+    a division whose `LeadDivision` has no ships gets `LeadDivision` := nil and `Role` := drIndependent (0xdb0cb5); a
+    division without ships is removed (`RemoveDivision` 0xdce054 → `RemoveDivFromForces`, `RemoveAsDivTarget` 0xda6738:
+    every `TargetDiv`/`LeadDivision` pointing to it := nil; the division is kept in the list at [0xf27600], not
+    freed). Inside that walk (the rescuer's call at 0xdb115d) and wherever a division empties outside it (the
+    reattach of a detached division to its `InitialDivision` +0xb1d, 0xdc7020, empties it after its own check) the
+    references can point to a division without ships until the next walk. Since 0.7.0 the lockstep hooks put a guard
+    before the routine (`LS_StanceGuard`, all battles once the hooks are in: a live battle, the host's battle after a
+    drop): an empty `LeadDivision` becomes nil with `Role` drIndependent, an empty `TargetDiv` nil, as the walk does,
+    with the log line `lockstep: stance guard: division '<name>' ...`.
     `TForce.AIControlled`: force decisions (`CheckForceWithdrawal`'s flotilla attacks 0xdaf1a1, the survivor, port
     arrival and sighting paths above, `CheckAllForcesForHumanFlagDivs`, `SetAIAirSearchPlan`).
     `TFightingShip.ForceIsHumanControlled`: `TForce.CheckSearchAircraft` (0xe5a334: human ships launch floatplanes only
@@ -1435,12 +1564,43 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     play; nation order does not matter), so the mod runs it on the joined player's PC. Harmless: `[0xfb591c]` (a
     once-a-month aircraft message flag). The host player's invasion fields (+0x4a8c, +0x4a94, +0x4a98) are loaded from
     the save too (`InvasionCount` +0x4a90 is not).
-  - *Raider vs patrol battles (static, 2026-10-23).* `CheckRaiderVsPatrols` 0xcce6bc -> `CheckRaiderInterceptions`
-    0xccee94 (records one interception in `PendingRaiderBattle` +0x4a1b: flag, +0x4a1c/+0x4a20 the ships, +0x4a24 the
-    enemy nation, +0x4a28 the area, +0x4a2d the caption, +0x4a31 the side; writes the "thwarts raider" lines) ->
-    `CheckPendingRaiderBattle` 0xcd1910 (`TdlgMapMessage.RaiderBattleDialog`: `QuickResolveRaiderBattle` 0xd0b534,
-    which calls `DoStrategicTurn`, or a tactical battle set up by 0xbdbf1c without `DoBattle`). DoTurn2 and
-    DoStrategicTurn clear the pending flag.
+  - *Raider vs patrol battles (static 2026-10-23; 0.7.0 static and live 2026-10-26).* `CheckForBattles2` calls
+    `CheckRaiderVsPatrols` 0xcce6bc at two places, each after `Random(100) < 30` (0xcecb7e after the invasion check;
+    0xcecfbc in the `GetRandomEnemy` passes after a `CheckAttackLocation` that found nothing); a True ends the search
+    like any battle. `CheckRaiderVsPatrols`: War > 0 (`[0xf52ff4]`, the routine 0xccd5fc) else False; loop 1, i = 1..8
+    with `GetBNation(i).Tension` (+0x256) > 40 and not i.`Blockaded` (+0x1c5): `CheckRaiderInterceptions`(PlayerNation
+    raids, i defends); loop 2, i = 0..8 with Tension > 40 and not PlayerNation.`Blockaded`: (i raids, PlayerNation
+    defends); then `CheckPendingRaiderBattle` 0xcd1910(force = False), whose answer it returns.
+    `CheckRaiderInterceptions` 0xccee94: every raider (Status 4, `IsOperational`) of the raiding nation against every
+    operational ship of the defender in the same `LocationArea` (+0x82): Status 3 or 6 (trade protection, foreign
+    station) of type 1, 3, 4 or 6 over 1000 t; Status 4 with `Random(100) < 20`; any other status only when the
+    defender's own Tension field is >= 40 (so never the player's ships), type 3 or 4 and `Random(100) < 15` (type 10
+    over 1000 t with `Random(100) < 25` outside the defender's home area). The chance c = (10, or 8 with a short range)
+    + 2 when `Random(3)` < AircraftCapacity, - 1 for cramped quarters or range 0, ..., times 3 (a carrier: 1).
+    `Random(150) < c` with no interception yet records one in `PendingRaiderBattle` (+0x4a1b): +0 the flag, +1 the
+    player's ship, +5 the enemy's, +9 the enemy nation (`BuilderNations` index), +0xd the area (`MapAreas` index),
+    +0x11 0, +0x12 the caption ("<defender> ship intercepts <raider's nation> raider <type and name> in <area>." when
+    the player raids, side +0x16 = 0; "<defender> ship <type and name> intercepts <raider's nation> raider in <area>."
+    when the player patrols, side 1; the nations' `Name` +8). Then the thwart:
+    `Random(100) < 2c` (or, after an interception, `Random(80) < 2c`): "Patrolling ship <patrol> thwarts <nation>
+    raider <raider> attack on merchant shipping in <area>!" into `TurnMessages` (+0x3208, the player's turn report) and
+    `RaiderSummary` (+0xa73), both ships `Used` (+0x37) := 1; after 1925 also "Patrolling aircraft thwarts ..." (the
+    raider `Used`). `Used` stops `CheckRaiderSinkings` for that raider in the month's `DoStrategicTurn` (it resets Used
+    there) and keeps a ship out of a battle's forces; `ResetUsedShips` (DoTurn2 0xce1794, DoBattle) clears nation 0's
+    and the opponent's. `CheckPendingRaiderBattle`: War = 0 and not forced: the flag cleared, False; else with the
+    flag: `BattleText` "Raider battle in <area>", a point of the area (`Random(3)`, closer than 650 + 150 i to the
+    player's bases), `TdlgMapMessage.RaiderBattleDialog(caption, point)` 0xc154d8 (modal; `bnAccept` "Fight Battle",
+    ModalResult 1 -> True; `bnDecline` "Auto resolve", 2 -> False). False: `QuickResolveRaiderBattle`(patrol, raider,
+    side) 0xd0b534 (its only caller): "Intercepted ship ... escapes.", "Intercepting ship ... retires from larger
+    enemy.", sinkings (`SinkShip`, "Enemy ship ... sunk by our raider ...", "Our raider ... sunk by enemy ship ...",
+    the player's VP +0x175 / `EnemyVP` +0x4a63 by `GetLogAdjustedVP(GetApproxVP)`, `KillCommander`) or "... both ships
+    damaged in indecisive battle.", each a `ShowMessagePos` box, then `DoStrategicTurn` and `UpdateUIValues`. True:
+    `DoAutosaveBeforeBattle(-1)`, `BattleArea` := nil, `frmMain` freed and created again, the battle set up by 0xbdbf1c
+    (the two ships, the enemy, the side, the point, the area) without `DoBattle`; its end runs `HandleBattleAftermath`.
+    Either way True. The flag stays set (DoTurn2 and DoStrategicTurn clear it). The test menu's
+    `TestRaiderBattle1Click` 0xd58c98 fills the record and calls `CheckPendingRaiderBattle(True)`. `Random(n)`
+    0x837834 is `push eax; call [0xf1c040]; pop edx; mul edx; mov eax, edx` (a 32-bit draw from the procedure in the
+    cell, scaled).
 - **Missiles (2026-10-17, static reading of 1.01.44, for engine level 9; `verify_p4.py` checks the patterns).** The
   weapons research of 2026-10-16 (`limits-weapons.md` §2, §3) with the details the build needed.
   - *Automatic fire.* `CheckMissileFiringForAllShips` (0xda91fc, EOTP after 1940), per division with ships and `Side` <

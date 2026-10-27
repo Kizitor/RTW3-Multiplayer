@@ -14,7 +14,7 @@ enum {
     IDC_ADDRS = 1020, IDC_STATUS,
     IDC_PLAYERS = 1030,
     IDC_NATION = 1040, IDC_CLAIM,
-    IDC_LIMIT = 1050, IDC_SETLIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE,
+    IDC_LIMIT = 1050, IDC_SETLIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE, IDC_LEGACYALLOW, IDC_LEGACYBUILD,
     IDC_START = 1060, IDC_ADVANCE, IDC_RELEASE,
     IDC_CHATLOG = 1070, IDC_CHATIN, IDC_SEND,
     IDC_DIPLOLBL = 1080, IDC_DIPLO, IDC_DWAR, IDC_DALLY, IDC_DPEACE, IDC_DLEAVE, IDC_DCANCEL,
@@ -435,6 +435,16 @@ static void OnCommand(int id) {
             SaveCfg();
             mp::SetAutoStrike(g_cfg["autostrike"] == "1");
             break;
+        case IDC_LEGACYALLOW:  // the host's option: joined players may build their legacy fleet by hand (first month)
+            g_cfg["legacy"] = SendDlgItemMessageW(g_wnd, IDC_LEGACYALLOW, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0";
+            SaveCfg();
+            mp::SetLegacyAllowed(g_cfg["legacy"] == "1");
+            break;
+        case IDC_LEGACYBUILD:  // the joined player's choice (read when the campaign's first month arrives)
+            g_cfg["legacybuild"] = SendDlgItemMessageW(g_wnd, IDC_LEGACYBUILD, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0";
+            SaveCfg();
+            mp::SetLegacyWanted(g_cfg["legacybuild"] == "1");
+            break;
         case IDC_START: {
             int r = mp::StartSession();
             if (r == 1)
@@ -578,6 +588,12 @@ static void CreateMpWindow() {
     HWND autoStrike = Ctl(L"BUTTON", L"Computer flies carrier strikes in live battles", WS_TABSTOP | BS_AUTOCHECKBOX, 10,
                           y, 330, 20, IDC_AUTOSTRIKE);
     SendMessageW(autoStrike, BM_SETCHECK, g_cfg.count("autostrike") && g_cfg["autostrike"] == "1" ? BST_CHECKED : BST_UNCHECKED, 0);
+    HWND legacyAllow = Ctl(L"BUTTON", L"Manual legacy fleets", WS_TABSTOP | BS_AUTOCHECKBOX, 345, y, 145, 20,
+                           IDC_LEGACYALLOW);
+    SendMessageW(legacyAllow, BM_SETCHECK, g_cfg.count("legacy") && g_cfg["legacy"] == "0" ? BST_UNCHECKED : BST_CHECKED, 0);
+    HWND legacyBuild = Ctl(L"BUTTON", L"Build my legacy fleet by hand (a new campaign's first month)",
+                           WS_TABSTOP | BS_AUTOCHECKBOX, 10, y, 400, 20, IDC_LEGACYBUILD);
+    SendMessageW(legacyBuild, BM_SETCHECK, g_cfg.count("legacybuild") && g_cfg["legacybuild"] == "1" ? BST_CHECKED : BST_UNCHECKED, 0);
     y += 28;
     Ctl(L"BUTTON", L"Start session", WS_TABSTOP, 10, y, 150, 30, IDC_START);
     Ctl(L"BUTTON", L"Advance turn now", WS_TABSTOP, 170, y, 150, 30, IDC_ADVANCE);
@@ -698,9 +714,12 @@ static void RefreshInner() {
     EnableWindow(GetDlgItem(g_wnd, IDC_SETLIMIT), host);
     EnableWindow(GetDlgItem(g_wnd, IDC_LIMIT), host || none);
     EnableWindow(GetDlgItem(g_wnd, IDC_AUTOSTRIKE), host || none);
+    EnableWindow(GetDlgItem(g_wnd, IDC_LEGACYALLOW), host || none);
+    ShowWindow(GetDlgItem(g_wnd, IDC_LEGACYBUILD), client ? SW_SHOWNA : SW_HIDE);  // (the host's controls' row)
     EnableWindow(GetDlgItem(g_wnd, IDC_START), host && v.phase == mp::Phase::Lobby);
     EnableWindow(GetDlgItem(g_wnd, IDC_ADVANCE), host && v.phase == mp::Phase::Planning);
-    for (int id : {IDC_START, IDC_ADVANCE, IDC_RELEASE, IDC_SETLIMIT, IDC_LIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE})  // host-only controls
+    for (int id : {IDC_START, IDC_ADVANCE, IDC_RELEASE, IDC_SETLIMIT, IDC_LIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE,
+                   IDC_LEGACYALLOW})  // host-only controls
         ShowWindow(GetDlgItem(g_wnd, id), client ? SW_HIDE : SW_SHOWNA);
     EnableWindow(GetDlgItem(g_wnd, IDC_SEND), !none);
 
@@ -944,6 +963,8 @@ void Init(HINSTANCE inst) {
                              L"Times New Roman");
     LoadCfg();
     mp::SetAutoStrike(g_cfg.count("autostrike") && g_cfg["autostrike"] == "1");  // the host's live-battle option
+    mp::SetLegacyAllowed(!(g_cfg.count("legacy") && g_cfg["legacy"] == "0"));      // 0.7.0, default on
+    mp::SetLegacyWanted(g_cfg.count("legacybuild") && g_cfg["legacybuild"] == "1");  // default off
     mp::g_onChanged = [] { Refresh(); };
     mp::g_onNotice = [](const std::string& s) { Notice(s); };
     mp::g_onReveal = [] { RevealMpWindow(); };

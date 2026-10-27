@@ -28,6 +28,7 @@ enum : uint16_t {
     MSG_LOCKSTEP,       // live player-vs-player battles (relayed by the host)
     // Relations v2 (a number of its own, away from the sequence other branches extend; older peers ignore it):
     MSG_RELATIONS = 40,  // player -> host: what the player's relation routines changed for its nation this month
+    MSG_LEGACY = 41,     // player -> host: the player's legacy build started / ended (0.7.0; a notice; older hosts ignore it)
     EV_CONNECTED = 0xFF00,
     EV_DISCONNECTED = 0xFF01,
 };

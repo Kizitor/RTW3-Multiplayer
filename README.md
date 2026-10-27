@@ -39,8 +39,8 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
   winner, as in single player: land, ships and reparations.
 - Each joined player's nation follows the player's rules of single player with the computer's nations: its own
   tension changes, war warnings, wars and peace, with their dialogs on that player's screen at the start of the month,
-  the effects of its wars (blockades, allies, the raider and submarine war), and the player's money rules (see
-  [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)).
+  the effects of its wars (blockades, allies, the raider and submarine war), its invasions, and the player's money
+  rules (see [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)).
 - Every player fights their own nation's tactical battles on their own PC; battles between players are fought live by
   both players at the same time (see [Tactical battles](#tactical-battles)).
 
@@ -89,9 +89,10 @@ Hamachi example:
 
 **Video walkthrough (1 minute):** [docs/hosting.mp4](docs/hosting.mp4). It shows the host's screen from the title
 screen to the first processed month; a second copy of the game plays the joined player "Captain". The video and the
-pictures below were made with version 0.1: today's Multiplayer window also has the **Fight my battles** and
-**Computer flies carrier strikes in live battles** checkboxes and the Diplomacy list. The addresses in them are
-examples.
+pictures below were made with version 0.1: today's Multiplayer window also has the **Fight my battles**,
+**Computer flies carrier strikes in live battles** and **Manual legacy fleets** checkboxes (a joined player sees
+**Build my legacy fleet by hand (a new campaign's first month)** in their place) and the Diplomacy list. The
+addresses in them are examples.
 
 1. Open **Multiplayer**, enter your name, optionally a password and a turn time limit in minutes (0 = none), and
    press **Host game**. Players can join and pick nations right away. Give them the VPN address shown under the
@@ -127,6 +128,12 @@ examples.
   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops)).
 - **Carrier strikes in live battles:** tick **Computer flies carrier strikes in live battles** to let the computer
   fly both sides' carrier strikes (see [Commands in live battles](#commands-in-live-battles)).
+- **Legacy fleets of joined players:** with **Manual legacy fleets** ticked (the default), each joined player may build
+  their nation's starting ("legacy") fleet by hand in a new campaign's first month, as the game's **Manual build of
+  legacy fleet** lets you do for your own nation (see [Joining a session](#joining-a-session)). A hand-built fleet can
+  give a player an edge: the computer's nations built their fleets with the campaign and don't answer it (see
+  [Known limitations](#known-limitations)). Untick the box before you start the session to give every joined player
+  the fleet the game generated. The chat tells you when a player builds one and when it is in the campaign.
 
 ## Joining a session
 1. Open **Multiplayer**, enter your name, the host's IP (or use **Find LAN games**) and the password. Leave **Fight my
@@ -134,6 +141,17 @@ examples.
    before you join. Then press **Join game**.
 2. Choose a nation in the list and press **Claim nation**. You can do this before the host has a campaign; your pick
    is matched when the host opens one. A refused pick is explained in the chat.
+   - **To build your legacy fleet by hand** in a new campaign, tick **Build my legacy fleet by hand (a new campaign's
+     first month)** before the host starts the session, as you would tick the game's **Manual build of legacy
+     fleet** for a new campaign of your own. It works in the campaign's first month only, once, and only if the host
+     allows it (**Manual legacy fleets**). Your nation's generated fleet, its ship designs and its divisions (**Fleet
+     organization**) are then replaced by what you build: the game's own screens open in its "Construct initial
+     fleet" mode, with the game's budget for a manual build, as in single player (four months of your nation's budget
+     less 10 %, scaled by the nation's own factor in the game's data; your prestige drops by one). Design your classes
+     with **Design Ship**, build them with **Build ship**, then press **Continue**: money over the game's limit is
+     lost, as in single player. Choose your ships under construction, press **Continue** again, then plan the month
+     and **Submit** as usual. If the host starts the month first (its time limit or **Advance turn now**), your fleet
+     is submitted as it is.
 3. When the host starts, the month loads automatically and you play as your nation. Your copy lives in save slot
    `Game77` (your battles in `Game87`), so your own saves are never touched. At the start of each month, first answer
    your nation's dialogs: its random event, if any, and its relations (see
@@ -192,8 +210,8 @@ random event, then runs your nation's relation routines, and you answer their di
 - war plans with your spies' warnings and rumours, declarations of war ("Russia has declared war on us!"), and
   nations that join a war against you or on your side;
 - at a war's start with a computer nation, the game's surprise moves (with 0.6.0 on the host and on your PC): a
-  computer nation's takeover of an unowned possession, and a surprise attack, which you play after the month (see
-  [Battles against AI nations](#battles-against-ai-nations));
+  computer nation's takeover of an unowned possession, with 0.7.0 its landing in one of your possessions, and a
+  surprise attack, which you play after the month (see [Battles against AI nations](#battles-against-ai-nations));
 - at war with a computer nation, the help of your allies, the seizure of ships building in your enemies' yards and in
   yours, and a revolution in an enemy nation (with 0.6.0 on the host and on your PC; see *War effects* below);
 - at war with a computer nation, the game's peace offer, when it makes one (see *Peace* below).
@@ -222,7 +240,8 @@ and their messages come in your game's turn report at the start of the new month
   panel marks the blockades of your wars.
 - **The raider and submarine war:** your raiders and submarines sink your enemies' merchant ships and theirs sink
   yours, with victory points against each enemy, the game's messages and a monthly summary ("Trade war this month:
-  our raiders sank ...").
+  our raiders sank ..."). With 0.7.0, raiders and patrols also meet in battle (see
+  [Battles against AI nations](#battles-against-ai-nations)).
 - **War weariness:** your unrest grows when your war goes badly ("Our people is getting dissatisfied with the bad war
   situation!"), for the governments that the game applies it to.
 - **The wartime build rules:** construction delays, submarine building and the war budget ("War budget means
@@ -405,6 +424,37 @@ computer, as in single player.
   surprise attack trait strikes you, or you it ("Mobilize all ships for the surprise attack?"). The chat announces it
   ("* Surprise attack? Japan may strike Germany at the war's start. Captain plays it after the month."), and you play
   it with your battles after the month, not at once as in single player.
+- **Raiders and patrols:** with 0.7.0 on the host and on your PC and **Fight my battles** on, your raiders can be
+  intercepted by enemy patrols and your patrols (ships on trade protection or on a foreign station) can intercept
+  enemy raiders, with the game's chances of single player: the month's battle search checks the raiders up to twice
+  (each time with a chance of 30 %), and an interception is the month's battle. You play it with your battles after
+  the month: the game's dialog (for example "German ship CA Blücher intercepts Spanish raider in Northeast Asia.")
+  lets you *Fight Battle* (a tactical battle) or *Auto resolve* it (the game's quick resolution and its messages).
+  Either result goes back to the host: sunk and damaged ships, victory points. The chat announces such a month
+  ("* Battle? Germany's raiders and patrols may meet the enemy's. Captain plays it after the month."; with a battle
+  the search found first, its own line ends "..., or its raiders and patrols the enemy's."), and the host's chat
+  names the result ("* The raider battle of Germany against Spain in ... was auto-resolved by Captain."). The game's
+  lines "Patrolling ship ... thwarts ... raider ... attack on merchant shipping in ...!" come in your chat with the
+  new month. A raider check that intercepts nothing is no battle, and the month's search goes on as in single
+  player. Raider battles against the host's or another player's nation don't happen. With an older version on either
+  PC your nation has no raider battles (as with 0.6.x).
+- **Invasions:** with 0.7.0 on the host and on your PC, your nation invades and is invaded as the player is in single
+  player. Pick an invasion target with the game's own button (a possession of a computer nation you are at war with,
+  worth less than 10, within your invasion range); your turn sends it, and the host's chat says if it can't be taken
+  (for example a possession of the host's or another player's nation: invasions between players are not supported).
+  The target costs money every month, as in single player. After each month the host resolves your invasions with the
+  game's own rules, in your nation's view: the months of preparation, the weather, the strength of the fleets in the
+  area, landings, the fighting on land, captures, and the computer's invasions of your possessions (its landings, the
+  battles it plans and "Enemy fleets dominate the seas around ... Lose N VP!"). Its messages come in your turn report.
+  The invasion battles of single player come with your battles after the month (with **Fight my battles** on; without
+  it, an invasion battle that the month's invasions bring is dropped): your own invasion battle ("Our troops are
+  embarking for the invasion of ...!"), the enemy's landing in your possession ("The enemy is preparing to invade
+  ...!") and the battles in support of the land fighting. As in single player, a battle you decline, or one your
+  fleet can't fight ("Friendly ships not available to oppose the enemy in the area!"), lets the enemy land; a won
+  invasion battle lands your troops. A computer nation that starts a war on you with a surprise can land in your
+  possession at once, and the computer's fleets go to defend their possessions you invade and to escort their own
+  landings, as they do against the player. Your peace with a computer nation ends your invasions in that war and your
+  invasion plan; the host's peace leaves them alone.
 - Your battles against the host's nation and against other players' nations are live battles (below).
 
 ### Battles between players (live)
@@ -549,11 +599,21 @@ players' nations for the rest of that month. A battle between two joined players
   first player's PC.
 
 ## Known limitations
-- **Battles:** joined nations get no invasion battles and no battles between raiders and patrols yet (see *Not built
-  yet for joined nations* below), and submarine attacks are resolved by the game. The battles of a player who
-  doesn't fight their battles are resolved by the game too, or fought by the host against the computer when the
-  enemy is the host's nation. What live battles do differently: see
+- **Battles:** submarine attacks are resolved by the game. A raider that a patrol thwarts on your PC still sinks its
+  merchant ships of that month: the host's month counted the raiders' sinkings before your battles. The battles of a
+  player who doesn't fight their battles are resolved by the game too, or fought by the host against the computer
+  when the enemy is the host's nation. What live battles do differently: see
   [Differences from single player](#differences-from-single-player).
+- **Invasions of joined nations** (0.7.0) differ from single player in a few ways. They are resolved while the player
+  is connected: in a month your PC isn't, they wait. One invasion per possession: a newer one replaces an older one
+  (the host's log names it). The host's battles may change the land fighting's support in your invasions, as an
+  ally's battles would. With several computer enemies, the points of "Enemy fleets dominate the seas around ..." go
+  to the first of them in the game's list of nations. After you decline an invasion battle, the month brings no
+  other battle (in single player it may). Your nation's base expansions are completed without their message, and the
+  game's rule that a base expansion worries a neighbour (tension) is not applied to joined nations. Invasions between
+  players' nations are not supported: you can't pick a possession of the host's or another player's nation, but in a
+  war with the host's nation the host's game may still let your nation invade the host's possessions, as it lets a
+  computer nation.
 - **Victory points:** a joined player's *VP* counts what their nation scored in its wars, including battles against
   the host; *Enemy VP* counts the points of the nations at war with them. (The game itself only keeps the host's view,
   so the mod fills in a joined player's.) Points the host's enemies score outside battles (blockades, sinkings,
@@ -563,6 +623,13 @@ players' nations for the rest of that month. A battle between two joined players
   and the first air groups of newly launched carriers. Diplomacy between players is decided with the buttons, and a
   joined nation's relations with the computer's nations by the player's rules on its player's PC (see
   [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)).
+- **A legacy fleet built by hand** (see [Joining a session](#joining-a-session)) differs from single player in three
+  ways. The computer's nations don't answer it: their starting fleets were built with the campaign, while in single
+  player they add a few cruisers when your fleet has many. Its ships have no commanders, like every joined nation's
+  ships. And in a 1920 or 1935 campaign its finished carriers start without air groups: the game's reminder
+  ("... has no air units assigned!") is the host's own Turn check and doesn't come to joined players, and air groups
+  assigned on your PC don't reach the host's campaign. Carriers you lay down get their first air groups from the game
+  when they are launched.
 - **Design studies of joined players** count down every month on the host, including the game's occasional one-month
   "technical issues" delay, and the player is told in the Multiplayer chat when a design is ready for construction.
   The game's random committee and Air Force events about design studies only happen for the host's nation.
@@ -591,9 +658,6 @@ players' nations for the rest of that month. A battle between two joined players
   reach only the host, and what your nation knows about other navies' ships (classes, aircraft) is the host's. The
   Diplomacy list in the Multiplayer window shows your own relations with the other players.
 - **Not built yet for joined nations** (planned for a later version):
-  - invasions: your nation's own invasions and invasion battles, landings in your possessions (also an enemy's
-    surprise landing at a war's start), and an enemy's invasion of a possession after you decline a battle;
-  - battles between raiders and patrols (a patrol intercepting a raider);
   - in a war between two joined players' nations, neither side raids the other's merchant shipping, and ships
     building in each other's yards aren't seized;
   - the game's surprise attack from 1925 to 1934, a submarine attack without a battle.
@@ -633,9 +697,9 @@ players' nations for the rest of that month. A battle between two joined players
 - **Resigning** is not possible during a session: leave the session first.
 - **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
   play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same live-battle
-  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1 a new one), and a host on 0.4.0 or
-  newer pairs only players with its own (see [Battles between players](#battles-between-players-live)). Joined players
-  use save slot 77, and slot 87 for their battles.
+  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1 and 0.7.0 a newer one), and a host on
+  0.4.0 or newer pairs only players with its own (see [Battles between players](#battles-between-players-live)).
+  Joined players use save slot 77, and slot 87 for their battles.
 - **A host on 0.3.x** passes on the live battles between two joined players on 0.4.0, but can't start such a battle
   again for a player who dropped out: the computer keeps that player's ships to the end of the battle, although the
   other player's chat says they get them back by joining again. Update the host.
@@ -716,6 +780,16 @@ players' nations for the rest of that month. A battle between two joined players
   lost must be made again.
 
 ### Upgrading from an older version
+- **0.7.0** plays with 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and every player:
+  - 0.7.0 has the live-battle engine of 0.6.1 (18): players on 0.6.1 and 0.7.0 fight their live battles together, a
+    player on 0.6.0 or older can't (see 0.6.1 below).
+  - The legacy fleet built by hand needs 0.7.0 on the host (it offers the build) and on the player's PC (it builds the
+    fleet). With an older host or an older player, the player's nation keeps the fleet the game generated, and
+    nothing else changes. Existing campaigns can't use it: it comes only in a new campaign's first month.
+  - Raider battles and invasions need 0.7.0 on the host and on your PC: with an older version on either PC, your
+    nation has neither, as before. Under an older host, the invasion target on your screen is cleared at every
+    month's load: the month's save holds the host's own target, and the host wouldn't carry out yours.
+  - The host's own invasions no longer go on a month early with 0.7.0 on the host, whatever the players have.
 - **0.6.1** plays with 0.6.0, 0.5.0, 0.4.1, 0.4.0 and 0.3.x (protocol 3). Everyone must update for live battles, the
   host too:
   - 0.6.1 has a new live-battle engine (18): the check of the game data files leaves out the game's temporary files

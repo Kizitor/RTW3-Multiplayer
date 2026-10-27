@@ -2061,6 +2061,8 @@ void __stdcall LS_LandCap(int side);
 void __stdcall LS_SearchAir(void* force);
 int __stdcall LS_FireMissileMount(void* self, void* mount, void* ship, void* target, void* loc, int bearing, int n);
 int __stdcall LS_FireSSM(void* self, int side, void* loc);
+void* g_lsOrigStance = nullptr;
+void __stdcall LS_StanceGuard(void* self, void* div, void* ret);
 }
 
 // TfrmMain.FireMissileMount(Self=EAX, aMount=EDX, aShip=ECX; aTargetShip, aTargetLocation (a pointer to the TPointLL),
@@ -2111,6 +2113,22 @@ extern "C" __declspec(naked) void LS_dFireSSM() {
         jmp dword ptr [g_lsOrigFireSSM]
     skip:
         ret 28
+    }
+}
+
+// The division stance routine (AIDetermineTacticalStance2: Self=EAX, aDivision=EDX; no RTTI name, found through
+// DetachShip's call): LS_StanceGuard(Self, aDivision, its return address) first, then the routine with its registers.
+extern "C" __declspec(naked) void LS_dStance() {
+    __asm {
+        push eax
+        push edx
+        push dword ptr [esp + 8]
+        push edx
+        push eax
+        call LS_StanceGuard
+        pop edx
+        pop eax
+        jmp dword ptr [g_lsOrigStance]
     }
 }
 
@@ -2436,6 +2454,7 @@ static bool HookOne(void* target, void* detour, void** orig, const char* name) {
 }
 
 static void* DialogForm(const char* cls);
+static void* FindStanceRoutine();
 
 bool BeginTextCapture() {
     if (!g_showPicHooked) {
@@ -2551,6 +2570,12 @@ bool EnsureHooks() {
                                    "FireMissileMount")))
         g_featMissile = false;
     if (!(g_ssmHookable && HookOne(E.fireSSM, (void*)&LS_dFireSSM, &g_lsOrigFireSSM, "FireSSM"))) g_featMissile = false;
+    // The division stance routine: its stance routines read the flagship of the division's LeadDivision and TargetDiv
+    // without checking that division has ships left (LS_StanceGuard). Without the hook the game's routine runs as is.
+    void* stance = FindStanceRoutine();
+    bool stanceOn = stance && HookOne(stance, (void*)&LS_dStance, &g_lsOrigStance, "AIDetermineTacticalStance2");
+    Log("lockstep: the division stance routine's guard: %s (%p)", stanceOn ? "on" : "OFF (the routine was not found)",
+        stance);
     if (g_featMissile && !(E.mslDlgVar && dl::IsInstanceOf(*E.mslDlgVar, "TdlgMissileFire"))) {
         g_featMissile = false;
         Log("lockstep: manual missile salvoes OFF (the missile dialog was not found)");
@@ -7204,6 +7229,70 @@ static void OnSimFrameUnwound(int idx) {
     if (idx == kManual || !S.on || !S.minuteRunning) return;
     if (!S.minuteBroken) Log("lockstep: the running minute lost %s to an exception (t=%s)", g_ctx[idx].name, ClockText().c_str());
     S.minuteBroken = true;
+}
+
+// ---- The division stance routine's guard ----
+// AIDetermineTacticalStance2 (0xdc108c) runs one stance routine per ship type (0xdb726c / 0xdba690 / 0xdbd104 /
+// 0xdc0010). They read the flagship of the division's LeadDivision and TargetDiv without checking that this division
+// still has ships (the destroyer routine for drSupport/drScreen at 0xdbddc4: LeadDivision.GetFlagship.IsBigShip):
+// GetFlagship is nil then and IsBigShip reads +0x9d3 of it ("Error in AIDetermineTacticalStance2 procedure! ... Read of
+// address 000009D3"). The game keeps those references valid at the end of each minute: CheckAllDivAfterMove clears the
+// LeadDivision of a division whose lead has no ships left (0xdb0cb5: LeadDivision := nil, Role := drIndependent) and
+// removes a division without ships (RemoveDivision -> RemoveAsDivTarget: every TargetDiv and LeadDivision pointing to it
+// := nil). The guard applies those rules to the division the routine is about to judge, so a reference to a division
+// whose ships are gone reads as none, as it will after CheckAllDivAfterMove; it changes nothing else.
+static int g_fTargetDiv = -1, g_fDivRole = -1;
+
+static void* FindStanceRoutine() {
+    void* ds = dl::Method("TfrmMain", "DetachShip");
+    void* gf = dl::Method("TDivision", "GetFlagship");
+    void* big = dl::Method("TFightingShip", "IsBigShip");
+    int fAI = E.fDAI, fSinking = dl::Field("TFightingShip", "Sinking");
+    g_fTargetDiv = dl::Field("TDivision", "TargetDiv");
+    g_fDivRole = dl::Field("TDivision", "Role");
+    if (!ds || !gf || !big || fAI <= 0 || fAI > 0x7f || fSinking <= 0) return nullptr;
+    // DetachShip, the new division: cmp byte ptr [ebx+AIControlled], 0; je; cmp dword ptr [edi+Sinking], 0; jne;
+    // mov edx, ebx; mov eax, [ebp-8]; call AIDetermineTacticalStance2
+    uint8_t* h = Find(ds, 0x400, {0x80, 0x7B, fAI, 0x00, 0x74, -1, 0x83, 0xBF, fSinking & 0xff, (fSinking >> 8) & 0xff,
+                                  (fSinking >> 16) & 0xff, (fSinking >> 24) & 0xff, 0x00, 0x75, -1, 0x8B, 0xD3, 0x8B, 0x45,
+                                  0xF8, 0xE8});
+    if (!h) return nullptr;
+    uint8_t* fn = (uint8_t*)CallTarget(h + 20);
+    // its first test: mov eax, ebx; call GetFlagship; call IsBigShip
+    uint8_t* t = Find(fn, 0x80, {0x8B, 0xC3, 0xE8, -1, -1, -1, -1, 0xE8});
+    return t && CallTarget(t + 2) == gf && CallTarget(t + 7) == big ? fn : nullptr;
+}
+
+static int g_stanceFixes = 0;
+
+static void StanceFixNote(void* div, void* ret, void* lead, void* target) {
+    auto name = [](void* d) { return W2U(dl::ReadUStr(dl::At<void*>(d, E.fDivName))); };
+    std::string what;
+    if (lead) what += "its lead division '" + name(lead) + "' (LeadDivision := none, role independent)";
+    if (target) what += std::string(what.empty() ? "" : " and ") + "its target division '" + name(target) + "' (TargetDiv := none)";
+    Log("lockstep: stance guard: division '%s' (side %d) at t=%s, from rva %x: %s has no ships left%s", name(div).c_str(),
+        dl::At<int>(div, E.fDivSide), ClockText().c_str(), (unsigned)((uintptr_t)ret - (uintptr_t)dl::g_base),
+        what.c_str(), g_stanceFixes == 20 ? " (the last such line in this game)" : "");
+}
+
+extern "C" void __stdcall LS_StanceGuard(void* self, void* div, void* ret) {
+    int fTarget = g_fTargetDiv, fRole = g_fDivRole;
+    (void)self;
+    __try {
+        if (!div || E.fShips <= 0 || E.fLeadDiv <= 0 || fTarget <= 0 || fRole <= 0) return;
+        void* lead = dl::At<void*>(div, E.fLeadDiv);
+        void* target = dl::At<void*>(div, fTarget);
+        if (lead && dl::ListCount(dl::At<void*>(lead, E.fShips)) > 0) lead = nullptr;
+        if (target && dl::ListCount(dl::At<void*>(target, E.fShips)) > 0) target = nullptr;
+        if (!lead && !target) return;
+        if (lead) {
+            dl::At<void*>(div, E.fLeadDiv) = nullptr;
+            dl::At<uint8_t>(div, fRole) = 0;  // drIndependent
+        }
+        if (target) dl::At<void*>(div, fTarget) = nullptr;
+        if (++g_stanceFixes <= 20) StanceFixNote(div, ret, lead, target);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
 }
 
 static void AfterMinute() {

@@ -41,10 +41,23 @@ bool BuildStateBundle(const std::wstring& slotDir, int slot, int idOffset, Bundl
 bool ApplyStateBundle(const Bundle& b, const std::wstring& slotDir, int slot, std::string& err);
 // Client: extract this nation's data from its own saved slot (idStart = IDNo received with the month); 0.6.1: also its
 // campaign divisions ("divisions.ini": the [CampaignDivisions] section of the slot's .off; older hosts ignore it).
+// 0.7.0, legacy: the turn holds the legacy fleet the player built by hand ([General] MPLegacy=1, see ClearNationFleet).
 bool BuildSubmission(const std::wstring& slotDir, int slot, int nationIdx, long long idStart, Bundle& out,
-                     std::string& err);
-// Host: merge a client's submission into the host slot files.
+                     std::string& err, bool legacy = false);
+// Host: merge a client's submission into the host slot files. A legacy turn also drops the nation's air units based on
+// ships its new ship list no longer holds.
 bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const Bundle& sub, std::string& err);
+bool IsLegacySubmission(const Bundle& sub);
+
+// The legacy fleet of a joined player (0.7.0): in the campaign's first month the player builds the nation's starting
+// fleet by hand, as the game's "Manual build of legacy fleet" does for nation 0. ClearNationFleet puts nation K of a
+// slot's files into the state the game's manual build starts from: no ships ([NationKShips] empty, ShipCount=0), no
+// designs (DesignFilesK.des empty, DesignIDCount kept), none of K's air units based on those ships and no campaign
+// divisions (the slot's .off holds K's own list since 0.6.1, naming those ships: CampDivNo=0).
+bool ClearNationFleet(const std::wstring& slotDir, int slot, int K, std::string& summary, std::string& err);
+// Drops nation K's air units ([AirUnits] AU<n>...) whose HomeBase is one of `ids`, renumbering the rest. Returns the
+// count dropped.
+int DropAirUnitsOn(IniDoc& d, int K, const std::set<std::string>& ids);
 // Read [General] Year/Month from a slot's .bcs.
 bool ReadDate(const std::wstring& slotDir, int slot, int& year, int& month);
 // Read [General] IDNo from a slot's .bcs (-1 if unavailable).
@@ -68,11 +81,12 @@ bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::v
 // host names (nation numbers in them mapped back), plus the changes of K's VP/prestige/fleet morale and of J's VP.
 // ApplyBattleResult merges that into the host's save field by field (only what the battle changed relative to what was
 // sent, never the player's intel fields; ships no longer listed were sunk), for the nations in `allowed` only. It
-// changes `host` only if everything applies.
+// changes `host` only if everything applies. keepUsed (0.7.0, raider battles): the ships' Used marks stay the host's
+// (the raider check's thwarts mark ships Used; the month's raider sinkings on the host came before the battle phase).
 bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterBcs, int K, int J, Bundle& out,
                          std::string& summary, std::string& err);
 bool ApplyBattleResult(IniDoc& host, const std::string& sentBcs, int K, int J, const Bundle& result,
-                       const std::vector<int>& allowed, std::string& summary, std::string& err);
+                       const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed = false);
 
 // Campaign divisions (the strategic screen's Fleet organization): the [CampaignDivisions] section of a slot's .off as
 // TCampaignDivision.SaveMe writes it: CampDivNo=<n>, then for each division i < n the keys CampDiv<i><Field> with the

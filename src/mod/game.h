@@ -23,6 +23,19 @@ void* PlayerNation();
 int PlayerIndex();
 
 int StartBuildPhase();  // 0/1 = initial fleet phases, 2 = normal play
+// The legacy fleet of a joined player (0.7.0): the game's manual build of the starting fleet for the PlayerNation of a
+// loaded campaign (see game.cpp). EnterLegacyBuild starts it (StartBuild 0), LegacyShowStartMessage shows the game's
+// picture message (modal), LegacyCheckDone ends it once the game is back in normal play, FinishLegacyBuild ends it at
+// once without the game's questions.
+bool LegacyAvailable();
+bool LegacyActive();
+bool EnterLegacyBuild(std::string& info);
+void LegacyShowStartMessage();
+bool LegacyCheckDone(int* ships = nullptr, int* funds = nullptr);
+bool FinishLegacyBuild(int* ships = nullptr, int* funds = nullptr);
+void LegacyAbort();
+std::string LegacyFleetInfo();
+std::string DescribeControl(const char* formCls, const char* field);  // tests (bridge `vcl`)
 int CampaignStartYear();
 int CurrentSlot();
 void SetCurrentSlot(int slot);
@@ -161,16 +174,62 @@ int DoBattleCalls();               // how often the game's battle setup (DoBattl
 struct BattleAttempt {
     int a = -1, b = -1;
     std::wstring area;
+    int type = 0;  // 0.7.0: 0 CheckAttackLocation(a, b, area); 1 the raider check (CheckRaiderVsPatrols with a = K);
+                   // 2 the invasion check (CheckForInvasionBattles with a = K, K's invasions in its battle slot)
 };
 bool BattleGeneratorAvailable();
 bool BattleReplayAvailable();      // a battle slot here can replay the generator's attempts and report declines
-bool RunBattleGenerator(int K, int war, const bool human[9], std::vector<BattleAttempt>& out, std::string& err);
+// raiders (0.7.0): the view records the game's raider checks too (type 1; only for a PC that replays them, hello gen 3)
+// invasions (0.7.0): the view records the game's invasion check (type 2; a PC that replays it, hello gen 4, for a
+// nation with invasions or an invasion plan)
+bool RunBattleGenerator(int K, int war, const bool human[9], std::vector<BattleAttempt>& out, std::string& err,
+                        bool raiders = false, bool invasions = false);
+// 0.7.0: raiders against patrols for a joined nation, in its battle slot (K = nation 0): the game's CheckRaiderVsPatrols
+// (CheckRaiderInterceptions for its raiders and the enemies', the "thwarts" lines, at most one interception, then
+// CheckPendingRaiderBattle: the player's choice between a tactical battle and QuickResolveRaiderBattle). `mask`: nations
+// (this game's indices) that read Tension <= 40 meanwhile (the nations people play). TEST ONLY: testSide 0/1 with
+// testEnemy: an interception of that side is forced (TestForcedRaid).
+struct RaiderCheck {
+    bool ran = false, result = false;  // the game's routine ran; its answer (an interception was fought or resolved)
+    bool pending = false, quick = false;  // an interception was recorded; QuickResolveRaiderBattle ran (auto resolve)
+    int enemy = -1, side = -1;  // the enemy nation (this game's index); 0 the player's raider intercepted, 1 its patrol
+    std::wstring area, caption;
+    std::vector<std::wstring> news;  // the turn messages it added (the "thwarts" lines)
+    std::string test;                // the forced test setup (log text)
+};
+bool RaiderReplayAvailable();
+RaiderCheck StartRaiderCheck(const std::vector<int>& mask, int testSide = -1, int testEnemy = -1);
+// 0.7.0 (invasions, P3): the game's CheckForInvasionBattles in a joined nation's battle slot (K = nation 0, its
+// invasions put in by inv::SlotPut): the enemy's pending landing, K's own invasion battle at its target, the battles
+// for invaded possessions (the player's question, the computer's decline, the player's: DoPlayerDecline, the enemy
+// lands). `mask` as for StartRaiderCheck.
+struct InvasionCheck {
+    bool ran = false, result = false;  // the game's routine ran; its answer (a battle was fought)
+    std::vector<std::wstring> news;    // the turn messages it added
+    int plain = -1;                    // TEST ONLY: a plain check (`battles testinv 1`): how often its hooks answered
+};
+bool InvasionReplayAvailable();
+InvasionCheck StartInvasionCheck(const std::vector<int>& mask);
+// TEST ONLY: the next invasion check is plain (the computer does not decline, the player is not caught out); false if
+// the hooks for it are not available.
+bool SetTestInvasionPlain(bool on);
+// 0.7.0 (fix-afb): the game's AdjustForcesForBattle gives the reinforcements of an intelligence coup's ambush the
+// player's nation (it left them an unset local: its access-violation box). TEST ONLY (`battles testcoup <0|1|2>`): the
+// next AdjustForcesForBattle on this PC runs as an ambush that finds the player's side the weaker (2: without the mod's
+// nation, the game's box); false if unavailable.
+bool AmbushFixAvailable();
+bool SetTestCoup(int mode);
+long TestCoupRuns();  // TEST ONLY: the setups the switch made an ambush
+int RunHostInvasionCheck();  // TEST ONLY (host): the game's CheckForInvasionBattles for the host (1/0, -1 exception)
+int QuickRaiderCalls();            // how often the game's QuickResolveRaiderBattle ran
 // 0.6.0 (B6's view, shared with B5), host: K's view of the campaign (K at index 0 and as PlayerNation, the host's nation
 // at index K, relation and alliance cells permuted, War := `war`; human[real index] nations read Tension <= 40 with K).
 // Not nested; false (nothing changed) when the campaign is not in place. No game exception may unwind through it:
 // game calls inside go under __try. HostViewLeave puts everything back. Nation(i) answers view indices meanwhile.
 bool HostViewEnter(int K, int war, const bool human[9]);
 void HostViewLeave();
+// 0.7.0 (invasions): the game's ShowMessage boxes recorded instead of shown (on); off returns the last text ("" none).
+std::wstring SetBoxCapture(bool on);
 int PlayerDeclineCalls();          // how often the game's DoPlayerDecline ran (the player declined a battle)
 // 0.6.0: the player's decline counts (form DeclineCount, saved with the campaign, and EnemyDeclineCount, which the game
 // saves but never loads: a battle slot holds the host player's and this PC's last): a joined nation's own are put in
@@ -359,6 +418,11 @@ struct PlayerTurnSetup {
     bool surprise = false;
     int testSaNation = -1;
     bool testSaK = false, testTakeover = false, testSaDry = false;
+    // 0.7.0 (invasions, P4): CheckForWar's surprise landing in K's possession runs as in single player and is recorded
+    // (a host with welcome `gen` 4, which keeps K's invasions); else it stays out (B6 piece 2). TEST ONLY: testLanding:
+    // the landing's pick is K's first possession worth < 200 in the area and its strength test passes.
+    bool landings = false;
+    bool testLanding = false;
 };
 struct PairChange {
     int a, b, before, after;  // a < b
@@ -389,6 +453,8 @@ struct PlayerTurnResult {
     // ""), and the unowned possessions taken over (ChangePossessionOwner, from -1)
     std::vector<BattleAttempt> surprise;
     std::vector<PeaceLand> takeovers;
+    // 0.7.0 (P4): the surprise landings in K's possessions (name; `to` = the landing computer nation, real index)
+    std::vector<PeaceLand> landings;
 };
 bool AllyHelpAvailable();  // B5 (d): WarHelpFromAllies for K in its view
 bool BuildWarAvailable();  // B5 (e): CheckBuildingShipsForWar for K in its view

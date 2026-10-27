@@ -7,6 +7,7 @@
 #include "net.h"
 #include "saveio.h"
 #include "warfx.h"
+#include "invasion.h"
 #include "x87.h"
 #include <iterator>
 #include <tuple>
@@ -130,13 +131,16 @@ static std::mt19937 g_rng((unsigned)(GetTickCount() ^ (GetCurrentProcessId() << 
 // months at war (> 0) or at peace (<= 0). Stepped once per month by the host; saved with the month; sent with it.
 static std::map<int, int> g_kWar;                         // nation -> counter
 static std::map<int, std::pair<int, int>> g_kDecl;        // 0.6.0: nation -> its DeclineCount, EnemyDeclineCount
+static std::vector<std::wstring> g_invNews[9];            // 0.7.0: a joined nation's invasion texts for its next month
+static void ClearQueuedNews(const char* why);
 static int g_hostGen = 0;  // client: the host's battle requests (welcome `gen`; 1 = it merges a declined battle; 2 = it
-                           // takes surprise attacks (kind 2) and takeovers at a war's start)
+                           // takes surprise attacks (kind 2) and takeovers at a war's start; 3 = raider checks, 0.7.0)
 // 0.6.0 (B6 piece 2), client tests: the next relation turn's forced war plan of nation J with a surprise attack
-// (`battles testsa J [k]`), and CheckSurpriseAttack's random gates passed by asking again (`battles saretry n`).
+// (`battles testsa J [k] [land]`; 0.7.0 `land`: its surprise landing in this nation's possession, forced), and
+// CheckSurpriseAttack's random gates passed by asking again (`battles saretry n`).
 static struct {
     int J = -1;
-    bool k = false;
+    bool k = false, land = false;
 } g_testSa;
 static int g_testSaRetry = 0;
 static int g_kWarSteppedSeq = -1;                         // the month (g_seq) whose processing last stepped them
@@ -234,6 +238,12 @@ struct BattleReq {
     int kind = 0;
     std::vector<game::BattleAttempt> attempts;
     bool declined = false;  // the player declined it; the game's consequences on the player's PC were merged (risk 4)
+    // 0.7.0: a raider battle came of the request's raider check (an attempt of type 1, hello `gen` 3): 1 fought on the
+    // player's PC, 2 auto-resolved there (QuickResolveRaiderBattle); `opp` is then the interception's enemy
+    int raider = 0;
+    // 0.7.0 (invasions, P3): the battle came of the request's invasion check (an attempt of type 2, hello `gen` 4);
+    // `opp` is then the invasion battle's enemy
+    bool invasion = false;
 };
 static std::vector<BattleReq> g_battles;
 static int g_battleNextId = 1;
@@ -241,6 +251,15 @@ static bool g_battlePhase = false, g_battleFinishing = false, g_battleMerged = f
 static std::string g_battlePhaseBytes;  // the host save when the battle phase began (restored if a reload fails)
 static int g_battleTimeoutSec = 30 * 60;
 static DWORD g_battleStatusTick = 0;
+// 0.7.0 (invasions, P3), host: a joined nation's invasions during the battle phase. Each battle of the nation takes
+// them to its PC (its battle slot) and the result brings them back; `base` is what the phase's first battle took,
+// `now` what the last result returned (the next battle takes it); applied by name after the phase's reload.
+struct InvPhase {
+    inv::KState plan0;                     // the plan before the phase (back if the battles' results are not loaded)
+    std::vector<inv::PossState> base, now;
+    bool changed = false;
+};
+static std::map<int, InvPhase> g_invPhase;
 
 // Client: a battle of this player's nation, fought in a separate battle slot.
 static std::string g_battleIn;  // a received battle waiting for an idle moment
@@ -252,13 +271,28 @@ static struct {
     int kind = 0;        // 0.6.0: the request's kind (BattleReq::kind)
     int cand = -1;       // ... and the attempt being replayed (kind 1)
     bool dc = false;     // ... and the nation's own decline counts are in the battle slot (sent back with the result)
+    int raider = 0;      // 0.7.0: the raider check gave a battle: 1 fought, 2 auto-resolved (BattleReq::raider)
+    std::vector<std::string> news;  // ... and the turn messages of the raider checks (the "thwarts" lines)
+    bool inv = false;    // 0.7.0 (P3): the nation's invasions are in the battle slot (sent back with the result)
+    int iopp = -1;       // ... and the invasion check gave a battle (or a decline) against this nation (real index)
+    bool iatt = true;    // ... which the player's nation attacked (its own invasion) or defended against
 } g_cb;
+static struct {  // TEST ONLY (`battles testraid <side> <J>`): the next raider check forces an interception
+    int side = -1, J = -1;
+} g_testRaid;
 static int g_battleSlot = 87;
 
 // Live player-vs-player battles (lockstep.cpp). The host's own battles against a player's nation start from the
 // game's DoBattle (host = A); battles between two players' nations from the battle phase (the first player = A).
 static bool g_lsEnabled = true;  // offer (host) / accept (client) live battles
 static bool g_autoStrike = false;  // host: the computer flies both sides' carrier strikes in live battles (ui option)
+// The legacy fleet (0.7.0). Host: the option, and the nations whose hand-built legacy fleet is merged (kept in
+// rtw3mp_session.ini: a resent first month must not clear it again). Client: the player's choice, the month (seq) whose
+// legacy build ran here (its turn carries MPLegacy), the picture message due, and the build's start/end notices.
+static bool g_legacyAllowed = true, g_legacyWanted = false;
+static std::set<int> g_legacyDone;
+static int g_legacyBuiltSeq = -1;
+static bool g_legacyMsgDue = false;
 static struct {
     int opp = -1, peer = -1, bid = -1;
     std::string name;
@@ -289,6 +323,22 @@ static std::string g_lastEvent;        // summary of the last event (tests and l
 // The messages of the player's economy rules the host ran for this PC's nation (the month's `econnews`), shown once in
 // the game's turn report before the month's event roll.
 static std::vector<std::wstring> g_econNews;
+static inv::KState g_invPlan;          // 0.7.0, client: the nation's invasion plan from the host's last state
+static bool g_invPlanFromHost = false;  // ... the host keeps one (hostgen 4); else the form holds none
+
+// 0.7.0, client: after every load of the player's slot the form's invasion fields are the nation's (the save holds the
+// host player's: its Turn would send them as the nation's target).
+static void ClientInvasionForm(int nation, const char* why) {
+    if (!inv::Available() || nation < 1 || nation > 8) return;
+    if (g_invPlanFromHost)
+        Log("invasions: nation %d's plan in the form (%s): %s", nation, why, inv::ClientSetForm(g_invPlan, false).c_str());
+    else if (!inv::FormTarget().empty())
+        Log("invasions: the host keeps no invasion plan for nation %d (%s): %s", nation, why,
+            inv::ClientSetForm(inv::KState(), true).c_str());
+    else
+        return;
+    game::RefreshUI();
+}
 static int g_econNewsSeq = -1;
 
 static const int kIdStride = 20000;
@@ -642,6 +692,7 @@ static void SaveReservations() {
     kv["treaties"] = EncodeTreaties();
     kv["kwar"] = EncodeKWar();
     kv["kdecl"] = EncodeKDecl();
+    kv["kinv"] = inv::EncodeStates(&inv::State(0));
     kv["kecon"] = economy::EncodeState();  // the player's economy rules: each joined nation's own state
     kv["kwill"] = EncodeKArr(g_kWill);
     kv["kts"] = EncodeKArr(g_kTs);
@@ -655,6 +706,9 @@ static void SaveReservations() {
         std::string kr;
         for (auto& e : g_kRevo) kr += std::to_string(e.first) + ":" + std::to_string(e.second) + ",";
         kv["krevo"] = kr;
+        std::string lg;  // 0.7.0: the nations whose hand-built legacy fleet is in the campaign
+        for (int n : g_legacyDone) lg += std::to_string(n) + ",";
+        kv["klegacy"] = lg;
     }
     {
         std::string rr;
@@ -666,7 +720,9 @@ static void SaveReservations() {
 }
 
 static void LoadReservations() {
+    ClearQueuedNews("the host took up another campaign");
     g_reserved.clear();
+    inv::DecodeStates("", &inv::State(0));  // 0.7.0: dated like kwar (below)
     g_dip.clear();
     g_pactAllies.clear();
     g_pactWars.clear();
@@ -711,6 +767,10 @@ static void LoadReservations() {
         int n = atoi(e.c_str());
         if (n >= 1 && n <= 8) g_kLend.insert(n);
     }
+    for (auto& e : Split(KVStr(kv, "klegacy"), ',')) {  // 0.7.0: any save of the campaign
+        int n = atoi(e.c_str());
+        if (n >= 1 && n <= 8) g_legacyDone.insert(n);
+    }
     for (auto& e : Split(KVStr(kv, "krevo"), ',')) {  // B5: as the save's RevolutionPending (any save of the campaign)
         auto f = Split(e, ':');
         int n = f.size() == 2 ? atoi(f[0].c_str()) : 0, r = f.size() == 2 ? atoi(f[1].c_str()) : 0;
@@ -729,6 +789,7 @@ static void LoadReservations() {
         DecodeTreaties(KVStr(kv, "treaties"));
         DecodeKWar(KVStr(kv, "kwar"));
         DecodeKDecl(KVStr(kv, "kdecl"));
+        inv::DecodeStates(KVStr(kv, "kinv"), &inv::State(0));  // 0.7.0: the joined nations' invasion plans
         economy::DecodeState(KVStr(kv, "kecon"));
         g_kWill = DecodeKArr(KVStr(kv, "kwill"));
         g_kTs = DecodeKArr(KVStr(kv, "kts"));
@@ -840,6 +901,24 @@ static void KWarFollow(int K, const char* why) {
 static std::map<int, std::vector<std::wstring>> g_kTreatyNews;  // the turn report's line for each nation at war
 static int g_treatyEnds = 0;
 static std::string g_lastTreatyEnd;
+
+// 0.7.0 (fix-afb): the turn messages the host keeps for each joined nation's next month (its invasions, war effects,
+// economy, the treaty's end, the notices) belong to the campaign of this session: dropped when the session ends or the
+// host takes up another campaign (else they showed in that nation's first month of the next campaign).
+static void ClearQueuedNews(const char* why) {
+    size_t n = 0;
+    for (int K = 0; K < 9; K++) {
+        n += g_invNews[K].size() + warfx::TakeNews(K).size() + economy::TakeNews(K).size();
+        g_invNews[K].clear();
+    }
+    for (auto* m : {&g_playerNews, &g_treatyNews})
+        for (auto& e : *m) n += e.second.size();
+    for (auto& e : g_kTreatyNews) n += e.second.size();
+    g_playerNews.clear();
+    g_treatyNews.clear();
+    g_kTreatyNews.clear();
+    if (n) Log("turn messages kept for the joined nations dropped (%s): %u", why, (unsigned)n);
+}
 
 static void HostArmsTreatyCheck(const char* why) {
     if (g_role != Role::Host || game::WarCounter() > 0) return;
@@ -1738,6 +1817,17 @@ static void HostApplyPeace(int K, const KV& kv, std::string& applied, std::vecto
         }
         states++;
     }
+    if (accepted) {  // 0.7.0 (P5): DoPeace's resets of the nation's invasion plan (its possessions' came with `ptaken`)
+        inv::KState& st = inv::State(K);
+        if (!st.Empty()) {
+            Log("invasions: nation %d's peace ends its invasion plan (target %s/%d, enemy target %s/%d, %d mark(s))", K,
+                st.target.empty() ? "-" : W2U(st.target).c_str(), st.count,
+                st.enemyTarget.empty() ? "-" : W2U(st.enemyTarget).c_str(), st.pending, (int)st.itt.size());
+            st = inv::KState();
+            SaveReservations();
+            applied += " invasion-plan-reset";
+        }
+    }
     std::set<int> changed;
     for (auto& e : Split(KVStr(kv, "pdelta"), ';')) {
         auto f = Split(e, ':');
@@ -1981,6 +2071,29 @@ static void HostApplySurprise(Player& p, int K, const KV& kv, std::string& appli
         applied += " takeover " + f[0] + " -1->" + std::to_string(to);
         chat.push_back("In a surprise move, " + Nm(to) + " has taken control of " + f[0] + "!");
     }
+    // 0.7.0 (P4): the surprise landings in the nation's possessions (CheckForWar's, run on its PC): the computer nation
+    // invades the possession, marked this month (`kitt`) as the game marks it, if the nation still owns it uninvaded
+    for (auto& rec : Split(KVStr(kv, "kland"), kSepRec)) {
+        auto f = Split(rec, kSepField);
+        if (f.size() < 2 || f[0].empty()) continue;
+        std::wstring name = U2W(f[0]);
+        int by = atoi(f[1].c_str());
+        std::string why = !inv::Available() || p.genLevel < 4         ? "invasions are not on for the nation"
+                          : by < 1 || by > 8 || by == K || IsHumanNation(by) ? "not by a computer nation"
+                          : inv::PossessionOwner(name) != K           ? "not the nation's possession"
+                          : inv::PossessionInvader(name) != -1        ? "invaded already"
+                                                                      : inv::SetPossession(name, by, 0, false);
+        if (!why.empty()) {
+            Log("invasions: surprise landing of nation %d's turn in %s by %d skipped: %s", K, f[0].c_str(), by, why.c_str());
+            continue;
+        }
+        inv::KState& st = inv::State(K);
+        if (std::find(st.itt.begin(), st.itt.end(), name) == st.itt.end()) st.itt.push_back(name);
+        SaveReservations();
+        applied += " landing " + f[0] + " by " + std::to_string(by);
+        Log("invasions: surprise landing of nation %d's turn: nation %d invades %s (marked this month)", K, by, f[0].c_str());
+        chat.push_back(Nm(by) + " troops have made a surprise landing in " + Nm(K) + "'s possession " + f[0] + "!");
+    }
     std::vector<game::BattleAttempt> at;
     for (auto& e : Split(KVStr(kv, "ksa"), ';')) {
         auto f = Split(e, ',');
@@ -2209,6 +2322,11 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     // 0.6.0: this host ends the disarmament treaty for a joined nation's war (HostArmsTreatyCheck), so the player's PC
     // may end it at once when its nation's war starts there (older clients ignore the key)
     if (game::ArmsTreatyAvailable()) h["armstreaty"] = "1";
+    // 0.7.0: a new campaign's first month (nothing processed yet): the player may build the nation's legacy fleet by
+    // hand, once (older clients ignore the key; the player's choice decides, see ClientApplyPendingState)
+    if (g_legacyAllowed && p.nation >= 1 && p.nation <= 8 && y == game::CampaignStartYear() && m == 1 &&
+        !g_legacyDone.count(p.nation))
+        h["legacy"] = "1";
     if (hookcb::PlayerRulesNation(p.nation) && g_kRelMonth[p.nation] != HostMonth()) {
         // Relations v2, B3 (not again in a month whose turn was applied, e.g. after a reconnect): the player's relation routines run on the player's PC this month, with the nation's own
         // per-relation state and past wars and the nations people play (the host's and the joined ones).
@@ -2269,6 +2387,8 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
         // The player's war effects the host ran for this nation (warfx.cpp, B5): their messages go the same way (0.5.0
         // clients show them too).
         std::vector<std::wstring> war = warfx::TakeNews(p.nation);
+    for (auto& l : g_invNews[p.nation]) war.push_back(l);  // 0.7.0: the nation's invasions (CheckRebellionAndInvasions)
+    g_invNews[p.nation].clear();
         for (auto& l : war) news += SafeText(W2U(l)) + kSepRec;
         // 0.6.0: the disarmament treaty ended by this nation's war (HostArmsTreatyCheck), the game's line, once
         auto tn = g_kTreatyNews.find(p.nation);
@@ -2279,6 +2399,11 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
         }
         if (!news.empty()) h["econnews"] = news;
         h["kao"] = std::to_string(economy::ArmyOffensiveOf(p.nation));
+        if (p.genLevel >= 4 && p.nation >= 1 && p.nation <= 8) {  // 0.7.0: the nation's invasion plan for its form
+            inv::KState one[9];
+            one[p.nation] = inv::State(p.nation);
+            h["kinv"] = "+" + inv::EncodeStates(one);  // "+": present even when empty
+        }
         if (!econ.empty())
             Log("economy: %d message(s) of nation %d's rules go with state seq %d", (int)econ.size(), p.nation, g_seq);
         if (!war.empty())
@@ -2511,11 +2636,37 @@ static void SendBattle(BattleReq& r) {
     if (r.kind != 0) {  // 0.6.0 (only to players announcing hello `gen`): the player's generator's attempts
         h["kind"] = std::to_string(r.kind);
         h["att"] = std::to_string(r.attempts.size());
-        for (size_t i = 0; i < r.attempts.size(); i++)
-            h["att" + std::to_string(i)] = std::to_string(r.attempts[i].a) + "," + std::to_string(r.attempts[i].b) + "," +
-                                           W2U(r.attempts[i].area);
+        bool raids = false;
+        for (size_t i = 0; i < r.attempts.size(); i++) {
+            const game::BattleAttempt& t = r.attempts[i];
+            raids |= t.type == 1 || t.type == 2;  // 0.7.0: a raider check (hello `gen` 3), an invasion check (`gen` 4)
+            h["att" + std::to_string(i)] = t.type == 1   ? std::string("R")
+                                           : t.type == 2 ? std::string("I")
+                                                         : std::to_string(t.a) + "," + std::to_string(t.b) + "," + W2U(t.area);
+        }
+        if (raids) {  // the nations people play (real indices): no raider or invasion battle with them on the player's PC
+            std::string hs;
+            for (int n = 0; n < 9 && n < game::NationCount(); n++)
+                if (IsHumanNation(n)) hs += (hs.empty() ? "" : ",") + std::to_string(n);
+            h["humans"] = hs;
+        }
     }
     Player* p2 = r.pvp ? PlayerOfNation(r.opp) : nullptr;
+    if (!r.pvp && p->genLevel >= 4 && inv::Available() && hookcb::PlayerRulesNation(r.human)) {
+        // 0.7.0 (invasions, P3): the nation's invasions and plan go with every battle of it (the battle's aftermath, the
+        // invasion check and the declines act on them in its battle slot) and come back with the result
+        auto it = g_invPhase.find(r.human);
+        if (it == g_invPhase.end()) {
+            InvPhase ph;
+            ph.plan0 = inv::State(r.human);
+            ph.base = ph.now = inv::KPossessions(r.human);
+            it = g_invPhase.emplace(r.human, ph).first;
+        }
+        inv::KState one[9];
+        one[r.human] = inv::State(r.human);
+        h["kinv"] = "+" + inv::EncodeStates(one);
+        h["kinvp"] = inv::EncodePoss(it->second.now);
+    }
     if (p2) {  // the other side is commanded live from p2's PC; the host relays the battle's messages
         h["pvp"] = "1";
         h["p2"] = p2->name;
@@ -2589,53 +2740,184 @@ static bool B6On(int K) {
 static std::string AttemptsText(const std::vector<game::BattleAttempt>& at) {
     std::string s;
     for (auto& t : at)
-        s += (s.empty() ? "" : "; ") + std::to_string(t.a) + ">" + std::to_string(t.b) +
-             (t.area.empty() ? std::string(" (area by the game)") : " " + W2U(t.area));
+        s += (s.empty() ? "" : "; ") +
+             (t.type == 1   ? std::string("raider check")
+              : t.type == 2 ? std::string("invasion check")
+                            : std::to_string(t.a) + ">" + std::to_string(t.b) +
+                                  (t.area.empty() ? std::string(" (area by the game)") : " " + W2U(t.area)));
     return s;
 }
 
-// Runs nation K's generator; its attempts against computer nations become one request of kind 1 (none if none).
-// `queue` false: a dry run (tests). Returns the request's id, 0 for no attempt, -1 if the generator could not run.
+// 0.7.0: the player's PC replays raider checks (hello `gen` 3); the first computer nation at war with K names a request
+// that has raider checks only (the interception's enemy is known after it).
+static bool RaiderChecksOn(int K) {
+    Player* p = PlayerOfNation(K);
+    return p && p->genLevel >= 3;
+}
+
+// 0.7.0 (invasions, P3): the player's PC replays the invasion check (hello `gen` 4) of a nation with invasions or a plan.
+static bool InvasionChecksOn(int K) {
+    Player* p = PlayerOfNation(K);
+    return p && p->genLevel >= 4 && inv::Available() && game::InvasionReplayAvailable() && inv::HasWork(K, inv::State(K));
+}
+
+static int FirstComputerEnemy(int K) {
+    for (int n = 1; n <= 8 && n < game::NationCount(); n++)
+        if (n != K && !IsHumanNation(n) && game::AtWar(K, n)) return n;
+    return -1;
+}
+
+// The computer nation K's invasion battle would most likely be against (the enemy's pending landing, the owner of K's
+// target, the other side of K's first invasion), else -1.
+static int InvasionEnemy(int K) {
+    const inv::KState& st = inv::State(K);
+    auto computer = [K](int n) { return n >= 1 && n <= 8 && n != K && !IsHumanNation(n) && game::AtWar(K, n); };
+    if (st.pending >= 0 && st.pending != K && computer(st.pending)) return st.pending;
+    int o = st.target.empty() ? -1 : inv::PossessionOwner(st.target);
+    if (computer(o)) return o;
+    for (auto& p : inv::KPossessions(K)) {
+        int n = p.invader == K ? inv::PossessionOwner(p.name) : p.invader;
+        if (computer(n)) return n;
+    }
+    return -1;
+}
+
+// Runs nation K's generator; its attempts against computer nations (and, 0.7.0, its raider checks and its invasion
+// check) become one request of kind 1 (none if none). `queue` false: a dry run (tests). Returns the request's id, 0 for
+// no attempt, -1 if the generator could not run.
 static int HostRunGenerator(int K, bool queue, std::string& out) {
     bool human[9];
     for (int n = 0; n < 9; n++) human[n] = IsHumanNation(n);
     std::vector<game::BattleAttempt> at, ok;
     std::string err;
     int war = KWar(K);
-    if (!game::RunBattleGenerator(K, war, human, at, err)) {
+    if (!game::RunBattleGenerator(K, war, human, at, err, RaiderChecksOn(K), InvasionChecksOn(K))) {
         out = err;
         Log("the player's battle generator for nation %d: %s", K, err.c_str());
         return -1;
     }
     for (auto& t : at) {
         int opp = t.a == K ? t.b : t.b == K ? t.a : -1;
-        if (opp >= 1 && opp <= 8 && !IsHumanNation(opp)) ok.push_back(t);
+        if (t.type == 1 || t.type == 2 || (opp >= 1 && opp <= 8 && !IsHumanNation(opp))) ok.push_back(t);
     }
     out = AttemptsText(at);
     Log("the player's battle generator for nation %d (war counter %d)%s: %d attempt(s)%s%s", K, war,
         queue ? "" : " (dry run)", (int)at.size(), at.empty() ? "" : ": ", out.c_str());
     Player* p = PlayerOfNation(K);
     if (ok.empty() || !queue || !p) return 0;
+    const game::BattleAttempt* first = nullptr;  // the first attempt with an opponent names the request
+    int raids = 0, invs = 0;
+    for (auto& t : ok) {
+        if (t.type == 1) raids++;
+        else if (t.type == 2) invs++;
+        else if (!first) first = &t;
+    }
+    int ie = invs ? InvasionEnemy(K) : -1;
+    int opp = first ? (first->a == K ? first->b : first->a) : ie >= 1 ? ie : FirstComputerEnemy(K);
+    if (opp < 1) {
+        Log("the player's battle generator for nation %d: %d raider check(s), %d invasion check(s) but no computer "
+            "nation at war", K, raids, invs);
+        return 0;
+    }
     BattleReq r;
     r.id = g_battleNextId++;
     r.kind = 1;
     r.attempts = ok;
-    r.a = ok[0].a;
-    r.b = ok[0].b;
-    r.area = ok[0].area;
+    r.a = first ? first->a : K;
+    r.b = first ? first->b : opp;
+    r.area = first ? first->area : std::wstring();
     r.human = K;
-    r.opp = r.a == K ? r.b : r.a;
+    r.opp = opp;
     r.player = p->name;
     g_battles.push_back(r);
-    Log("battle request %d (the player's generator): nation %d vs %d%s, %d attempt(s), fought by %s", r.id, K, r.opp,
-        InArea(r.area).c_str(), (int)ok.size(), p->name.c_str());
-    AddChat("* Battle? " + CampaignNationName(K) + "'s navy may meet the " + CampaignNationName(r.opp) + " navy" +
-            InArea(r.area) + ". " + p->name + " plays it after the month.");
+    Log("battle request %d (the player's generator): nation %d vs %d%s, %d attempt(s)%s%s, fought by %s", r.id, K, r.opp,
+        InArea(r.area).c_str(), (int)ok.size(), raids ? (" (" + std::to_string(raids) + " raider check(s))").c_str() : "",
+        invs ? " (an invasion check)" : "", p->name.c_str());
+    std::string more = std::string(raids ? ", or its raiders and patrols the enemy's" : "") +
+                       (invs ? ", or its invasions bring a battle" : "");
+    AddChat("* Battle? " + CampaignNationName(K) + "'s " +
+            (first  ? "navy may meet the " + CampaignNationName(r.opp) + " navy" + InArea(r.area) + more
+             : invs ? "invasions may bring a battle" + std::string(raids ? ", or its raiders and patrols meet the enemy's" : "")
+                    : std::string("raiders and patrols may meet the enemy's")) +
+            ". " + p->name + " plays it after the month.");
     return r.id;
 }
 
 // Host, DoTurn2: the game is about to look for the host's battle of the month; each joined nation K under the player's
 // rules and at war looks for its own first (at most one a month each, as for the player in single player).
+// 0.7.0: the nation's invasion target from its turn (`kinvt`, "" none). The game's own checks ran on the player's PC
+// (not invaded, value below 10, only home areas while blockaded, the invasion range); the host takes a possession of a
+// computer nation, not invaded and below 10, and starts its months of preparation again when the target changes.
+static void HostTakeInvasionOrder(const std::string& player, int K, const std::wstring& name) {
+    inv::KState& st = inv::State(K);
+    if (name == st.target) return;
+    std::string why;
+    if (!name.empty()) {
+        int owner = inv::PossessionOwner(name);
+        why = owner == -2   ? "no such possession"
+              : owner < 0   ? "it has no owner"
+              : owner == K  ? "it is the nation's own"
+              : IsHumanNation(owner) ? "a person plays its owner (invasions between players are not supported)"
+              : inv::PossessionValue(name) >= 10 ? "its value is 10 or more"
+              : inv::PossessionInvader(name) != -1 ? "it is invaded already"
+                                                    : "";
+    }
+    if (!why.empty()) {
+        AddChat("* " + player + "'s invasion target " + W2U(name) + " was not taken: " + why + ".");
+        Log("invasions: nation %d's target %s refused (%s)", K, W2U(name).c_str(), why.c_str());
+        return;
+    }
+    Log("invasions: nation %d's target %s -> %s", K, st.target.empty() ? "-" : W2U(st.target).c_str(),
+        name.empty() ? "-" : W2U(name).c_str());
+    st.target = name;
+    st.count = 0;
+    SaveReservations();
+}
+
+// 0.7.0: each joined nation's invasions, the game's CheckRebellionAndInvasions in its view (invasion.cpp), after the
+// month's battles (single player's order: the month's battle, then the invasions) and before the war counters' step.
+// Nations whose PC announced hello gen 4 (it sends the nation's orders and fights its invasion battles).
+static void HostRunInvasions() {
+    std::string hid = inv::TakeHideLog();
+    if (!hid.empty()) Log("invasions: the host's own routines and the joined nations' invasions this month: %s", hid.c_str());
+    if (!inv::Available()) return;
+    bool human[9], ran = false;
+    for (int i = 0; i < 9; i++) human[i] = IsHumanNation(i);
+    for (int K = 1; K <= 8; K++) {
+        inv::KState& st = inv::State(K);
+        if (st.pending != -1) {  // the month's start (DoStrategicTurn) ends a battle pending since the last month
+            Log("invasions of nation %d: the invasion battle pending (nation %d) ends with the month", K, st.pending);
+            st.pending = -1;
+            ran = true;
+        }
+        Player* p = PlayerOfNation(K);
+        if (!hookcb::PlayerRulesNation(K) || !p || p->genLevel < 4) continue;
+        if (!inv::HasWork(K, st)) continue;
+        int war = KWar(K);
+        auto d = g_kDecl.find(K);
+        inv::RunResult r = inv::RunForNation(K, war, human, st, economy::ArmyOffensiveOf(K),
+                                             d != g_kDecl.end() ? d->second.second : 0);
+        if (!r.ran) {
+            Log("invasions of nation %d: not run (%s)", K, r.error.c_str());
+            continue;
+        }
+        Log("invasions of nation %d (war counter %d): %s%s%s", K, war, r.summary.c_str(), r.error.empty() ? "" : "; ERROR ",
+            r.error.c_str());
+        for (auto& t : r.news) {
+            g_invNews[K].push_back(t);
+            Log("invasions of nation %d: \"%s\"", K, W2U(t).c_str());
+        }
+        if (r.enemyVP > 0)  // "Enemy fleets dominate the seas around ...": K's enemies' points (the first computer enemy)
+            for (int j = 1; j <= 8; j++)
+                if (j != K && !IsHumanNation(j) && game::AtWar(K, j)) {
+                    hookcb::CreditWarVP(j, K, r.enemyVP, "invasions");
+                    break;
+                }
+        ran = true;
+    }
+    if (ran) SaveReservations();  // the plans (`kinv`) of the new month
+}
+
 static void HostRunBattleGenerators() {
     if (g_role != Role::Host || !g_turnRunning) return;
     for (int K = 1; K <= 8 && K < game::NationCount(); K++) {
@@ -2733,6 +3015,7 @@ static void BattlePhaseTick() {
 static bool FinishBattlePhase() {
     g_battleFinishing = true;
     bool ok = true;
+    std::vector<std::wstring> marks = g_battleMerged ? inv::MarkedThisTurn() : std::vector<std::wstring>();
     if (g_battleMerged && !game::LoadCampaign(g_hostSlot, 0)) {
         Log("battle phase: loading the merged save failed; restoring the month without the battles");
         for (auto& r : g_battles)
@@ -2743,6 +3026,26 @@ static bool FinishBattlePhase() {
         ok = WriteFileBytes(HostBcsPath(), g_battlePhaseBytes) && game::LoadCampaign(g_hostSlot, 0);
     }
     game::SetStrategicEnabled(true);
+    if (ok && !marks.empty())  // 0.7.0: InvadedThisTurn is not saved (the month's new invasions wait a month)
+        Log("battle phase: invaded this month kept across the reload: %d of %d", inv::RestoreMarked(marks),
+            (int)marks.size());
+    // 0.7.0 (P3): the joined nations' invasions as their battles left them (not if the month was restored without the
+    // battles' results)
+    bool restored = g_battleMerged && std::none_of(g_battles.begin(), g_battles.end(), [](const BattleReq& r) {
+                        return r.state == 2;
+                    });
+    for (auto& e : g_invPhase) {
+        if (!e.second.changed) continue;
+        if (restored || !ok) {
+            inv::State(e.first) = e.second.plan0;
+            SaveReservations();
+            Log("battle phase: nation %d's invasions as before its battles (the results were not loaded)", e.first);
+            continue;
+        }
+        std::string s = inv::ApplyPossessions(e.first, e.second.base, e.second.now);
+        Log("battle phase: nation %d's invasions after its battles: %s", e.first, s.empty() ? "no change" : s.c_str());
+    }
+    g_invPhase.clear();
     if (!ok) {
         Notice("The month could not be loaded after the battles. Load the save and host again.");
         g_battles.clear();
@@ -2755,7 +3058,11 @@ static bool FinishBattlePhase() {
                                             CampaignNationName(r.human) + InArea(r.area) + "."
                             : r.declined ? r.player + " declined battle for " + CampaignNationName(r.human) + " against " +
                                                CampaignNationName(r.opp) + InArea(r.area) + "."
-                                         : "The battle of " + CampaignNationName(r.human) + " against " +
+                            : r.raider   ? "The raider battle of " + CampaignNationName(r.human) + " against " +
+                                             CampaignNationName(r.opp) + InArea(r.area) + " was " +
+                                             (r.raider == 2 ? "auto-resolved" : "fought") + " by " + r.player + "."
+                                         : std::string(r.invasion ? "The invasion battle of " : "The battle of ") +
+                                               CampaignNationName(r.human) + " against " +
                                                CampaignNationName(r.opp) + InArea(r.area) + " was fought by " +
                                                r.player + "."));
             continue;
@@ -2836,7 +3143,83 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
             }
         }
         int cand = KVInt(h, "cand", -1);  // kind 1, 2: the attempt that gave it
-        if (r.kind >= 1 && cand >= 0 && cand < (int)r.attempts.size()) {
+        auto ip = g_invPhase.find(r.human);
+        if (!r.pvp && h.find("kinv") != h.end() && ip != g_invPhase.end() && outcome != "failed") {
+            // 0.7.0 (invasions, P3): the nation's invasions and plan as its battle slot left them
+            inv::KState one[9];
+            inv::DecodeStates(KVStr(h, "kinv").substr(1), one);
+            std::vector<inv::PossState> now = inv::DecodePoss(KVStr(h, "kinvp"));
+            inv::KState& st = inv::State(r.human);
+            std::string was = inv::EncodePoss(ip->second.now);
+            bool planChanged = one[r.human].target != st.target || one[r.human].count != st.count ||
+                               one[r.human].enemyTarget != st.enemyTarget || one[r.human].pending != st.pending ||
+                               one[r.human].itt != st.itt;
+            bool changed = planChanged || inv::EncodePoss(now) != was;
+            if (changed) {
+                st = one[r.human];
+                ip->second.now = now;
+                ip->second.changed = true;
+                SaveReservations();
+            }
+            std::string ps;
+            for (auto& x : now)
+                ps += (ps.empty() ? "" : ", ") + W2U(x.name) + " " + std::to_string(x.invader) + "/" +
+                      std::to_string(x.support);
+            Log("battle %d: nation %d's invasions after it%s: plan %s/%d, enemy plan %s/%d, %d mark(s); %s", r.id,
+                r.human, changed ? "" : " (unchanged)", st.target.empty() ? "-" : W2U(st.target).c_str(), st.count,
+                st.enemyTarget.empty() ? "-" : W2U(st.enemyTarget).c_str(), st.pending, (int)st.itt.size(),
+                ps.empty() ? "no invasion" : ps.c_str());
+            // the month's invasion check used the pending battle (single player's DoStrategicTurn ends it before the
+            // next check): a second request of the phase does not meet it again ("no invasion target")
+            bool checked = std::any_of(r.attempts.begin(), r.attempts.end(),
+                                       [](const game::BattleAttempt& t) { return t.type == 2; });
+            if (checked && st.pending != -1) {
+                Log("battle %d: nation %d's pending invasion battle (nation %d) was this month's", r.id, r.human, st.pending);
+                st.pending = -1;
+                ip->second.changed = true;
+                SaveReservations();
+            }
+        }
+        if (r.kind == 1 && p.genLevel >= 3) {  // 0.7.0: the raider checks' "thwarts" lines: the player's news
+            for (auto& l : Split(KVStr(h, "news"), kSepRec)) {
+                if (l.empty()) continue;
+                g_playerNews[r.human].push_back(l.substr(0, 400));
+                Log("battle %d: news for nation %d: %s", r.id, r.human, l.substr(0, 400).c_str());
+            }
+        }
+        if (r.kind >= 1 && cand >= 0 && cand < (int)r.attempts.size() && r.attempts[cand].type == 2) {
+            // 0.7.0 (P3): the invasion check gave it: the invasion battle's enemy (a computer nation)
+            int iopp = KVInt(h, "iopp", -1);
+            bool gave = h.find("iopp") != h.end() || outcome == "fought" || avoided || declined;
+            if (gave && (iopp < 1 || iopp > 8 || iopp == r.human || IsHumanNation(iopp))) {
+                Log("battle %d: an invasion battle against nation %d is not taken", r.id, iopp);
+                BattleFallback(r, "its invasion battle's enemy is not a computer nation");
+                return;
+            }
+            if (gave) {
+                r.invasion = true;
+                r.a = KVInt(h, "iatt", 1) ? r.human : iopp;
+                r.b = r.a == r.human ? iopp : r.human;
+                r.opp = iopp;
+                r.area = U2W(KVStr(h, "area"));
+            }
+        } else if (r.kind >= 1 && cand >= 0 && cand < (int)r.attempts.size() && r.attempts[cand].type == 1) {
+            // 0.7.0: a raider check gave it: the interception's enemy (a computer nation at war with the player's)
+            int ropp = KVInt(h, "ropp", -1);
+            r.raider = KVInt(h, "raider", 0);
+            if (r.raider != 0 && (ropp < 1 || ropp > 8 || ropp == r.human || IsHumanNation(ropp) || r.raider > 2)) {
+                Log("battle %d: a raider battle against nation %d is not taken", r.id, ropp);
+                r.raider = 0;
+                BattleFallback(r, "its raider battle's enemy is not a computer nation");
+                return;
+            }
+            if (r.raider != 0) {
+                r.a = r.human;
+                r.b = ropp;
+                r.opp = ropp;
+                r.area = U2W(KVStr(h, "area"));
+            }
+        } else if (r.kind >= 1 && cand >= 0 && cand < (int)r.attempts.size()) {
             const game::BattleAttempt& t = r.attempts[cand];
             r.a = t.a;
             r.b = t.b;
@@ -2862,7 +3245,7 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         bool ok = ReadFileBytes(HostBcsPath(), bytes);
         if (ok) {
             host = ParseIni(bytes);
-            ok = saveio::ApplyBattleResult(host, r.sentBcs, r.human, r.opp, b, allowed, summary, err) &&
+            ok = saveio::ApplyBattleResult(host, r.sentBcs, r.human, r.opp, b, allowed, summary, err, r.raider != 0) &&
                  WriteFileBytes(HostBcsPath(), WriteIni(host));
         }
         if (!ok) {
@@ -2876,7 +3259,11 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         g_battleMerged = true;
         if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
         Log("battle %d applied: %s (player: %s)%s", id, summary.c_str(), KVStr(h, "summary").c_str(),
-            avoided ? "; the enemy declined battle" : declined ? "; the player declined battle" : "");
+            avoided    ? "; the enemy declined battle"
+            : declined ? "; the player declined battle"
+            : r.raider == 2 ? "; a raider battle, auto-resolved"
+            : r.raider == 1 ? "; a raider battle"
+                            : "");
         const std::string* deltas = b.Get("deltas");
         KV dk = deltas ? KVDecode(*deltas) : KV();
         CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K")), std::max(0, KVInt(dk, "dVP_J")));
@@ -2927,7 +3314,15 @@ static void RunHostTurn() {
         if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err)) {
             merged++;
             nplay::HostTakeSubmission(s.second, it->second.nation);  // its own intelligence spending and reports
-            nplay::HostTakeDivisions(s.second, it->second.nation);   // 0.6.1: its own campaign divisions
+            bool legacy = saveio::IsLegacySubmission(s.second) && it->second.nation >= 1 && it->second.nation <= 8;
+            // 0.6.1: its own campaign divisions; 0.7.0: after a legacy turn only those of the new fleet (or none)
+            nplay::HostTakeDivisions(s.second, it->second.nation, legacy);
+            if (legacy) {
+                g_legacyDone.insert(it->second.nation);  // (a resent first month offers no second build)
+                SaveReservations();
+                AddChat("* " + it->second.name + "'s hand-built legacy fleet of " +
+                        W2U(game::NationName(it->second.nation)) + " is in the campaign.");
+            }
         } else {
             Log("host turn: %s's turn NOT applied: %s", it->second.name.c_str(), err.c_str());
             AddChat("* Could not apply " + it->second.name + "'s turn: " + err);
@@ -2936,12 +3331,15 @@ static void RunHostTurn() {
         }
     }
     g_submissions.clear();
+    std::vector<std::wstring> marks = merged > 0 ? inv::MarkedThisTurn() : std::vector<std::wstring>();
     if (merged > 0 && !game::LoadCampaign(g_hostSlot, 0)) {
         Notice("Reloading the merged game failed!");
         g_phase = Phase::Planning;
         g_turnRunning = false;
         return;
     }
+    if (!marks.empty())  // 0.7.0: InvadedThisTurn is not saved: the invasions begun last month keep their month
+        Log("host turn: invaded this month kept across the reload: %d of %d", inv::RestoreMarked(marks), (int)marks.size());
     Log("host turn: %d submissions merged, running turn", merged);
     if (g_enemyVPSeen < 0) g_enemyVPSeen = game::EnemyVP();  // the points before this month (see ShareEnemyVP)
     game::RunOriginalTurn();
@@ -3344,8 +3742,10 @@ static void HostOnMessage(net::Msg& m) {
             w["cpu"] = x87::CpuVendor();  // (the player's log names both)
             if (datafiles::Ready()) w["dh"] = datafiles::Combined();
             // 0.6.0: this host's battle requests (1: a declined battle's result is merged; 2: surprise attacks, kind 2,
-            // and takeovers at a war's start from a joined player's relation turn)
-            w["gen"] = "2";
+            // and takeovers at a war's start from a joined player's relation turn; 3 (0.7.0): raider checks in the
+            // player's generator's requests, their battles' results and "thwarts" lines merged)
+            // 4 (0.7.0): invasions for joined nations (the nation's plan in its turn `kinvt` and in the state `kinv`)
+            w["gen"] = inv::Available() ? "4" : "3";
             net::Send(m.peer, net::MSG_WELCOME, KVEncode(w));
             AddChat("* " + name + " joined" + (p->nation > 0 ? " as " + CampaignNationName(p->nation) : ""));
             BroadcastLobby();
@@ -3438,6 +3838,8 @@ static void HostOnMessage(net::Msg& m) {
                 break;
             }
             if (KVInt(h, "nation") != p->nation) break;
+            if (p->genLevel >= 4 && h.find("kinvt") != h.end() && p->nation >= 1 && p->nation <= 8)
+                HostTakeInvasionOrder(p->name, p->nation, U2W(KVStr(h, "kinvt")));
             Bundle b;
             if (!b.Unpack(body)) break;
             g_submissions[m.peer] = b;
@@ -3466,6 +3868,20 @@ static void HostOnMessage(net::Msg& m) {
             break;
         case net::MSG_RELATIONS:
             if (p && p->welcomed) HostApplyRelations(*p, KVDecode(m.data));
+            break;
+        case net::MSG_LEGACY:  // 0.7.0: the player's legacy build (the fleet itself comes with the turn)
+            if (p && p->welcomed && p->nation >= 1 && p->nation <= 8) {
+                KV kv = KVDecode(m.data);
+                std::string st = KVStr(kv, "state"), info = KVStr(kv, "info");
+                Log("legacy fleet: %s (nation %d) %s: %s", p->name.c_str(), p->nation, st.c_str(), info.c_str());
+                std::string who = W2U(game::NationName(p->nation));
+                if (st == "start")
+                    AddChat("* " + p->name + " builds the legacy fleet of " + who + " by hand (the computer's starting "
+                            "fleet of " + who + " is replaced when the turn is merged).");
+                else if (st == "done")
+                    AddChat("* " + p->name + " finished the legacy fleet of " + who + ": " + KVStr(kv, "ships") +
+                            " ship(s), funds left " + KVStr(kv, "funds") + ".");
+            }
             break;
         case net::MSG_BATTLE_RESULT:
             if (p && p->welcomed) HostOnBattleResult(*p, m.data);
@@ -3555,6 +3971,25 @@ static void ClientApplyPendingState() {
         WriteFileBytes(dir + L"rtw3mp_player.ini", KVEncode(mk));
     }
     g_clientIdStart = saveio::ReadIdNo(dir, g_clientSlot);
+    // 0.7.0: the legacy fleet. In a new campaign's first month the host offers (`legacy`) and the player chose it: the
+    // nation's generated fleet and designs go before the load, and the game's manual build starts after it. A month
+    // loaded during a build ends that build (its ships were only in this copy).
+    game::LegacyAbort();
+    g_legacyMsgDue = false;
+    g_legacyBuiltSeq = -1;
+    bool legacyNow = KVInt(h, "legacy", 0) == 1 && g_legacyWanted && nation >= 1 && game::LegacyAvailable();
+    if (KVInt(h, "legacy", 0) == 1 && !legacyNow)
+        Log("legacy fleet: offered for nation %d, not used (%s)", nation,
+            !g_legacyWanted ? "the player's choice is off" : "unavailable in this copy");
+    if (legacyNow) {
+        std::string sum, lerr;
+        if (saveio::ClearNationFleet(dir, g_clientSlot, nation, sum, lerr)) {
+            Log("legacy fleet: nation %d cleared for the manual build: %s", nation, sum.c_str());
+        } else {
+            Log("legacy fleet: cannot clear nation %d (%s); the generated fleet stays", nation, lerr.c_str());
+            legacyNow = false;
+        }
+    }
     // The nation's own war counter (relations v2); a 0.4.1 host sends none and the host's stays in place.
     game::SetOwnWarCounter(KVInt(h, "kwar", INT_MIN));
     // 0.6.0: the host ends the disarmament treaty for a joined nation's war; then this PC ends it at once too (older
@@ -3609,6 +4044,23 @@ static void ClientApplyPendingState() {
         Notice("Loading the received game failed.");
         return;
     }
+    if (legacyNow) {
+        std::string info;
+        if (game::EnterLegacyBuild(info)) {
+            g_legacyMsgDue = true;
+            KV lk;
+            lk["state"] = "start";
+            lk["info"] = info;
+            net::Send(0, net::MSG_LEGACY, KVEncode(lk));
+        } else {  // (not expected: LegacyAvailable passed) the month as sent, with the generated fleet
+            Log("legacy fleet: the build cannot start (%s); the month is loaded again as sent", info.c_str());
+            legacyNow = false;
+            if (!saveio::ApplyStateBundle(b, dir, g_clientSlot, err) || !game::LoadCampaign(g_clientSlot, nation)) {
+                Notice("Loading the received game failed.");
+                return;
+            }
+        }
+    }
     {  // 0.6.0 (B6 round 3): the ship-type flags only a processed month sets (this game processes none)
         std::string st = game::RefreshShipTypeFlags();
         if (!st.empty()) Log("month: ship-type flags %s (the game's CheckShipTypesExist on the received game)", st.c_str());
@@ -3634,6 +4086,14 @@ static void ClientApplyPendingState() {
         Log("economy: army offensive of nation %d: %d month(s) (ArmyOffensive %s)", nation, kao, what.c_str());
         if (what.rfind("set", 0) == 0) game::RefreshUI();
     }
+    // 0.7.0: the nation's invasion plan in this PC's form (the save holds the host player's); an older host keeps none
+    g_invPlanFromHost = h.find("kinv") != h.end() && nation >= 1 && nation <= 8;
+    if (g_invPlanFromHost) {
+        inv::KState one[9];
+        inv::DecodeStates(KVStr(h, "kinv").substr(1), one);
+        g_invPlan = one[nation];
+    }
+    ClientInvasionForm(nation, "the month's load");
     g_econNews.clear();
     for (auto& l : Split(KVStr(h, "econnews"), kSepRec))
         if (!l.empty()) g_econNews.push_back(U2W(l));
@@ -3648,12 +4108,18 @@ static void ClientApplyPendingState() {
     nplay::ClientSetMonth(nation, KVInt(h, "intel") != 0, g_clientSlot);
     g_remoteRemaining = KVInt(h, "remaining", -1);
     g_date = DateStr(KVInt(h, "year"), KVInt(h, "month"));
-    game::SetTurnButtonCaption(L"Submit");
+    game::SetTurnButtonCaption(legacyNow ? L"Continue" : L"Submit");
     KV a;
     a["seq"] = std::to_string(seq);
     net::Send(0, net::MSG_ACK, KVEncode(a));
-    Notice("New month " + g_date + ": you command " + KVStr(h, "nationName") +
-           ". Press Submit when your orders are ready.");
+    if (legacyNow)
+        Notice("New month " + g_date + ": you command " + KVStr(h, "nationName") +
+               ". Build its legacy fleet by hand: design classes and build ships with the game's Design and Build "
+               "buttons, then press Continue; next choose the ships under construction and press Continue again. "
+               "Then plan the month and press Submit.");
+    else
+        Notice("New month " + g_date + ": you command " + KVStr(h, "nationName") +
+               ". Press Submit when your orders are ready.");
     g_eventRollSeq = seq;  // this month's event roll happens as soon as the game is idle
 }
 
@@ -3674,10 +4140,35 @@ static void SendBattleResult(int id, const std::string& outcome, const std::stri
     if (id == g_cb.id && g_cb.kind != 0 && g_cb.cand >= 0) {  // 0.6.0: the attempt that gave it, and its sea area
         h["cand"] = std::to_string(g_cb.cand);
         h["area"] = W2U(g_cb.area);
+        if (g_cb.raider) {  // 0.7.0: a raider battle: how it ended and the interception's enemy (real index)
+            h["raider"] = std::to_string(g_cb.raider);
+            h["ropp"] = std::to_string(g_cb.opp);
+        }
+    }
+    if (id == g_cb.id && !g_cb.news.empty()) {  // 0.7.0: the raider checks' turn messages, for the player's news
+        std::string all;
+        for (auto& l : g_cb.news) all += l + kSepRec;
+        h["news"] = all;
     }
     int dcOwn = 0, dcEnemy = 0;  // 0.6.0: the nation's decline counts after it (the game's, in the battle slot)
     if (id == g_cb.id && g_cb.dc && game::BattleSlotMode() && game::GetDeclineCounts(dcOwn, dcEnemy))
         h["dc"] = std::to_string(dcOwn) + ":" + std::to_string(dcEnemy);
+    if (id == g_cb.id && g_cb.inv && game::BattleSlotMode() && outcome != "failed") {
+        // 0.7.0 (invasions, P3): the nation's invasions and plan as the battle slot's game left them
+        inv::KState one[9];
+        std::vector<inv::PossState> ps;
+        inv::SlotRead(g_cb.K, one[g_cb.K], ps);
+        h["kinv"] = "+" + inv::EncodeStates(one);
+        h["kinvp"] = inv::EncodePoss(ps);
+        if (g_cb.iopp >= 0) {
+            h["iopp"] = std::to_string(g_cb.iopp);
+            h["iatt"] = g_cb.iatt ? "1" : "0";
+        }
+        Log("battle %d: the nation's invasions after it: plan %s/%d, enemy plan %s/%d, %d invasion(s), %d mark(s)", id,
+            one[g_cb.K].target.empty() ? "-" : W2U(one[g_cb.K].target).c_str(), one[g_cb.K].count,
+            one[g_cb.K].enemyTarget.empty() ? "-" : W2U(one[g_cb.K].enemyTarget).c_str(), one[g_cb.K].pending,
+            (int)ps.size(), (int)one[g_cb.K].itt.size());
+    }
     net::Send(0, net::MSG_BATTLE_RESULT, PackHB(KVEncode(h), b ? b->Pack() : std::string()));
     Log("battle %d: %s%s%s", id, outcome.c_str(), why.empty() ? "" : " - ", why.c_str());
 }
@@ -3689,8 +4180,10 @@ static void LeaveBattleSlot() {
     std::wstring own = game::SaveDir(g_clientSlot) + L"RTWGame" + std::to_wstring(g_clientSlot) + L".bcs";
     if (g_myNation > 0 && FileExists(own) && !game::LoadCampaign(g_clientSlot, g_myNation))
         Notice("Loading your game again failed; it loads with the next month.");
-    else if (g_myNation > 0 && FileExists(own))
+    else if (g_myNation > 0 && FileExists(own)) {
         game::RefreshShipTypeFlags();  // (0.6.0: the month's own flags, as after the month's load)
+        ClientInvasionForm(g_myNation, "back from the battle slot");
+    }
 }
 
 // The session ended (left, disconnected): forget queued battles. A battle being fought goes on as a single-player
@@ -3786,12 +4279,40 @@ static void ClientStartBattle() {
         }
     }
     std::vector<game::BattleAttempt> atts;
+    std::vector<int> humans;  // 0.7.0: the nations people play, in this slot's indices (a raider check's mask)
+    for (auto& s : Split(KVStr(h, "humans"), ','))
+        if (!s.empty() && atoi(s.c_str()) >= 0 && atoi(s.c_str()) <= 8) humans.push_back(sw(atoi(s.c_str())));
+    g_cb.raider = 0;
+    g_cb.news.clear();
+    g_cb.inv = false;
+    g_cb.iopp = -1;
+    g_cb.iatt = true;
+    if (h.find("kinv") != h.end() && inv::Available()) {
+        // 0.7.0 (invasions, P3): the nation's invasions and plan in place of the host's (the slot is the host's campaign)
+        inv::KState one[9];
+        inv::DecodeStates(KVStr(h, "kinv").substr(1), one);
+        Log("battle %d: the nation's invasions in the battle slot: %s", id,
+            inv::SlotPut(K, one[K], inv::DecodePoss(KVStr(h, "kinvp"))).c_str());
+        g_cb.inv = true;
+    }
     if (g_cb.kind == 1 || g_cb.kind == 2) {
         int n = std::min(64, KVInt(h, "att", 0));
         for (int i = 0; i < n; i++) {
             std::string s = KVStr(h, ("att" + std::to_string(i)).c_str());
             size_t c1 = s.find(','), c2 = c1 == std::string::npos ? c1 : s.find(',', c1 + 1);
             game::BattleAttempt t;
+            if (s == "R" && g_cb.kind == 1 && game::RaiderReplayAvailable()) {  // 0.7.0: a raider check
+                t.type = 1;
+                t.a = K;
+                atts.push_back(t);
+                continue;
+            }
+            if (s == "I" && g_cb.kind == 1 && g_cb.inv && game::InvasionReplayAvailable()) {  // 0.7.0: the invasion check
+                t.type = 2;
+                t.a = K;
+                atts.push_back(t);
+                continue;
+            }
             if (c2 != std::string::npos) {
                 t.a = atoi(s.c_str());
                 t.b = atoi(s.c_str() + c1 + 1);
@@ -3849,6 +4370,58 @@ static void ClientStartBattle() {
                 Log("battle %d: test: CheckSurpriseAttack asked again (%d of %d)", id, tries + 1, g_testSaRetry);
             }
             started = saTrue;
+        } else if (t.type == 2) {  // 0.7.0 (P3): the game's invasion check as this nation, with its invasions
+            inv::PossBattle pb;
+            long pb0 = inv::PossessionBattles(nullptr);
+            int d0 = game::PlayerDeclineCalls(), s0 = game::DoBattleCalls(), v0 = game::NationVP(0);
+            game::InvasionCheck ic = game::StartInvasionCheck(humans);
+            for (auto& l : ic.news) g_cb.news.push_back(W2U(l));
+            bool any = inv::PossessionBattles(&pb) != pb0;
+            bool gave = ic.result || game::BattleActive() || game::DoBattleCalls() != s0 ||
+                        game::PlayerDeclineCalls() != d0 || game::NationVP(0) != v0;
+            if (any && gave) {
+                int e = pb.attacker == 0 ? pb.defender : pb.attacker;  // the enemy, this slot's index
+                g_cb.iopp = e >= 0 ? sw(e) : -1;
+                g_cb.iatt = pb.attacker == 0;
+                g_cb.opp = g_cb.iopp;
+                g_cb.area = pb.area;
+                Log("battle %d: attempt %d (invasion check): %s at %s (%s) against nation %d%s; possession battles: %s%s",
+                    id, i,
+                    ic.result || game::BattleActive()     ? "a battle"
+                    : game::PlayerDeclineCalls() != d0     ? "the player's decline"
+                    : game::NationVP(0) != v0              ? "no battle (the points changed)"
+                                                           : "a battle set up",
+                    W2U(pb.poss).c_str(), W2U(pb.area).c_str(), g_cb.iopp,
+                    g_cb.iatt ? " (our invasion)" : " (the enemy's invasion)", inv::PossessionBattlesText(pb0).c_str(),
+                    ic.plain >= 0 ? (" (TEST: plain, " + std::to_string(ic.plain) + " answer(s))").c_str() : "");
+            } else if (!gave && g_role == Role::Client && g_cb.id == id) {
+                Log("battle %d: attempt %d (invasion check) gave no battle (possession battles: %s; %d turn message(s))",
+                    id, i, inv::PossessionBattlesText(pb0).c_str(), (int)ic.news.size());
+                continue;
+            }
+            started = ic.result;
+        } else if (t.type == 1) {  // 0.7.0: the game's raider check as this nation, the nations people play masked
+            int q0 = game::QuickRaiderCalls();
+            game::RaiderCheck rc = game::StartRaiderCheck(humans, g_testRaid.side, g_testRaid.J >= 0 ? sw(g_testRaid.J) : -1);
+            if (!rc.test.empty()) g_testRaid = {};
+            for (auto& l : rc.news) g_cb.news.push_back(W2U(l));
+            int ropp = rc.pending ? sw(rc.enemy) : -1;
+            bool sane = ropp >= 1 && ropp <= 8 && ropp != K &&
+                        std::find(humans.begin(), humans.end(), rc.enemy) == humans.end();
+            started = rc.result && sane;
+            if (rc.result && !sane) Log("battle %d: attempt %d: a raider battle with nation %d (not a computer enemy)", id, i, ropp);
+            if (started) {
+                g_cb.opp = ropp;
+                g_cb.area = rc.area;
+                g_cb.raider = game::QuickRaiderCalls() != q0 ? 2 : 1;
+                Log("battle %d: attempt %d (raider check): %s raider battle against nation %d in %s (%s)", id, i,
+                    rc.side == 0 ? "our raider intercepted:" : "our patrol intercepts:", ropp, W2U(rc.area).c_str(),
+                    g_cb.raider == 2 ? "auto-resolved" : "fought");
+            } else if (g_role == Role::Client && g_cb.id == id) {
+                Log("battle %d: attempt %d (raider check) found no interception (%d turn message(s))", id, i,
+                    (int)rc.news.size());
+                continue;
+            }
         } else {
             started = game::StartPlayerBattle(sw(t.a), sw(t.b), t.area);
         }
@@ -3870,11 +4443,27 @@ static void ClientStartBattle() {
     }
     g_cb.starting = false;
     if (g_cb.kind == 1 && started && game::BattleActive())
-        AddChat("* Battle! " + W2U(game::NationName(0)) + " meets " + W2U(game::NationName(opp)) +
-                (area.empty() ? "" : " in " + W2U(area)) + ".");
+        AddChat(std::string(g_cb.raider ? "* Raider battle! " : g_cb.iopp >= 0 ? "* Invasion battle! " : "* Battle! ") +
+                W2U(game::NationName(0)) + " meets " +
+                W2U(game::NationName(opp)) + (area.empty() ? "" : " in " + W2U(area)) + ".");
     if (g_cb.kind == 2 && started && game::BattleActive())
         AddChat("* Surprise attack! " + W2U(game::NationName(0)) + " meets " + W2U(game::NationName(opp)) +
                 (area.empty() ? "" : " in " + W2U(area)) + ".");
+    if (started && g_cb.raider == 2) {  // 0.7.0: the player chose "Auto resolve": QuickResolveRaiderBattle ran here
+        std::string after, summary, err;
+        Bundle res;
+        game::SaveGame();
+        if (ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", after) &&
+            saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err)) {
+            SendBattleResult(id, "fought", "", &res, summary);
+            AddChat("* Raider battle against the " + W2U(game::NationName(opp)) + " navy" +
+                    (area.empty() ? "" : " in " + W2U(area)) + " auto-resolved; result sent to the host (" + summary + ").");
+        } else {
+            SendBattleResult(id, "failed", "cannot read the result: " + err, nullptr, "");
+        }
+        LeaveBattleSlot();
+        return;
+    }
     if (!started || !game::BattleActive()) {
         bool declined = declinedHere || (entered && !game::BattleActive());
         int gain = game::NationVP(0) - vp0;
@@ -4227,6 +4816,12 @@ static KV RelationsKV(const game::PlayerTurnResult& r, int seq, std::string& sum
         kv["sland"] = tk;
         summary += " ksa=" + sa + " sland=" + std::to_string(r.takeovers.size());
     }
+    if (!r.landings.empty()) {  // 0.7.0 (P4, a gen 4 host): the surprise landings in this nation's possessions
+        std::string kl;
+        for (auto& l : r.landings) kl += SafeText(W2U(l.name)) + kSepField + std::to_string(l.to) + kSepRec;
+        kv["kland"] = kl;
+        summary += " kland=" + std::to_string(r.landings.size());
+    }
     // Relations v2, B4: the peace part (B3 hosts ignore these keys).
     const game::PeaceResult& p = r.peace;
     if (!p.ran) return kv;
@@ -4340,11 +4935,14 @@ static void ClientRunRelations(bool force = false) {
     g_forcedPeaceCode = g_forcedPeaceChance = 0;
     // 0.6.0 (B6 piece 2): surprise attacks and takeovers at a war's start, for a host that takes them (welcome `gen` 2)
     s.surprise = g_hostGen >= 2 && game::SurpriseAvailable();
+    // 0.7.0 (P4): the surprise landing in this nation's possession too, for a host that keeps its invasions (`gen` 4)
+    s.landings = s.surprise && g_hostGen >= 4 && inv::Available();
     if (g_testSa.J > 0) {  // tests (`battles testsa`): nation J's war on this nation starts this turn, with a surprise
         if (s.surprise && g_testSa.J <= 8 && g_testSa.J != g_myNation && !s.human[g_testSa.J]) {
             s.testSaNation = g_testSa.J;
             s.testSaK = g_testSa.k;
-            s.testTakeover = true;
+            s.testTakeover = !g_testSa.land;
+            s.testLanding = g_testSa.land && s.landings;
             s.will[g_testSa.J] = 1;
         } else {
             Log("tests: the forced surprise of nation %d is not possible (host gen %d, here %s)", g_testSa.J, g_hostGen,
@@ -4497,8 +5095,11 @@ static void ClientOnMessage(net::Msg& m) {
             kv["ls"] = g_lsEnabled && lockstep::Available() ? std::to_string(AnnouncedLsLevel()) : "0";  // engine level
             kv["rel"] = game::PlayerTurnAvailable() ? "1" : "0";  // relations v2: the player's relation routines run here
             kv["gen"] = !game::BattleReplayAvailable() ? "0"
-                        : game::SurpriseAvailable()    ? "2"   // 0.6.0 piece 2: surprise attacks and takeovers too
-                                                       : "1";  // 0.6.0: replays the player's battle generator
+                        : game::SurpriseAvailable() && game::RaiderReplayAvailable()
+                            ? inv::Available() ? "4"   // 0.7.0: invasions (the plan in the form, the target sent)
+                                               : "3"   // 0.7.0: raiders against patrols too (raider checks replayed)
+                        : game::SurpriseAvailable() ? "2"   // 0.6.0 piece 2: surprise attacks and takeovers too
+                                                    : "1";  // 0.6.0: replays the player's battle generator
             // 0.6.1: this PC loads its nation's own campaign divisions (game.cpp d_LoadDivisions) and sends them with
             // its turn; the host then sends them back with the month instead of the host's own (else: an empty list)
             kv["div"] = game::DivisionsAvailable() ? "1" : "0";
@@ -4690,12 +5291,123 @@ void SetAutoStrike(bool on) {
     g_autoStrike = on;
 }
 bool AutoStrike() { return g_autoStrike; }
+void SetLegacyAllowed(bool on) {
+    if (on != g_legacyAllowed) Log("host option: manual legacy fleets of joined players: %s", on ? "on" : "off");
+    g_legacyAllowed = on;
+}
+void SetLegacyWanted(bool on) {
+    if (on != g_legacyWanted) Log("legacy fleet: build it by hand when a new campaign's first month comes: %s", on ? "yes" : "no");
+    g_legacyWanted = on;
+}
+bool LegacyWanted() { return g_legacyWanted; }
 
 // Tests and diagnostics: battles of joined players.
 //   host:   list | inject <K> <J> <area...> | injectgen <K> <J> [area...] | injectsa <A> <B> | gen <K> [queue|fault] |
-//           aitest <K> <J> <area...> | resolve <id|all> | timeout <seconds>
+//           injectraid <K> (0.7.0) | injectinv <K> (0.7.0) | aitest <K> <J> <area...> | resolve <id|all> | timeout <seconds>
 //   client: state | hostgen <n> (as if the host's welcome had `gen` n; 0 = a 0.5.0 host) | saretry <n> |
-//           testsa <J> [k] | sadry <J> [k]
+//           testsa <J> [k] | sadry <J> [k] | testraid <0|1> <J> | testraid off (0.7.0)
+// 0.7.0, bridge `inv ...`: joined nations' invasions. Host: `state [K]`, `marks`, `run K` (K's month resolution now),
+// TEST ONLY `set <poss> <invader|-1> [support] [itt]`, `target K <poss|->`, `plan K <count> <enemyPoss|-> <pending> [itt]`,
+// `rnd <0|1|2>` (the routine's own draws: off, low, high). Client: `form`, TEST ONLY `pick <poss|->` (the form's target
+// as the game's Invasion target button sets it). Possession names: '_' for ' '.
+std::string DebugInvasions(const std::vector<std::string>& a) {
+    std::string cmd = a.size() > 1 ? a[1] : "state";
+    auto name = [&](size_t i) {
+        std::string s = a.size() > i ? a[i] : "-";
+        for (char& ch : s)
+            if (ch == '_') ch = ' ';
+        return U2W(s == "-" ? "" : s);
+    };
+    auto stateOf = [](int K) {
+        const inv::KState& s = inv::State(K);
+        std::string itt;
+        for (auto& n : s.itt) itt += W2U(n) + "/";
+        return "K=" + std::to_string(K) + " target=" + W2U(s.target) + " count=" + std::to_string(s.count) +
+               " enemy=" + W2U(s.enemyTarget) + " pending=" + std::to_string(s.pending) + " itt=" + itt +
+               " poss=" + inv::Describe(K) + " cost=" +
+               std::to_string(s.target.empty() ? 0 : inv::TargetCost(game::Nation(K)));
+    };
+    if (!inv::Available()) return "error invasions unavailable";
+    if (cmd == "form") return "ok target=" + W2U(inv::FormTarget()) + " hostgen=" + std::to_string(g_hostGen);
+    if (cmd == "pick") {
+        inv::KState s;
+        s.target = name(2);
+        return "ok " + inv::ClientSetForm(s, s.target.empty());
+    }
+    if (cmd == "marks") {
+        std::string s;
+        for (auto& n : inv::MarkedThisTurn()) s += W2U(n) + "/";
+        return "ok marks=" + s;
+    }
+    if (cmd == "rnd" && a.size() > 2) {
+        inv::SetTestRandom(atoi(a[2].c_str()));
+        return "ok rnd=" + std::to_string(inv::TestRandom());
+    }
+    if (cmd == "set" && a.size() > 3) {  // (also on a client: its copy, e.g. before its peace's test)
+        std::string e = inv::SetPossession(name(2), atoi(a[3].c_str()), a.size() > 4 ? atoi(a[4].c_str()) : 0,
+                                          a.size() > 5 && a[5] == "itt");
+        return e.empty() ? "ok " + inv::Describe(-1) : "error " + e;
+    }
+    if (g_role != Role::Host) return "error host only";
+    if (cmd == "hostpeace") {  // TEST ONLY: the game's DoPeace for the host's nation (through the hook; async: its box)
+        RunOnMainThread([] {
+            if (void* m = dl::Method("TfrmBuildCamp", "DoPeace"))
+                if (void* f = game::BuildCamp()) dl::Call(m, (uint32_t)(uintptr_t)f);
+            Log("invasions: TEST: the host's DoPeace ran: %s", inv::Describe(-1).c_str());
+        });
+        return "ok";
+    }
+    if (cmd == "hostcheck") {  // TEST ONLY: the game's CheckForInvasionBattles for the host's nation (P1's refusals)
+        std::string before = inv::TakeHideLog();
+        int r = game::RunHostInvasionCheck();
+        std::string log = inv::TakeHideLog();
+        if (!before.empty())
+            Log("invasions: the host's own routines and the joined nations' invasions this month: %s", before.c_str());
+        return "ok result=" + std::to_string(r) + " " + log;
+    }
+    if (cmd == "state") {
+        if (a.size() > 2) return "ok " + stateOf(atoi(a[2].c_str()));
+        std::string s = "ok all=" + inv::Describe(-1);
+        for (int K = 1; K <= 8; K++)
+            if (!inv::State(K).Empty()) s += " | " + stateOf(K);
+        return s;
+    }
+    int K = a.size() > 2 ? atoi(a[2].c_str()) : 0;
+    if (K < 1 || K > 8) return "error K";
+    if (cmd == "target") {
+        inv::State(K).target = name(3);
+        inv::State(K).count = 0;
+        SaveReservations();
+        return "ok " + stateOf(K);
+    }
+    if (cmd == "plan" && a.size() > 5) {
+        inv::KState& s = inv::State(K);
+        s.count = atoi(a[3].c_str());
+        s.enemyTarget = name(4);
+        s.pending = atoi(a[5].c_str());
+        s.itt.clear();
+        if (a.size() > 6) s.itt.push_back(name(6));
+        SaveReservations();
+        return "ok " + stateOf(K);
+    }
+    if (cmd == "run") {
+        bool human[9];
+        for (int i = 0; i < 9; i++) human[i] = IsHumanNation(i);
+        auto d = g_kDecl.find(K);
+        inv::RunResult r = inv::RunForNation(K, KWar(K), human, inv::State(K), economy::ArmyOffensiveOf(K),
+                                             d != g_kDecl.end() ? d->second.second : 0);
+        std::string news;
+        for (auto& t : r.news) {
+            news += W2U(t) + " | ";
+            g_invNews[K].push_back(t);
+        }
+        SaveReservations();
+        return (r.ran ? "ok " : "error ") + r.summary + (r.error.empty() ? "" : " ERROR " + r.error) + " news=" + news;
+    }
+    if (cmd == "escort") return "ok " + inv::EscortTest(K);  // P7: computer nation K's most important area
+    return "error unknown";
+}
+
 std::string DebugBattles(const std::vector<std::string>& a) {
     std::string cmd = a.size() > 1 ? a[1] : "list";
     if (cmd == "state") {
@@ -4704,7 +5416,8 @@ std::string DebugBattles(const std::vector<std::string>& a) {
                " nation=" + std::to_string(g_cb.K) + " opp=" + std::to_string(g_cb.opp) + " area=" + W2U(g_cb.area) +
                " slot=" + std::to_string(g_battleSlot) + " slotMode=" + (game::BattleSlotMode() ? "1" : "0") +
                " aftermath=" + (game::BattleAftermathSeen() ? "1" : "0") + " fight=" + (g_fightBattles ? "1" : "0") +
-               " hostgen=" + std::to_string(g_hostGen);
+               " hostgen=" + std::to_string(g_hostGen) + " raider=" + std::to_string(g_cb.raider) + " testraid=" +
+               (g_testRaid.side < 0 ? std::string("off") : std::to_string(g_testRaid.side) + ":" + std::to_string(g_testRaid.J));
     }
     if (cmd == "hostgen" && a.size() > 2) {  // tests (decision 4): the client's decline under an older host
         if (g_role != Role::Client) return "error client only";
@@ -4733,6 +5446,7 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         if (g_role != Role::Client || g_myNation <= 0 || !g_haveState) return "error client with a nation only";
         int J = atoi(a[2].c_str());
         bool k = a.size() > 3 && a[3] == "k";
+        bool land = (a.size() > 3 && a[3] == "land") || (a.size() > 4 && a[4] == "land");
         game::PlayerTurnSetup s = g_relSetup;
         MarkLobbyHumans(s.human);
         if (J < 1 || J > 8 || J == g_myNation || s.human[J]) return "error J must be a computer nation";
@@ -4740,9 +5454,11 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         if (cmd == "testsa") {
             g_testSa.J = J;
             g_testSa.k = k;
-            Log("tests: the next relation turn: nation %d starts its war on nation %d with a surprise%s", J, g_myNation,
-                k ? " (this nation attacks)" : "");
-            return "ok testsa=" + std::to_string(J) + (k ? " k" : "") + " hostgen=" + std::to_string(g_hostGen);
+            g_testSa.land = land;
+            Log("tests: the next relation turn: nation %d starts its war on nation %d with a surprise%s%s", J, g_myNation,
+                k ? " (this nation attacks)" : "", land ? " and its landing in this nation's possession" : "");
+            return "ok testsa=" + std::to_string(J) + (k ? " k" : "") + (land ? " land" : "") +
+                   " hostgen=" + std::to_string(g_hostGen);
         }
         s.K = g_myNation;
         s.relations = s.tensionChanges = s.peace.run = false;
@@ -4755,6 +5471,37 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         for (auto& t : r.surprise) out += std::to_string(t.a) + ">" + std::to_string(t.b) + ";";
         return std::string("ok ran=") + (r.ranSurprise ? "1" : "0") + " pairs=" + out;
     }
+    if (cmd == "testraid" && a.size() > 2) {  // 0.7.0, client tests: testraid <0|1> <J> | testraid off
+        if (a[2] == "off") {
+            g_testRaid = {};
+            return "ok testraid=off";
+        }
+        int side = atoi(a[2].c_str()), J = a.size() > 3 ? atoi(a[3].c_str()) : -1;
+        if ((side != 0 && side != 1) || J < 1 || J > 8 || J == g_myNation) return "error usage: testraid <0|1> <J> | off";
+        g_testRaid.side = side;
+        g_testRaid.J = J;
+        Log("tests: the next raider check forces an interception of side %d with nation %d", side, J);
+        return "ok testraid=" + std::to_string(side) + ":" + std::to_string(J);
+    }
+    if (cmd == "testinv" && a.size() > 2) {  // 0.7.0 (P3), tests (any PC): testinv <0|1>: the next invasion check plain
+        bool on = a[2] == "1";
+        if (!game::SetTestInvasionPlain(on)) return "error not available";
+        Log("tests: the next invasion check %s", on ? "is plain (no computer decline, not caught out)" : "as the game has it");
+        return std::string("ok testinv=") + (on ? "1" : "0");
+    }
+    if (cmd == "testcoup" && a.size() > 2) {  // 0.7.0 (fix-afb), tests (any PC): the next setup as a coup's ambush
+        int mode = atoi(a[2].c_str());
+        if (mode < 0 || mode > 2) return "error usage: testcoup <0|1|2>";
+        if (!game::SetTestCoup(mode)) return "error not available";
+        long runs = game::TestCoupRuns();
+        Log("tests: the next battle setup on this PC %s (setups made an ambush so far: %ld)",
+            mode == 0   ? "as the game has it"
+            : mode == 1 ? "runs as an intelligence coup's ambush"
+                        : "runs as an intelligence coup's ambush, the mod's nation for its reinforcements off "
+                          "(the game's box)",
+            runs);
+        return "ok testcoup=" + std::to_string(mode) + " forced=" + std::to_string(runs);
+    }
     if (g_role != Role::Host) return "error host only";
     if (cmd == "list") {
         std::string s = "ok phase=" + std::string(g_battlePhase ? "1" : "0") + " timeout=" +
@@ -4763,7 +5510,8 @@ std::string DebugBattles(const std::vector<std::string>& a) {
             s += std::to_string(r.id) + ":" + std::to_string(r.human) + "-" + std::to_string(r.opp) + ":" + W2U(r.area) +
                  ":" + BattleStateName(r.state) + (r.why.empty() ? "" : ":" + r.why) +
                  (r.kind ? ":kind=" + std::to_string(r.kind) + ":att=" + std::to_string(r.attempts.size()) : "") +
-                 (r.declined ? ":declined" : r.avoided ? ":avoided" : "") + "; ";
+                 (r.declined ? ":declined" : r.avoided ? ":avoided" : "") +
+                 (r.raider ? ":raider=" + std::to_string(r.raider) : "") + "; ";
         return s;
     }
     if (cmd == "gen" && a.size() > 2) {  // B6, tests: nation K's generator now; "queue" adds its request (month end)
@@ -4843,6 +5591,55 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         g_battles.push_back(r);
         Log("battle request %d injected (the player's generator): nation %d attacks %d%s", r.id, K, J,
             InArea(area).c_str());
+        return "ok " + std::to_string(r.id);
+    }
+    if (cmd == "injectraid" && a.size() > 2) {  // 0.7.0, tests: a request of the player's generator: one raider check
+        if (g_afterTurnPending || g_battlePhase) return "error not while the month or its battles are processed";
+        int K = atoi(a[2].c_str());
+        if (!B6On(K)) return "error the player's battle generator is not on for nation " + std::to_string(K);
+        if (!RaiderChecksOn(K)) return "error the player's PC does not replay raider checks (hello gen < 3)";
+        int J = FirstComputerEnemy(K);
+        if (J < 1) return "error nation " + std::to_string(K) + " is at war with no computer nation";
+        game::BattleAttempt t;
+        t.type = 1;
+        t.a = K;
+        BattleReq r;
+        r.id = g_battleNextId++;
+        r.kind = 1;
+        r.attempts = {t};
+        r.a = K;
+        r.b = J;
+        r.human = K;
+        r.opp = J;
+        r.player = PlayerOfNation(K)->name;
+        g_battles.push_back(r);
+        Log("battle request %d injected (the player's generator): a raider check of nation %d (named for %d)", r.id, K, J);
+        return "ok " + std::to_string(r.id);
+    }
+    if (cmd == "injectinv" && a.size() > 2) {  // 0.7.0 (P3), tests: a request of the player's generator: the invasion check
+        if (g_afterTurnPending || g_battlePhase) return "error not while the month or its battles are processed";
+        int K = atoi(a[2].c_str());
+        if (!B6On(K)) return "error the player's battle generator is not on for nation " + std::to_string(K);
+        if (!InvasionChecksOn(K))
+            return "error the player's PC does not replay invasion checks (hello gen < 4) or the nation has no invasion";
+        int J = InvasionEnemy(K);
+        if (J < 1) J = FirstComputerEnemy(K);
+        if (J < 1) return "error nation " + std::to_string(K) + " is at war with no computer nation";
+        game::BattleAttempt t;
+        t.type = 2;
+        t.a = K;
+        BattleReq r;
+        r.id = g_battleNextId++;
+        r.kind = 1;
+        r.attempts = {t};
+        r.a = K;
+        r.b = J;
+        r.human = K;
+        r.opp = J;
+        r.player = PlayerOfNation(K)->name;
+        g_battles.push_back(r);
+        Log("battle request %d injected (the player's generator): the invasion check of nation %d (named for %d)", r.id,
+            K, J);
         return "ok " + std::to_string(r.id);
     }
     if (cmd == "timeout" && a.size() > 2) {
@@ -4960,6 +5757,7 @@ void Leave() {
     g_pactAllies.clear();
     g_pactWars.clear();
     g_cSnap = DipSnap();
+    ClearQueuedNews("the session ended");
     g_playerNews.clear();
     g_treatyNews.clear();
     g_pendingTreaty.clear();
@@ -4976,6 +5774,7 @@ void Leave() {
     game::SetHostEndsArmsTreaty(false);
     g_econNews.clear();
     g_econNewsSeq = -1;
+    g_invPlanFromHost = false;
     g_relNations.clear();
     g_relForced.clear();
     g_kLend.clear();
@@ -5008,6 +5807,7 @@ void Leave() {
     g_autoStart = false;
     if (g_battlePhase) game::SetStrategicEnabled(true);
     g_battles.clear();
+    g_invPhase.clear();
     g_battlePhase = g_battleFinishing = g_battleMerged = false;
     g_battlePhaseBytes.clear();
     ClientDropBattle();
@@ -5222,6 +6022,23 @@ void SendChat(const std::string& text) {
     }
 }
 
+// 0.7.0: the player's legacy build ended (the game's own "Continue" steps, or a forced submit): this month's turn
+// carries the hand-built fleet, and the host gets a notice.
+static void ClientLegacyFinished(int ships, int funds, bool forced) {
+    g_legacyBuiltSeq = g_clientSeq;
+    game::SetTurnButtonCaption(L"Submit");
+    KV k;
+    k["state"] = "done";
+    k["ships"] = std::to_string(ships);
+    k["funds"] = std::to_string(funds);
+    if (forced) k["forced"] = "1";
+    net::Send(0, net::MSG_LEGACY, KVEncode(k));
+    Log("legacy fleet: built%s: %d ship(s), funds %d", forced ? " (ended by the submit)" : "", ships, funds);
+    if (!forced)
+        Notice("Your legacy fleet is built: " + std::to_string(ships) + " ship(s), funds " + std::to_string(funds) +
+               ". Plan the month and press Submit.");
+}
+
 void SubmitTurn() {
     if (g_role != Role::Client) return;
     if (!g_haveState || g_phase != Phase::Planning) {
@@ -5237,6 +6054,15 @@ void SubmitTurn() {
         Notice("Another game is loaded; cannot submit.");
         return;
     }
+    if (game::LegacyActive()) {  // the time limit or the host's Advance end the legacy build as it is
+        if (!g_submitForcedByHost) {
+            Notice("Finish your legacy fleet first: press Continue on the strategic screen (twice).");
+            return;
+        }
+        int ships = 0, funds = 0;
+        game::FinishLegacyBuild(&ships, &funds);
+        ClientLegacyFinished(ships, funds, true);
+    }
     // The game's Turn asks its player about missing trade protection and foreign stations (PlayerChecksBeforeTurn);
     // the player's Submit asks the same for the player's nation, with the same choice to go back (not when the host's
     // time limit submits).
@@ -5249,13 +6075,15 @@ void SubmitTurn() {
     game::SaveGame();
     Bundle b;
     std::string err;
-    if (!saveio::BuildSubmission(game::SaveDir(g_clientSlot), g_clientSlot, g_myNation, g_clientIdStart, b, err)) {
+    if (!saveio::BuildSubmission(game::SaveDir(g_clientSlot), g_clientSlot, g_myNation, g_clientIdStart, b, err,
+                                 g_legacyBuiltSeq >= 0 && g_legacyBuiltSeq == g_clientSeq)) {
         Notice("Cannot package your turn: " + err);
         return;
     }
     nplay::ClientAddSubmission(b, game::SaveDir(g_clientSlot), g_clientSlot, g_myNation);  // own intelligence
     KV h;
     h["seq"] = std::to_string(g_clientSeq);
+    if (g_hostGen >= 4) h["kinvt"] = W2U(inv::FormTarget());  // 0.7.0: the nation's invasion target ("" none)
     h["nation"] = std::to_string(g_myNation);
     net::Send(0, net::MSG_SUBMIT, PackHB(KVEncode(h), b.Pack()));
     g_submitted = true;
@@ -5646,6 +6474,8 @@ void OnNet() {
 void Tick() {
     DWORD now = GetTickCount();
     lockstep::Tick();
+    // 0.7.0: a legacy build belongs to a joined player's session (its skips must not outlive it)
+    if (g_role != Role::Client && game::LegacyActive()) game::LegacyAbort();
     // Client B of a live battle: back to the player's own game once the battle screen is closed.
     if (g_lsLeave && !game::BattleActive() && !game::IsBusy() && !lockstep::Busy()) {
         g_lsLeave = false;
@@ -5695,6 +6525,7 @@ void Tick() {
                         g_afterTurnPending = false;
                         g_turnRunning = false;
                         ApplyDiplomacy();
+                        HostRunInvasions();  // 0.7.0: after the battles, before the war counters' step
                         KWarMonthStep();
                         BroadcastState();
                     } else {
@@ -5757,9 +6588,20 @@ void Tick() {
             Log("economy: showing %d message(s) of this nation's money and war rules", (int)lines.size());
             game::ShowTurnMessagesOf(lines);
         }
+        // 0.7.0: the legacy build: the game's picture message once the month is shown, then its end (back in normal
+        // play after the game's own "Continue" steps). The month's event roll and relation routines wait for it.
+        if (g_legacyMsgDue && g_haveState && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive()) {
+            g_legacyMsgDue = false;
+            game::LegacyShowStartMessage();
+        }
+        {
+            int ships = 0, funds = 0;
+            if (game::LegacyActive() && game::LegacyCheckDone(&ships, &funds)) ClientLegacyFinished(ships, funds, false);
+        }
         // This month's event roll (once per calendar month, see ClientRunEvent).
         if (g_eventRollSeq >= 0 && g_eventRollSeq == g_clientSeq && g_haveState && g_phase == Phase::Planning &&
-            !g_submitted && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive()) {
+            !g_submitted && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive() &&
+            !game::LegacyActive() && !g_legacyMsgDue) {
             g_eventRollSeq = -1;
             ClientRunEvent(-1);
         }
@@ -5925,6 +6767,8 @@ bool OnTurnClick(void* self, void* sender) {
         return true;
     }
     if (g_role == Role::Client) {
+        // 0.7.0: during the legacy build the Turn button is the game's own "Continue" (its start-build steps)
+        if (game::LegacyActive() && game::StartBuildPhase() != 2) return false;
         SubmitTurn();
         return true;
     }

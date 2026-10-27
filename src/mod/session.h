@@ -139,7 +139,13 @@ bool FightBattles();
 // the strike dialog); the host's live battles and the battles it relays between two players carry it.
 void SetAutoStrike(bool on);
 bool AutoStrike();
+// The legacy fleet (0.7.0): the host's option (joined players may build their legacy fleet by hand in a new
+// campaign's first month; default on) and the joined player's choice (default off).
+void SetLegacyAllowed(bool on);
+void SetLegacyWanted(bool on);
+bool LegacyWanted();
 std::string DebugBattles(const std::vector<std::string>& args);  // bridge `battles ...`
+std::string DebugInvasions(const std::vector<std::string>& args);  // bridge `inv ...` (0.7.0)
 // Live player-vs-player battles: bridge `ls ...` (session-level `ls enable 0|1`, `ls session`, `ls autostrike`,
 // `ls rejoin`; the rest: lockstep.h).
 std::string DebugLockstep(const std::vector<std::string>& args);
