@@ -987,27 +987,9 @@ def confirm(pid, title, timeout=5):
     return False
 
 
-def run_month(ctx, label, driver=None, slot=HOST_SLOT, checks=True):
-    """Process one month: the client submits, the host waits for everyone, presses Turn and its dialogs (and the
-    client's) are answered until the client plans the new month. Never polls the host's bridge meanwhile: its
-    calls run on the game's main thread, which is busy with the month. Then the client's event roll of the new
-    month is awaited (its dialog answered: an open event dialog refuses most bridge commands), and the per-month
-    checks (intel reports, saved files, month package size, event roll) run.
-    driver: a BattleDriver for a month with joined players' battles (it answers the client's dialogs, never
-    dismiss_dialogs); without one, a battle the month sends the client anyway is declined (battle_dialogs).
-    slot: the host's save slot. checks=False: a month of another campaign than the run's slot 1 session (`air_units`:
-    the 1935 copy in its own slot): no pre-month or month hooks and no month_checks (they follow slot 1 and nation 1);
-    the caller checks the month."""
-    n_month = len(ctx.months) + 1
-    for hook in list(ctx.pre_month_hooks) if checks else ():
-        hook(ctx, label, n_month)
-    date0 = ctl.status(C).get('date')
-    mark, cmark = log_mark(H), log_mark(C)
-    ctx.month_marks = (mark, cmark)
-    war = rel(0, 1).get('warCounter', '0')
-    if war.lstrip('-').isdigit() and int(war) > 0:
-        log(f'  WARNING: the host nation is at war (warCounter={war}); the month may start a tactical battle')
-    t0 = time.time()
+def month_prepare(ctx, slot=HOST_SLOT, checks=True):
+    """run_month's start before the host's Turn: the client submits, the host sees everyone ready; the state the
+    per-month checks compare with. Returns the possessions' fields before the turn."""
     cmd(C, 'submit')
     # (since 0.4.1 `submit` is asynchronous: its Turn questions may show; submitting=1 until it has returned)
     wait(C, lambda s: s.get('submitted') == '1' and s.get('submitting', '0') == '0', 30, 'client submitted',
@@ -1020,7 +1002,35 @@ def run_month(ctx, label, driver=None, slot=HOST_SLOT, checks=True):
     ctx.kwar_before = kwar_counters(H) if checks else None
     if checks:
         relrules_pre_month(ctx)
-    cmd(H, 'turn')
+    return pf0
+
+
+def run_month(ctx, label, driver=None, slot=HOST_SLOT, checks=True, started=False):
+    """Process one month: the client submits, the host waits for everyone, presses Turn and its dialogs (and the
+    client's) are answered until the client plans the new month. Never polls the host's bridge meanwhile: its
+    calls run on the game's main thread, which is busy with the month. Then the client's event roll of the new
+    month is awaited (its dialog answered: an open event dialog refuses most bridge commands), and the per-month
+    checks (intel reports, saved files, month package size, event roll) run.
+    driver: a BattleDriver for a month with joined players' battles (it answers the client's dialogs, never
+    dismiss_dialogs); without one, a battle the month sends the client anyway is declined (battle_dialogs).
+    slot: the host's save slot. checks=False: a month of another campaign than the run's slot 1 session (`air_units`:
+    the 1935 copy in its own slot): no pre-month or month hooks and no month_checks (they follow slot 1 and nation 1);
+    the caller checks the month. started=True: the caller has already set the month going (`disk_full`: the host's
+    save after a failed one lets the stopped month go on); only the waiting and the checks."""
+    n_month = len(ctx.months) + 1
+    for hook in list(ctx.pre_month_hooks) if checks and not started else ():
+        hook(ctx, label, n_month)
+    date0 = ctl.status(C).get('date')
+    mark, cmark = log_mark(H), log_mark(C)
+    ctx.month_marks = (mark, cmark)
+    war = rel(0, 1).get('warCounter', '0') if not started else '0'
+    if war.lstrip('-').isdigit() and int(war) > 0:
+        log(f'  WARNING: the host nation is at war (warCounter={war}); the month may start a tactical battle')
+    t0 = time.time()
+    pf0 = poss_fields(slot)
+    if not started:
+        pf0 = month_prepare(ctx, slot, checks)
+        cmd(H, 'turn')
     timeout = MONTH_TIMEOUT + (driver.extra_timeout if driver else 0)
     end = time.time() + timeout
     ev_seen = []  # the client's event dialogs (the new month's roll may show one before the month is detected)
@@ -5142,12 +5152,22 @@ def ship_holders(port, sid):
 
 def peace_war(K, J, t=50):
     """A war (or peace, t <= 40) between nations K and J on both copies at once (`settension`; no month needed); a war
-    started this way gets K's war counter as the game's WarStartsWithNation sets it (1) when it was at peace."""
+    started this way gets K's war counter as the game's WarStartsWithNation sets it (1) when it was at peace, and a
+    peace that ends K's last war sets it to 0 as the host's own rule does at its next look (KWarFollow). 0.7.1: a
+    counter left above 0 while K is at peace (a war an earlier scenario ended by a bare `settension`, no month between)
+    is put to 0 first, else the next war counted on from the old one (war_effects' M1 "war counter 6" after
+    `battles`)."""
+    at_war = lambda: any(rel(K, x).get('war') == '1' for x in range(9) if x != K)  # noqa: E731
+    kw = (kwar_counters(H) or {}).get(K)
+    if kw is not None and kw > 0 and not at_war():
+        cmd(H, f'kwar {K} 0')
+        kw = 0
     for port in (H, C):
         cmd(port, f'settension {K} {J} {t}')
-    kw = (kwar_counters(H) or {}).get(K)
     if t > 40 and kw is not None and kw <= 0:
         cmd(H, f'kwar {K} 1')
+    elif t <= 40 and kw is not None and kw > 0 and not at_war():
+        cmd(H, f'kwar {K} 0')
     return rel(K, J), value(cmd(C, f'rel {K} {J}'))
 
 
@@ -5164,7 +5184,10 @@ def scenario_battle_generator(ctx):
     declined on the client is merged ("the player declined battle"), never resolved by the game (a preview without an
     enabled Decline is fought); e) `battles aitest 1 J area`: the game's resolution with its result box captured, no
     box on the host; e2) (0.6.1) `battles aitest` where nation J has no ship that can fight: no battle, the game's routine
-    not called (it read a nil ship: "Error in DoBattleBetweenAINations procedure!"). The war ends at the end."""
+    not called (it read a nil ship: "Error in DoBattleBetweenAINations procedure!"); f) (0.7.1, `battle_noforce`, one
+    more month) the battle setup's SelectForce without a ship of nation 1 that can fight in the area and with its ally's
+    division (TEST `battles testnoforce`): the mod's guard, no game error box, no battle (not a decline), the next
+    attempt played. The war ends at the end."""
     K = 1
     for port, who in ((H, 'host'), (C, 'client')):
         ln = log_lines(log_since(port), r"Player's battle generator for joined nations")
@@ -5292,7 +5315,8 @@ def scenario_battle_generator(ctx):
     for b in (b1, b0):
         rec_b = drv.rec.get(b, {})
         o = rec_b.get('outcome')
-        merged = re.search(rf'battle {b} applied: .*the player declined battle', hlog)
+        merged = re.search(rf'battle {b} applied: .*(the player declined battle|the game\'s no-force rule, not a decline)',
+                           hlog)  # 0.7.1: the game's no-force rule of nation 1's side is merged as a decline's is
         game = re.search(rf'battle {b} resolved by the game', hlog)
         check(f'd) battle {b} ({"the player" if b == b1 else "the computer"}\'s generator) declined on the client '
               f'({o}): merged with the decline\'s consequences, never resolved by the game (the enemy\'s decline, no '
@@ -5327,7 +5351,108 @@ def scenario_battle_generator(ctx):
               and not game_error_boxes(t_e), dict(reply=r, log=ln[-2:]))
     else:
         log(f'  e2) no area where nation {K} has ships and nation {J} none: not checked')
+    battle_noforce(ctx, K, J, area, humans)
     peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() else 5)
+
+
+def battle_noforce(ctx, K, J, area, humans):
+    """battle_generator f) (0.7.1, fix-selforce): the battle setup's force builder SelectForce when nation K's side has
+    no ship that can fight in the area. The game's fallback gives the side its ally's division and looks for a division
+    of the side for it to join; there is none, and the game read that missing division ("Error in SelectForce
+    procedure! Access violation ... Read of address 0000000D" on the player's PC; the 0.7.1 RC's NO-GO) and the replay
+    sent the player's decline. A computer ally X of nation K at war with J on both copies (war_effects' setup); the
+    client's `battles testnoforce 1 X 2` (TEST: the next two force builds of nation K's side without its ships in the
+    area, X's ships there, the fallback's own draws high, the attempts plain); two requests of the player's generator
+    (`battles injectgen K J area`: one attempt; `... x2`: two attempts) and a month with a battle driver (decline). f1)
+    every TEST build ended by the mod's guard (its log line, the ally's ships unused again), no game error box; f2) the
+    request of one attempt: "nobattle" with the reason on the client, the host's "no battle" with it (not applied as a
+    decline), nation K's decline counts not raised (the map message's Accept sets its own to 0 first, as in single
+    player); f3) the request of two attempts: attempt 0 found no force, attempt 1
+    was played (single player's generator goes on). A request whose attempt did not come to the setup: SKIP-note."""
+    nt = nation_table()
+    X = next((x for x in range(3, 9) if x not in humans and x != J and x in nt), None)
+    if X is None:
+        log('  SKIP-note f) no computer nation for the ally')
+        return
+    if rel(K, J).get('war') != '1':
+        log('  the war had ended:', peace_war(K, J))
+    tkx, txj = rel(K, X).get('tension', '5'), rel(X, J).get('tension', '5')
+    for port in (H, C):
+        cmd(port, f'setally {K} {X} 24')
+        cmd(port, f'settension {K} {X} 2')
+        cmd(port, f'settension {X} {J} 50')
+    try:  # the alliance, the war X-J and the switch are undone however f) ends
+        rt = cmd(C, f'battles testnoforce 1 {X} 2')
+        if not check(f'f) setup: alliance {K}-{X}, war {X}-{J} on both copies; the client\'s `battles testnoforce 1 {X} '
+                     f'2` (guard=1)', rel(K, X).get('ally') not in (None, '0') and rel(X, J).get('war') == '1' and
+                     rt.startswith('ok testnoforce=1 n=2') and 'guard=1' in rt,
+                     dict(kx=rel(K, X), xj=rel(X, J), test=rt)):
+            return
+        ra, rb = cmd(H, f'battles injectgen {K} {J} {area}'), cmd(H, f'battles injectgen {K} {J} {area} x2')
+        a = int(ra.split()[1]) if ra.startswith('ok ') else None
+        b = int(rb.split()[1]) if rb.startswith('ok ') else None
+        if not check(f'f) setup: requests of the player\'s generator in {area}: one attempt ({a}), two attempts ({b})',
+                     a and b, dict(a=ra, b=rb)):
+            for bid in (a, b):
+                if bid:
+                    cmd(H, f'battles resolve {bid}')
+            return
+        battle_noforce_month(ctx, K, J, area, a, b)
+    finally:
+        cmd(C, 'battles testnoforce 0')
+        for port in (H, C):
+            cmd(port, f'setally {K} {X} 0')
+            cmd(port, f'settension {X} {J} {txj}')
+            cmd(port, f'settension {K} {X} {tkx}')
+
+
+def battle_noforce_month(ctx, K, J, area, a, b):
+    """battle_noforce's month (requests a: one attempt, b: two attempts) and its checks f1) to f3)."""
+    t_f = time.time()
+    drv = BattleDriver(ctx, {a: 'decline', b: 'decline'}, K, J)
+    drv.label = 'battlegen noforce'
+    run_month(ctx, drv.label, driver=drv)
+    cl, hl = log_since(C, drv.cmark), log_since(H, drv.hmark)
+    tests = log_lines(cl, r'battle setup: TEST: side 0 ')
+    guards = [re.search(r'\((\d+) of the ally\'s ships unused again\)', x) for x in
+              log_lines(cl, r'the mod ends the force build there')]
+    boxes = game_error_boxes(t_f)
+    check(f'f1) every TEST force build ({len(tests)}) ended by the mod\'s guard (client log "... the mod ends the force '
+          f'build there: no battle, as after the game\'s box (n of the ally\'s ships unused again)", n >= 1: the ships '
+          f'the fallback took), no game error box on either copy',
+          tests and len(guards) == len(tests) and all(g and int(g[1]) >= 1 for g in guards) and not boxes,
+          dict(tests=[x.split('TEST: ', 1)[-1][:160] for x in tests], guards=[g[0] if g else None for g in guards],
+               boxes=boxes))
+    ca = log_lines(cl, rf'\] battle {a}: ')
+    if any('the battle setup found no force' in x for x in ca):
+        oa = (drv.rec.get(a) or {}).get('outcome')
+        dca = re.search(rf'battle {a}: nation {K}\'s decline counts (-?\d+)/(-?\d+) \(were (-?\d+)/(-?\d+)\)', hl)
+        check(f'f2) request {a} (one attempt, its setup found no force): "nobattle" with the reason ("... had no ship that '
+              f'could fight in {area}") on the client, the host\'s "battle {a} (kind 1): no battle (...)", not applied as '
+              f'a decline, nation {K}\'s decline counts not raised (the map message\'s Accept sets its own to 0, as in '
+              f'single player)',
+              oa == 'nobattle' and any(re.search(r': nobattle - .* had no ship that could fight in ', x) for x in ca)
+              and re.search(rf'battle {a} \(kind 1\): no battle \(.* had no ship that could fight in ', hl)
+              and not re.search(rf'battle {a} applied', hl) and
+              (not dca or (int(dca[1]) <= max(0, int(dca[3])) and int(dca[2]) <= max(0, int(dca[4])))),
+              dict(outcome=oa, client=[x.split('] ', 1)[-1][:160] for x in ca[-3:]],
+                   host=[x.split('] ', 1)[-1][:200] for x in log_lines(hl, rf'battle {a}\b')[-3:]]))
+    else:
+        log(f'  SKIP-note f2) request {a}\'s attempt did not come to the battle setup:',
+            [x.split('] ', 1)[-1][:160] for x in ca[-3:]])
+    cb = log_lines(cl, rf'\] battle {b}: ')
+    if any(re.search(r': attempt 0: the battle setup found no force', x) for x in cb):
+        played = log_lines(cl, rf'\] battle {b}: attempt 0 \(.*found no battle \(its setup found no force: the next '
+                               r'attempt, as single player\)')
+        n1 = len(log_lines(cl, r'StartPlayerBattle \d+ attacks \d+ in '))
+        check(f'f3) request {b} (two attempts): attempt 0\'s setup found no force, attempt 1 was played (client "attempt 0 '
+              f'(...) found no battle (its setup found no force: the next attempt, as single player)"; the request\'s '
+              f'outcome is attempt 1\'s)', played and (drv.rec.get(b) or {}).get('outcome') is not None,
+              dict(lines=[x.split('] ', 1)[-1][:160] for x in cb[-5:]], outcome=(drv.rec.get(b) or {}).get('outcome'),
+                   starts=n1))
+    else:
+        log(f'  SKIP-note f3) request {b}\'s attempt 0 did not come to the battle setup:',
+            [x.split('] ', 1)[-1][:160] for x in cb[-3:]])
 
 
 def month_state_checks(ctx, K, clog, st_set, bids):
@@ -5499,18 +5624,37 @@ def scenario_battle_surprise(ctx):
 PEACE_SHIP_SKIPPED = r"relations v2: peace of nation {K}: ship (\d+) \(.*?\) skipped: not among nation {K}'s ships"
 
 
+def battle_slot_race(drv, bid, within=3.0):
+    """Battle `bid`'s slot read by the BattleDriver unreadable because the client was copying its next battle into the
+    battle slot then (the known race, Known traps: the next "player copy in slot N" within `within` s of "battle bid:
+    fought" in the client's log): the times as text, else None."""
+    c = log_since(C, drv.cmark)
+    pre, hit, post = c.partition(f'] battle {bid}: fought')
+    if not hit:
+        return None
+    line = pre.rsplit('\n', 1)[-1]
+    m = re.search(rf'^(\d\d:\d\d:\d\d\.\d{{3}}) \[[ \d]+\] player copy in slot {BATTLE_SLOT}:', post, re.M)
+    t_f, t_c = log_secs(line), (log_secs(m[1]) if m else None)
+    if t_f is None or t_c is None or not 0 <= t_c - t_f <= within:
+        return None
+    return f'"fought" at {line[:12]}, the next battle\'s copy into slot {BATTLE_SLOT} at {m[1]}: the slot not readable then'
+
+
 def raider_merge_check(drv, bid, K, J, tag, forced_line):
     """0.7.0: a raider battle's result in the host's save. Every field of nation K's and J's ships that the battle slot
     changed (relative to the host's save at the battle phase's start; intel fields, BuildingNationIdx and Used excluded:
     a raider battle's merge keeps the host's Used marks) has the slot's value in the merged save, sunk ships are gone;
-    the two ships the test put in place (`battles testraid`) have their own status and area back (unless sunk)."""
+    the two ships the test put in place (`battles testraid`) have their own status and area back (unless sunk). A battle
+    slot the client had already replaced with its next battle's copy when the driver read it (its write time after
+    "fought", or no file then: battle_slot_race) is not cross-checked (a SKIP-note, as `battles` b): 0.7.1 RC)."""
     s0, g87, s1 = drv.s0, drv.g87.get(bid), drv.s1.get(bid)
-    if not check(f'{tag}: the saves for the merge check (phase start, battle slot, merged)', s0 and g87 and s1,
-                 dict(s0=bool(s0), g87=bool(g87), s1=bool(s1))):
+    stale = drv.g87_stale.get(bid) or (None if g87 else battle_slot_race(drv, bid))
+    if not check(f'{tag}: the saves for the merge check (phase start, battle slot, merged)', s0 and (g87 or stale) and s1,
+                 dict(s0=bool(s0), g87=bool(g87), s1=bool(s1), stale=stale)):
         return
     skip = ('PlayerIntel', 'EnemyClassName', 'EnemySpeed', 'EnemyBelt', 'BuildingNationIdx', 'Used')
     bad, changed, sunk = [], 0, 0
-    for slot_n, host_n in ((0, K), (J, J)):
+    for slot_n, host_n in ((0, K), (J, J)) if not stale else ():
         before = ships_by_id(s0.get(f'Nation{host_n}Ships'))
         after = ships_by_id(g87.get(f'Nation{slot_n}Ships'))
         merged = ships_by_id(s1.get(f'Nation{host_n}Ships'))
@@ -5527,8 +5671,12 @@ def raider_merge_check(drv, bid, K, J, tag, forced_line):
                 changed += 1
                 if merged.get(sid, {}).get(k) != v:
                     bad.append((host_n, sid, k, v, merged.get(sid, {}).get(k)))
-    check(f'{tag}: merged on the host: every ship field of nations {K} and {J} the battle changed ({changed}) has the '
-          f'battle slot\'s value, sunk ships ({sunk}) gone (the Used marks stay the host\'s)', not bad, bad[:5])
+    if stale:
+        log(f'  SKIP-note {tag}: the merge cross-check of battle {bid}: the client had copied its next battle into slot '
+            f'{BATTLE_SLOT} before the runner read this one\'s ({stale})')
+    else:
+        check(f'{tag}: merged on the host: every ship field of nations {K} and {J} the battle changed ({changed}) has the '
+              f'battle slot\'s value, sunk ships ({sunk}) gone (the Used marks stay the host\'s)', not bad, bad[:5])
     m = re.search(r'raider (.+?) \(status (\d+)\) and patrol (.+?) \(status (\d+)\) in (.+)$', forced_line or '')
     if not m:
         return
@@ -5557,7 +5705,9 @@ def scenario_battle_raider(ctx):
     with its "thwarts" lines; outcome fought, merged on the host ("; a raider battle[, auto-resolved]"), the merge
     cross-checked, the test's setup not merged; the "thwarts" lines in nation 1's news (the client's chat with the new
     month), not in the host's chat; the host unchanged (nation 0's ships as at the phase start, no raider box on the
-    host); the host's chat line. The war ends at the end."""
+    host); the host's chat line. A case whose test finds no ships for its pair in the battle slot ("no ships for it":
+    the scenario's earlier raider battles sank or damaged them; 0.7.1 RC2) checks its clean no-battle and is a
+    SKIP-note. The war ends at the end."""
     K = 1
     for port, who in ((H, 'host'), (C, 'client')):
         ln = log_lines(log_since(port), r'Raiders against patrols for joined nations')
@@ -5615,6 +5765,21 @@ def scenario_battle_raider(ctx):
         hlog, clog = log_since(H, hm), log_since(C, cm)
         rec = drv.rec.get(bid, {})
         forced = log_lines(clog, rf'StartRaiderCheck: TEST: forced interception \(side {side}, nation {J}\): raider ')
+        noships = log_lines(clog, rf'StartRaiderCheck: TEST: forced interception \(side {side}, nation {J}\): no ships '
+                                  r'for it')
+        if noships and not forced:  # 0.7.1 RC2: the scenario's own earlier battles left no pair for the test
+            check(f'{tag}: the test found no ships for the forced interception in the battle slot: battle {bid} ended '
+                  f'without a battle (nobattle), the host\'s "battle {bid} (kind 1): no battle (...)", nothing merged, no '
+                  f'game error box', rec.get('outcome') == 'nobattle' and
+                  re.search(rf'battle {bid} \(kind 1\): no battle \(', hlog) and
+                  not re.search(rf'battle {bid} applied', hlog) and not game_error_boxes(t_b),
+                  dict(outcome=rec.get('outcome'), host=[x.split('] ', 1)[-1] for x in
+                                                         log_lines(hlog, rf'battle {bid}\b')[-2:]],
+                       errors=game_error_boxes(t_b)))
+            log(f'  SKIP-note {tag}: the client\'s game had no ships for the forced interception (an operational cruiser '
+                f'of the patrolling side or an operational ship of the raiding side, nation {J} or {K}: the scenario\'s '
+                f'earlier raider battles sank or damaged them):', noships[-1].split('] ', 1)[-1])
+            continue
         res = log_lines(clog, r'StartRaiderCheck: True, interception yes')
         nmsg = re.search(r', (\d+) new turn message', res[-1]) if res else None
         check(f'{tag}: the client put the pair in place and the game\'s CheckRaiderVsPatrols found the interception '
@@ -5858,6 +6023,14 @@ def scenario_battle_invasion(ctx):
             if e['took'] else None
         return mc and mh and mc.group(1) == mh.group(1) and mc.group(2) == mh.group(2)
 
+    def ended_same_month(e, name):
+        """The game's own CheckRebellionAndInvasions ended the landing at `name` later in the battle's month, after the
+        host applied it: its message in the host's "invasions of nation K: ..." lines after the battle phase (0.7.1 RC:
+        "The Russian troops in Kiautschou Bay have been defeated!"). The lines, [] if none."""
+        rest = e['hlog'].split(f"battle phase: nation {K}'s invasions after its battles: ", 1)
+        return [x.split('] ', 1)[-1] for x in log_lines(rest[1], rf'invasions of nation {K}: ".*{re.escape(name)}')] \
+            if len(rest) > 1 else []
+
     e1 = inv_battle('e1) nation 1\'s invasion battle', [(C, f'inv pick {u(t2)}'), (H, f'inv target {K} {u(t2)}'),
                                                      (H, f'inv plan {K} 0 - {K}')], 'fight', t2)
     if e1:
@@ -5874,12 +6047,15 @@ def scenario_battle_invasion(ctx):
                                           rf'{re.escape(nt[J]["name"])}.* was fought by ', chat(ctx.hp)),
               dict(outcome=e1['rec'].get('outcome'), answers=e1['rec'].get('answers'), applied=e1['applied'][-1:]))
         landed = re.search(rf'(?:=|;){re.escape(t2)}:{J}:{K}:', s1)
+        rep1 = bool(e1['took']) and f'{t2} {K}/' in e1['took'][-1]
+        end1 = ended_same_month(e1, t2) if rep1 and landed is None else []
         check(f'e1) the battle slot\'s invasions came back with the result (the game\'s HandleInvasionResults) and the '
               f'host took the same plan and applied them: the battle pending no more; {t2} invaded by nation {K} after a '
-              f'won battle (else not) on the host as on the client', e1['back'] and same_state(e1, t2, 'e1') and
-              'pending=-1' in s1 and (landed is not None) == (f'{t2} {K}/' in e1['took'][-1]) and
-              (not landed or f'{t2} new: invader {K}' in ''.join(e1['appl'])),
-              dict(back=e1['back'][-1:], took=e1['took'][-1:], appl=e1['appl'][-1:], state=s1[:240]))
+              f'won battle (else not) on the host as on the client (or the landing applied and then ended by the game\'s '
+              f'own invasion routine in the same month)', e1['back'] and same_state(e1, t2, 'e1') and
+              'pending=-1' in s1 and ((landed is not None) == rep1 or rep1 and end1) and
+              (not rep1 or f'{t2} new: invader {K}' in ''.join(e1['appl'])),
+              dict(back=e1['back'][-1:], took=e1['took'][-1:], appl=e1['appl'][-1:], ended=end1[:2], state=s1[:240]))
         check('e1) no invasion box on the host, no game error box', not e1['hbox'] and not e1['errors'],
               dict(boxes=e1['hbox'][:2], errors=e1['errors']))
     # e2) the enemy's invasion of nation 1's possession kp2 where nation 1 has ships (pending: `inv plan 1 0 kp2 J`),
@@ -5918,14 +6094,18 @@ def scenario_battle_invasion(ctx):
                   dict(put=e2['put'][-1:], att=e2['att'][-1:], answers=e2['rec'].get('answers'),
                        buttons=e2['rec'].get('map_buttons')))
             landed = i2 is not None and i2[0] == K and i2[1] == J
+            rep2 = bool(e2['took']) and f'{kp2} {J}/' in e2['took'][-1]
+            end2 = ended_same_month(e2, kp2) if rep2 and not landed else []
             check(f'e2) battle {e2["bid"]}: {e2["rec"].get("outcome")}; the slot\'s invasions came back (the enemy\'s '
                   f'plan over) and the host took the same plan; {kp2} invaded by nation {J} on the host iff the client '
-                  f'reported it (the landing applied by name)', e2['rec'].get('outcome') in ('fought', 'declined') and
+                  f'reported it (the landing applied by name; or applied and then ended by the game\'s own invasion '
+                  f'routine in the same month)', e2['rec'].get('outcome') in ('fought', 'declined') and
                   e2['applied'] and same_state(e2, kp2, 'e2') and 'enemy plan -/-1' in e2['back'][-1] and
-                  landed == (f'{kp2} {J}/' in e2['took'][-1]) and
-                  (not landed or f'{kp2} new: invader {J}' in ''.join(e2['appl'])),
+                  (landed == rep2 or rep2 and end2) and
+                  (not rep2 or f'{kp2} new: invader {J}' in ''.join(e2['appl'])),
                   dict(outcome=e2['rec'].get('outcome'), answers=e2['rec'].get('answers'), applied=e2['applied'][-1:],
-                       back=e2['back'][-1:], took=e2['took'][-1:], appl=e2['appl'][-1:], inv=i2, state=s2[:200]))
+                       back=e2['back'][-1:], took=e2['took'][-1:], appl=e2['appl'][-1:], inv=i2, ended=end2[:2],
+                       state=s2[:200]))
             check('e2) no invasion box on the host, no game error box', not e2['hbox'] and not e2['errors'],
                   dict(boxes=e2['hbox'][:2], errors=e2['errors']))
     clear_k()
@@ -5943,7 +6123,7 @@ def scenario_battle_invasion(ctx):
             out[f.get('LocationAreaName')] = out.get(f.get('LocationAreaName'), 0) + 1
         return out
 
-    kl, jl = locs(K), locs(J)
+    kl, jl = fighting_ships_by_area(K), locs(J)  # (nation 1's ships that can fight: 0.7.1 RC, see below)
     weak = sorted(((jl.get(p['area'], 0) - kl.get(p['area'], 0), p['name'], p['area'], jl.get(p['area'], 0),
                     kl.get(p['area'], 0)) for p in (poss_list(H, f'possessions {J}') or [])
                    if 0 < p['value'] < 16 and kl.get(p['area'], 0) >= 1), reverse=True)
@@ -5951,7 +6131,7 @@ def scenario_battle_invasion(ctx):
     if want and any(w[1] == want for w in weak):
         weak = [w for w in weak if w[1] == want] + [w for w in weak if w[1] != want]
     if check('e3) setup: a possession of J in the sea area where J is the strongest against nation 1\'s ships there '
-             '(nation 1 has ships there)', weak, weak[:3]):
+             '(nation 1 has ships there that can fight: fighting_ships_by_area)', weak, weak[:3]):
         t3 = weak[0][1]
         on = cmd(C, f'battles testcoup {coup}')
         e3 = inv_battle('e3) nation 1\'s invasion battle, its setup as an intelligence coup\'s ambush',
@@ -5975,20 +6155,32 @@ def scenario_battle_invasion(ctx):
                 e3ok = amb and not afb and e3['rec'].get('outcome') in ('declined', 'fought')
                 e3ev = dict(testcoup=(on, off), att=e3['att'][-1:], setup=e3['setup'][-2:], boxes=afb,
                             answers=e3['rec'].get('answers'))
-                if rein or weak[0][0] > 0:
+                pv = e3['rec'].get('preview_t')
+                if rein:
                     check(f'{e3what}: the reinforcements of nation 1\'s side got its nation ("had no nation ... gave '
                           f'them nation 0"), no AdjustForcesForBattle box, {e3["rec"].get("outcome")}',
                           e3ok and rein and 'gave them nation 0' in rein[-1], e3ev)
                 else:
                     # nation 1 not outnumbered in the area (0.7.0 RC2: the default run's only candidate Northern Russia,
                     # 9 v 16 in Northern Europe, and `--only battle_invasion` with RTW3_INV_E3_TARGET there, 14 v 33:
-                    # forced +1, no line, no box): the reinforcement step meets no unset nation there, so the fix's path
-                    # is not exercised: the battle still checks for the box
+                    # forced +1, no line, no box): the reinforcement step meets no unset nation there; or no battle came
+                    # to its preview (0.7.1 RC: Finland, 42 v 1 in The Baltic: "Friendly ships not available to oppose
+                    # the enemy in the area!" after the map message, no setup): the fix's path is not exercised, the
+                    # battle still checks for the box. 0.7.1 RC2 (the --stress run): Northern Russia with nation 1
+                    # outnumbered (14 v 6 in Northern Europe), the preview reached, forced +1: no line and no box
+                    # either, so the ships in the area do not decide it (an unset local the game reads shows its box)
                     check(f'{e3what}: no AdjustForcesForBattle box, {e3["rec"].get("outcome")}', e3ok, e3ev)
-                    log(f'  SKIP-note e3) no "battle setup: the ambush\'s reinforcements" line at {t3}: nation 1 is not '
-                        f'outnumbered there ({weak[0][3]} ships of J, {weak[0][4]} of nation 1 in {weak[0][2]}; the '
-                        f'candidates {weak[:3]}), so the reinforcement step met no unset nation: the fix\'s path is '
-                        f'not exercised in this battle')
+                    why = (f'nation 1 is not outnumbered there ({weak[0][3]} ships of J, {weak[0][4]} of nation 1 in '
+                           f'{weak[0][2]}; the candidates {weak[:3]}), so the reinforcement step met no unset nation'
+                           if weak[0][0] <= 0 else
+                           f'the battle never came to its preview (answers {e3["rec"].get("answers")}: e.g. the game\'s '
+                           f'"Friendly ships not available to oppose the enemy in the area!"), so no battle was set up'
+                           if not pv else
+                           f'the reinforcement step met no unset nation although J outnumbers nation 1 there '
+                           f'({weak[0][3]} ships of J, {weak[0][4]} of nation 1 in {weak[0][2]}; the candidates '
+                           f'{weak[:3]}; no box)')
+                    log(f'  SKIP-note e3) no "battle setup: the ambush\'s reinforcements" line at {t3}: {why}: the fix\'s '
+                        f'path is not exercised in this battle')
         clear_k()
     # f) P5: nation 1's peace with J (client `peacetest 100 2 1`: the game's DoPeace in its view, B4's peace part) ends
     #    its invasions with J (the possessions' war state, `ptaken`) and its invasion plan (the host resets it)
@@ -6122,23 +6314,42 @@ def scenario_battle_invasion(ctx):
     clear_k()
     cmd(H, f'inv plan {K} 0 - -1')
     jcap = [p for p in (poss_list(H, f'possessions {J}') or []) if 0 < p['value'] < 16]
-    areas_k = [c[3] for c in battle_pairs(K) if c[2] == J]
-    pc2 = next((p['name'] for a in areas_k for p in jcap if p['area'] == a), None)
-    if check(f'i2) setup: a possession of J where nation {K} has ships', pc2, dict(areas=areas_k, J=[p['name'] for p in jcap[:3]])):
-        took, runs = False, []
-        for mode in (1, 0, 0, 0):  # (draws low, then the game's: the fortifications' test)
-            cmd(H, f'inv rnd {mode}')
-            cmd(H, f'inv set {u(pc2)} {K} 50')
-            hm = log_mark(H)
-            rr = cmd(H, f'inv run {K}')
-            runs.append(rr[:200])
-            if log_lines(log_since(H, hm), rf'invasions: nation {K}\'s month: {re.escape(pc2)} passes from nation {J} to '
-                                            rf'nation {K}'):
-                took = 'taken control' in rr
+    # 0.7.1 RC2: the game's month resolution defeats the player's invasion whenever the enemy's strength in the area is
+    # above the invader's ("E > Ps", its draw then always passes with support 50: "Our forces in <p> have been
+    # defeated!", The Philippines against the USA's ships in Southeast Asia), so the candidates go by the ships there:
+    # J's fewest (all of them) against nation K's that can fight first, at most three tried
+    kf2, bcs2 = fighting_ships_by_area(K), read_save(save_path(HOST_SLOT)) or {}
+    jl2 = {}
+    for f in ships_by_id(bcs2.get(f'Nation{J}Ships')).values():
+        jl2[f.get('LocationAreaName')] = jl2.get(f.get('LocationAreaName'), 0) + 1
+    cands2 = sorted((jl2.get(p['area'], 0) - kf2[p['area']], jl2.get(p['area'], 0), p['name'], p['area'], kf2[p['area']])
+                    for p in jcap if kf2.get(p['area'], 0) >= 1)
+    if check(f'i2) setup: a possession of J where nation {K} has ships that can fight (J\'s fewest ships there first)',
+             cands2, dict(cands=cands2[:3], J=[p['name'] for p in jcap[:4]])):
+        took, runs, tried, full = None, [], [], []
+        for _, nj, pc2, area2, nk in cands2[:3]:
+            tried.append(f'{pc2} ({area2}: {nj} ship(s) of J, {nk} of nation {K})')
+            for mode in (1, 0, 0, 0):  # (draws low, then the game's: the fortifications' test)
+                cmd(H, f'inv rnd {mode}')
+                cmd(H, f'inv set {u(pc2)} {K} 50')
+                hm = log_mark(H)
+                rr = cmd(H, f'inv run {K}')
+                runs.append(rr[:200])
+                full.append((pc2, rr))
+                if log_lines(log_since(H, hm), rf'invasions: nation {K}\'s month: {re.escape(pc2)} passes from nation {J} '
+                                                rf'to nation {K}'):
+                    took = pc2 if 'taken control' in rr else False
+                    break
+            if took is not None:
                 break
         cmd(H, 'inv rnd 0')
-        check(f'i2) nation {K} captures {pc2} in its month (support 50, draws low then the game\'s: "Our forces have taken control of", '
-              f'ChangePossessionOwner {J} -> {K})', took, runs[-2:])
+        if took is None and full and all(r.startswith('ok') and f'Our forces in {pc} have been defeated' in r
+                                         for pc, r in full):
+            log(f'  SKIP-note i2) the game\'s resolution defeated nation {K}\'s invasion in every run (the enemy\'s strength '
+                f'in the area above the invader\'s): {tried}; {runs[-1:]}')
+        else:
+            check(f'i2) nation {K} captures {took or tried} in its month (support 50, draws low then the game\'s: "Our '
+                  f'forces have taken control of", ChangePossessionOwner {J} -> {K})', took, runs[-2:])
     clear_k()
     jp3 = [p['name'] for p in (poss_list(H, f'possessions {J}') or []) if 0 < p['value'] < 10]
     if jp3:
@@ -7790,7 +8001,12 @@ def war_month(ctx, label, K, J):
     2026-10-23: arms_treaty M1's undeclinable battle, answered without a driver, outlived MONTH_TIMEOUT)."""
     drv = BattleDriver(ctx, {}, K, J)
     drv.label = label
-    return run_month(ctx, label, driver=drv)
+    r = run_month(ctx, label, driver=drv)
+    nf = log_lines(log_since(C, drv.cmark), r'battle setup: side \d .*(the mod ends the force build there|the game\'s '
+                                            r'no-force rule)|\] battle \d+: attempt \d+: the battle setup found no force')
+    if nf:  # 0.7.1 (fix-selforce): a battle setup without a side's force (the mod's guard or the game's rule), noted
+        log(f'  {label}: battle setups without a side\'s force: ' + '; '.join(x.split('] ', 1)[-1][:220] for x in nf))
+    return r
 
 
 def ship_changes(s0, g87, K, J, slot_k=0):
@@ -8226,7 +8442,10 @@ def battle_oldhost_checks(ctx, K, J, area, me, them):
     battle; the game resolves it."), the host has the game resolve it ("battle N: resolved by the game (Captain declined
     it)", after the battles "battle N resolved by the game: battle|no battle" with its result box captured, none shown).
     Three injected battles a month (nation K attacks: the preview's Decline is enabled), up to 2 months; then
-    `battles hostgen` back to the welcome's value (1; 2 since B6 piece 2)."""
+    `battles hostgen` back to the welcome's value (1; 2 since B6 piece 2). Only an injected battle counts: a battle of
+    the player's generator declined in the same month goes the generator's way on the host ("battle N (kind 1): no
+    battle (Captain declined it)", chat "* No battle of <nation> this month (...)"), not the checks' (0.7.1 RC: the
+    three injected battles avoided by the enemy, the generator's battle 20 declined)."""
     g0 = cstate().get('hostgen') or 1
     r = cmd(C, 'battles hostgen 0')
     check('c2) client `battles hostgen 0` -> "ok hostgen=0", `battles state` hostgen=0',
@@ -8240,15 +8459,17 @@ def battle_oldhost_checks(ctx, K, J, area, me, them):
             drv.label = f'battles D{attempt}'
             run_month(ctx, drv.label, driver=drv)
             for b, rec in sorted(drv.rec.items()):
-                notes.append((b, rec.get('outcome'), rec.get('preview_buttons')))
-                if not found and rec.get('outcome') == 'declined' and rec.get('preview_t') and not rec.get('no_decline'):
+                notes.append((b, rec.get('outcome'), rec.get('preview_buttons'))
+                             + (() if b in drv.plan else ('not injected',)))
+                if not found and b in drv.plan and rec.get('outcome') == 'declined' and rec.get('preview_t') \
+                        and not rec.get('no_decline'):
                     found = (b, drv)
             if found:
                 break
-            log(f'  c2) no battle declined in its preview (attempt {attempt}): {notes}')
+            log(f'  c2) no injected battle declined in its preview (attempt {attempt}): {notes}')
     finally:
         r1 = cmd(C, f'battles hostgen {g0}')
-    check(f'c2) a battle declined in its preview under the emulated older host (id, outcome, preview buttons); '
+    check(f'c2) an injected battle declined in its preview under the emulated older host (id, outcome, preview buttons); '
           f'`battles hostgen {g0}` after (the welcome\'s value)', found and r1 == f'ok hostgen={g0}',
           dict(notes=notes, restore=r1))
     if not found:
@@ -8799,6 +9020,717 @@ def scenario_divisions(ctx):
     boxes = [(w, t[:200]) for ts, w, _, t in BOX_SEEN if ts >= t0 and re.search(r'Error in \w*Division|Missing ship', t)]
     check('e) no exception, access violation, "Error in FillDivisionList2" or "Missing ship" in either log, no such box '
           f'(the scenario\'s {time.time() - t0:.0f} s)', not bad and not boxes, f'{bad[:4]}; {boxes[:4]}')
+
+
+# ---------------------------------------------------------------- a joined player's ship statuses (0.7.1)
+
+SS_TAB = 'Ships in service'  # the strategic screen's tab of lvShips (popup menu PopupShip)
+# (key, PopupShip item, the TCampaignShip.Status it sets): the game's status routine sets Status directly for the
+# selected rows (Reserve/Mothballed only in a home area, the foreign station not for a damaged ship); Raider calls
+# PutShipInRaiderStatus (5 in a home area, else 4). "Trade protection" and "Raider" are enabled only at war.
+SS_PLAN = (('tp1', 'Trade protection', (3,)), ('tp2', 'Trade protection', (3,)), ('raider', 'Raider', (4, 5)),
+           ('reserve', 'Reserve Fleet', (1,)), ('mothballed', 'Mothballed', (2,)),
+           ('station', 'To foreign station', (6,)))
+SS_STATUS = {0: 'active', 1: 'reserve', 2: 'mothballed', 3: 'trade protection', 4: 'raider', 5: 'raider (home area)',
+             6: 'foreign station', 7: 'interned', 8: 'sunk', 9: 'museum', 10: 'working up', 11: 'division training'}
+SS_NO_RAIDER = ('DD', 'KE')  # PutShipInRaiderStatus: "<type> not allowed as raiders." (TShipType 9 and 10)
+SS_ACTIVE = 'Active fleet'  # ActiveFleet1's caption as PopupShipPopup sets it on every popup (the form has "Active Fleet")
+# ShipStatusWatch (each version of slot 77's and slot 1's saves during a month, for a diagnosis) only with env
+# RTW3_SS_WATCH=1: reading a slot right after a save can collide with the game's next save of it (the known trap
+# "Error in SaveBuildCampaign procedure! Cannot create file", see Known traps)
+SS_WATCH = os.environ.get('RTW3_SS_WATCH', '') == '1'
+# The game's ship data dialog (TdlgShipStatus: "View data"): its VMT and its TLabels lbShipname, lbClass, lbShipType and
+# lbDisplacement (RTTI, 1.01.44), read from the copy's memory as box_text reads a box's message
+SHIPDLG_VMT_RVA = 0xbfc5c0 - 0x830000
+SHIPDLG_LABELS = (('name', 0x514), ('class', 0x5f4), ('type', 0x5f8), ('displacement', 0x5f0))
+SS_HOST_RE = (r'merge nation \d|submissions merged|LoadCampaign slot|AI moves undone|nation \d month: |'
+              r'AI suppressed: \w+ for nation 1\b|battle phase|battle \d+ (sent|applied)|DoEndOfTurn finished|'
+              r'(?i:trade prot|raider|ship status)')
+SS_CLIENT_RE = (r'turn checks for nation|submit|LoadCampaign slot|player copy in slot|client month:|'
+                r'battle \d+: (fought|declined|nobattle|avoided)|(?i:trade prot|raider|ship status)')
+
+
+def form_labels(top, vmt_rva, labels):
+    """{key: text} of a game form's TLabels (they have no window), read-only from the copy's memory as box_text reads a
+    box: the form object behind the window (its VMT checked), each label's FText. {} if it can't be read."""
+    out = {}
+    try:
+        pid = wt.DWORD()
+        tid = _u32.GetWindowThreadProcessId(top, ctypes.byref(pid))
+        base = exe_base(pid.value)
+        atom = _k32.GlobalFindAtomW(f'ControlOfs{base:08X}{tid:08X}') if base and tid else 0
+        obj = _u32.GetPropW(top, atom) if atom else None
+        h = _k32.OpenProcess(0x0010, False, pid.value) if obj else None  # PROCESS_VM_READ
+        if not h:
+            return out
+        try:
+            if _rd32(h, obj) == base + vmt_rva:
+                for key, off in labels:
+                    p = _rd32(h, _rd32(h, obj + off) + CONTROL_FTEXT)
+                    n = _rd32(h, p - 4) if p else 0  # (FText is a PWideChar from StrAlloc: its size at -4)
+                    raw = next((b for b in (_rpm(h, p, m) for m in (2 * n, n, 64) if 0 < m < 8000) if b), b'')
+                    out[key] = raw.decode('utf-16-le', errors='replace').split('\x00', 1)[0].replace('\r', ' ') \
+                        .replace('\n', ' ').strip()
+        finally:
+            _k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def ss_info(port, n, i):
+    """`shipinfo n i` -> dict(i, name, loc, ordered, status), None past the end of nation n's ship list."""
+    r = ctl.cmd(port, f'shipinfo {n} {i}', 30)
+    m = re.match(r'^ok (.*?) loc=(.*?) ordered=(.*?) status=(\d+)\s*$', r)
+    return dict(i=i, name=m[1], loc=m[2], ordered=m[3], status=int(m[4])) if m else None
+
+
+def ss_fleet(port, n, limit=600):
+    """Nation n's ships on one copy as {name: ss_info} (`shipinfo n i` from 0 until "no such ship"); a name that occurs
+    more than once is left out."""
+    out, seen = {}, set()
+    for i in range(limit):
+        s = ss_info(port, n, i)
+        if s is None:
+            break
+        if s['name'] in seen:
+            out.pop(s['name'], None)
+        else:
+            out[s['name']] = s
+        seen.add(s['name'])
+    return out
+
+
+def lv_headers(pid, lv):
+    """The column headers of a report list view in a game copy (LVM_GETCOLUMNW)."""
+    cols = []
+    with RemoteBuf(pid) as rb:
+        for c in range(24):
+            rb.write(128, bytes(480))
+            rb.write(0, struct.pack('<IiiIiiiiiii', 0x4, 0, 0, rb.addr + 128, 200, 0, 0, 0, 0, 0, 0))  # LVCF_TEXT
+            if not _u32.SendMessageW(lv, 0x105F, c, rb.addr):  # LVM_GETCOLUMNW
+                break
+            cols.append(rb.read(128, 400).decode('utf-16-le', 'replace').split('\x00')[0])
+    return cols
+
+
+def ss_list(pid, refresh=False):
+    """lvShips on a copy's "Ships in service" tab (selected first; refresh: filled anew): dict(lv, cols, ix (the columns
+    of Type, Name, Class, Location, Status), rows=[dict(row, name, cls, type, loc, status (the list's text), sel)]),
+    None without it."""
+    if not fo_set_tab(pid, SS_TAB, refresh=refresh):
+        return None
+    f = fo_frm(pid)
+    lv, cols = None, []
+    for h in children(f) if f else []:
+        if e2e_test.class_name(h) == 'TListView' and u.IsWindowVisible(h):
+            cols = lv_headers(pid, h)
+            if 'Name' in cols and 'Class' in cols:
+                lv = h
+                break
+    if not lv:
+        return None
+    ix = {k: cols.index(k) if k in cols else d for k, d in (('Type', 0), ('Name', 1), ('Class', 2), ('Location', 8))}
+    ix['Status'] = next((c for c, x in enumerate(cols) if 'status' in x.lower()), 9)
+    rows = []
+    for r, (_, sel, t) in enumerate(lv_rows(pid, lv, len(cols))):
+        v = {k: t[c].strip() if c < len(t) else '' for k, c in ix.items()}
+        rows.append(dict(row=r, name=v['Name'], cls=v['Class'], type=v['Type'], loc=v['Location'], status=v['Status'],
+                         sel=sel))
+    return dict(lv=lv, cols=cols, ix=ix, rows=rows)
+
+
+def ss_cur_tab(pid):
+    tc, _ = fo_tabs(pid)
+    return _u32.SendMessageW(tc, 0x130B, 0, 0) if tc else None  # TCM_GETCURSEL
+
+
+def ss_select(pid, lv, nc, name):
+    """Only lvShips's row of ship `name` selected (LVM_SETITEMSTATE on item -1 clears the multi-select list, as
+    fo_popup); its row, None without exactly one row of that name."""
+    names = [t[nc].strip() if len(t) > nc else '' for _, _, t in lv_rows(pid, lv, nc + 1)]
+    if names.count(name) != 1:
+        return None
+    with RemoteBuf(pid) as rb:
+        rb.write(0, _lvitem(state=0, state_mask=0x3))
+        _u32.SendMessageW(lv, LVM_SETITEMSTATE, 0xFFFFFFFF, rb.addr)
+    time.sleep(0.2)
+    lv_select(pid, lv, names.index(name))
+    time.sleep(0.4)
+    return names.index(name)
+
+
+def ss_menu_states(pid, wnd):
+    """{item: enabled} of a control's popup menu as the game builds it now (opened as popup_pick does, so its OnPopup
+    ran; GetMenuState MF_GRAYED | MF_DISABLED), closed again without a pick; {} without a menu."""
+    close_menus(pid)
+    u.PostMessageW(wnd, 0x007B, wnd, -1)  # WM_CONTEXTMENU (keyboard form)
+    menu = wait_until(lambda: next(iter(open_menus(pid)), None), bool, 4, step=0.2)
+    hm = _u32.SendMessageW(menu, MN_GETHMENU, 0, 0) if menu else 0
+    out = {}
+    for i in range(max(0, _u32m.GetMenuItemCount(hm)) if hm else 0):
+        b = ctypes.create_unicode_buffer(64)
+        _u32m.GetMenuStringW(hm, i, b, 64, 0x400)  # MF_BYPOSITION
+        if b.value:
+            out[b.value.replace('&', '')] = not _u32m.GetMenuState(hm, i, 0x400) & 0x3
+    close_menus(pid)
+    return out
+
+
+def ss_boxes(pid, who, quiet=1.2, cap=12):
+    """The game's boxes (TMessageForm, #32770) a popup item showed: their texts; answered (answer_dialogs) until none
+    showed for `quiet` s."""
+    texts, t0, last = [], time.time(), time.time()
+    while time.time() - t0 < cap and time.time() - last < quiet:
+        tops = [t for t in top_windows(pid) if e2e_test.class_name(t) in ('TMessageForm', '#32770')]
+        for t in tops:
+            s = box_text(t) or caption(t)
+            if s not in texts:
+                texts.append(s)
+        if tops:
+            answer_dialogs(pid, who)
+            last = time.time()
+        time.sleep(0.3)
+    return texts
+
+
+def ss_popup(pid, L, name, label, who, boxes=True):
+    """PopupShip's item `label` on lvShips's row of ship `name` (ss_list's L), only that row selected; then the boxes it
+    showed (not for View data: its dialog stays open). dict(pick, row, boxes; menu: the items' enabled states when the
+    pick failed)."""
+    i = ss_select(pid, L['lv'], L['ix']['Name'], name)
+    if i is None:
+        return dict(pick=f'no single row {name!r}', row=None, boxes=[])
+    r = popup_pick(pid, L['lv'], label, f' on row {i} {name!r}')
+    if 'picked' not in r:
+        return dict(pick=r, row=i, boxes=[], menu=ss_menu_states(pid, L['lv']))
+    return dict(pick=r, row=i, boxes=ss_boxes(pid, who) if boxes else [])
+
+
+def ss_shipdata(port):
+    """The fixed build's read-only `shipdata`: the game's latest ship data call (calls=, ship=, owner=, asked=, used=,
+    design=, dnation=) as a dict with raw=; only raw= on a build without it (0.7.0 answers an error)."""
+    r = ctl.cmd(port, 'shipdata', 30)
+    d = dict(raw=r)
+    if r.startswith('ok'):
+        d.update(re.findall(r'(\w+)=(.*?)(?=\s+\w+=|\s*$)', r[2:]))
+        d.update({k: int(v) for k, v in d.items() if k != 'raw' and re.fullmatch(r'-?\d+', str(v))})
+    return d
+
+
+def ss_view_data(pid, port, who, L, name, shot=None):
+    """"View data" (PopupShip) on ship `name`'s row -> the game's ship data dialog (TdlgShipStatus, modal): whether it
+    showed within 8 s, its labels (form_labels), a PrintWindow capture into `shot` (a PNG path; evidence), then closed
+    with its Close button (WM_CLOSE if that fails); the fixed build's `shipdata` before and after (new: its call count
+    moved). dict(pick, shown, labels, closed, shot, boxes, shipdata, new)."""
+    sd0 = ss_shipdata(port)
+    r = ss_popup(pid, L, name, 'View data', who, boxes=False)
+    dlg = wait_window(pid, 'TdlgShipStatus', 8) if 'picked' in r['pick'] else None
+    out = dict(pick=r['pick'], shown=bool(dlg), labels={}, closed=None, shot=None)
+    if dlg:
+        time.sleep(1.0)
+        out['labels'] = form_labels(dlg, SHIPDLG_VMT_RVA, SHIPDLG_LABELS)
+        if shot:
+            try:
+                os.makedirs(os.path.dirname(shot), exist_ok=True)
+                out['shot'] = (shot, window_png(dlg, shot))
+            except Exception as e:  # noqa: BLE001
+                out['shot'] = (shot, repr(e))
+        b = dlg_buttons(dlg)
+        u.PostMessageW(b.get('close') or dlg, 0x00F5 if 'close' in b else 0x0010, 0, 0)  # BM_CLICK / WM_CLOSE
+        out['closed'] = bool(wait_window(pid, 'TdlgShipStatus', 6, gone=True))
+        if not out['closed']:
+            u.PostMessageW(dlg, 0x0010, 0, 0)
+            out['closed'] = bool(wait_window(pid, 'TdlgShipStatus', 6, gone=True))
+    out['boxes'] = ss_boxes(pid, who)
+    sd1 = ss_shipdata(port)
+    out['shipdata'], out['new'] = sd1, sd1.get('calls') != sd0.get('calls')
+    return out
+
+
+def ss_view_ok(v, owner, cls):
+    """View data showed the ship's own design: with `shipdata` (the fixed build) a new call with owner = used = the
+    ship's nation and the design's class = the list's Class; the dialog's lbClass (when read) names that class."""
+    if not (v and v['shown'] and cls):
+        return False
+    lab = v['labels'].get('class', '')
+    sd = v['shipdata']
+    if sd['raw'].startswith('ok'):
+        return v['new'] and sd.get('owner') == owner and sd.get('used') == owner \
+            and str(sd.get('design', '')).strip() == cls and (not lab or cls.lower() in lab.lower())
+    return cls.lower() in lab.lower()
+
+
+def ss_choose(rows, kf, ships, home):
+    """The ships for SS_PLAN from the client's list (in service), its `shipinfo` (kf, by name) and slot 77's ships (by
+    id): active (status 0 in memory and the save), in the home area, not under repair, an ASCII name that occurs once
+    (the save's names are not UTF-8). The raider: long range, no cramped quarters, no DD or KE (PutShipInRaiderStatus
+    refuses them), a cruiser if possible; cruisers for the trade protection and the station, battleships for reserve
+    and mothballs if possible. Returns ({key: dict(name, id, cls, type, raider_ok)}, size of the pool)."""
+    by_name = {}
+    for f in ships.values():
+        by_name.setdefault(f.get('Name'), []).append(f)
+    pool = []
+    for r in rows:
+        n, s, fs = r['name'], kf.get(r['name']), by_name.get(r['name'], [])
+        if not (n.isascii() and s and len(fs) == 1 and s['status'] == 0 and s['loc'] == home):
+            continue
+        f = fs[0]
+        if f.get('Status') != '0' or f.get('RepairTime', '0') != '0' or f.get('InPlay') != '1':
+            continue
+        typ = f.get('ShipType') or r['type']
+        pool.append(dict(name=n, id=f.get('Id'), cls=r['cls'], type=typ, raider_ok=typ not in SS_NO_RAIDER
+                         and f.get('Range', '0') != '0' and f.get('AccomodationCramped', '0') != '1'))
+    cruiser, capital = ('CA', 'CL'), ('B', 'BB', 'BC')
+    prefs = dict(raider=(lambda p: p['raider_ok'] and p['type'] in cruiser, lambda p: p['raider_ok']),
+                 station=(lambda p: p['type'] in cruiser, lambda p: True),
+                 tp1=(lambda p: p['type'] in cruiser, lambda p: True),
+                 tp2=(lambda p: p['type'] in cruiser, lambda p: True),
+                 reserve=(lambda p: p['type'] in capital, lambda p: True),
+                 mothballed=(lambda p: p['type'] in capital, lambda p: True))
+    out = {}
+    for key in ('raider', 'station', 'tp1', 'tp2', 'reserve', 'mothballed'):
+        for pred in prefs[key]:
+            p = next((p for p in pool if p['name'] not in {q['name'] for q in out.values()} and pred(p)), None)
+            if p:
+                out[key] = p
+                break
+    return out, len(pool)
+
+
+class ShipStatusWatch(threading.Thread):
+    """ship_status: each version of slot 77's and slot 1's .bcs written during a month (size and write time polled every
+    0.2 s; a version is read once it stayed unchanged for 0.3 s) with the tracked ships' Status/OldStatus in nation K's
+    section, the month in [General] and both mod logs' sizes then (which step of the month wrote it)."""
+
+    def __init__(self, K, ids):
+        super().__init__(daemon=True)
+        self.K, self.ids, self.rows, self.halt, self.t0 = K, list(ids), [], threading.Event(), time.time()
+        self.files = (('C77', save_path(CLIENT_SLOT)), ('H1', save_path(HOST_SLOT)))
+
+    @staticmethod
+    def stamp(path):
+        try:
+            s = os.stat(path)
+            return s.st_mtime_ns, s.st_size
+        except OSError:
+            return None
+
+    def grab(self, tag, path, st):
+        row = dict(t=time.time() - self.t0, tag=tag, size=st[1], hm=log_mark(H), cm=log_mark(C))
+        try:
+            with open(path, 'rb') as f:
+                raw = f.read()
+        except OSError as e:
+            row['err'] = repr(e)
+            self.rows.append(row)
+            return
+        s = parse_save(raw) or {}
+        g, ships = s.get('General') or {}, ships_by_id(s.get(f'Nation{self.K}Ships'))
+        row.update(date=f'{g.get("Year")}-{g.get("Month")}',
+                   st={i: ((ships.get(i) or {}).get('Status'), (ships.get(i) or {}).get('OldStatus')) for i in self.ids})
+        self.rows.append(row)
+
+    def run(self):
+        last = {}
+        try:
+            for tag, path in self.files:
+                last[tag] = self.stamp(path)
+                if last[tag]:
+                    self.grab(tag, path, last[tag])
+            while not self.halt.wait(0.2):
+                for tag, path in self.files:
+                    st = self.stamp(path)
+                    if st and st != last.get(tag):
+                        time.sleep(0.3)
+                        if self.stamp(path) == st:
+                            last[tag] = st
+                            self.grab(tag, path, st)
+        except Exception as e:  # noqa: BLE001
+            self.rows.append(dict(t=time.time() - self.t0, tag='watch', err=repr(e)))
+
+    def stop(self):
+        self.halt.set()
+        self.join(10)
+
+
+def ss_watch_report(w, names, hm0, cm0):
+    """The watcher's versions as log lines: seconds since the month's start, file, month, the tracked ships'
+    Status/OldStatus (by key) and the latest host and client log lines before the version was read."""
+    def raw(port, mark):
+        try:
+            with open(log_path(port), 'rb') as f:
+                f.seek(mark)
+                return f.read()
+        except OSError:
+            return b''
+
+    def last(b, n):
+        ln = [x for x in b[:max(0, n)].decode('utf-8', 'replace').splitlines() if x.strip()]
+        return re.sub(r'^(\d\d:\d\d:\d\d)\.\d+ \[\d+\] ', r'\1 ', ln[-1]) if ln else '-'
+
+    hraw, craw, out = raw(H, hm0), raw(C, cm0), []
+    for r in w.rows:
+        head = f'{r["t"]:6.1f}s {r["tag"]:<3}'
+        if 'err' in r:
+            out.append(f'{head} {r["err"]}')
+            continue
+        sts = ' '.join(f'{names.get(i, i)}={a}/{b}' for i, (a, b) in r['st'].items())
+        out.append(f'{head} {r["date"]} {sts} | host: {last(hraw, r["hm"] - hm0)[:120]} | client: '
+                   f'{last(craw, r["cm"] - cm0)[:100]}')
+    return out
+
+
+def ss_lines(txt, pattern, limit):
+    """A month's log lines matching pattern without the thread id, repeats dropped, at most `limit`."""
+    out, seen = [], set()
+    for x in log_lines(txt, pattern):
+        x = re.sub(r'^(\d\d:\d\d:\d\d)\.\d+ \[\d+\] ', r'\1 ', x)
+        if x[9:] not in seen:
+            seen.add(x[9:])
+            out.append(x[:200])
+    return out[:limit]
+
+
+def ss_battle_effects(drv, K, J, ids):
+    """What the month's fought battles did to the tracked ships (ship_changes of the host's save as sent and the battle
+    slot's save): ({id: status after the battle or 'sunk'}, {id: [fields changed]})."""
+    legit, inb = {}, {}
+    for bid, g87 in (drv.g87 if drv else {}).items():
+        if bid in drv.g87_stale:
+            continue
+        changed, sunk = ship_changes(drv.s0, g87, K, J)
+        for sid in ids:
+            ch = changed.get((K, sid))
+            if ch:
+                inb[sid] = sorted(ch)
+                if 'Status' in ch and str(ch['Status'][1]).isdigit():
+                    legit[sid] = int(ch['Status'][1])
+            if (K, sid) in sunk:
+                legit[sid] = 'sunk'
+    return legit, inb
+
+
+def ss_kept(t, v, legit):
+    """A tracked ship's status v (None: no longer in the list) is as expected: what it was set to (the raider 4 or 5;
+    interned or sunk by the game's raider rules too), or what the month's battle made of it."""
+    if t['id'] in legit:
+        return (v is None or v == 8) if legit[t['id']] == 'sunk' else v == legit[t['id']]
+    return v in t['want'] or t['key'] == 'raider' and (v is None or v in (7, 8))
+
+
+def ss_after(ctx, K, track, host0):
+    """After a month: each tracked ship's status in the host's memory (`shipinfo K i`), slot 1's save (Status,
+    OldStatus), the client's memory, slot 77's save and the client's list (its Status text); the host's own ships whose
+    status changed ({name: (before, after)}; the end of a work-up or division training excepted)."""
+    hk, ck = ss_fleet(H, K), ss_fleet(C, K)
+    s1 = ships_by_id((read_save(save_path(HOST_SLOT)) or {}).get(f'Nation{K}Ships'))
+    s77 = ships_by_id((read_save(save_path(CLIENT_SLOT)) or {}).get(f'Nation{K}Ships'))
+    L = ss_list(ctx.cp, refresh=True)
+    texts = {r['name']: r['status'] for r in (L or {}).get('rows', [])}
+
+    def st(f):
+        return int(f['Status']) if f and str(f.get('Status', '')).isdigit() else None
+
+    got = {k: dict(host=(hk.get(t['name']) or {}).get('status'), h1=st(s1.get(t['id'])),
+                   h1old=(s1.get(t['id']) or {}).get('OldStatus'), client=(ck.get(t['name']) or {}).get('status'),
+                   c77=st(s77.get(t['id'])), text=texts.get(t['name'])) for k, t in track.items()}
+    h0 = ss_fleet(H, 0)
+    hdiff = {}
+    for n, a in host0.items():
+        b = (h0.get(n) or {}).get('status')
+        if b != a and not (a in (10, 11) and b == 0):
+            hdiff[n] = (a, b)
+    return got, hdiff
+
+
+def ss_month(ctx, K, J, track, host0, letter, drv):
+    """One month of ship_status (drv: its BattleDriver) with ShipStatusWatch running; then the stage table, the month's
+    relevant log lines and the checks: the host and the client keep the tracked ships' statuses (unless the month's
+    battle changed them: the ship's expectation follows), the host's own ships keep theirs."""
+    names = {t['id']: k for k, t in track.items()}
+    live = {k: t for k, t in track.items() if not t.get('gone')}  # (a ship an earlier battle sank: not checked)
+    hm, cm = log_mark(H), log_mark(C)
+    w = ShipStatusWatch(K, names) if SS_WATCH else None
+    if w:
+        w.start()
+    try:
+        run_month(ctx, drv.label, driver=drv)
+        time.sleep(2)
+    finally:
+        if w:
+            w.stop()
+    label = drv.label.split()[-1]
+    if w:
+        log(f'  {label}: slot {CLIENT_SLOT} (C77) and slot {HOST_SLOT} (H1) versions written during the month (Status/'
+            'OldStatus of the tracked ships; the latest log lines then):')
+        for ln in ss_watch_report(w, names, hm, cm):
+            log('    ' + ln)
+    legit, inb = ss_battle_effects(drv, K, J, list(names))
+    got, hdiff = ss_after(ctx, K, track, host0)
+    # the battle phase: the host's save as it began (s0), the battle slot after the battle (nation K is nation 0 there),
+    # the host's save after the battle's merge ("battle N applied")
+    ph = [('s0', ships_by_id((drv.s0 or {}).get(f'Nation{K}Ships')))]
+    ph += [(f'slot {BATTLE_SLOT} #{b}', ships_by_id((g or {}).get('Nation0Ships'))) for b, g in sorted(drv.g87.items())]
+    ph += [(f'applied #{b}', ships_by_id((s or {}).get(f'Nation{K}Ships'))) for b, s in sorted(drv.s1.items())]
+    for k, t in track.items():
+        seq = {tag: '>'.join(str(r['st'][t['id']][0]) for r in w.rows if r.get('tag') == tag and 'st' in r)
+               if w else '(no watcher: RTW3_SS_WATCH=1)' for tag in ('C77', 'H1')}
+        g = got[k]
+        phase = ', '.join(f'{n} {(s.get(t["id"]) or {}).get("Status")}' for n, s in ph) if drv.s0 else 'none'
+        log(f'  {label} {k} {t["name"]}: set {t["set"]}; slot {CLIENT_SLOT} versions {seq["C77"]}; slot {HOST_SLOT} '
+            f'versions {seq["H1"]}; battle phase: {phase}; host memory {g["host"]}, slot {HOST_SLOT} {g["h1"]} (old '
+            f'{g["h1old"]}); client memory {g["client"]}, slot {CLIENT_SLOT} {g["c77"]}, list "{g["text"]}"'
+            + (f'; the battle: {legit.get(t["id"], "status unchanged")} ({inb.get(t["id"])})'
+               if t['id'] in inb or t['id'] in legit else ''))
+    hl, cl = ss_lines(log_since(H, hm), SS_HOST_RE, 45), ss_lines(log_since(C, cm), SS_CLIENT_RE, 25)
+    log(f'  {label} host log:\n      ' + '\n      '.join(hl))
+    log(f'  {label} client log:\n      ' + '\n      '.join(cl))
+    fought = drv.fought()
+    bat = f'battle {fought} fought' if fought is not None else 'no battle fought'
+
+    def desc(src, src2):
+        return '; '.join(f'{t["name"]} {"/".join(map(str, t["want"]))}: {got[k][src]}/{got[k][src2]}'
+                         + (f' (battle: {legit[t["id"]]})' if t['id'] in legit else '') for k, t in live.items())
+
+    check(f'{letter}) {label} ({bat}): the host keeps the statuses nation {K}\'s player set (memory `shipinfo {K} i` / '
+          f'slot {HOST_SLOT}\'s [Nation{K}Ships] Status): {desc("host", "h1")}',
+          live and all(ss_kept(t, got[k]['host'], legit) and ss_kept(t, got[k]['h1'], legit) for k, t in live.items()),
+          {k: (t['name'], got[k]) for k, t in live.items()})
+    check(f'{letter}) {label}: the client\'s new month keeps them (memory / slot {CLIENT_SLOT}; the list\'s Status column '
+          f'{[got[k]["text"] for k in live]}): {desc("client", "c77")}',
+          live and all(ss_kept(t, got[k]['client'], legit) and ss_kept(t, got[k]['c77'], legit)
+                       for k, t in live.items()), {k: (t['name'], got[k]) for k, t in live.items()})
+    check(f'{letter}) {label}: the host\'s own ships (nation 0, {len(host0)} in service) keep their statuses', not hdiff,
+          hdiff)
+    for k, t in track.items():  # a status the battle changed is the ship's status from now on
+        if legit.get(t['id']) == 'sunk':
+            t['gone'] = True
+        elif t['id'] in legit:
+            t['want'] = (legit[t['id']],)
+    return got
+
+
+def scenario_ship_status(ctx):
+    """0.7.1 (reports on 0.7.0: "Non host players' trade protection ships don't stay"; "Non host can't view the data of
+    their own ships via View data"): a joined player's ship statuses set through the game's own popup menu (lvShips's
+    PopupShip on the "Ships in service" tab: one row selected, the item picked with posted keys) stay over the host's
+    months. Setup: the client fights its battles (joins again with `fightbattles 1` if not; back at the end), nation 1
+    at war with a computer nation J (`settension` on both copies) and one war month M0, so the client's game has nation
+    1's war counter > 0 (the popup's "Trade protection" and "Raider" are enabled only at war). a) the war, the counter,
+    both items enabled on the client; b) on the client six of nation 1's active ships in its home area: two to "Trade
+    protection" (3), one "Raider" (4/5: long range, no cramped quarters), "Reserve Fleet" (1), "Mothballed" (2), "To
+    foreign station" (6): the client's `shipinfo` and the list's Status column (the host's own ships' statuses
+    recorded); c) "View data" on the client's first trade protection ship and on a host ship: the game's TdlgShipStatus
+    shows the ship's own design (its lbClass read from memory; with the fixed build's `shipdata`: owner = used = 1 on the
+    client, 0 on the host, the design = the list's class); d) M1, a war month with two battles injected (one fought on
+    the client on auto-run): every tracked ship keeps its status in the host's memory, slot 1's save and the client's
+    new month (`shipinfo`, slot 77, the list), unless the battle sank or changed it (the battle slot's save); a watcher
+    logs each version of slot 77 and slot 1 written during the month with the tracked statuses (where a status is
+    lost); the host's own ships unchanged (the end of a work-up or division training excepted); e) M2, a war month (a
+    status lost in M1 is set again first): the same; f) the ships back to "Active Fleet" through the popup
+    (`shipstatus` only as a logged fallback), peace again, M3 at peace: active (or working up) on both copies; the
+    host's own ships unchanged."""
+    K = 1
+    t_sc = time.time()
+    tabs = {pid: ss_cur_tab(pid) for pid in (ctx.hp, ctx.cp)}
+    rejoined = not cstate().get('fight')
+    if rejoined:  # (scenario battles ends with the client joined with `fightbattles 0`)
+        log('  the client does not fight its battles: joins again with fightbattles 1', rejoin(ctx, K, True)[0])
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    cands = [c for c in battle_pairs(K) if c[2] not in humans]
+    track, J, t0 = {}, None, '5'
+
+    def finish(restored):
+        """Peace and the tracked ships active again (if the scenario stopped before f), the tabs, fightbattles."""
+        if not restored:
+            ck = ss_fleet(C, K)
+            for t in track.values():
+                s = ck.get(t['name'])
+                if s and s['status'] != 0:
+                    r = cmd(C, f'shipstatus {K} {s["i"]} 0')
+                    log(f'  {t["name"]} back to active: client {r}')
+            if J is not None:
+                log('  peace again:', peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() and int(t0) <= 40 else 5))
+        for pid, ix in tabs.items():
+            if ix is not None:
+                fo_set_tab(pid, ix)
+        if rejoined:
+            st = rejoin(ctx, K, False)[0]
+            cs = cstate()
+            check(f'end: the client joined again with `fightbattles 0` as before the scenario (`battles state` fight=0; '
+                  f'it plans nation {K})', cs.get('fight') is False and st.get('playerIdx') == str(K), cs.get('raw'))
+        report_unplanned()
+        log(f'  ship_status: {time.time() - t_sc:.0f} s')
+
+    if not check(f'setup: a computer nation with a possession in a sea area where nation {K} has >= 4 ships', cands,
+                 cands[:3]):
+        return finish(True)
+    _, _, J, area = cands[0]
+    nat = nation_table(H)
+    them = nat.get(J, {}).get('name')
+    t0 = rel(K, J).get('tension', '5')
+    hr, cr = peace_war(K, J)
+    log(f'  war {K}-{J} ({them}), battles in {area}: host {hr}, client {cr}')
+    war_month(ctx, 'ship_status M0', K, J)
+    if rel(K, J).get('war') != '1':
+        log('  the war ended (AI peace?): again', peace_war(K, J))
+
+    # a) the war counter on the client: the popup's war items
+    kw = own_war_counter(C)
+    L = ss_list(ctx.cp, refresh=True)
+    states = {}
+    if L and L['rows'] and ss_select(ctx.cp, L['lv'], L['ix']['Name'], L['rows'][0]['name']) is not None:
+        states = ss_menu_states(ctx.cp, L['lv'])
+    hrel, crel = rel(K, J), value(cmd(C, f'rel {K} {J}'))
+    log(f'  client list: {L and len(L["rows"])} rows, columns {L and L["cols"]}, first rows '
+        f'{[(r["type"], r["name"], r["cls"], r["loc"], r["status"]) for r in (L or {}).get("rows", [])[:3]]}; popup {states}')
+    check(f'a) nation {K} at war with computer nation {J} ({them}) on both copies (`settension {K} {J} 50`; was {t0}) '
+          f'after a war month (M0): the client\'s game has nation {K}\'s war counter > 0 (`kwar` own/game {kw}); its '
+          f'ship list (tab "{SS_TAB}", columns {L and L["cols"]}) has the popup items "Trade protection" and "Raider" '
+          f'enabled', hrel.get('war') == '1' and 'war=1' in (crel or '') and kw and kw[1] > 0
+          and states.get('Trade protection') and states.get('Raider'),
+          dict(host=hrel, client=crel, kwar=kw, menu=states, list=bool(L)))
+    if not (L and L['rows']):
+        return finish(False)
+
+    # b) the statuses through the popup, one ship at a time
+    kf = ss_fleet(C, K)
+    locs = {}
+    for r in L['rows']:
+        s = kf.get(r['name'])
+        if s and s['status'] == 0:
+            locs[s['loc']] = locs.get(s['loc'], 0) + 1
+    home = max(locs, key=locs.get) if locs else None
+    ships77 = ships_by_id((read_save(save_path(CLIENT_SLOT)) or {}).get(f'Nation{K}Ships'))
+    picks, npool = ss_choose(L['rows'], kf, ships77, home)
+    text0 = {r['name']: r['status'] for r in L['rows']}
+    tracked = ', '.join(f'{k}={p["name"]} ({p["type"]})' for k, p in picks.items())
+    log(f'  client: {len(L["rows"])} ships in service, {npool} candidates (active, in {home}, not under repair); '
+        f'tracked: {tracked}')
+    for key, label, want in SS_PLAN:
+        p = picks.get(key)
+        if not p:
+            continue
+        r = ss_popup(ctx.cp, L, p['name'], label, 'client')
+        s = ss_info(C, K, kf[p['name']]['i'])
+        track[key] = dict(p, key=key, label=label, want=want, i=kf[p['name']]['i'], pick=r['pick'], boxes=r['boxes'],
+                          set=s and s['status'])
+        log(f'  b) {key}: {p["name"]} ({p["type"]}, {p["cls"]}) "{label}": '
+            f'{r["pick"][-70:] if "picked" in r["pick"] else r["pick"]}; boxes {r["boxes"]}; `shipinfo` {s}'
+            + (f'; menu {r["menu"]}' if r.get('menu') else ''))
+    L2 = ss_list(ctx.cp)
+    text1 = {r['name']: r['status'] for r in (L2 or {}).get('rows', [])}
+    for t in track.values():
+        t['text'] = text1.get(t['name'])
+    check(f'b) client: {len(track)} of {len(SS_PLAN)} of nation {K}\'s active ships in {home} set through the ship list\'s '
+          'popup (one row selected each; client `shipinfo`, the list\'s Status column before -> after): '
+          + '; '.join(f'{t["name"]} "{t["label"]}" -> {t["set"]} ({SS_STATUS.get(t["set"])}), "{text0.get(t["name"])}" -> '
+                      f'"{t["text"]}"' for t in track.values()),
+          len(track) == len(SS_PLAN) and all(t['set'] in t['want'] and t['text'] and t['text'] != text0.get(t['name'])
+                                             for t in track.values()),
+          {k: (t['name'], t['pick'][-60:], t['boxes'], t['set'], t['text']) for k, t in track.items()} or picks)
+    if not track:
+        return finish(False)
+    hk0 = ss_fleet(H, K)
+    log('  host before the month: nation 1\'s tracked ships in its memory: '
+        + ', '.join(f'{t["name"]}={(hk0.get(t["name"]) or {}).get("status")}' for t in track.values()))
+    HL = ss_list(ctx.hp, refresh=True)
+    h0f = ss_fleet(H, 0)
+    host0 = {r['name']: h0f[r['name']]['status'] for r in (HL or {}).get('rows', []) if r['name'] in h0f}
+    hstates = {}
+    if HL and HL['rows'] and ss_select(ctx.hp, HL['lv'], HL['ix']['Name'], HL['rows'][0]['name']) is not None:
+        hstates = ss_menu_states(ctx.hp, HL['lv'])
+    counts = {}
+    for v in host0.values():
+        counts[v] = counts.get(v, 0) + 1
+    log(f'  host: nation 0 has {len(host0)} ships in service, statuses {counts}; its popup at peace: Trade protection '
+        f'{hstates.get("Trade protection")}, Raider {hstates.get("Raider")}')
+
+    # c) View data on the client (its own ship) and on the host
+    tp = track.get('tp1') or next(iter(track.values()))
+    shot = os.path.join(SHOTS_DIR, 'ship_status_viewdata_client.png') if SHOTS_DIR else None
+    vc = ss_view_data(ctx.cp, C, 'client', L2 or L, tp['name'], shot=shot)
+    check(f'c) client: "View data" on its {tp["name"]} ({tp["cls"]}) shows the game\'s ship data dialog with the ship\'s '
+          f'own design (TdlgShipStatus shown: {vc["shown"]}; its labels {vc["labels"]}; `shipdata` {vc["shipdata"]["raw"]})',
+          ss_view_ok(vc, K, tp['cls']), vc)
+    hrow = next((r for r in (HL or {}).get('rows', []) if r['name'].isascii() and r['name'] in h0f and r['cls']), None)
+    if hrow:
+        vh = ss_view_data(ctx.hp, H, 'host', HL, hrow['name'])
+        check(f'c) host: "View data" on its {hrow["name"]} ({hrow["cls"]}) shows its own design (TdlgShipStatus shown: '
+              f'{vh["shown"]}; labels {vh["labels"]}; `shipdata` {vh["shipdata"]["raw"]})', ss_view_ok(vh, 0, hrow['cls']),
+              vh)
+    for pid, ix in tabs.items():
+        if ix is not None:
+            fo_set_tab(pid, ix)
+
+    # d) M1: a war month with the player's battle
+    if rel(K, J).get('war') != '1':
+        log('  the war ended (AI peace?): again', peace_war(K, J))
+    ids = [inject(K, J, area) for _ in range(2)]
+    log(f'  M1: battles injected {ids}')
+    drv = BattleDriver(ctx, {b: 'fight' for b, _ in ids if b is not None}, K, J, fight_any=True)
+    drv.label = 'ship_status M1'
+    ss_month(ctx, K, J, track, host0, 'd', drv)
+
+    # e) M2: a war month (a status lost in M1 set again first)
+    L = ss_list(ctx.cp, refresh=True)
+    ck = ss_fleet(C, K)
+    for k, t in track.items():
+        s = ck.get(t['name'])
+        if t.get('gone') or not s or s['status'] in t['want'] or s['status'] in (7, 8) or not L:
+            continue
+        r = ss_popup(ctx.cp, L, t['name'], t['label'], 'client')
+        s2 = ss_info(C, K, s['i'])
+        t['set'] = s2 and s2['status']
+        log(f'  e) {k} {t["name"]}: {s["status"]} after M1, "{t["label"]}" again: {r["pick"][-60:]}; boxes {r["boxes"]}; '
+            f'now {t["set"]}')
+    for pid, ix in tabs.items():
+        if ix is not None:
+            fo_set_tab(pid, ix)
+    if rel(K, J).get('war') != '1':
+        log('  the war ended (AI peace?): again', peace_war(K, J))
+    drv = BattleDriver(ctx, {}, K, J)
+    drv.label = 'ship_status M2'
+    ss_month(ctx, K, J, track, host0, 'e', drv)
+
+    # f) back to active through the popup, peace, a month at peace
+    L = ss_list(ctx.cp, refresh=True)
+    ck, back = ss_fleet(C, K), {}
+    for k, t in track.items():
+        s = ck.get(t['name'])
+        if s and s['status'] in (7, 8):  # (interned or sunk by the game's raider rules: left as they are)
+            t['gone'] = True
+        if t.get('gone') or not s or s['status'] == 0:
+            continue
+        r = ss_popup(ctx.cp, L, t['name'], SS_ACTIVE, 'client') if L else dict(pick='no list', boxes=[])
+        s2 = ss_info(C, K, s['i'])
+        how = 'popup'
+        if not s2 or s2['status'] != 0:
+            fb = cmd(C, f'shipstatus {K} {s["i"]} 0')
+            how = f'popup gave {s2 and s2["status"]} ({r["pick"][:200]}, boxes {r["boxes"]}, menu {r.get("menu")}): ' \
+                  f'shipstatus {fb}'
+            s2 = ss_info(C, K, s['i'])
+        back[k] = (t['name'], s['status'], s2 and s2['status'], how)
+    log(f'  f) back to "Active Fleet" on the client: {back}')
+    pw = peace_war(K, J, int(t0) if str(t0).lstrip('-').isdigit() and int(t0) <= 40 else 5)
+    log(f'  f) peace {K}-{J}: {pw}')
+    for pid, ix in tabs.items():
+        if ix is not None:
+            fo_set_tab(pid, ix)
+    run_month(ctx, 'ship_status M3')
+    got, hdiff = ss_after(ctx, K, track, host0)
+    live = {k: t for k, t in track.items() if not t.get('gone')}
+    check(f'f) the tracked ships back to "Active Fleet" through the popup on the client, peace with {J} again (tension '
+          f'{t0}: {rel(K, J).get("war") == "0"}), M3 at peace: active (0) or working up (10) on the host (memory / slot '
+          f'{HOST_SLOT}) and the client (memory / slot {CLIENT_SLOT}): '
+          + '; '.join(f'{t["name"]} {got[k]["host"]}/{got[k]["h1"]} {got[k]["client"]}/{got[k]["c77"]}'
+                      for k, t in live.items()),
+          live and rel(K, J).get('war') == '0' and all(got[k][x] in (0, 10) for k in live
+                                                       for x in ('host', 'h1', 'client', 'c77'))
+          and all(v[3] == 'popup' for v in back.values()), dict(back=back, got=got))
+    check(f'f) M3: the host\'s own ships (nation 0, {len(host0)} in service) keep their statuses', not hdiff, hdiff)
+    finish(True)
 
 
 # ---------------------------------------------------------------- live player-vs-player battles (lockstep)
@@ -12607,8 +13539,12 @@ def shot_png(pid, path):
     """PrintWindow (PW_RENDERFULLCONTENT) of a copy's battle window into a PNG: the game's own window, never the screen
     (safety rule 2); evidence only. Returns (w, h) or None."""
     f = battle_frm(pid)
-    if not f:
-        return None
+    return window_png(f, path) if f else None
+
+
+def window_png(f, path):
+    """PrintWindow (PW_RENDERFULLCONTENT) of one of a game copy's own windows into a PNG (never the screen: safety rule
+    2); evidence only. Returns (w, h) or None."""
     r = wt.RECT()
     _u32w.GetWindowRect(f, ctypes.byref(r))
     w, h = r.right - r.left, r.bottom - r.top
@@ -18793,6 +19729,486 @@ def scenario_legacy_fleet(ctx):
           not now_ids & gen_ids and now_ids <= set(k_ids), f'battle {fought}; ships {sorted(now_ids)[:14]}')
 
 
+# ---------------------------------------------------------------- the disk (0.7.1)
+# A 0.7.0 report: "Error in SaveDesignFiles procedure! Stream write error: There is not enough space on the disk" on the
+# host. The mod reloads the campaign in the same process every month and around every battle, and three of the game's
+# lists grew with every such reload before (intel reports 0.2.2, air units 0.3.3, campaign divisions 0.6.1).
+DISK_MONTHS = 8  # disk_growth: processed months
+DISK_RELOADS = 6  # disk_growth: save and reload cycles on each copy
+DISK_LIST_KEYS = ('ReportNo', 'AirUnitNo', 'CampDivNo', 'Officers', 'ships', 'designs', 'lines_bcs', 'lines_off',
+                  'lines_map')
+
+
+def des_count(path):
+    """A DesignFiles<n>.des file's design count (its second line; the first is the format, `v10139`), or None."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(256).decode('utf-8-sig', errors='replace').splitlines()
+        return int(head[1]) if len(head) > 1 and is_int(head[1].strip()) else None
+    except OSError:
+        return None
+
+
+def line_count(path):
+    try:
+        with open(path, 'rb') as f:
+            return f.read().count(b'\n')
+    except OSError:
+        return None
+
+
+def slot_audit(slot):
+    """A save slot's files (name -> size), their total, and the counts of the lists a load could append to: intel
+    reports, air units, campaign divisions, officers, ships, designs, and the line counts of the INI files."""
+    d = slot_dir(slot)
+    out = dict(files={}, total=0, counts={})
+    if not os.path.isdir(d):
+        return out
+    for fn in sorted(os.listdir(d)):
+        p = os.path.join(d, fn)
+        if os.path.isfile(p):
+            out['files'][fn] = os.path.getsize(p)
+    out['total'] = sum(out['files'].values())
+    bcs = read_save(os.path.join(d, f'RTWGame{slot}.bcs')) or {}
+    off = read_save(os.path.join(d, f'RTWGame{slot}.off')) or {}
+    c = out['counts']
+    c['IDNo'] = bcs.get('General', {}).get('IDNo')
+    c['ReportNo'] = bcs.get('IntelReports', {}).get('ReportNo')
+    c['AirUnitNo'] = bcs.get('AirUnits', {}).get('AirUnitNo')
+    c['CampDivNo'] = off.get('CampaignDivisions', {}).get('CampDivNo')
+    c['Officers'] = len(off.get('Officers', {}))
+    c['ships'] = sum(1 for s, sec in bcs.items() if re.fullmatch(r'Nation\dShips', s)
+                     for k in sec if re.fullmatch(r'Ship\d+Id', k))
+    c['designs'] = sum(des_count(os.path.join(d, fn)) or 0 for fn in out['files']
+                       if re.fullmatch(r'DesignFiles\d\.des', fn))
+    c['lines_bcs'] = line_count(os.path.join(d, f'RTWGame{slot}.bcs'))
+    c['lines_off'] = line_count(os.path.join(d, f'RTWGame{slot}.off'))
+    c['lines_map'] = line_count(os.path.join(d, f'MapData{slot}.dat'))
+    for k in ('ReportNo', 'AirUnitNo', 'CampDivNo'):
+        c[k] = int(c[k]) if is_int(c[k]) else c[k]
+    out['leftovers'] = [fn for fn in out['files'] if fn.endswith('.mptmp')]
+    return out
+
+
+def mod_files_audit():
+    """The mod's own files next to the saves: the logs and the DESYNC reports (count, bytes)."""
+    out = dict(logs={}, desync=(0, 0))
+    if not os.path.isdir(LOG_DIR):
+        return out
+    dn = db = 0
+    for fn in os.listdir(LOG_DIR):
+        p = os.path.join(LOG_DIR, fn)
+        if fn.endswith('.log'):
+            out['logs'][fn] = os.path.getsize(p)
+        elif fn.startswith('ls_desync_'):
+            dn, db = dn + 1, db + os.path.getsize(p)
+    out['desync'] = (dn, db)
+    return out
+
+
+def new_files(root, since, skip=()):
+    """Files under `root` written after `since` (epoch seconds): [(path, bytes)], at most 2000 looked at per folder."""
+    out = []
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [x for x in dns if not any(s in os.path.join(dp, x) for s in skip)]
+        for fn in fns[:2000]:
+            p = os.path.join(dp, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if st.st_mtime >= since and not any(s in p for s in skip):
+                out.append((p, st.st_size))
+    return out
+
+
+def audit_line(label, a):
+    c = a['counts']
+    return (f'{label}: {a["total"] / 1e6:.3f} MB in {len(a["files"])} files; ' +
+            ', '.join(f'{k} {c.get(k)}' for k in ('IDNo',) + DISK_LIST_KEYS))
+
+
+def scenario_disk_growth(ctx):
+    """0.7.1, group disk, --stress: what the mod makes grow over a long session. a) save and reload cycles on both copies
+    (the host's slot 1 as the host's month reloads it, the client's slot 77 as the client's month does): every list
+    count and the line counts of the .bcs, .off and MapData stay the same; b) DISK_MONTHS processed months: per month
+    the slots' sizes and list counts (the table in the log), the growth bounded; the mod's logs and DESYNC reports, new
+    files in the game folder and in the temp folder."""
+    t0 = time.time()
+    disk_session(ctx, 'disk_growth')
+    mods0 = mod_files_audit()
+    # a) reload cycles: nothing of the campaign changes, so nothing may grow
+    for port, slot, who, player in ((H, HOST_SLOT, 'host', 0), (C, CLIENT_SLOT, 'client', 1)):
+        rows = []
+        for i in range(DISK_RELOADS + 1):
+            r = cmd(port, 'save', 120)
+            a = slot_audit(slot)
+            rows.append(a)
+            log(f'  {audit_line(f"{who} reload {i}", a)}; private memory {private_mb(ctx.hp if port == H else ctx.cp)} MB'
+                + ('' if r.startswith('ok') else f' (save: {r})'))
+            if i < DISK_RELOADS:
+                lr = cmd(port, f'load {slot} {player} mod', 180)
+                if not lr.startswith('ok'):
+                    check(f'a) {who}: reload {i + 1} of slot {slot}', False, lr)
+                    break
+        grew = {k: [x['counts'].get(k) for x in rows] for k in DISK_LIST_KEYS
+                if len({x['counts'].get(k) for x in rows}) > 1}
+        sizes = [x['total'] for x in rows]
+        check(f'a) {who}: {len(rows) - 1} save and reload cycles of slot {slot} change no list count and no line count '
+              f'of its .bcs, .off and MapData (a load that appends to a list would show here)', not grew and
+              len(rows) == DISK_RELOADS + 1, f'changed: {grew}; slot bytes {sizes}')
+        check(f'a) {who}: the slot\'s size stays within 1 % over the cycles', max(sizes) <= min(sizes) * 1.01,
+              f'{sizes}')
+    # b) months
+    hist = [(0, slot_audit(HOST_SLOT), slot_audit(CLIENT_SLOT), mod_files_audit(), private_mb(ctx.hp),
+             private_mb(ctx.cp))]
+    for m in range(1, DISK_MONTHS + 1):
+        run_month(ctx, f'disk_growth {m}')
+        hist.append((m, slot_audit(HOST_SLOT), slot_audit(CLIENT_SLOT), mod_files_audit(), private_mb(ctx.hp),
+                     private_mb(ctx.cp)))
+    log('  disk_growth: per month (host slot 1 | client slot 77 | the logs | memory):')
+    for m, ha, ca, mf, hm, cm in hist:
+        lg = mf['logs']
+        log(f'    month {m}: host {ha["total"]:,} B ({ha["counts"].get("lines_bcs")} .bcs lines, '
+            f'{ha["counts"].get("designs")} designs, {ha["counts"].get("ReportNo")} reports, '
+            f'{ha["counts"].get("AirUnitNo")} air units, {ha["counts"].get("ships")} ships) | client {ca["total"]:,} B | '
+            f'log {lg.get(f"rtw3mp_{H}.log", 0):,} / {lg.get(f"rtw3mp_{C}.log", 0):,} B | desync {mf["desync"]} | '
+            f'mem {hm} / {cm} MB')
+    for who, idx in (('host', 1), ('client', 2)):
+        bad = []
+        for (m0, *a0), (m1, *a1) in zip(hist, hist[1:]):
+            s0, s1 = a0[idx - 1], a1[idx - 1]
+            if s0['total'] and s1['total'] > s0['total'] * 1.15:
+                bad.append(f'month {m1}: {s0["total"]} -> {s1["total"]} B')
+            for k in ('AirUnitNo', 'CampDivNo', 'Officers', 'designs', 'lines_off', 'lines_map'):
+                v0, v1 = s0['counts'].get(k), s1['counts'].get(k)
+                if isinstance(v0, int) and isinstance(v1, int) and v0 >= 20 and v1 >= 2 * v0:
+                    bad.append(f'month {m1}: {k} {v0} -> {v1}')
+        first, last = hist[0][idx]['total'], hist[-1][idx]['total']
+        check(f'b) {who}: over {DISK_MONTHS} months its slot grows by at most 15 % a month and no list doubles in a '
+              f'month ({first:,} -> {last:,} B)', not bad and last, bad[:4])
+        left = hist[-1][idx].get('leftovers')
+        check(f'b) {who}: no temporary file of the mod left in its slot (*.mptmp)', not left, left)
+    lg0, lg1 = hist[0][3]['logs'], hist[-1][3]['logs']
+    per = {fn: (lg1.get(fn, 0) - lg0.get(fn, 0)) / DISK_MONTHS for fn in (f'rtw3mp_{H}.log', f'rtw3mp_{C}.log')}
+    check('b) the logs grow by less than 1 MB a month', all(v < 1e6 for v in per.values()),
+          {k: f'{v / 1e3:.1f} kB/month' for k, v in per.items()})
+    check('b) no DESYNC report written in these months (no live battle)', hist[-1][3]['desync'] == mods0['desync'],
+          f'{mods0["desync"]} -> {hist[-1][3]["desync"]}')
+    gnew = new_files(ctl.GAME, t0)
+    log(f'  files the game\'s folder got since the scenario began: {[(os.path.relpath(p, ctl.GAME), b) for p, b in gnew][:12]}')
+    check('b) the game\'s folder got no file of more than 1 MB', not [p for p, b in gnew if b > 1e6], gnew[:6])
+    tnew = new_files(tempfile.gettempdir(), t0, skip=('rtw3mp_regression_backup',))
+    big = sum(b for _, b in tnew)
+    log(f'  temp folder: {len(tnew)} new files, {big:,} B since the scenario began (any program\'s): '
+        f'{[(os.path.basename(p), b) for p, b in sorted(tnew, key=lambda x: -x[1])[:6]]}')
+    ctx.disk_hist = hist
+
+
+def cmd_bg(port, line, timeout=120):
+    """A bridge command in a thread (it may wait for a box of the game): (thread, result dict with 'r')."""
+    import threading
+    out = {}
+    th = threading.Thread(target=lambda: out.update(r=ctl.cmd(port, line, timeout)), daemon=True)
+    th.start()
+    return th, out
+
+
+def answer_until(pid, who, pred, timeout):
+    """Answer the dialogs of a copy until pred() holds (or the timeout passes); pred()'s last value."""
+    end = time.time() + timeout
+    while time.time() < end:
+        answer_dialogs(pid, who)
+        if pred():
+            return True
+        time.sleep(0.5)
+    return pred()
+
+
+def save_boxes(who, since):
+    return [t for ts, w, k, t in BOX_SEEN if ts >= since and w == who and k == 'TMessageForm' and 'Error in Save' in t]
+
+
+def disk_session(ctx, name):
+    """disk_full and disk_growth follow slot 1 and nation 1 (their months, the per-month checks, slot_audit). A scenario
+    before them on another campaign (lockstep_air's 1935 campaign with its battle going on against the computer after
+    the drop, lockstep_strike's, lockstep_missiles' slot 48) leaves the session there: its battle is ended (as
+    legacy_fleet does) and a new session hosted on slot 1 (session_again). 0.7.1 RC: the default run's disk_full after
+    lockstep_air pressed Turn under the host's test battle on the 1935 campaign (`battle slot: DoStrategicTurn
+    skipped`, `host turn: click handler returned (endOfTurn=0 battle=1)`): the month never ran."""
+    hs, st = sstatus(H), sstatus(C)
+    if hs.get('slot') == str(HOST_SLOT) and hs.get('playerIdx') == '0' and st.get('slot') == str(CLIENT_SLOT) \
+            and st.get('playerIdx') == '1' and st.get('phase') == 'planning' and not battle_up(ctx.hp) \
+            and not battle_up(ctx.cp) and lss(H).get('on') != '1':
+        return False
+    log(f'  {name}: the session is not on slot 1 (host slot {hs.get("slot")}, client slot {st.get("slot")} nation '
+        f'{st.get("playerIdx")} {st.get("phase")}; battle screens: host {battle_up(ctx.hp)}, client '
+        f'{battle_up(ctx.cp)}): the host\'s battle ended, a new session on slot 1')
+    ls_quiet(ctx)
+    if lss(H).get('on') == '1':
+        scmd(H, 'ls drop')
+        time.sleep(3)
+    for pid in (ctx.hp, ctx.cp):
+        close_modeless(pid)
+    if battle_up(ctx.hp):
+        ls_finish_host(ctx)
+        ls_quiet(ctx)
+    scmd(C, 'leave')
+    time.sleep(1.5)
+    scmd(H, 'leave')
+    time.sleep(1.5)
+    hm = log_mark(H)
+    session_again(ctx)
+    ctx.intel_prev = intel_snapshot(ctx, hm, f'{name}: the session on slot 1 again')
+    st = sstatus(C)
+    check(f'{name}: setup: a new session on slot 1, the client plans nation 1 in slot {CLIENT_SLOT} ({st.get("date")})',
+          st.get('slot') == str(CLIENT_SLOT) and st.get('playerIdx') == '1' and st.get('phase') == 'planning'
+          and sstatus(H).get('slot') == str(HOST_SLOT), st)
+    return True
+
+
+def scenario_disk_full(ctx):
+    """0.7.1, default: a full disk, simulated with the TEST commands (`diskfree <MB>`: what the free-space check reports;
+    `diskfull on`: every write under the Save folder fails with ERROR_DISK_FULL, as on a full disk, after the file was
+    created or cut to nothing). a) 120 MB free on both copies: one notice and chat line "Low disk space on drive ..." on
+    each in the month, which runs. b) the host's disk full at its Turn: the game's save fails (its first box shown, the
+    rest only logged), `savestate` failed, the save's design files cut to nothing in slot 1, and the mod stops the month
+    there: nothing merged or loaded, the host's date unchanged, the notice and the chat line "The host's disk is full
+    ..." on both copies. c) the disk free again, the host saves: the save works and the stopped month goes on by itself;
+    the client's month package holds complete design files. d) the client's disk full at Submit: no turn sent, its
+    notice, the host's chat "[disk] ..."; free again, the client saves: the turn goes in by itself. e) WriteFileBytes on
+    a full disk leaves the file as it was (no in-place write, no *.mptmp). f) 0.7.1 (sr7): a file of the save in use
+    for a moment (TEST `savelock <s>`: held without sharing from the save's start, as OneDrive's sync or an antivirus
+    scan holds one), at the client's Submit (4 s) and the host's Turn (5 s): the save fails with the cause inuse, no box
+    shown, it saves again by itself (2 s apart) and the turn goes in / the month goes on; the notice and chat lines. g)
+    the file held 25 s at the host's Turn: five tries, then the month stops ("still in use ... pause OneDrive's sync,
+    then save"), the game's box once (the last try's); free again, the host's save lets the month go on."""
+    rx_box = re.compile(r'Error in Save\w* procedure')
+    disk_session(ctx, 'disk_full')
+    for p in (H, C):
+        cmd(p, 'mpwindow')
+    # a) low disk space
+    hb, cb = chat(ctx.hp), chat(ctx.cp)
+    hm, cm = log_mark(H), log_mark(C)
+    for p in (H, C):
+        cmd(p, 'diskfree 120')
+    di = cmd(H, 'diskinfo')
+    run_month(ctx, 'disk_full a')
+    for p in (H, C):
+        cmd(p, 'diskfree off')
+    hl = log_lines(log_since(H, hm), r'disk: Low disk space on drive')
+    cl = log_lines(log_since(C, cm), r'disk: Low disk space on drive')
+    check('a) the host reports 120 MB free (`diskinfo`: below the threshold)', 'free=120' in di and 'low=1' in di, di)
+    check('a) the host warns once in the month: "Low disk space on drive C: 120 MB free; the game may fail to save"',
+          len(hl) == 1 and '120 MB free; the game may fail to save' in hl[0], hl)
+    check('a) the client warns once in the month', len(cl) == 1 and '120 MB free' in cl[0], cl)
+    ha, ca = chat(ctx.hp), chat(ctx.cp)
+    check('a) the host\'s chat line on both copies ("* The host\'s disk: Low disk space ...")',
+          ha.count("The host's disk: Low disk space") > hb.count("The host's disk: Low disk space") and
+          ca.count("The host's disk: Low disk space") > cb.count("The host's disk: Low disk space"),
+          (ha.strip().splitlines()[-3:], ca.strip().splitlines()[-3:]))
+    check('a) the client\'s own chat line and its line to the host ("[disk] Low disk space here ...")',
+          ca.count('* Low disk space on drive') > cb.count('* Low disk space on drive') and
+          wait_until(lambda: chat(ctx.hp), lambda t: t.count('[disk] Low disk space here') >
+                     hb.count('[disk] Low disk space here'), 8).count('[disk] Low disk space here') >
+          hb.count('[disk] Low disk space here'), ca.strip().splitlines()[-4:])
+    # b) the host's save fails at its Turn
+    month_prepare(ctx)
+    date0 = ctl.status(H).get('date')
+    s0 = cmd(H, 'savestate')
+    hb, cb = chat(ctx.hp), chat(ctx.cp)
+    hm, cm = log_mark(H), log_mark(C)
+    t_b = time.time()
+    cmd(H, 'diskfree 30')
+    full = cmd(H, 'diskfull on')
+    th, out = cmd_bg(H, 'turn')
+    stopped = answer_until(ctx.hp, 'host', lambda: 'stopped (' in log_since(H, hm) and not th.is_alive(), 60)
+    st = cmd(H, 'savestate')
+    files = {fn: os.path.getsize(os.path.join(slot_dir(HOST_SLOT), fn)) for fn in os.listdir(slot_dir(HOST_SLOT))
+             if fn.startswith('DesignFiles')}
+    hst = ctl.status(H)
+    cmd(H, 'diskfull off')
+    cmd(H, 'diskfree off')
+    BOX_EXPECTED.append((t_b, time.time() + 1, rx_box))
+    hl = log_since(H, hm)
+    shown = save_boxes('host', t_b)
+    check('b) the full-disk simulation is on for the host', full.startswith('ok'), full)
+    check('b) the host\'s save at its Turn failed (`savestate` last=failed; the log: "save: slot 1 FAILED")',
+          'last=failed' in st and log_lines(hl, r'save: slot 1 FAILED'), f'{s0} -> {st}')
+    check('b) the game\'s box of the failed save shown once (its repeats only logged)', len(shown) == 1 and
+          log_lines(hl, r'save: the game\'s box \d+ of this save not shown'), shown[:3])
+    check('b) the failed save left its design files cut to nothing in slot 1 (what the mod must not send or load)',
+          files and min(files.values()) == 0, files)
+    check('b) the mod stopped the month: "disk: a save failed; the month stopped"; nothing merged, no reload, the '
+          'host\'s date unchanged', stopped and log_lines(hl, r'disk: a save failed; the month stopped') and
+          not log_lines(hl, r'submissions merged|host turn: click handler') and hst.get('date') == date0,
+          f'{log_lines(hl, r"disk: |merged")[:4]}; date {date0} -> {hst.get("date")}')
+    ok_c = wait_until(lambda: chat(ctx.cp), lambda t: t.count("The host's disk is full") >
+                      cb.count("The host's disk is full"), 10)
+    check('b) the notice and the chat line "The host\'s disk is full (30 MB free on drive ...): the month stopped; the '
+          'last good state is kept. Free space and save again ..." on both copies',
+          chat(ctx.hp).count("The host's disk is full") > hb.count("The host's disk is full") and
+          ok_c.count("The host's disk is full") > cb.count("The host's disk is full") and
+          'Free space and save again' in hst.get('status', '') + ok_c, ok_c.strip().splitlines()[-2:])
+    # c) the disk free again: the host's save works and the month goes on by itself
+    hm = log_mark(H)
+    r = cmd(H, 'save')
+    run_month(ctx, 'disk_full c', started=True)
+    hl = log_since(H, hm)
+    st = cmd(H, 'savestate')
+    cdes = {fn: des_count(os.path.join(slot_dir(CLIENT_SLOT), fn)) for fn in os.listdir(slot_dir(CLIENT_SLOT))
+            if re.fullmatch(r'DesignFiles\d\.des', fn)}
+    check('c) the host\'s save works again (`save` ok, `savestate` last=ok)', r.startswith('ok') and 'last=ok' in st,
+          f'{r} {st}')
+    check('c) the stopped month went on by itself ("the save works again; the month goes on") and was merged',
+          log_lines(hl, r'disk: the save works again; the month goes on') and
+          log_lines(hl, r'host turn: \d+ submissions merged'), log_lines(hl, r'disk: |merged')[:4])
+    check('c) the client\'s month holds nine complete design files', len(cdes) == 9 and all(cdes.values()), cdes)
+    # d) the client's save fails at Submit
+    hb, cb = chat(ctx.hp), chat(ctx.cp)
+    cm = log_mark(C)
+    t_d = time.time()
+    cmd(C, 'diskfree 30')
+    cmd(C, 'diskfull on')
+    cmd(C, 'submit')
+    stopped = answer_until(ctx.cp, 'client', lambda: 'stopped (' in log_since(C, cm), 60)
+    time.sleep(2)
+    cst = ctl.status(C)
+    cl = log_since(C, cm)
+    cmd(C, 'diskfull off')
+    cmd(C, 'diskfree off')
+    BOX_EXPECTED.append((t_d, time.time() + 1, rx_box))
+    check('d) the client\'s save at Submit failed and its turn was not sent ("disk: a save failed; your turn stopped", '
+          '`status` submitted=0)', stopped and log_lines(cl, r'save: slot 77 FAILED') and
+          log_lines(cl, r'disk: a save failed; your turn stopped') and cst.get('submitted') == '0',
+          f'{log_lines(cl, r"disk: |FAILED")[:3]}; submitted={cst.get("submitted")}')
+    hc = wait_until(lambda: chat(ctx.hp), lambda t: t.count('[disk] My game could not save') >
+                    hb.count('[disk] My game could not save'), 10)
+    check('d) the client\'s notice ("Your disk is full ...") and its line to the host ("[disk] My game could not save '
+          '(the disk is full): your turn waits until it can.")', 'Your disk is full' in chat(ctx.cp) + cst.get('status', '')
+          and hc.count('[disk] My game could not save') > hb.count('[disk] My game could not save'),
+          hc.strip().splitlines()[-2:])
+    r = cmd(C, 'save')
+    went = wait_until(lambda: ctl.status(C), lambda s: s.get('submitted') == '1', 20)
+    check('d) the disk free again, the client saves: its turn goes in by itself (submitted=1)',
+          r.startswith('ok') and went.get('submitted') == '1' and
+          log_lines(log_since(C, cm), r'disk: the save works again; your turn goes on'), f'{r} {went.get("submitted")}')
+    run_month(ctx, 'disk_full d')
+    # e) WriteFileBytes on a full disk
+    p = os.path.join(slot_dir(CLIENT_SLOT), LOCK_FILE)
+    r1 = cmd(C, f'writetest {CLIENT_SLOT} {LOCK_FILE} 1000')
+    cmd(C, 'diskfull on')
+    r2 = cmd(C, f'writetest {CLIENT_SLOT} {LOCK_FILE} 5000')
+    cmd(C, 'diskfull off')
+    size = os.path.getsize(p) if os.path.exists(p) else None
+    left = [fn for fn in os.listdir(slot_dir(CLIENT_SLOT)) if fn.endswith('.mptmp')]
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+    check('e) a write of the mod on a full disk fails (error 112) and leaves the file as it was (1000 bytes), no '
+          '*.mptmp', r1.startswith('ok') and parse_writetest(r2)[0] == 112 and size == 1000 and not left,
+          f'{r1} / {r2}; size {size}; left {left}')
+    # f) a file of the save in use for a moment (TEST `savelock`: held without sharing from the save's start, as
+    # OneDrive's sync or an antivirus scan holds one): the client's Submit and the host's Turn save again by themselves
+    rx_use = r'A file of the host\'s campaign save was in use by another program \(for example OneDrive or antivirus\): ' \
+             r'the month waits; it saves again by itself'
+    hb, cb = chat(ctx.hp), chat(ctx.cp)
+    hm, cm = log_mark(H), log_mark(C)
+    t_f = time.time()
+    lc = cmd(C, 'savelock 4')
+    month_prepare(ctx)
+    cl = log_since(C, cm)
+    lh = cmd(H, 'savelock 5')
+    th, out = cmd_bg(H, 'turn')
+    run_month(ctx, 'disk_full f', started=True)
+    hl = log_since(H, hm)
+    shown = save_boxes('host', t_f) + save_boxes('client', t_f)
+    check('f) the locks taken (`savelock`; "TEST: savelock: RTWGame77.bcs of slot 77 held without sharing for 4 s", '
+          'RTWGame1.bcs of slot 1 for 5 s)', lc.startswith('ok') and lh.startswith('ok') and
+          log_lines(cl, r'TEST: savelock: RTWGame77\.bcs of slot 77 held') and
+          log_lines(hl, r'TEST: savelock: RTWGame1\.bcs of slot 1 held'), (lc, lh))
+    check('f) the client\'s save at Submit failed on the file in use ("save: slot 77 FAILED ... the cause: inuse") and '
+          'saved again by itself ("your turn: saving again (1 of 5)", "the save worked again"): its turn went in',
+          log_lines(cl, r'save: slot 77 FAILED .*the cause: inuse') and
+          log_lines(cl, r'disk: your turn: saving again \(1 of 5\)') and log_lines(cl, r'disk: the save worked again') and
+          log_lines(cl, r'disk: the save works again; your turn goes on'), log_lines(cl, r'disk: |FAILED')[:6])
+    check('f) the host\'s save at its Turn failed on the file in use ("save: slot 1 FAILED ... the cause: inuse"; the '
+          'game\'s text "Cannot create file ... being used by another process")',
+          log_lines(hl, r'save: slot 1 FAILED .*the cause: inuse.*(being used by another process|Cannot create file)'),
+          log_lines(hl, r'FAILED')[:2])
+    check('f) the host saved again by itself and the month went on: "the month: saving again (1 of 5)", "the save worked '
+          'again", the step on that save, merged; no stop', log_lines(hl, r'disk: the month: saving again \(1 of 5\)') and
+          log_lines(hl, r'disk: the save worked again') and log_lines(hl, r'disk: the step goes on with the save that') and
+          log_lines(hl, r'host turn: \d+ submissions merged') and not log_lines(hl, r'disk: a save failed; .* stopped'),
+          log_lines(hl, r'disk: |merged')[:8])
+    check('f) no box of the game shown (the tries\' boxes kept off the screen: "not shown (a file in use: the mod saves '
+          'again)")', not shown and log_lines(hl, r'not shown \(a file in use: the mod saves again\)') and
+          log_lines(cl, r'not shown \(a file in use: the mod saves again\)'), shown[:2])
+    ha, ca = chat(ctx.hp), chat(ctx.cp)
+    check('f) the notice and chat line on both copies: "A file of the host\'s campaign save was in use by another program '
+          '(for example OneDrive or antivirus): the month waits; it saves again by itself."; the client\'s own and its line '
+          'to the host ("[disk] My game could not save (a file of the save was in use by another program): my turn waits; '
+          'it saves again by itself.")',
+          len(re.findall(rx_use, ha)) > len(re.findall(rx_use, hb)) and
+          len(re.findall(rx_use, ca)) > len(re.findall(rx_use, cb)) and
+          ca.count('A file of your campaign save was in use by another program') >
+          cb.count('A file of your campaign save was in use by another program') and
+          ha.count('[disk] My game could not save (a file of the save was in use') >
+          hb.count('[disk] My game could not save (a file of the save was in use'),
+          (ha.strip().splitlines()[-4:], ca.strip().splitlines()[-4:]))
+    # g) the file stays in use: five tries 2 s apart, then the month stops ("still in use", the game's box once); the
+    # file free again, the host's save lets it go on
+    month_prepare(ctx)
+    date0 = ctl.status(H).get('date')
+    hb, cb = chat(ctx.hp), chat(ctx.cp)
+    hm = log_mark(H)
+    t_g = time.time()
+    lh = cmd(H, 'savelock 25')
+    th, out = cmd_bg(H, 'turn')
+    stopped = answer_until(ctx.hp, 'host', lambda: 'stopped (' in log_since(H, hm) and not th.is_alive(), 90)
+    st = cmd(H, 'savestate')
+    BOX_EXPECTED.append((t_g, time.time() + 1, rx_box))
+    hl = log_since(H, hm)
+    shown = save_boxes('host', t_g)
+    tries = log_lines(hl, r'disk: the month: saving again \(\d of 5\)')
+    check('g) the host\'s save failed on the file in use and was tried again five times ("saving again (1 of 5)" .. '
+          '"(5 of 5)"), then the month stopped ("disk: a save failed; the month stopped ... the cause: inuse"), '
+          '`savestate` cause=inuse', len(tries) == 5 and
+          log_lines(hl, r'disk: a save failed; the month stopped \(.*the cause: inuse') and 'cause=inuse' in st,
+          (tries, st[:120]))
+    check('g) the game\'s box shown once: the last try\'s ("Cannot create file ... being used by another process"); the '
+          'others kept off the screen', len(shown) == 1 and
+          re.search(r'Cannot create file|being used by another process', shown[0]) and
+          len(log_lines(hl, r'not shown \(a file in use: the mod saves again\)')) >= 5, shown[:2])
+    rx_still = r'A file of the host\'s campaign save is still in use by another program \(RTWGame1\.bcs\): the month ' \
+               r'stopped; the last good state is kept\. Close that program or pause OneDrive\'s sync, then save \(the ' \
+               r'game\'s Save button\): it goes on then\.'
+    ok_c = wait_until(lambda: chat(ctx.cp), lambda t: len(re.findall(rx_still, t)) > len(re.findall(rx_still, cb)), 10)
+    hst = ctl.status(H)
+    check('g) the notice and the chat line on both copies: "A file of the host\'s campaign save is still in use by '
+          'another program (RTWGame1.bcs): the month stopped; the last good state is kept. Close that program or pause '
+          'OneDrive\'s sync, then save (the game\'s Save button): it goes on then."',
+          len(re.findall(rx_still, chat(ctx.hp))) > len(re.findall(rx_still, hb)) and
+          len(re.findall(rx_still, ok_c)) > len(re.findall(rx_still, cb)) and
+          'pause OneDrive' in hst.get('status', '') + ok_c, (ok_c.strip().splitlines()[-2:], hst.get('status', '')[:160]))
+    # (the host's date is read from its .bcs: once the file is free again)
+    freed = wait_until(lambda: log_since(H, hm), lambda t: 'TEST: savelock: RTWGame1.bcs released' in t, 40)
+    hst = ctl.status(H)
+    hl = log_since(H, hm)
+    check('g) the month stays stopped until the host saves: nothing merged, no reload, the host\'s date unchanged',
+          stopped and not log_lines(hl, r'submissions merged|host turn: click handler') and hst.get('date') == date0,
+          f'stopped={stopped}; date {date0} -> {hst.get("date")}')
+    hm = log_mark(H)
+    r = cmd(H, 'save')
+    run_month(ctx, 'disk_full g', started=True)
+    hl = log_since(H, hm)
+    check('g) the file free again ("TEST: savelock: RTWGame1.bcs released"), the host saves (`save` ok): the stopped '
+          'month goes on by itself and is merged', 'released' in freed and r.startswith('ok') and
+          log_lines(hl, r'disk: the save works again; the month goes on') and
+          log_lines(hl, r'host turn: \d+ submissions merged'), (r, log_lines(hl, r'disk: |merged')[:4]))
+
+
 SCENARIOS = [  # name, months processed, what it guards, function
     ('session', 0, 'host/join/claim/start; the client plans nation 1 in slot 77; nation 2 reserved as the stand-in '
                    'player "Bot"; client Multiplayer window open', scenario_session),
@@ -18846,6 +20262,10 @@ SCENARIOS = [  # name, months processed, what it guards, function
                      'Autosave.off CampDivNo: no duplicates after its reload); no exception, "Error in '
                      'FillDivisionList2" or "Missing ship"; the divisions stay for the later scenarios',
      scenario_divisions),
+    ('ship_status', 4, '0.7.1: a joined player\'s ship statuses (Trade protection, Raider, Reserve, Mothballed, Foreign '
+                       'station) set through the game\'s own popup menu stay over the host\'s months, also in a war '
+                       'month with the player\'s battles; the ship list\'s View data shows the player\'s own ship\'s '
+                       'data; the host\'s own ships unchanged', scenario_ship_status),
     ('victory_points', 1, 'joined players\' victory points (0.2.6): a host battle against a joined nation credits '
                           'it (battlevp = the game\'s HandleBattleAftermath), EnemyVP outside battles (enemyvpadd) is '
                           'shared among the host\'s enemies at month end (1 enemy, 2 enemies 51/50, a drop shares '
@@ -18891,12 +20311,14 @@ SCENARIOS = [  # name, months processed, what it guards, function
                        'no treaty, conference=1 treaty=0 treatyBM=0); M4 at war: no box, no second end; peace '
                        '(peacetest 100 2 1)',
      scenario_arms_treaty),
-    ('battle_generator', 4, '0.6.0 (B6): the player\'s battle generator for nation 1 (CheckForBattles2 in its view on the '
+    ('battle_generator', 5, '0.6.0 (B6): the player\'s battle generator for nation 1 (CheckForBattles2 in its view on the '
                             'host): dry runs (`battles gen`: attempts against computer nations only, relations '
                             'unchanged), up to 3 months (the generator once a month, at most one request of kind 1, the '
                             'computer\'s generator suppressed for nation 1, the request replayed and fought or answered '
                             'on the client); risk 4: declines of both kinds merged, never resolved by the game; the '
-                            'game\'s resolution\'s box captured on the host (`battles aitest`)', scenario_battle_generator),
+                            'game\'s resolution\'s box captured on the host (`battles aitest`); 0.7.1: the battle setup '
+                            'without a force of nation 1 and with its ally\'s division (`battles testnoforce`): no game '
+                            'error box, no battle, the next attempt', scenario_battle_generator),
     ('battle_surprise', 2, '0.6.0 (B6 piece 2): surprise attacks and takeovers at a war\'s start for nation 1: a forced '
                            'war start in its relation turn (`battles testsa`: the takeover recorded and applied on the '
                            'host by name, CheckSurpriseAttack recorded -> a request of kind 2), `battles sadry` (both '
@@ -19057,6 +20479,21 @@ SCENARIOS = [  # name, months processed, what it guards, function
                              'each player\'s own Fire at will, manual salvoes from A, B and both, the panel showing your '
                              'own side, a resync with a pending heavy-missile target',
      scenario_lockstep_missiles),
+    ('disk_full', 5, '0.7.1: a full disk, simulated (TEST `diskfree`, `diskfull`): the low-disk notice and chat line on '
+                     'both copies; the host\'s save failing at its Turn (the game\'s first box shown, the month stopped: '
+                     'nothing merged or loaded, the date unchanged, the notice on both copies), the month going on by '
+                     'itself once the host\'s save works (complete design files sent); the client\'s save failing at '
+                     'Submit (no turn sent, its line to the host) and its turn going in once a save works; a write of '
+                     'the mod on a full disk leaves the file as it was; a file of the save in use (TEST `savelock`): '
+                     'saved again by itself without a box (the client\'s Submit, the host\'s Turn), held too long: the '
+                     'month stops ("still in use", the game\'s box once) and goes on after the host\'s save',
+     scenario_disk_full),
+    ('disk_growth', DISK_MONTHS, 'group disk, --stress (0.7.1): what grows over a long session: save and reload cycles '
+                                 'on both copies change no list count (a load that appends shows here), then '
+                                 f'{DISK_MONTHS} processed months with the slots\' sizes and list counts per month '
+                                 '(bounded growth, no list doubling, no *.mptmp left), the logs (< 1 MB a month), no '
+                                 'DESYNC report, the game\'s and the temp folder\'s new files',
+     scenario_disk_growth),
     ('legacy_fleet', 3, 'group legacy (0.7.0; the legacy test campaign given with --legacy-fixture or '
                         'RTW3_LEGACY_FIXTURE, copied to the throwaway slot 46; SKIP without it): a joined player builds '
                         'the starting fleet of Germany by hand in a new 1900 campaign\'s first month (`legacy 1`): the '
@@ -19068,7 +20505,7 @@ SCENARIOS = [  # name, months processed, what it guards, function
      scenario_legacy_fleet),
 ]
 STRESS_ONLY = ('lockstep_stress', 'lockstep_rejoin', 'lockstep_resume', 'lockstep_torpedo', 'lockstep_strike',
-               'lockstep_missiles')  # not in the default run: --stress, --group or --only
+               'lockstep_missiles', 'disk_growth')  # not in the default run: --stress, --group or --only
 GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), in the suite's order
     'limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_data', 'lockstep_air'),
     'rejoin': ('lockstep_rejoin', 'lockstep_resume'),
@@ -19083,6 +20520,7 @@ GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), i
     'battlegen': ('battle_generator', 'battle_surprise', 'battle_raider', 'battle_invasion'),
     'twopc': ('twopc',),
     'legacy': ('legacy_fleet',),
+    'disk': ('disk_full', 'disk_growth'),
 }
 # Game time per scenario in seconds: measured in the dist_ll_7 default run (the 0.3.2-era scenarios) and on the 0.4.0
 # release candidate dist_ll_16 (2026-10-18: the default run 1528 s with lockstep_ui 213, lockstep_limits 175, air_units
@@ -19093,8 +20531,9 @@ EST = dict(session=14, intel_reports=1, file_lock=4, events=4, merge=17, researc
            lockstep_limits=175, lockstep_pvp=72, lockstep_month=109, lockstep_rejoin=565, lockstep_resume=380,
            lockstep_torpedo=470, lockstep_stress=1310, lockstep_air=265, air_units=65, lockstep_strike=420,
            lockstep_missiles=330, twopc=175, relations_peace=40, war_effects=220, arms_treaty=150,
-           battle_generator=150, battle_surprise=60, battle_raider=300, battle_invasion=600, relations_war=40, lockstep_data=15, divisions=90,
-           legacy_fleet=420)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s);
+           battle_generator=170, battle_surprise=60, battle_raider=300, battle_invasion=600, relations_war=40, lockstep_data=15, divisions=90,
+           legacy_fleet=420, disk_growth=330, disk_full=230, ship_status=180)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s), + f)'s month (dist_sf7_2, 2026-10-28: 91-104 s with c) fought in its first month);
+# ship_status: dist_rc070_2 (0.7.0), 2026-10-28 (167-175 s, four months, one with a fought battle)
 # divisions: dist_fd_2, 2026-10-25 (90 s, two months)
 # battles: dist_b6_5, 2026-10-23 (180 s with c2), one more month; battle_surprise: dist_b6_7, 2026-10-23 (57 s, one fought battle)
 # relations_war: dist_fw_1, 2026-10-25 (37 s); lockstep_data: dist_i61_1, 2026-10-25 (13 s)
@@ -19486,8 +20925,13 @@ def remove_copy_slots(slots):
 
 
 def game_error_boxes(since):
-    """The game's own error boxes (GAME_ERROR_RE; message boxes only) answered on any copy since `since`: (who, text)."""
-    return [(w, t[:200]) for ts, w, k, t in BOX_SEEN if ts >= since and k == 'TMessageForm' and GAME_ERROR_RE.search(t)]
+    """The game's own error boxes (GAME_ERROR_RE; message boxes only) answered on any copy since `since`: (who, text);
+    not the ones a scenario provoked on purpose (BOX_EXPECTED: (from, to, regex) while a simulated full disk was on)."""
+    return [(w, t[:200]) for ts, w, k, t in BOX_SEEN if ts >= since and k == 'TMessageForm' and GAME_ERROR_RE.search(t)
+            and not any(a <= ts <= b and r.search(t) for a, b, r in BOX_EXPECTED)]
+
+
+BOX_EXPECTED = []  # (from, to, compiled regex): the game's error boxes a scenario provokes on purpose (disk_full)
 
 
 def run_scenarios(ctx, names):

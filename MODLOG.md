@@ -227,6 +227,16 @@ belong to 0.4.0.
   - Testing:
     [the 0.7.0 release candidate dist_rc070_1](#testing-2026-10-26-the-070-release-candidate-dist_rc070_1-v070);
     [the 0.7.0 release candidate 2 dist_rc070_2](#testing-2026-10-26-the-070-release-candidate-2-dist_rc070_2-v070)
+- **0.7.1** (fixes of bugs reported on 0.7.0; its entries carry "0.7.1-dev" or "0.7.1")
+  - Fix:
+    [the bare "Access violation ... Read of address 00000109" box: a campaign save cut short](#fix-2026-10-28-the-bare-access-violation--read-of-address-00000109-box-a-campaign-save-cut-short-v071-dev);
+    [a joined player's trade protection and raiders, and View data of the player's own ships](#fix-2026-10-28-a-joined-players-trade-protection-and-raiders-and-view-data-of-the-players-own-ships-v071-dev);
+    [a full disk: a failed save stops the month, the low-disk notice, and what grows over a long session](#fix-2026-10-28-a-full-disk-a-failed-save-stops-the-month-the-low-disk-notice-and-what-grows-over-a-long-session-v071-dev);
+    [a failed save is not always a full disk: a file in use is saved again by itself](#fix-2026-10-28-a-failed-save-is-not-always-a-full-disk-a-file-in-use-is-saved-again-by-itself-v071-dev);
+    [the battle setup's "Error in SelectForce procedure!" box: a side without ships that can fight and its ally's division](#fix-2026-10-28-the-battle-setups-error-in-selectforce-procedure-box-a-side-without-ships-that-can-fight-and-its-allys-division-v071)
+  - Testing:
+    [the 0.7.1 release candidate dist_rc071_1](#testing-2026-10-28-the-071-release-candidate-dist_rc071_1-v071);
+    [the 0.7.1 release candidate 2 dist_rc071_2](#testing-2026-10-29-the-071-release-candidate-2-dist_rc071_2-v071)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -5527,7 +5537,9 @@ copy or delay proxy left running, the game folder copy deleted.
   of the possession) were lost. The same box came for every battle the game resolved (no battle, failed, time limit,
   the player gone).
 - **Now.** The battle slot counts the player's declines (`DoPlayerDecline` hook: the map question's No, and the
-  preview's Decline, which returns from DoBattle without it) and sends `declined` WITH the slot's result
+  preview's Decline, which returns from DoBattle without it) and sends `declined` WITH the slot's result. (Corrected
+  2026-10-28, 0.7.1 docs: the preview's Decline runs `DoPlayerDecline` too; later live records show it raising
+  `DeclineCount` and setting `InvadedThisTurn`, which only `DoPlayerDecline` does; GAME-INTERNALS is corrected.)
   (`ExtractBattleResult`: ships, losses, VP of both sides, prestige and morale): the host merges it like a battle
   (`battle N applied: ...; the player declined battle`, chat "* Captain declined battle for Germany against Spain in
   Northern Europe.", the war score credited), for both kinds of request; the game resolves nothing. A battle the game
@@ -7318,3 +7330,656 @@ developers' session files (`r72\logs_*`).
 - **Verdict: GO** for publishing 0.7.0 with exactly dist_rc070_2: no product issue. Neither of RC1's game error boxes came
   back (the fixed ambush path shown twice by e3)) and no other box came; every failure was a suite issue (fixed and run
   again) or a battle condition of the game (passed when run again); the mixed versions as designed.
+
+## Fix 2026-10-28: the bare "Access violation ... Read of address 00000109" box: a campaign save cut short (v0.7.1-dev)
+A 0.7.0 playthrough of two players on two PCs (no logs): a bare box titled "Rule the Waves III", "Access violation at
+address 0113D52A in module 'RTW3.exe'. Read of address 00000109." (no PC or moment known). The same playthrough had a
+full disk on the host ("Error in SaveDesignFiles procedure! Stream write error ...").
+- **The routine (static).** RTW3.exe loads at a random 64 KB-aligned base, so only the address's low 16 bits are the
+  rva's: 0xD52A. Of the 110 addresses 0x83d52a + k x 0x10000 in the code section (analysis base 0x830000), exactly
+  one is an instruction that reads [reg+0x109] (checked from its routine's start): 0xc5d52a (rva 0x42d52a) `mov eax,
+  [edi+0x109]` in `TBuilderNation.GetNationAreaShipString(anArea, ActiveOnly, ExcludeKE): string` (0xc5d4e0), its first
+  use of Self (EDI = EAX at entry): `ShipList` +0x109. Self was nil; the report's base was 0xd10000. Its callers: the
+  strategic map's hint (`WorldGlobeMouseMove` -> 0xce8d10 -> 0xcec8e8: "Map area: ..." with each nation's ships for
+  `GetBNation(i)`, i = 0..8, unchecked; `GetBNation` (0xc80040) is nil for i >= Count), the map's area details
+  (`WorldGlobeMouseUp` and `Details1Click` -> 0xcea020, the same loop), and the battle prompts of `DoPossessionBattle`,
+  `DoHomeAreaBattle` and `CheckSurpriseAttack` for `PlayerNation` (inside the game's error handlers or the mod's
+  `GuardedCall`: never a bare box). Only the map's handlers have no handler of the game, so their fault reaches
+  `TApplication.Run`'s: the bare box. The other 109 addresses read no +0x109 (or are no instruction start).
+- **How a nation goes missing.** `LoadBuildCampaign` (0xc998c4) empties `BuilderNations` (0xc99a89) and adds a nation
+  per `[Nation<i>]` section until the first missing one (`IndexOf = -1`, 0xc9a41d), without an error; its "Loading ship
+  designs" loop then calls `LoadDesignsFromLargeFile` (0xd49c5c) for the nil `GetBNation(i)`: "Error loading game!
+  Access violation at address <base+0x519cb9> ... Read of address 00000004" (its own box), and it returns False with
+  the nations before the cut. 0.7.0's `game::LoadCampaign` showed the strategic screen after a failed load too. A
+  `.bcs` written to a full disk is cut short (the game writes `[VERSION]` last): the mod's reloads of the host's slot
+  after a merge or the client's month (the host sends its slot's files) load it the same way.
+- **Reproduced (0.7.0, dist_rc070_2):** slot 1 copied to a throwaway slot 61, its `.bcs` cut before `[Nation5]`; the
+  bridge's `loadasync 1`, then `loadasync 61`: the game's box above ("... 008D9CB9 ... Read of address 00000004", base
+  0x3c0000), `LoadCampaign slot 61 player 0 -> FAILED`, `nations` lists 0..4; the first posted WM_MOUSEMOVE over a sea
+  area of `WorldGlobe` (373,59) shows the bare #32770 box "Access violation at address 007ED52A in module 'RTW3.exe'.
+  Read of address 00000109." The RTW3MP_DIAG trace: rva 42d52a <- 4bc938 (0xcec8e8) <- 4b8e0d (0xce8d10) <- 52801e
+  (`WorldGlobeMouseMove`) <- the VCL's mouse dispatch. Without a campaign loaded before, the map has no areas and no
+  hint shows (the first two runs).
+- **Fix 1, the load.** `game::LoadCampaign` refuses a `.bcs` without the nine `[Nation<i>]` sections or `[VERSION]`
+  before the game's load, so the campaign in memory stays whole (`LoadCampaign refused: slot <n>'s campaign file is
+  incomplete (<bytes> bytes, <k> of 9 nations, no [VERSION] section: a save cut short (a full disk?))`); after the
+  game's load it checks `game::CampaignComplete` (nine nations, none nil, `PlayerNation` one of them) and reports a
+  failure (`LoadCampaign: the loaded campaign is incomplete (...)`). Every caller already handles a failed load.
+- **Fix 2, the map.** `WorldGlobeMouseMove`, `WorldGlobeMouseUp` and `Details1Click` (hooked) do nothing while the
+  campaign in memory is incomplete, also after the player's own load of such a file (`the map's hint and details are
+  off: the campaign in memory is incomplete (a failed load)`, at most once a minute).
+- **Fix 3, the mod's own calls.** The mod's main-thread work (its timer, network messages and `RunOnMainThread` calls,
+  so every bridge command) runs under an SEH guard: a game exception no game routine handled (a Delphi exception or a
+  processor fault) is logged with the mod's call site and the 0.6.0 RTW3MP_DIAG trace (registers, objects, the game's
+  return rvas; now also without RTW3MP_DIAG) and that piece of work is dropped, instead of the game's bare box with no
+  trace: `ERROR: game exception <code> at rva <x> [<class>: <message>] in the mod's main-thread work (<function>, line
+  <n>): caught, that work dropped`. `RunOnMainThread` records its caller (`__builtin_FUNCTION`, `__builtin_LINE`). The
+  mod's C++ exceptions stay with its own catch blocks (/EHsc).
+- **Test switches:** `RTW3MP_TEST_NOLOADCHECK=1` (the mod's loads take such a file: the game's own load) and the
+  bridge's `pocguard` (`GetNationAreaShipString` with Self nil from the mod's main-thread work).
+- **Proof (dist_av7_1, dist_av7_2):** the reproduction on the fix: `LoadCampaign refused: slot 61's campaign file is
+  incomplete (495473 bytes, 5 of 9 nations, no [VERSION] section ...)`, `nations` 0..8, 77 posted mouse moves, no box.
+  With `RTW3MP_TEST_NOLOADCHECK=1`: the game's own "Error loading game!" box, then the map guard's line and no bare box;
+  `pocguard`: `ERROR: game exception c0000005 at rva 42d52a in the mod's main-thread work (Execute, line 100): caught,
+  that work dropped` with the trace, no box (without RTW3MP_DIAG). `regression.py --only
+  session,divisions,legacy_fleet,battle_invasion,relations_war --legacy-fixture ...` on dist_av7_2: 234/234 checks
+  passed (game open 510 s); the host's and client's logs hold no refused load, no map guard line and no game exception.
+  Game open in all: 699 s.
+
+## Fix 2026-10-28: a joined player's trade protection and raiders, and View data of the player's own ships (v0.7.1-dev)
+Two reports from a two-PC game on 0.7.0 (host = nation 0, the joined player = nation K): "Non host players' trade
+protection ships don't stay" (the next month they are back in active service) and "Non host also can't view the data of
+their own ships via the 'View Data' item" of the ship list's popup menu.
+
+**Reproduced on the released 0.7.0** (the installed dist_rc070_2, the 1900 fixture, host and client on one PC; the new
+scenario `ship_status`, `--only session,ship_status`, two runs, 199 + 191 s with the game open): 73/78, the five
+failures exactly the two bugs.
+- On the client (nation 1 = Germany at war with Spain, its war counter 2: the popup enables *Trade protection* and
+  *Raider* only at war) Hela and Gazelle were set to trade protection (3), Hertha to raider (the game sets 5), three
+  more to reserve (1), mothballed (2) and foreign station (6), all through the game's popup. A watcher of the saves
+  showed where the war statuses go: the client's slot 77 at its Submit 3/3/5, the host's merged save 3/3/5, the host's
+  month at `nation 1 month: at war, 2 ships on trade protection of 4 required` (the mod's check at
+  CheckShipsOnForeignStations) still 3/3, then the save of the battle phase 0/0/0 with `OldStatus` 0 (so already 0 at
+  `DoEndOfTurn`'s first call, `RecordOldStatusForShips` 0xd2a5e0), the host's memory and slot 1 0/0/0, the client's next
+  month "AF". Reserve, mothballed and foreign station stayed. Not the merge, not the battle (the battle-phase save was
+  already 0) and not the AI-moves restore (no `AI moves undone for nation 1` in M1).
+- View data on the client for the German light cruiser Hela showed "HELA / COLLINGWOOD CLASS (1899) / BRITISH
+  BATTLESHIP / 14000 tons, 18 knots" with the British flag (one PrintWindow of the game's dialog, kept in the session
+  folder); on the host its own Collingwood showed correctly.
+
+**Cause 1, trade protection and raiders: a side effect of the maintenance cost, under the relations mask.**
+- A probe (a diagnostic build, removed afterwards): from DoStrategicTurn's start a thread polled the Status byte of every
+  ship of the joined nations; on a change it suspended the main thread, read EIP and the stack's return addresses,
+  resumed it and logged them. The month's log:
+  `relations v2: ReduceTimeLimits runs without the pairs of nation(s) 1 (player's rules)`,
+  `AI suppressed: AINationAdjustBudget / AIMonthlyBuild / CheckAIRebuilds for nation 1`, then
+  `nation 1 ship 5 status 4 -> 0 at eip 0xc4f392; returns 0xc5d33e 0xc7c083 0xce1dd4 ...` (EIP in
+  `TBuilderNation.GetMonthlyExpenses` right after its `GetTotalMonthlyMaintenanceCost` call, 0xc5d33e in
+  `GetMonthlyBalance`, 0xc7c083 ReduceTimeLimits' `mov eax, edi; call GetMonthlyBalance` of its loop of the computer's
+  nations, the one that calls HaltMostExpensiveShip while the balance is negative, 0xce1dd4 DoStrategicTurn's call of
+  ReduceTimeLimits), and ships 6 and 10 3 -> 0 in the same pass.
+- `TBuilderNation.GetShipMaintenanceCost(aShip, AllActive)` (0xc59b60), at its end:
+  `mov eax, edi; call NationIsAtWar; test al, al; jne done; movzx eax, [ebx+0xac]; add al, 0xfd; sub al, 2; jb reset;
+  sub al, 2; jne done; reset: mov byte [ebx+0xac], 0` (0xc59f1d-0xc59f39): a ship on trade protection (3) or raiding
+  (4, 5) returns to active service whenever its nation's maintenance is computed while the nation is not at war.
+  `NationIsAtWar` (0xc634f8): PlayerNation while `[0xf52ff4]` (the war counter) > 0, or `Tension` (+0x256) > 40, or
+  `IsAtAIWar` (0xc68ecc: not PlayerNation; any of the cells +0x25a.. (AI tension with 1..8) > 40).
+- Relations v2 B2 (0.5.0) runs ReduceTimeLimits (and the other computer relation routines) with every pair (K, j) of
+  a nation under the player's rules at tension 5 (`AIMaskEnter`), so inside it K is at peace with the computer's
+  nations, and its halt loop computed K's balance: every month K's trade protection and raiders went back to active
+  service. In single player the player's nation uses the war counter (NationIsAtWar's first test), and on the player's
+  PC the client's own war counter is in place (also in the battle slot, `MakeNationPlayer`), so only the host's month
+  had it. The host's own war counter (-68 in the test) played no part.
+
+**Cause 2, View data: nation 0 hard-coded.** `TfrmBuildCamp.Data1Click` (0xca2f5c, the item of both popup menus of the
+ship lists): `push 1; push 0; mov edx, [eax+0x594] (lvShips); xor ecx, ecx; call ShowShipDataFromLV`; the same nation 0
+in `lvShipsDblClick`, `TdlgMoveShips.Viewdata1Click`, `TdlgMapDetails.D1Click` and `Shipdata1Click`.
+`ShowShipData(aShip, aNationIdx, Correct, ShowPicture)` (0xcb3528) looks the ship's `DesignRefId` (+0x08) up with
+`GetBNation(idx).GetShipDesignFromId` (nil: it returns silently), sets the design's Nation (+0x14) := idx and shows
+nation idx's flag and name. Design ids are per nation (2..N for every nation of the fixture), so on a joined player's
+PC (PlayerNation = nation K, nation 0 the host's) a ship showed the host's design with the same id. Another screen that
+reads nation 0 for the player, like the research screen (0.2.8) and the relations view (0.4.1).
+
+**Fixes** (game.cpp; protocol 3 and the live-battle engine 18 unchanged):
+- `AIMaskEnter` notes the ships with Status 3-5 of every masked nation; `AIMaskLeave`, after the real relations are
+  back, gives each of them that the masked routine set to 0 its status again when the nation is at war by the game's
+  own test (`NationAtWarNow`: the player's war counter, else the tension with nation 0 or any AI tension above 40):
+  `relations v2: nation 1 at war: 3 ship(s) on trade protection or raiding kept (ReduceTimeLimits saw it at peace)`.
+  At peace the game's rule applies, as for its own player; ships sunk, interned or changed otherwise are left alone.
+- A hook of `ShowShipData` (naked thunk: EAX/EDX kept, ECX replaced): a ship of the player's nation K asked for as
+  nation 0's on a PC where PlayerNation is BuilderNations[K] is shown as nation K's (`ship data: a ship of the player's
+  nation 1 shown with its own designs (the game asked for nation 0's)`). Elsewhere (the host, single player, the battle
+  slot, the views that put K at index 0) nothing changes. `ShowShipDataFromLV` keeps index 0, so the player's own ships
+  under construction still show. Read-only bridge command `shipdata` (the last call: ship, owner, asked, used, the
+  design's class).
+
+**Version mixes** (each fix lives on one PC, no message changes):
+- 0.7.1 host + 0.7.0 client: the statuses are kept (the host's month); the 0.7.0 client's View data still shows the
+  host's designs.
+- 0.7.0 host + 0.7.1 client: View data shows the player's own ships; the 0.7.0 host still returns the trade
+  protection and raiders to active service every month.
+- Live battles between 0.7.0 and 0.7.1 PCs as before (engine 18).
+
+**Proof** (dist_tp7_2: both fixes plus the probe, `--only session,ship_status`, 197 s): 78/78. Over M1 (a war month
+with the player's battle fought on the client) and M2 (war) the host keeps Hela 3, Gazelle 3, Hertha (set 5: a raider
+that must break out; 4 after M1, the game's own breakout), Brandenburg 1, Wittelsbach 2, Victoria Louise 6 in memory
+and in slot 1, and the client's next months and slot 77 show them (the list: TP, TP, R, RF, MB, FS); the probe shows the
+reset and the restore of the same ships around the same routine (`status 4 -> 0` in ReduceTimeLimits' halt loop, then
+`0 -> 4` at the mask's end); the host's 48 ships unchanged. View data on the client for Hela: "HELA CLASS (1899) /
+GERMAN LIGHT CRUISER / 3200 tons, 22 knots", `shipdata` `ship=Hela owner=1 asked=0 used=1 design=Hela dnation=1`; on
+the host its Collingwood as before (`owner=0 asked=0 used=0`). Back to active fleet and at peace (M3) every ship is 0.
+
+**Suite on the final build** dist_tp7_3 (the two fixes, the probe removed), `--only session,battles,divisions,ship_status`:
+222/224 with the game open 722 s; divisions 42/42, ship_status 62/62 (its months M1 with battle 5 of the month fought on
+the client, M2). The two failures are one box, counted by `battles` and by `session`'s whole-run check: the known save
+collision `Error in SaveBuildCampaign procedure! Cannot create file "...\Game1\RTWGame1.bcs". The process cannot access
+the file because it is being used by another process` on the host one second after battle 5 was applied in `battles`
+A2 (the runner reads the host's slot right after a merge; [Known traps](docs/TESTING.md#known-traps)). After that run the
+scenario's save watcher (each version of slot 77 and slot 1 during a month, used for the diagnosis above) became
+opt-in (env `RTW3_SS_WATCH=1`): it reads the slots right after the game's saves, the same collision's risk. The same four scenarios again on dist_tp7_3 with the committed suite (the watcher off): 235/235 (session 17/17, battles 114/114, divisions 42/42, ship_status 62/62), 697 s with the game open; the collision did not recur.
+
+## Fix 2026-10-28: a full disk: a failed save stops the month, the low-disk notice, and what grows over a long session (v0.7.1-dev)
+Two players of 0.7.0 on two PCs reported that the host's game showed "Error in SaveDesignFiles procedure! Stream write
+error: There is not enough space on the disk"; the host's disk really was nearly full, and the same playthrough showed
+a bare "Access violation at address 0113D52A in module 'RTW3.exe'. Read of address 00000109." box (investigated on its
+own branch: [the bare box](#fix-2026-10-28-the-bare-access-violation--read-of-address-00000109-box-a-campaign-save-cut-short-v071-dev)).
+Branch fix-disk from dev-071 a3b17e5 (0.7.1-dev).
+- **The game's failed save** (static reading of 1.01.44; [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)).
+  `SaveBuildCampaign` (0xc8e5c4) writes, when no battle is in progress, `ClearUnusedDesignFiles` and
+  `SaveDesignFilesInOneFile` (0xd481ac) for nations 0-8 (`DesignFiles<n>.des`: "v10139", the count, the designs,
+  `TStringList.SaveToFile`), then `SaveAircraftData`, `SaveMonthRecords` (the `.sta`), the `.bcs`, the `.off`
+  (`Autosave.*` for an autosave) and with BeforeBattle `BattleInfo.bbi`. Every part has an except handler that shows the
+  error with `ShowMessage` (0xab7970) and goes on: "Error in SaveDesignFiles procedure!" + the message (0xd4836c), then
+  the routine returns its `[ebp-0xd]`, which is still True; "Error in SaveBuildCampaign procedure!"#13 + the message
+  (0xc8f450) ends the save early. `SaveToFile` opens with `fmCreate` (the file emptied first). So a full disk gives up to
+  ten boxes (nine design files, then the `.bcs`), the save returns as usual, and the files it could not write are empty
+  or old; the caller can't tell.
+- **What the mod did with it (0.7.0).** `game::SaveGame` always returned true. After a failed save the host's month
+  (`RunHostTurn`) merged the turns into the slot and loaded it again, `BroadcastState` packed the slot's files for the
+  players, a joined player's Submit packed its slot, and a battle's result was read from the battle slot's save: a
+  campaign without designs (empty `DesignFiles<n>.des`) loaded on the host and sent to everyone, or a turn taken from
+  empty files. A guess, not shown: the reported access violation may come from such a load (the other branch's
+  question). Also `WriteFileBytes` (every write of the mod: the merge, the month package, the battle slot) fell back to
+  writing a file in place after any error; on a full disk that empties the old file (CREATE_ALWAYS) and then fails.
+- **The fix.**
+  - `game.cpp`: a hook of `SaveBuildCampaign` (`d_SaveCampaign` -> `CB_SaveCampaign`, the call inside
+    `__try`/`__finally`, nested saves counted) records every save, the game's own and the mod's: a box of the game during
+    it (the `ShowMessage` hook, now always installed, found from `SaveBuildCampaign`'s handler, else from
+    `CheckForBattles2`'s; the B6 uses unchanged) or a file it had to write (`.bcs`/`.off` or `Autosave.*`, `.sta`, the nine
+    design files when ScenarioInProgress = -1) missing, older than the save (2 s slack) or cut short makes it a failed
+    save: `save: slot <n> FAILED (save; <MB> MB free on its drive): <the box's text / the file>`. Only the save's first
+    box is shown; its repeats go to the log (`save: the game's box <k> of this save not shown: ...`). `game::SaveGame`
+    returns false after a failed save; `SaveOkCount`, `SaveFailCount`, `LastSaveFailed`, `LastSaveError`; the bridge's
+    `savestate`.
+  - `session.cpp`: a failed save stops the step that saved (`SaveStopped`): the host's month (nothing merged, no reload,
+    the turns kept, back to planning), sending the new month, the battle phase (the battles wait instead of being given
+    to the computer), a player's turn, a player's save before a live battle. The notice and chat line: "The host's disk is
+    full (<n> MB free on drive C:): the month stopped; the last good state is kept. Free space and save again (the game's
+    Save button): it goes on then." (the host's to everyone; a player's own one locally and "[disk] My game could not save
+    (the disk is full): my turn waits until it can." to the host; "... game could not save the campaign" when the disk
+    isn't low). Once any save works (`SaveOkCount` moved, e.g. the player's own Save), `Tick` runs the step again; a
+    merge whose write failed on a full disk stops the month the same way (`WriteFailedDiskFull`). A joined player's
+    battle result is never read from a failed save (`SaveBattleSlot`: the result goes as failed, the host lets the game
+    resolve the battle). (Corrected 2026-10-28, 0.7.1 docs: only a battle of the computer's generator is resolved by
+    the game; one of the player's own generator is no battle that month, as ARCHITECTURE says.) A received month that a full disk could not store stays pending and is stored again every 15 s
+    ("Your disk is full ...: the new month could not be stored. Free some space: it is stored and loaded then by
+    itself.").
+  - Low disk space: before the month's saves (host: the Turn, the new month, the battles; client: its turn, storing the
+    month) `LowDiskCheck` reads the save folder's drive (`FreeSpaceMB`, GetDiskFreeSpaceExW); below 500 MB
+    (`kLowDiskMB`) a notice and a chat line, once a month: "Low disk space on drive C: <n> MB free; the game may fail to
+    save. Free some space." The value: the largest test campaign's slot is 11.6 MB (the 1958 missile campaign; 1900:
+    2.6 MB); a month writes the slot, the autosave and, on a joined player's PC, the battle slot, each file briefly twice
+    while it is replaced: about 50 MB at once at most, so 500 MB warns ten such months ahead.
+  - `util.cpp`: `WriteFileBytes` doesn't write in place after ERROR_DISK_FULL or ERROR_HANDLE_DISK_FULL (the old file
+    stays; `write <path> FAILED: the disk is full ...; the file is left as it was`); the log rotates at 32 MB within a
+    session (the earlier lines in the `.prev.log`: at most two files per log tag).
+  - Test hooks: the bridge's `diskfree <MB>|off` (what the free-space check reports), `diskfull on|off` (a `WriteFile`
+    hook installed on the first `on`: writes into files under the Save folder fail with ERROR_DISK_FULL after the file
+    was created or emptied, as on a full disk; the game's saves and the mod's writes alike), `diskinfo`.
+- **The growth audit** (the question: does anything the mod causes grow without bound?).
+  - Static: every list add reachable from `LoadBuildCampaign` four calls deep (117 routines, `addscan.py` in the
+    offline workspace): besides the intel reports (0.2.2), the air units (0.3.3) and the campaign divisions (0.6.1) only
+    `DesignStudyList` (+0xaec) is appended to without clearing, from `[DesignStudies]`, which nothing writes (the
+    string's only user is the load; `TDesignStudy.SaveMe` has no caller): it stays empty, not fixed. `MonthRecords` is a
+    fixed array (the `.sta` keeps its size); nations, designs, officers, map areas and ships are new objects at every
+    load.
+  - The mod's files: its slots 77 and 87 are written over (`ApplyStateBundle` deletes the old save files first; a live
+    battle's B deletes the old `*.skv`); `ls_desync_*.txt` keeps the 12 newest (`PruneDesyncReports`, since 0.4.0);
+    `rtw3mp_*.ini` are one per slot; the loader log (`RTW3MP_DIAG` only) is written anew at each start; the logs rotated
+    only at a start (fixed: 32 MB). Nothing in the game's folder or the temp folder.
+  - Live, the released 0.7.0 (dist_rc070_2), `disk_growth` (game open 175 s): six save and reload cycles on each copy
+    changed nothing (host slot 1: 2,556,688 B, IDNo 40553, 6 reports, 0 air units, 419 officers, 171 designs, 38079 .bcs
+    lines; client slot 77: 1,748,992 B), private memory +2.5 to 10 MB per reload (the known leak, Known limitations).
+    Eight months (Aug 1900 -> Apr 1901): host 2,556,688 -> 2,655,147 B (+12 KB a month: .bcs lines 38079 -> 39594,
+    designs 171 -> 178, reports 6 -> 9), client 1,748,992 -> 1,833,725 B, the logs +6.6 and +2.3 kB a month, no DESYNC
+    report, no new file in the game's folder. So 0.7.0's sessions grow only as the campaign does; the reported full disk
+    was not the mod's doing (as far as these runs show: no live battles in them).
+  - Live after the fix (dist_dk7_3, `disk_growth`, game open 171 s): the same: the reload cycles change nothing (host
+    2,556,688 B, 314 ships counted now; client 1,748,992 B), eight months host 2,556,688 -> 2,679,810 B, client 1,748,992
+    -> 1,854,282 B, logs +6.8 and +2.3 kB a month, the temp folder one new file of 53 B, nothing in the game's folder.
+- **The live proof of the full disk** (`disk_full`, the bridge's TEST `diskfree` and `diskfull`; dist_dk7_1: 54/54, game
+  open 89 s). The simulated full disk gives the report's box word for word: on the host's Turn the game's save showed
+  nine "Error in SaveDesignFiles procedure!Stream write error: There is not enough space on the disk" and then "Error in
+  SaveBuildCampaign procedure!" (box 10), left all nine `DesignFiles<n>.des` of slot 1 at 0 bytes, and returned as
+  usual. With the fix the first box showed, the nine others went to the log (`save: the game's box <k> of this save
+  not shown`), `save: slot 1 FAILED (save; 30 MB free on its drive): Error in SaveDesignFiles procedure!Stream write
+  error: There is not enough space on the disk ...`, "disk: a save failed; the month stopped": no merge, no reload,
+  the host's date unchanged, the notice and the chat line on both copies. With the simulation off the host's `save`
+  worked and the month went on by itself right after it ("the save works again; the month goes on", "1 submissions
+  merged"); the client's next month had nine complete design files. The client's Submit on a full disk: `save: slot 77
+  FAILED`, "your turn stopped", not submitted, "[disk] My game could not save (the disk is full): my turn waits until it
+  can." on the host; after its `save` the turn went in by itself. A write of the mod on a full disk (`writetest`):
+  error 112, the old file unchanged, no `*.mptmp`. The low-disk check at 120 MB: one line on each copy in the month.
+- **Review** (a code-review agent on the diff): a time-limited month (`g_forced`) called `RunHostTurn` again every tick
+  after a failed save (a box every 250 ms), now not until a save works; a stopped Submit could submit the next month's
+  turn by itself, now dropped when a new month is loaded (the host's stops when a new month goes out); the game's box
+  of a failed save runs a message loop in which the session's timer and network messages ran (a player joining would
+  save again inside the save, and that inner save looked successful): now `Tick` and `OnNet` wait while
+  `game::SaveInProgress()` and `SaveGame` refuses a nested save.
+- **The check is fix-av109's rule.** The save's check of the `.bcs` uses `CampaignFileProblem` (the nine `[Nation<i>]`
+  sections and `[VERSION]`, which the game writes last), copied word for word from fix-av109 (5fb5687), whose
+  `LoadCampaign` refuses such a file: one rule for a save cut short. The merge of both branches (int-071) keeps one
+  copy, used by the load's refusal and the save's check.
+- **Suite** (`tools/regression.py`): `disk_full` (default run, group `disk`), `disk_growth` (`--stress`, group `disk`),
+  `run_month(started=True)` and `month_prepare` (a month the caller set going), `BOX_EXPECTED` (the error boxes a
+  scenario provokes are not the run's failure).
+- **Commits and runs.** The fix eea420c, the suite ae73201. The final build dist_dk7_4 (`RTW3MP.dll` SHA-256
+  B7875DCD220E...): `--only battles,lockstep_month,disk_full,disk_growth` 331/331 (session 17, battles 102,
+  lockstep_month 51, disk_full 54, disk_growth 107), game open 523 s. Before it: dist_dk7_3 `--only
+  battles,lockstep_month,disk_full` 212/212 (403 s) and `--only disk_growth` 107/107 (171 s), dist_dk7_1 `--only
+  disk_full` 54/54 (89 s); the released 0.7.0 `--only disk_growth` 106/107 (175 s; the failure the check's own, fixed).
+  After the battles and the live battle of the final run the host's slot held 25 files (16 before: the battle's save,
+  its logs and the like, under fixed names), and the next eight months grew it as before (3,299,695 -> 3,433,269 B, the
+  client's 2,054,116 -> 2,145,932 B); private memory still grows by about 4 MB a reload (the known leak, Known
+  limitations), not on disk.
+- **Merge smoke (int-071: fix-av109, fix-disk and fix-tp merged on dev-071, 2026-10-28).** dist_i71_1 (`RTW3MP.dll`
+  SHA-256 BF6B5271A544...), `--only session,disk_full,ship_status,divisions,battles`: 277/277 (session 17, battles 102,
+  divisions 42, ship_status 62, disk_full 54), game open 575 s, no game error box. Both logs: "Failed saves: ok"; the
+  host's: "relations v2: nation 1 at war: 3 ship(s) on trade protection or raiding kept (ReduceTimeLimits saw it at
+  peace)" in ship_status's war months; the only failed saves are disk_full's own (slot 1 at the host's Turn, slot 77 at
+  the client's Submit); no refused load, map guard line or game exception on either copy.
+
+## Fix 2026-10-28: a failed save is not always a full disk: a file in use is saved again by itself (v0.7.1-dev)
+On int-071 (the three 0.7.1 fixes merged, 35eb80f). [The full-disk fix](#fix-2026-10-28-a-full-disk-a-failed-save-stops-the-month-the-low-disk-notice-and-what-grows-over-a-long-session-v071-dev)
+stopped the step at every failed save and called it a full disk ("The host's disk is full (...)" when the drive had
+less than 500 MB free, else "The host's game could not save the campaign"). A save also fails when another program
+holds one of its files for a moment: "Error in SaveBuildCampaign procedure! Cannot create file ... The process cannot
+access the file because it is being used by another process". The README's troubleshooting names antivirus and
+OneDrive for it; the game's save folder is in OneDrive on many PCs (this one too), and the suite's runner caused it
+once by reading slot 1 right after a save. Such a moment stopped the month until the host saved by hand.
+- **The game's side** (live, the TEST `savelock` below; [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)).
+  The game creates each file with `fmCreate` (CreateFile without sharing), so any other open handle fails it with
+  error 32: "Error in SaveBuildCampaign procedure!"#13"Cannot create file "...\Game1\RTWGame1.bcs". The process cannot
+  access the file because it is being used by another process", about 20 ms into the save (the design files and the
+  `.sta` already new, the `.bcs` and `.off` old). The system's part comes from `FormatMessage` in the user's language
+  (Delphi's `SysErrorMessage`, the trailing dot cut); "Cannot create file", "Stream write error" and the "Error in ..."
+  prefixes are the game's own English. The same save a moment later works.
+- **The cause** (`game.cpp`). `SaveEnd` names it (`game::LastSaveCause`; `savestate` `cause=none|full|inuse|other`;
+  the log `save: slot <n> FAILED (save; <MB> MB free on its drive, the slot's files <KB> KB; the cause: <cause>)`):
+  a full disk when a box says "not enough space on the disk", "disk is full" or the system's words for errors 112
+  and 39; else a file in use for "being used by another process", "sharing violation", "Cannot create file" or the
+  system's words for errors 32, 33 and 1224; else, with no such text, a full disk when the drive has less free space
+  than the slot's files took when the save began (plus 1 MB); else another error. A save that works sets the cause
+  back to none. The players' text (`LastSaveText`, `LastSaveFile`) leaves the folders out (only the double quotes
+  Delphi puts round a file name end a path: an apostrophe may be part of a folder's name).
+- **A file in use is saved again** (`session.cpp`). The five steps that stop on a failed save (the host's month,
+  sending the new month, the battles; a player's turn, a player's save before a live battle) save with `StepSave`
+  (`game::SaveGame(true)`: the game's box about a file in use stays off the screen, logged `save: the game's box <k>
+  of this save not shown (a file in use: the mod saves again)`). `SaveStopped` with that cause holds the step and
+  `SaveRetryTick` (in `Tick`, when the game is idle; for the save before a live battle also while the battle waits to
+  load) saves again into the same slot 2 s later, up to five times (`disk: the month: saving again (<k> of 5)`); the
+  last try shows the game's box, so a failure that lasts shows one box and a passing one none. Once a try works the
+  step goes on with that save (`disk: the step goes on with the save that just worked`: a second save at once would
+  meet the other program again, which reads the file just written). After five failed tries the step stops as for a
+  full disk and waits for a save that works (the player's Save). A full disk and another error stop at once, as
+  before, each with its own words. A stop that was no save of the game's names its cause itself (the merge's own write
+  on a full disk: `SaveStopped(Turn, false, DiskFull)`); a `SaveGame` that refused to save (an event dialog) falls back
+  to the free-space rule (`FailedSaveCause`). A joined player's battle slot is saved again at once, five times 1 s
+  apart (`SaveBattleSlot`; the game is busy for those seconds), before the battle's result is given up.
+- **The words** (notice and chat line; the host's to everyone, a player's own locally and its line to the host):
+  - a file in use, saving again: "A file of the host's campaign save was in use by another program (for example
+    OneDrive or antivirus): the month waits; it saves again by itself." (a player: "A file of your campaign save ...:
+    your turn waits; ..."; to the host: "[disk] My game could not save (a file of the save was in use by another
+    program): my turn waits; it saves again by itself.");
+  - still in use after five tries: "A file of the host's campaign save is still in use by another program
+    (RTWGame1.bcs): the month stopped; the last good state is kept. Close that program or pause OneDrive's sync, then
+    save (the game's Save button): it goes on then." (to the host: "[disk] My game could not save (a file of the save
+    is still in use by another program): my turn waits until it can.");
+  - a full disk, unchanged: "The host's disk is full (<n> MB free on drive C:): the month stopped; the last good state
+    is kept. Free space and save again (the game's Save button): it goes on then.";
+  - another error: "The host's save failed (<the game's text, without folders>): the month stopped; the last good
+    state is kept. Save again (the game's Save button): it goes on then." (to the host: "[disk] My game could not save
+    (the save failed: <text>): my turn waits until it can.").
+- **Test hook.** The bridge's `savelock <seconds>|off [file]`: the next save finds a file of its slot (default
+  `RTWGame<slot>.bcs`) opened without sharing from its start; a thread of its own closes it <seconds> s later (the main
+  thread may sit in the game's box). When another program holds the file itself it waits for it up to 3 s.
+- **Review** (a code-review agent on the diff): the merge's own disk-full stop read the cause of an older save (a stale
+  "in use" would have saved again every 2 s without end): the cause is now passed, reset after a save that works, and
+  falls back to the free space; the players' text kept folders after an apostrophe in a folder's name.
+- **Live proof** (`disk_full` f and g, [TESTING](docs/TESTING.md#scenario-catalog)). dist_sr7_1, `--only
+  session,disk_full`: 104/106, game open 169 s (the two failures the checks' own: the host's date is read from its
+  `.bcs`, empty while the file is held; the host's status line is soon replaced by "All players are ready"). f) the
+  client's Submit with `RTWGame77.bcs` held 4 s: failed at 19:38:45.16 (cause inuse, no box), try 1 failed, the file
+  free at 49.15, try 2 worked at 49.50 and the turn went in on that save; the host's Turn with `RTWGame1.bcs` held 5 s:
+  tries 1 and 2 failed, the next worked, the month went on and was merged; no box on either copy, the lines on both.
+  g) held 25 s: tries 2.25 s apart (2 s plus the save), "saving again (5 of 5)", the month stopped (cause inuse), the
+  game's box once (the fifth try's), "... is still in use by another program (RTWGame1.bcs) ..." on both copies;
+  nothing merged and the date unchanged; the file free, the host's `save`: the month went on by itself.
+  dist_sr7_2 (the review's fixes), `--only session,disk_full,lockstep_month,battles`: session 17/17, lockstep_month
+  51/51, battles 111/112 (c2: every battle of both tries avoided by the computer, no preview to decline: the game's
+  roll, seen before), disk_full 84/89: g) passed, but f)'s host lock was not taken: `TEST: savelock: RTWGame1.bcs
+  cannot be opened (error 32)` at 20:07:22.495, 14 s after a save, i.e. another program really held the host's file
+  then (the folder is OneDrive's); the game's save a few milliseconds later worked. `savelock` now waits for such a
+  holder (up to 3 s).
+  The final build dist_sr7_3 (`RTW3MP.dll` SHA-256 1558CC15D5E8...), `--only session,disk_full,lockstep_month,battles`:
+  session 17/17, disk_full 89/89, lockstep_month 51/51, battles 99/102, game open 461 s. The three battles failures
+  are the scenario's, not saves (no failed save, no save again, no hidden box and no exception in either log during
+  it): b) the month's second battle for the player loaded the battle slot (20:11:12) before the runner read the first
+  one's result from it (20:11:20), so the cross-check compared another battle's slot; c2) the declined battle 17 got no
+  "resolved by the game: battle|no battle" line (the game's resolution). `--only session,battles` again on the same
+  build: 107/107 (battles 90/90), game open 250 s. Game open in all: about 25 min (169 + 591 + 461 + 250 s).
+- **Commits.** The fix afc3834 (with ARCHITECTURE and GAME-INTERNALS), the suite 463a357 (with TESTING).
+
+## Testing 2026-10-28: the 0.7.1 release candidate dist_rc071_1 (v0.7.1)
+The release candidate dist_rc071_1 (int-071 30e1ed1: 0.7.1, live-battle engine 18, protocol 3; RTW3MP.dll SHA-256
+814AB3014D30E8F3..., version.dll 45E7D1DD8865EC69...): the released 0.7.0 with the three 0.7.1 fixes (the cut-short
+save's bare box, a joined player's trade protection and raiders and View data, a full disk and a file of the save in
+use). Run on the reg-071 runner, installed from its frozen snapshot (`--dist`), the released 0.7.0 (dist_rc070_2) put
+back after every run (hash checked); slots 1 and 9 and the Preferences identical to their backup after every run, the
+save folders as before (Game1, Game2, Game9), no game folder copy, delay proxy, `python` or `RTW3.exe` left, the game
+lock released. The logs of every run are kept with the developers' session files (`r711\logs_*`).
+- **Runs** (checks, seconds with the game open):
+  - `--group disk`: 213/213 (310 s): `disk_full` 89/89 (with f) and g): a file of the save in use, saved again by
+    itself or the month stopped after five tries), `disk_growth` 107/107.
+  - The default run (34 scenarios, `--legacy-fixture`): 1456/1465 (3163 s): `ship_status` 62/62, `lockstep_month`
+    51/51, `twopc` 61/61, `lockstep_air` 41/41; the failures below (`battles` b) and c2), `battle_raider` c),
+    `battle_invasion` e2) and e3), `disk_full` stopped at its first month, `legacy_fleet` not run). No game error box.
+  - Mixed versions (`mixed_071.py`, [TESTING](docs/TESTING.md#mixed-versions)): a) a 0.7.1 host with a 0.7.0 player
+    87/87 (224 s), b) a 0.7.0 host with a 0.7.1 player 87/87 (205 s), below.
+  - `--only battles,battle_invasion` with the suite's fixes: 250/250 (520 s): `battles` b) fought, c2) an injected
+    battle declined, `battle_invasion` e1) to e3) (e3) at Sakhalin, 3 ships of J against 1: "had no nation ... gave them
+    nation 0").
+  - `--group relations`: 414/416 (785 s): the client's SelectForce box (below), counted by `war_effects` and by
+    `session`'s whole-run check; `battle_raider` 94/94 with its fix, `relations_war` 19/19.
+  - Not run after the box (NO-GO): the `--stress` run (the long `lockstep_month`, `lockstep_stress`, the missile and
+    legacy campaigns, `disk_growth` after the other campaigns) and `--only lockstep_air,disk_full,legacy_fleet` for the
+    `disk_full` fix.
+  - With the game open: 310 + 3163 + 224 + 205 + 520 + 785 = 5207 s.
+- **The game error box (NO-GO).** In the `--group relations` run, `war_effects` M1 (Sep -> Oct 1900, nation 1 at war
+  with Russia, its ally the USA), the client's battle 1 at 21:48:35-37: the host's battle of the player's generator for
+  nation 1 (`the player's battle generator for nation 1 (war counter 1): 6 attempt(s): 3>1 (area by the game); 1>3 The
+  Baltic; ...`, `battle request 1 ... fought by Captain`). On the client: `notice: Battle! Germany meets Russia in .`,
+  the battle slot loaded, the map message accepted, then the game's box "Error in SelectForce procedure! Access
+  violation at address 00777A62 in module 'RTW3.exe'. Read of address 0000000D" (RVA 0x3b7a62: `SelectForce`'s
+  fallback reads the nil main division of a side that has no force after its tries,
+  [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-other-relation-and-war-routines)), `DoBattle(opponent 3) -> 0`,
+  `StartPlayerBattle 3 attacks 0 in  -> none`, `battle 1: declined`, and at the next load `the last battle's area
+  Indian Ocean and possession Tanganyika cleared`: the game's `CheckAttackLocation` (the attempt's area left to the
+  game) chose Russia's attack on Tanganyika. The host: `battle 1 applied: 2 ships changed (2 fields), 0 removed, VP
+  0/0 ...; the player declined battle`, the month went on, no other box. Not the scenario's TEST draws (`allyrand`
+  patches `Random` only inside the allies' war help). Not new in 0.7.1: the same box (the same RVA, 0x3b7a62) came on
+  0.6.0 (2026-10-23, a `--group relations` run of the SaveBuildCampaign fix, `war_effects` M2's battle of the player's
+  generator "Germany vs Russia in Northern Europe"), before the runner recorded the boxes answered in a client's
+  battle; the default run's `war_effects` of this candidate had none. A joined player sees the game's error box and
+  the battle is lost as a decline: a product issue (the battle of the player's generator on the player's PC, where the
+  0.6.1 fix guards only the battles the host's game resolves), so by this regression's rule no release with it.
+- **0.7.1's fixes as tested.** `ship_status` 62/62 (the statuses kept over the war months on both PCs, View data of
+  the player's own ships); `disk_full` 89/89 with the file in use; no "save: slot N FAILED", "saving again" or "the
+  save worked again" outside `disk_full`'s own TEST windows in any log of these runs (the saves are in a OneDrive folder
+  on this PC: no real file in use met). The mixed versions as the fix entry says: a) the 0.7.1 host keeps the 0.7.0
+  player's trade protection and raider (Hela 3, Gazelle 3, Hertha 4; `relations v2: nation 1 at war: 3 ship(s) on trade
+  protection or raiding kept (ReduceTimeLimits saw it at peace)`), the 0.7.0 player's View data shows the host's design
+  with the same id (Hela as "COLLINGWOOD CLASS (1899)"); b) the 0.7.1 player's View data shows its own design
+  (`shipdata` `ship=Hela owner=1 asked=0 used=1 design=Hela`), the 0.7.0 host returns the trade protection and the
+  raider to active service (Hela, Gazelle, Hertha 0: the 0.7.0 bug); both: the join line (`Captain: mod <the other>,
+  live-battle engine 18 (this host: 18), player's relation rules 1, battle generator 4, campaign divisions 1`), two
+  months merged, the host's battle against the player fought live (514 and 424 minutes equal, no DESYNC, ended by
+  agreement), no box.
+- **Failures and their classes** (besides the box):
+  - `battles` b) (default run; the game's choice): nine attempts, all "avoided" ("The Spanish navy declines battle!"),
+    as under dist_rc050_2. Passed when run again.
+  - `battles` c2) (default run; suite): its three injected battles were avoided by the enemy and a battle of the
+    player's generator (kind 1) was declined in its preview in the same month; c2) took it for its own and checked the
+    injected battles' way, while the host resolves a generator battle as designed (`battle 20 (kind 1): no battle
+    (Captain declined it)`). Only an injected battle counts now (b753578). Passed when run again.
+  - `battle_raider` c) side 0 and side 1 fought (default run; suite): the battle slot read while the client copied its
+    next battle into it, 0.47 and 0.41 s after "fought" (once no file, once the next copy: "33 sunk in the battle slot,
+    afloat in the merged save"), the race `battles` b) already leaves out of its cross-check. Such a read is a
+    `SKIP-note` now (`battle_slot_race`, d0e490d; self-test 139/139). Passed when run again (`--group relations`).
+  - `battle_invasion` e2) (default run; suite): the landing at Kiautschou Bay the client reported was applied by the
+    host (`Kiautschou Bay new: invader 3`) and ended by the game's own CheckRebellionAndInvasions in the same month
+    ("The Russian troops in Kiautschou Bay have been defeated!"); the check read the invasions after the month. e1) and
+    e2) accept that now. e3) (default run; suite): its candidate Finland (42 ships of J, 1 of nation 1 in The Baltic)
+    gave "Friendly ships not available to oppose the enemy in the area!": no battle, no setup. e3) picks by the ships
+    that can fight and gives a battle without a preview the SKIP-note (47ffadb). Passed when run again.
+  - `disk_full` (default run; suite): it came after `lockstep_air`, whose session was on the 1935 campaign with its test
+    battle going on against the computer; its first month pressed Turn under that battle (`battle slot: DoStrategicTurn
+    skipped`, `host turn: click handler returned (endOfTurn=0 battle=1)`, the battle in progress offered to the player
+    again and `load of slot 9 FAILED (the battle did not open)`), and the month never ran (240 s): the 0.7.0 RC2 trap of
+    `legacy_fleet` after `lockstep_air`, met by the scenario 0.7.1 put in between; `legacy_fleet` was not run (only the
+    runner's `turn` reaches Turn under a battle screen). `disk_full` and `disk_growth` now end the battle and host a
+    session on slot 1 first (`disk_session`, 3d448ac); not yet run live (the NO-GO came first).
+- **Suite fixes** (reg-071): b753578 (`battles` c2)), d0e490d (`battle_raider` c), self-test 139/139), 47ffadb
+  (`battle_invasion` e1) to e3)), 3d448ac (`disk_full`, `disk_growth`); TESTING.md (the catalog, the game times, Mixed
+  versions, Known traps).
+- **Verdict: NO-GO** for publishing 0.7.1 with dist_rc071_1: a game error box on a joined player's PC in a normal
+  scenario (the client's "Error in SelectForce procedure! ... Read of address 0000000D" in a battle of the player's
+  generator). It is not a regression of 0.7.1 (0.6.0 showed it, 0.7.0 has the same path) and every other failure was the
+  suite's or the game's choice; 0.7.1's own fixes and the mixed versions passed. Logs: `r711\logs_run_20261028_220026`
+  (`rtw3mp_47701.log` the host, PID 16860; `rtw3mp_47702.log` the client, PID 26056, lines 212-225).
+
+## Fix 2026-10-28: the battle setup's "Error in SelectForce procedure!" box: a side without ships that can fight and its ally's division (v0.7.1)
+Branch fix-selforce from int-071 6db6828: the NO-GO of [the 0.7.1 release
+candidate](#testing-2026-10-28-the-071-release-candidate-dist_rc071_1-v071), the joined player's box "Error in
+SelectForce procedure! Access violation at address 00777A62 in module 'RTW3.exe'. Read of address 0000000D" in
+`war_effects` M1 (base 0x3C0000: rva 0x3b7a62, 0xbe7a62 in the analysis image).
+- **The mechanism** (static; [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-other-relation-and-war-routines), proven
+  live below). `SelectForce` (0xbe7c18) builds a side's force; the setup calls it for side 0 and, if that side got one,
+  for side 1, and a False ends the setup cleanly (DoBattle 0, no preview). When the side's nation has no ship for a
+  division (8 tries, then ship types 7/4/3/9/10 and nine random ships of any status in the area) and the side has no
+  division, the nested **ally fallback** 0xbe776c builds the division of the side's ally (the setup's pick 0xbdbe14:
+  for side 0 an ally of the player at war with the opponent, for side 1 another enemy of the player) and looks in the
+  battle's division list for a division of the same side to join. There is none; unless `Random(100) < 10` (the ally's
+  division leads, a battle with the ally's ships alone) it reads that nil division's ships at 0xbe7a62: the AV, the
+  except box, False, DoBattle 0, no consequences. Without such an ally, or without its ships there, the game's own
+  **no-force rule** 0xbe6f84 runs instead: "Friendly ships not available to oppose the enemy in the area! Enemy gains N
+  VP!" (side 0: EnemyVP, `DeclineCount` + 1, an enemy's landing goes ahead) or "Enemy unable to challenge our forces
+  in the area! Gain N VP!" (side 1). Single player then goes on with the generator's next candidate (DoBattle False ->
+  `DoPossessionBattle` False -> `CheckAttackLocation` False). This corrects the 0.6.0 note ("when a side has none
+  after 8 tries, its fallback reads the main division"): the fault needs the empty side's ally with ships there.
+- **The RC's battle** (the r711 logs). `war_effects` allies nation 1 (Germany) with X = the USA, at war with J =
+  Russia (`setally`, `settension`: the situation the game makes when an ally joins a war). The player's generator's
+  first attempt `3>1 (area by the game)` ran on the player's PC as the game's `CheckAttackLocation(Russia, Germany,
+  nil)`: the area by Germany's possessions, the Indian Ocean with Tanganyika (the client's next load cleared "the last
+  battle's area Indian Ocean and possession Tanganyika"), Russia's active strength there above 3. Germany had no ship
+  there that could fight, the USA had: the box, DoBattle 0, and the replay took the entered setup for the player's
+  decline (`battle 1: declined`); the host merged "2 ships changed (2 fields), VP 0/0" as "the player declined battle"
+  (most likely the USA's ships the fallback marked `Used`, which `ResetUsedShips` clears only for nation 0 and the
+  opponent: the TEST run below, with the ally's two ships in the area, merged "2 ships changed (3 fields)"). Side 1
+  had no ally (no other enemy of Germany), so the empty side was Germany's.
+- **The area and the host's attempts.** The host's view records every `CheckAttackLocation` call of the player's
+  generator without running it, an explicit area or not (by design: B6); the player's PC runs the game's own call with
+  area nil exactly as single player's `CheckForBattles2` does (0xcecddf, 0xcecf72: `push 0`): a random area where the
+  defender has a possession, the possession, and the presence test of the **attacker** only (`GetStrengthInArea(area,
+  False, ActiveOnly True, False)` > 3); the defender's ships are never looked at. So the empty side is the game's, single
+  player meets it the same way, and the replay needs no change. 0.7.1's trade protection (Status 3) does not count in
+  that test (active ships only) and is not needed by the force build (its last resort takes a ship of any status there);
+  `war_effects`' TEST raiders and `BuildingNationIdx` swaps (ships under construction are not in play) play no part.
+- **Who meets it.** Any nation at war with J that has an ally (`Allied` > 0) at war with J too (the game's "Our ally X
+  joins the war against Y!"), when J attacks one of its possessions in an area where it has no ship that can fight and
+  the ally has (or it attacks J's possession where J has none and another enemy of it has ships there): 90 % of such
+  setups show the box, in single player too (1.01.44). Before this fix a joined player saw it in its battle slot and
+  lost the attempt as a decline; the host could see it in its own battles. Without the ally the same situation is the
+  game's no-force rule, which the suite meets every few runs (below).
+- **The fix: the guard** (`game.cpp` `InstallSelectForceHooks`, every PC; found by SelectForce's prologue, checked
+  against its error text, the setup's two calls and the bytes of the no-force step). MinHook on SelectForce (a wrapper:
+  the TEST switch and the log of a force build without a force), on the ally fallback's start (from the no-force step:
+  a snapshot of the ally's ships' `Used`), on the no-force rule's start (counted) and on the fallback's read of the
+  division (0xbe7a59, `d_SfRead`): with no division to join, at the no-force step, it puts back the ally's ships the
+  fallback marked `Used`, unwinds the fallback's frame and jumps to SelectForce's no-force exit (0xbe9ee8: result
+  False, its try frame's end), as after the game's handled exception: no box, no battle, no rule's points (log `battle
+  setup: side 0 (nation 0 Germany) has no ship that can fight in <area> and its ally 3 Russia's division (n ship(s)) has
+  no division of the side to join: the game's SelectForce would read that missing division (...); the mod ends the
+  force build there: no battle, as after the game's box (n of the ally's ships unused again)`). Elsewhere (a nil
+  division off the no-force step, never seen) the game's own branch where the ally's division leads; its 10 % branch
+  stays the game's. Start line `The battle setup's force builder (SelectForce): ok, the ally fallback guarded (rva
+  0x3b7c18, ...)`.
+- **The replay** (`session.cpp` `ClientStartBattle`). The setups without a force are counted apart (`game::NoForce`:
+  the guard's ends and the game's rule; before, every setup without a preview read as the player's decline). The
+  guard's: no battle for that attempt, the next attempt is played, as single player (`attempt i (...) found no battle
+  (its setup found no force: the next attempt, as single player)`); a request that ends without a battle is `nobattle`
+  with the reason in `why` (client chat "* No battle came about (Germany had no ship that could fight in the Indian
+  Ocean).", host "* No battle of Germany this month (...)"): nothing merged, no decline counted (the map message's
+  Accept before the setup resets the player's own decline count, as in single player). The game's no-force rule ends
+  the search with its points, as 0.7.0 did, but as what it is: the enemy's side without ships is `avoided` with the
+  result (chat "* The <X> navy had no ships to challenge our forces in <area>: Germany gains N VP."; before 0.7.1 it was
+  sent as the player's decline), our side without ships `declined` with the result (chat "* Friendly ships not available
+  to oppose the <X> navy in <area>: <X> gains N VP."), both with the result key `noforce` (0 or 1): a 0.7.1 host logs
+  "the enemy had no ships there that could fight (the game's no-force rule)" or "the player's nation had no ships there
+  ... (the game's no-force rule, not a decline)" and chats "* Germany had no ships to oppose Russia in The Baltic:
+  Russia gains N VP." instead of "... declined battle ..."; a `nobattle`'s `why` names any kind's reason.
+- **Mixed versions.** Protocol 3 and live-battle engine 18 unchanged; the guard is each PC's own. A 0.7.1 player under a
+  0.7.0 host: no box, the next attempt; `nobattle` (no battle), `avoided`/`declined` merged as before (the key and
+  the reason ignored: a 0.7.0 host's chat says "declined battle" for the rule of our side). A 0.7.0 player under a
+  0.7.1 host: the box on that PC and a `declined` as before (no `noforce`: the host merges it as before).
+- **Test hooks** (TESTING.md). `battles testnoforce <0|1|2> [ally] [n]` (any PC): the next n force builds of side 0
+  without the side's ships in the battle's area (they read `Used`), the setup's ally of side 0 (or the given nation) in
+  its cell with one active ship of each type it lacks there moved in, the fallback's own draws high (Random's procedure
+  for calls from its code), StartPlayerBattle's attempts plain meanwhile (`testinv`'s answers: no computer decline,
+  not caught out); 2: the guard off (the game's box). `battles injectgen K J area xN`: N identical attempts.
+- **Suite** (`tools/regression.py`; self-test 139/139). `battle_generator` f) `battle_noforce` (one more month; EST
+  170 s): the K-X alliance and the X-J war, `battles testnoforce 1 X 2`, `injectgen` of one and of two attempts: f1)
+  every TEST build ended by the guard (n >= 1 ally ships unused again), no game error box; f2) the one-attempt request
+  `nobattle` with the reason on both sides, not merged, decline counts not raised; f3) the two-attempt request's
+  attempt 1 played. `war_month` notes every setup without a force; `battle_generator` d) accepts the rule's wording;
+  `peace_war` puts a war counter left above 0 at peace to 0 (`battles` ends its war with a bare `settension` and
+  `war_effects` started the next one with no month between: its M1 "war counter 2" read 6). A code-review agent found
+  `battle_noforce`'s early return leaving its alliance and requests (now `try`/`finally`, `battles resolve`).
+- **Before the fix** (dist_sf7_1 = this branch's TEST switch and logging without the guard; the probe `sf_probe.py` in
+  the developers' session files: the session scenario, war 1-7 (Spain), alliance 1-3 (Russia), war 3-7, the client's
+  `battles testnoforce 2 3`, three requests `injectgen 1 7 Northern Europe`; 48 s with the game open): battle 1 avoided
+  by Spain (no setup), battle 2 `battle setup: TEST: side 0 (nation 0 Germany) without its ships in Northern Europe (33
+  held back), its ally 3 Russia (the setup's) ... (1 ship(s) moved in), the fallback's draws high`, `the game's fallback
+  gives it its ally's division (nation 3 Russia)`, the client's box "Error in SelectForce procedure! Access violation at
+  address 00777A62 in module 'RTW3.exe'. Read of address 0000000D" (word for word the RC's, the same base), `SelectForce
+  side 0 -> no force`, `DoBattle(opponent 7) -> 0`, `battle 2: declined`, the host's `battle 2 applied: 2 ships changed
+  (3 fields), ... VP 0/0 ...; the player declined battle`: the RC's symptoms.
+- **After the fix** (dist_sf7_2, RTW3MP.dll SHA-256 F8C4B2559A1B8C5A..., version.dll 68D64AC20BEB68C8...). The probe with
+  `testnoforce 1 3 2` and requests of one, two and one attempt(s): 35/35, 49 s: battle 1 guarded (`... (1 of the ally's
+  ships unused again)`), `battle 1: nobattle - Germany had no ship that could fight in Northern Europe`, the host's
+  decline counts 0/0 (were 0/0), no `battle 1 applied`, `battle 1 (kind 1): no battle (...)`; battle 2's attempt 0
+  guarded, attempt 1 played (Spain declined: avoided); no box. `--only session,war_effects,battle_generator,battles`:
+  267/269 (512 s; the two suite failures above, fixed) and 256/256 (472 s). `--group relations`: 406/406 (750 s;
+    `battle_generator` 65/65 with f)). Natural cases on
+  the way: `battles` (run 1) "Enemy unable to challenge our forces in the area! Gain 215 VP!" -> `battle 7: avoided`, the
+  host's "... the enemy had no ships there that could fight (the game's no-force rule): the player's points"
+  (before 0.7.1: "the player declined battle"); `war_effects` M1 and M2 (relations run) the player's generator's
+  attempt `3>1 The Baltic` with no German ship there: the fallback entered with the USA as the ally, no USA ship there
+  either, so the rule of our side ("battle 1 applied: ... VP 0/305 ...; the player's nation had no ships there that
+  could fight (the game's no-force rule, not a decline)"); in that run the fallback was entered 7 times: twice by the
+  TEST (guarded) and 5 times naturally, each followed by the rule (`war_effects` M1 and M2 with the USA as the ally,
+  without ships there; `arms_treaty` M2 and M3 and `battle_surprise` M2 without an ally). `war_effects` ran three
+  times: 72/73 (run 1: the counter, a suite failure), 73/73, 73/73. After every run v0.7.0 (dist_rc070_2) was put back
+  (hash checked), slots 1 and 9 and the Preferences were identical to their backup, no test slot and no `RTW3.exe`
+  left, the game lock released. With the game open: 48 + 49 + 512 + 472 + 750 = 1831 s.
+- Docs: GAME-INTERNALS (the force builder, its fallback and rule; `CheckAttackLocation`'s area pick and presence test;
+  the corrected 0.6.0 note), ARCHITECTURE (hooks, the battle phase's setups without a force, the result's `noforce`,
+  versions), TESTING (`battles testnoforce`, `injectgen xN`, `battle_generator` f)).
+
+## Testing 2026-10-29: the 0.7.1 release candidate 2 dist_rc071_2 (v0.7.1)
+The release candidate dist_rc071_2 (int-071 e760781: 0.7.1, live-battle engine 18, protocol 3; RTW3MP.dll SHA-256
+7BFF4A5C25AB9692..., version.dll 8CAB68DB221A2B2B...): the first candidate with [the battle setup's SelectForce
+guard](#fix-2026-10-28-the-battle-setups-error-in-selectforce-procedure-box-a-side-without-ships-that-can-fight-and-its-allys-division-v071),
+the NO-GO of [the first candidate](#testing-2026-10-28-the-071-release-candidate-dist_rc071_1-v071) fixed. Run on the
+reg-071b runner (int-071 e760781 and the suite fixes below), installed from its frozen snapshot (`--dist`), the released
+0.7.0 (dist_rc070_2) put back after every run (hash checked); slots 1 and 9 and the Preferences identical to their
+backup after every run, the save folders as before (Game1, Game2, Game9), no game folder copy, delay proxy, `python` or
+`RTW3.exe` left, the game lock released. The logs of every run are kept with the developers' session files
+(`r712\logs_*`).
+- **Runs** (checks, seconds with the game open):
+  - `--group relations` (the first candidate's NO-GO group): 431/431 (706 s): `war_effects` 73/73, `arms_treaty`
+    66/66, `battle_generator` 90/90 with f), `battle_surprise` 39/39, `battle_raider` 93/93, `relations_war` 19/19.
+  - `--only war_effects` twice more (its area is the game's pick): 90/90 (160 s) and 90/90 (162 s).
+  - The default run (34 scenarios, `--legacy-fixture`): 1590/1598 (3312 s): `ship_status` 62/62, `lockstep_month`
+    51/51, `twopc` 61/61, `lockstep_air` 41/41, `disk_full` 90/90, `legacy_fleet` 25/25; the failures below
+    (`battle_raider` c), `battle_invasion` i2)).
+  - The whole `--stress` run (41 scenarios, `--missile-fixture`, `--legacy-fixture`; the first `--stress` run of 0.7.1):
+    2008/2015 (8522 s): `lockstep_month` (long) 95/95, `twopc` (full) 85/85, `lockstep_rejoin` 42/42, `lockstep_resume`
+    45/45, `lockstep_stress` 125/125, `lockstep_strike` 21/21, `lockstep_missiles` 23/23, `disk_full` 90/90,
+    `disk_growth` 107/107, `legacy_fleet` 25/25, `battle_raider` 93/93; the failures below (`battle_invasion` e3),
+    `lockstep_limits`, `lockstep_data` b), `lockstep_torpedo` b) to e)).
+  - Run again: `--only battle_invasion,lockstep_limits,lockstep_data` 213/213 (429 s), `--group torpedo` 38/38 (273 s).
+  - Mixed versions (`mixed_071.py`, [TESTING](docs/TESTING.md#mixed-versions)): a) a 0.7.1 RC2 host with a 0.7.0
+    player 87/87 (466 s), b) a 0.7.0 host with a 0.7.1 RC2 player 87/87 (472 s).
+  - Not needed: `--group disk` (`disk_full` passed in the default and the `--stress` run, `disk_growth` in the
+    `--stress` run) and `--stress --only lockstep_month` (its long variant was part of the `--stress` run).
+  - With the game open: 706 + 160 + 162 + 3312 + 8522 + 429 + 273 + 466 + 472 = 14502 s.
+- **No game error box** in any run but `disk_full`'s own (its "Error in SaveDesignFiles procedure! ... There is not
+  enough space on the disk" on both copies and its file in use of f) and g)); `session`'s whole-run check passed in
+  every run.
+- **The SelectForce fix as tested.** `battle_generator` f) (`battle_noforce`) passed in all three runs that have it
+  (relations, default, `--stress`): both TEST force builds of the client's `battles testnoforce 1 X 2` ended by the
+  guard (`... the mod ends the force build there: no battle, as after the game's box (1 of the ally's ships unused
+  again)`, 1 or 2 ships), no box; the request of one attempt `nobattle - Germany had no ship that could fight in Northern
+  Europe` with the host's `battle N (kind 1): no battle (...)`, not applied, no decline counted; the request of two
+  attempts played its attempt 1. On their own, in every log of these runs (host and client, the copies of killed and
+  restarted copies included, each line counted once): the guard 0 times (its line came only after the TEST's), the
+  game's ally fallback entered 23 times (4 times with the USA as Germany's ally in `war_effects`, Germany without a ship
+  that can fight in The Baltic and the USA without ships there, 19 times without an ally), each followed by the game's
+  no-force rule, which came 38 times in all: 32 on the joined player's PC (17 for its own side, "Friendly ships not
+  available to oppose the enemy in the area!", merged by the host as `the player's nation had no ships there that could
+  fight (the game's no-force rule, not a decline): the enemy's points`; 15 for the enemy's side, "Enemy unable to
+  challenge our forces in the area!", `the enemy had no ships there that could fight (the game's no-force rule): the
+  player's points`), in `war_effects` (four months of one run, the attempts `3>1 The Baltic` and `3>1 (area by the
+  game)` with the game's pick The Baltic), `arms_treaty`, `battle_generator`, `battle_surprise`, `battle_raider` and
+  `battle_invasion`; 6 on the host (its own battles against nation 1, two of them the test battles of `lockstep_limits`
+  and `lockstep_data` below). The first candidate's case (an area where the player's ally has ships and the player
+  none) did not come up on its own; the attempts left to the game (`(area by the game)`) went to Northeast Asia and The
+  Baltic.
+- **0.7.1's other fixes.** `ship_status` 62/62 twice; `disk_full` 90/90 twice, both after `lockstep_air` and from a
+  session on slot 1 (the first candidate's suite fix `disk_session`, live for the first time); `disk_growth` 107/107. A
+  real file in use (outside every TEST window; the session files' `inuse_scan.py`): in the `--stress` run's
+  `battle_generator` c), right after `battle 29 applied` (01:35:20, the runner reading slot 1 for its cross-check, or
+  OneDrive), the host's month save found `RTWGame1.bcs` in use: `save: the game's box 1 of this save not shown (a file
+  in use: the mod saves again)`, `disk: a save failed: a file of it is in use (RTWGame1.bcs); sending the new month
+  waits: it saves again in 2 s (1 of 5)`, the host's notice, and 2.3 s later `the save worked again (1 of 5); sending
+  the new month goes on`: no box, the month went on. No other failed save outside `disk_full`'s TEST windows.
+- **Mixed versions** as on the first candidate: the join line `Captain: mod <the other>, live-battle engine 18 (this
+  host: 18), player's relation rules 1, battle generator 4, campaign divisions 1` both ways, two months merged once
+  each; a) the 0.7.1 host keeps the 0.7.0 player's trade protection and raider (`relations v2: nation 1 at war: 3
+  ship(s) on trade protection or raiding kept (ReduceTimeLimits saw it at peace)`), the 0.7.0 player's View data shows
+  the host's design with the same id (Hela as "COLLINGWOOD CLASS (1899)", expected); b) the 0.7.1 player's View data
+  shows its own design ("HELA CLASS (1899)"), the 0.7.0 host returns Hela, Gazelle and Hertha to active service (the
+  0.7.0 bug, expected); the host's battle against the player in Dec 1900 fought live (412 and 463 minutes equal, no
+  DESYNC, ended by agreement); no box, exception, data-file "differ" line or failed save.
+- **Failures and their classes:**
+  - `battle_raider` c) side 1 auto-resolved (default run; suite, seven FAIL lines): side 1 fought just before sank
+    Spain's raider ("Spain has no ships left at sea! The scenario is over!"), and the next forced interception found no
+    ships for its pair (client `StartRaiderCheck: TEST: forced interception (side 1, nation 7): no ships for it`): no
+    interception, `battle 38: nobattle`, the host's `battle 38 (kind 1): no battle (no battle came about)`, nothing
+    merged. Such a case checks its clean no-battle and is a `SKIP-note` now (44bd725). Passed in the `--stress` run.
+  - `battle_invasion` i2) (default run; suite): J was the USA (Russia had fewer than three possessions worth 1..9 by
+    then), and i2)'s target The Philippines (Southeast Asia) gave "Our forces in The Philippines have been defeated!"
+    in all four runs, the first with the draws low: the game's month resolution defeats the player's invasion whenever
+    the enemy's strength in the area is above the invader's (with support 50 its draw always passes), so no capture can
+    come there. i2) takes up to three candidates by the ships in the area and logs a `SKIP-note` when every run was
+    defeated (a531fbc). Passed in the `--stress` run and when run again (Northern Russia taken).
+  - `battle_invasion` e3) (`--stress` run; suite): its only candidate Northern Russia (14 ships of J, 6 of nation 1 in
+    Northern Europe), the setup forced into the coup's ambush (forced +1), the preview reached and declined, but no
+    reinforcement line and no box. e3) wanted the line wherever J outnumbers nation 1 by ships; Northern Russia gave no
+    line in any run, outnumbered or not, while The Philippines (2 v 3, the default run: `held 00773AA6: the game's
+    code, rva 0x3b3aa6`, the value of the first candidate and of 0.7.0: the SelectForce wrapper keeps that stack slot)
+    and Sakhalin gave it. No line without a box is a `SKIP-note` now (f4aad3a); an unset local the game reads shows its
+    box. Passed when run again (Sakhalin, 3 v 1: "gave them nation 0").
+  - `lockstep_limits` and `lockstep_data` b) (`--stress` run; the game's): their test battle gave no battle, "Enemy
+    unable to challenge our forces in the area! Gain 102405 VP!" (the same VP as under dist_rc061_2: the earlier test
+    battles' results stay in the host's campaign in memory). Passed when run again.
+  - `lockstep_torpedo` b) to e) (`--stress` run; the game's): no division had a firing solution in 60 boundaries, the
+    fleets never met ("No contact between fleets! The scenario is over!"). Passed when run again (`--group torpedo`
+    38/38).
+- **Suite fixes** (reg-071b): 44bd725 (`battle_raider` c)), a531fbc (`battle_invasion` i2)), f4aad3a (e3)); self-test
+  139/139; TESTING.md (the catalog, the game times, Mixed versions, Known traps).
+- **Verdict: GO** for publishing 0.7.1 with dist_rc071_2: no game error box in any run (the first candidate's
+  SelectForce box is guarded: `battle_generator` f) three times, three `war_effects` runs without it), 0.7.1's fixes
+  passed, the mixed versions passed, and every failure was the suite's (fixed, passed again) or the game's choice
+  (passed when run again).

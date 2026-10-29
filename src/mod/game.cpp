@@ -2455,6 +2455,58 @@ static struct {
     int t[9][9], al[9][9];
 } g_aiMask;
 
+// 0.7.1: the game returns a nation's ships on trade protection and raiders (Status 3, 4, 5) to active service whenever it
+// computes their maintenance while the nation is at peace (GetShipMaintenanceCost 0xc59b60: NationIsAtWar false ->
+// Status 0; NationIsAtWar 0xc634f8: the player's war counter, else the nation's tension with nation 0 or any AI tension
+// above 40). The mask hides K's wars with the computer's nations, so a masked routine that computes K's monthly balance
+// (ReduceTimeLimits' loop of the computer's nations: GetMonthlyBalance) put K's trade protection and raiders back in
+// active service every month. Their statuses are put back when the mask ends while K is at war.
+struct MaskShip {
+    void* ship;
+    uint8_t st;
+};
+static std::vector<MaskShip> g_aiMaskShips[9];
+
+static bool NationAtWarNow(int k) {  // the game's NationIsAtWar for nation k (real relations)
+    if (Nation(k) == PlayerNation() && WarCounter() > 0) return true;
+    if (TensionCell(k, 0) > 40) return true;
+    for (int j = 1; j <= 8; j++)
+        if (j != k && TensionCell(k, j) > 40) return true;
+    return false;
+}
+
+static void MaskShipsSave(int k) {
+    g_aiMaskShips[k].clear();
+    void* n = Nation(k);
+    for (int i = 0, c = ShipCount(n); i < c; i++) {
+        void* s = Ship(n, i);
+        uint8_t st = s ? dl::At<uint8_t>(s, A.fShipStatus) : 0;
+        if (st >= 3 && st <= 5) g_aiMaskShips[k].push_back({s, st});
+    }
+}
+
+static void MaskShipsRestore(int k, const char* routine) {
+    if (g_aiMaskShips[k].empty()) return;
+    int kept = 0;
+    if (NationAtWarNow(k)) {
+        void* n = Nation(k);
+        for (int i = 0, c = ShipCount(n); i < c; i++) {
+            void* s = Ship(n, i);
+            for (const MaskShip& m : g_aiMaskShips[k])
+                if (s && s == m.ship && dl::At<uint8_t>(s, A.fShipStatus) == 0) {
+                    dl::At<uint8_t>(s, A.fShipStatus) = m.st;
+                    kept++;
+                }
+        }
+    }
+    if (kept)
+        Log("relations v2: nation %d at war: %d ship(s) on trade protection or raiding kept (%s saw it at peace)", k,
+            kept, routine);
+    g_aiMaskShips[k].clear();
+}
+
+static const char* g_aiMaskRoutine = "";
+
 static void AIMaskEnter(const char* routine) {
     if (g_aiMaskDepth++ > 0 || NationCount() < 9) return;
     g_aiMask.on = false;
@@ -2464,6 +2516,9 @@ static void AIMaskEnter(const char* routine) {
         if (g_aiMask.k[k]) ks += " " + std::to_string(k);
     }
     if (ks.empty()) return;
+    for (int k = 1; k <= 8; k++)
+        if (g_aiMask.k[k]) MaskShipsSave(k);
+    g_aiMaskRoutine = routine;
     for (int a = 1; a <= 8; a++)
         for (int b = 1; b <= 8; b++) {
             if (a == b || !(g_aiMask.k[a] || g_aiMask.k[b])) continue;
@@ -2489,6 +2544,8 @@ static void AIMaskLeave() {
         }
     g_aiMask.on = false;
     if (dropped) Log("relations v2: %d change(s) of the computer's rules to the masked pairs dropped", dropped);
+    for (int k = 1; k <= 8; k++)
+        if (g_aiMask.k[k]) MaskShipsRestore(k, g_aiMaskRoutine);
 }
 
 // The host's CheckForWar (kind 1) and RandomTensionChanges (kind 2) with K seen as a player; on a joined player's PC
@@ -4220,17 +4277,342 @@ std::wstring SaveDir(int slot) {
     return d;
 }
 
-bool SaveGame() {
+// ---------------------------------------------------------------------------------------------
+// 0.7.1: a save that failed. A 0.7.0 report: "Error in SaveDesignFiles procedure! Stream write error: There is not
+// enough space on the disk". SaveBuildCampaign (1.01.44: 0xc8e5c4) writes DesignFiles0-8.des (SaveDesignFilesInOneFile,
+// when no battle is in progress), the .sta, then the .bcs and the .off (Autosave.bcs/.off for an autosave). Its own
+// except handler and those of its helpers (SaveDesignFilesInOneFile, SaveMapData, SaveAircraftData, ...) show the error
+// with ShowMessage and carry on: the save returns as usual (SaveDesignFilesInOneFile even returns True), and the files
+// it could not write are left empty, cut short or old. The mod reads these files (the month's package, a turn, the
+// merge) and loads them again (the host's month, the client's month), so a failed save must stop it: the hook counts
+// the game's boxes during the save (d_ShowMessage) and checks the files (present, written by this save, not empty).
+extern "C" volatile LONG g_saveDepth = 0;
+extern "C" void* o_SaveCampaign = nullptr;
+static bool g_showMessageHooked = false;  // (HookShowMessage, below)
+static std::vector<std::wstring> g_saveBoxes;  // the game's boxes during the save (main thread)
+static FILETIME g_saveT0 = {};
+static volatile LONG g_saveOk = 0, g_saveFail = 0;
+static std::string g_saveWhy;   // the last failed save's reason
+static int g_saveFailSlot = -1;  // the slot of the last save, if it failed (-1: the last save worked)
+static int g_lastSaveSlot = -1;
+static SaveCause g_saveCause = SaveCause::None;  // why the last failed save failed
+static bool g_saveQuietInUse = false;  // SaveGame(true): this save's boxes about a file in use stay off the screen
+static bool g_saveBoxShown = false;    // a box of this save was shown
+static uint64_t g_saveNeed = 0;        // the bytes of the slot's files when the save began (what it writes, about)
+
+// The system's text for an error code in the user's language, as Delphi's SysErrorMessage gives it (no trailing dots,
+// spaces or line breaks): the game's message holds it ("Cannot create file "<path>". <text>").
+static std::wstring SysText(DWORD code) {
+    wchar_t* buf = nullptr;
+    DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_ALLOCATE_BUFFER,
+                             nullptr, code, 0, (LPWSTR)&buf, 0, nullptr);
+    std::wstring s = n && buf ? std::wstring(buf, n) : std::wstring();
+    if (buf) LocalFree(buf);
+    while (!s.empty() && (s.back() <= L' ' || s.back() == L'.')) s.pop_back();
+    return s;
+}
+
+static std::wstring Lower(std::wstring s) {
+    for (auto& c : s) c = towlower(c);
+    return s;
+}
+
+// A text of the game's box: what it says about the cause (Other: neither a full disk nor a file in use).
+static SaveCause TextCause(const std::wstring& text) {
+    static std::vector<std::wstring> full, inUse;
+    if (full.empty()) {
+        full = {L"not enough space on the disk", L"disk is full", L"disk full", Lower(SysText(ERROR_DISK_FULL)),
+                Lower(SysText(ERROR_HANDLE_DISK_FULL))};
+        inUse = {L"being used by another process", L"sharing violation", L"cannot create file",
+                 Lower(SysText(ERROR_SHARING_VIOLATION)), Lower(SysText(ERROR_LOCK_VIOLATION)),
+                 Lower(SysText(ERROR_USER_MAPPED_FILE))};
+    }
+    std::wstring t = Lower(text);
+    for (auto& m : full)
+        if (m.size() > 4 && t.find(m) != std::wstring::npos) return SaveCause::DiskFull;
+    for (auto& m : inUse)
+        if (m.size() > 4 && t.find(m) != std::wstring::npos) return SaveCause::InUse;
+    return SaveCause::Other;
+}
+
+// A box of the game during the save: recorded; true = show it. Only the first box of a save is shown: a full disk makes
+// every design file fail on its own (nine "Error in SaveDesignFiles procedure!" boxes, then SaveBuildCampaign's). A box
+// about a file in use stays off the screen in a save the mod tries again (SaveGame(true)): the next try may work.
+extern "C" bool __stdcall CB_SaveBox(const void* text) {
+    bool show = !g_saveBoxShown;
+    try {
+        std::wstring t = text ? dl::ReadUStr(text) : L"";
+        if (g_saveBoxes.size() < 16) g_saveBoxes.push_back(t.empty() ? L"(no text)" : t);
+        bool retried = g_saveQuietInUse && TextCause(t) == SaveCause::InUse;
+        show = show && !retried;
+        if (!show)
+            Log("save: the game's box %d of this save not shown%s: %s", (int)g_saveBoxes.size(),
+                retried ? " (a file in use: the mod saves again)" : "", W2U(t.substr(0, 200)).c_str());
+    } catch (...) {
+    }
+    if (show) g_saveBoxShown = true;
+    return show;
+}
+
+static uint64_t FtU64(const FILETIME& f) { return ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime; }
+
+// A file the save had to write: present, written after the save began (2 s of slack), at least `minBytes` long.
+static std::string SavedFileProblem(const std::wstring& dir, const std::wstring& name, uint64_t minBytes) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW((dir + name).c_str(), GetFileExInfoStandard, &a)) return W2U(name) + " is missing";
+    uint64_t size = ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    if (FtU64(a.ftLastWriteTime) + 20000000ull < FtU64(g_saveT0)) return W2U(name) + " was not written";
+    if (size < minBytes) return W2U(name) + " is cut short (" + std::to_string(size) + " bytes)";
+    return "";
+}
+
+// TEST ONLY: the bridge's `savelock` (SetTestSaveLock), armed for the next save: when it begins, a file of its slot is
+// opened without sharing, as OneDrive's sync or an antivirus scan holds one; a thread of its own closes it <seconds> s
+// later (the main thread may sit in the game's box meanwhile).
+static volatile LONG g_testLockSec = 0;
+static std::wstring g_testLockFile;
+struct TestLock {
+    HANDLE h;
+    DWORD ms;
+    std::string name;
+};
+
+static DWORD WINAPI TestLockThread(LPVOID p) {
+    TestLock* l = (TestLock*)p;
+    Sleep(l->ms);
+    CloseHandle(l->h);
+    Log("TEST: savelock: %s released", l->name.c_str());
+    delete l;
+    return 0;
+}
+
+static void TestLockTake(const std::wstring& dir, int slot) {
+    LONG sec = InterlockedExchange(&g_testLockSec, 0);
+    if (sec <= 0) return;
+    std::wstring name = g_testLockFile.empty() ? L"RTWGame" + std::to_wstring(slot) + L".bcs" : g_testLockFile;
+    // (another program may hold the file for a moment itself, as OneDrive does after a save: up to 3 s for it)
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD err = 0;
+    int waits = 0;
+    for (DWORD t0 = GetTickCount();; waits++) {
+        h = CreateFileW((dir + name).c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        if (h != INVALID_HANDLE_VALUE || err != ERROR_SHARING_VIOLATION || GetTickCount() - t0 > 3000) break;
+        Sleep(100);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        Log("TEST: savelock: %s cannot be opened (error %lu, %d waits)", W2U(name).c_str(), err, waits);
+        return;
+    }
+    TestLock* l = new TestLock{h, (DWORD)sec * 1000, W2U(name)};
+    HANDLE t = CreateThread(nullptr, 0, TestLockThread, l, 0, nullptr);
+    if (!t) {
+        CloseHandle(h);
+        delete l;
+        Log("TEST: savelock: no thread (error %lu); not held", GetLastError());
+        return;
+    }
+    CloseHandle(t);
+    Log("TEST: savelock: %s of slot %d held without sharing for %ld s (from the start of this save%s)",
+        W2U(name).c_str(), slot, sec, waits ? (", after " + std::to_string(waits) + " waits for another program").c_str() : "");
+}
+
+std::string SetTestSaveLock(int seconds, const std::wstring& file) {
+    if (file.find_first_of(L"\\/:") != std::wstring::npos || file.find(L"..") != std::wstring::npos)
+        return "error a file name of the slot's folder";
+    g_testLockFile = file;
+    InterlockedExchange(&g_testLockSec, seconds > 0 ? seconds : 0);
+    if (seconds > 0)
+        Log("TEST: savelock: the next save finds %s held for %d s", file.empty() ? "RTWGame<slot>.bcs" : W2U(file).c_str(),
+            seconds);
+    else
+        Log("TEST: savelock: off");
+    return "ok";
+}
+
+static void SaveBegin(int slot) {
+    g_saveBoxes.clear();
+    g_saveBoxShown = false;
+    GetSystemTimeAsFileTime(&g_saveT0);
+    g_saveNeed = 0;
+    std::wstring dir = slot >= 0 ? SaveDir(slot) : L"";
+    if (dir.empty()) return;
+    std::wstring s = std::to_wstring(slot);
+    std::vector<std::wstring> names = {L"RTWGame" + s + L".bcs", L"RTWGame" + s + L".off", L"RTWGame" + s + L".sta"};
+    for (int n = 0; n < 9; n++) names.push_back(L"DesignFiles" + std::to_wstring(n) + L".des");
+    for (auto& n : names) {
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        if (GetFileAttributesExW((dir + n).c_str(), GetFileExInfoStandard, &a))
+            g_saveNeed += ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    }
+    TestLockTake(dir, slot);
+}
+
+// A text for the players: the folders of the paths in it left out (the names of a user's folders stay on this PC).
+static std::string NoFolders(std::wstring t) {
+    for (auto& c : t)
+        if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+    for (size_t i = 0; i + 2 < t.size(); i++) {
+        bool drive = iswalpha(t[i]) && t[i + 1] == L':' && t[i + 2] == L'\\';
+        if (!drive && !(t[i] == L'\\' && t[i + 1] == L'\\')) continue;
+        size_t end = t.find(L'"', i);  // (Delphi quotes file names; an apostrophe may be part of a folder's name)
+        size_t last = t.rfind(L'\\', end == std::wstring::npos ? std::wstring::npos : end - 1);
+        if (last != std::wstring::npos && last >= i) t.erase(i, last - i + 1);
+    }
+    std::wstring o;
+    for (wchar_t c : t)
+        if (!(c == L' ' && !o.empty() && o.back() == L' ')) o += c;
+    return W2U(o);
+}
+
+static std::string g_saveText, g_saveFile;  // the last failed save's text for the players, the file a box names
+
+static std::string CampaignFileProblem(const std::wstring& path);  // (below, before LoadCampaign)
+
+static void SaveEnd(int slot, int sip, bool autosave, bool unwound) {
+    g_saveQuietInUse = false;  // (also after a save an exception left)
+    std::string why = unwound ? "the save was left by an exception" : "";
+    std::vector<std::pair<std::string, int>> texts;  // the boxes, repeats counted (a full disk: nine alike)
+    for (auto& b : g_saveBoxes) {
+        std::string t = W2U(b);
+        for (char& c : t)
+            if (c == '\r' || c == '\n') c = ' ';
+        if (!texts.empty() && texts.back().first == t)
+            texts.back().second++;
+        else
+            texts.push_back({t, 1});
+    }
+    for (auto& t : texts)
+        why += (why.empty() ? "" : " / ") + t.first + (t.second > 1 ? " (" + std::to_string(t.second) + " times)" : "");
+    std::wstring dir = slot >= 0 && !unwound ? SaveDir(slot) : L"";
+    if (why.empty() && !dir.empty()) {
+        std::wstring s = std::to_wstring(slot);
+        std::vector<std::pair<std::wstring, uint64_t>> files = {
+            {autosave ? L"Autosave.bcs" : L"RTWGame" + s + L".bcs", 1024},
+            {autosave ? L"Autosave.off" : L"RTWGame" + s + L".off", 16},
+            {L"RTWGame" + s + L".sta", 16}};
+        if (sip == -1)
+            for (int n = 0; n < 9; n++) files.push_back({L"DesignFiles" + std::to_wstring(n) + L".des", 8});
+        for (auto& f : files) {
+            std::string p = SavedFileProblem(dir, f.first, f.second);
+            if (!p.empty()) why += (why.empty() ? "" : "; ") + p;
+        }
+        // The campaign file whole: the same rule as the load's (fix-av109: the nine [Nation<i>] and [VERSION], which
+        // the game writes last)
+        std::wstring bcs = files[0].first;
+        std::string whole = why.empty() ? CampaignFileProblem(dir + bcs) : "";
+        if (!whole.empty()) why = W2U(bcs) + ": " + whole;
+    }
+    g_lastSaveSlot = slot;
+    if (why.empty()) {
+        InterlockedIncrement(&g_saveOk);
+        g_saveFailSlot = -1;
+        g_saveCause = SaveCause::None;
+        g_saveText.clear();
+        g_saveFile.clear();
+        return;
+    }
+    InterlockedIncrement(&g_saveFail);
+    g_saveFailSlot = slot;
+    g_saveWhy = why.substr(0, 400);
+    long long free = FreeSpaceMB(dir);
+    // The cause (0.7.1, sr7): the game's texts first (a full disk before a file in use: the retry of a file in use
+    // would fail again on a full disk), then the free space against the slot's files.
+    SaveCause cause = SaveCause::Other;
+    for (auto& b : g_saveBoxes)
+        if (TextCause(b) == SaveCause::DiskFull) cause = SaveCause::DiskFull;
+    for (auto& b : g_saveBoxes)
+        if (cause == SaveCause::Other && TextCause(b) == SaveCause::InUse) cause = SaveCause::InUse;
+    long long needMB = (long long)(g_saveNeed / (1024 * 1024)) + 1;
+    if (cause == SaveCause::Other && free >= 0 && free < needMB) cause = SaveCause::DiskFull;
+    g_saveCause = cause;
+    g_saveText = NoFolders(g_saveBoxes.empty() ? U2W(g_saveWhy) : g_saveBoxes[0]);
+    if (g_saveText.size() > 200) {  // (not inside a character of the UTF-8 text)
+        size_t n = 200;
+        while (n > 0 && ((unsigned char)g_saveText[n] & 0xC0) == 0x80) n--;
+        g_saveText = g_saveText.substr(0, n) + "...";
+    }
+    g_saveFile.clear();
+    for (auto& b : g_saveBoxes) {
+        if (TextCause(b) != SaveCause::InUse) continue;
+        std::string t = NoFolders(b);
+        size_t q = t.find('"'), e = q == std::string::npos ? q : t.find('"', q + 1);
+        if (e != std::string::npos && t.find('.', q) < e) g_saveFile = t.substr(q + 1, e - q - 1);
+        break;
+    }
+    Log("save: slot %d FAILED (%s%s; %lld MB free on its drive, the slot's files %llu KB; the cause: %s): %s", slot,
+        autosave ? "autosave" : "save", sip == -1 ? "" : ", a battle in progress", free,
+        (unsigned long long)(g_saveNeed / 1024), SaveCauseName(cause), g_saveWhy.c_str());
+}
+
+// SaveBuildCampaign(Self=EAX, ScenarioInProgress=EDX, Autosave=CL, BeforeBattle on the stack): ret 4.
+static void CallSaveCampaign(void* self, uint32_t sip, uint32_t autosave, uint32_t beforeBattle) {
+    dl::Call(o_SaveCampaign, (uint32_t)(uintptr_t)self, sip, autosave, 1, &beforeBattle);
+}
+
+extern "C" void __stdcall CB_SaveCampaign(void* self, uint32_t sip, uint32_t autosave, uint32_t beforeBattle) {
+    LONG depth = InterlockedIncrement(&g_saveDepth);
+    int slot = CurrentSlot();
+    if (depth == 1) SaveBegin(slot);
+    __try {
+        CallSaveCampaign(self, sip, autosave, beforeBattle);
+    } __finally {
+        if (InterlockedDecrement(&g_saveDepth) == 0)
+            SaveEnd(slot, (int)sip, (autosave & 0xFF) != 0, AbnormalTermination() != 0);
+    }
+}
+
+extern "C" __declspec(naked) void d_SaveCampaign() {
+    __asm {
+        push dword ptr [esp + 4]
+        push ecx
+        push edx
+        push eax
+        call CB_SaveCampaign
+        ret 4
+    }
+}
+
+uint32_t SaveOkCount() { return (uint32_t)g_saveOk; }
+uint32_t SaveFailCount() { return (uint32_t)g_saveFail; }
+bool SaveInProgress() { return g_saveDepth > 0; }
+bool LastSaveFailed(int slot) { return g_saveFailSlot >= 0 && (slot < 0 || g_saveFailSlot == slot); }
+std::string LastSaveError() { return g_saveWhy; }
+SaveCause LastSaveCause() { return g_saveCause; }
+const char* SaveCauseName(SaveCause c) {
+    return c == SaveCause::DiskFull ? "full" : c == SaveCause::InUse ? "inuse" : c == SaveCause::Other ? "other" : "none";
+}
+std::string LastSaveText() { return g_saveText; }
+std::string LastSaveFile() { return g_saveFile; }
+
+// The bridge's `savestate` (read only): "ok saves=<ok> fails=<n> last=<ok|failed> slot=<s> hook=<0|1> box=<0|1>
+// cause=<none|full|inuse|other> why=<text>".
+std::string SaveState() {
+    bool failed = g_saveFailSlot >= 0;
+    return "ok saves=" + std::to_string(SaveOkCount()) + " fails=" + std::to_string(SaveFailCount()) +
+           " last=" + (failed ? "failed" : "ok") + " slot=" + std::to_string(g_lastSaveSlot) +
+           " hook=" + (o_SaveCampaign ? "1" : "0") + " box=" + (g_showMessageHooked ? "1" : "0") +
+           " cause=" + SaveCauseName(failed ? g_saveCause : SaveCause::None) + " why=" + (failed ? g_saveWhy : std::string());
+}
+
+bool SaveGame(bool quietInUse) {
     void* f = BuildCamp();
     if (!f) return false;
     if (EventActive()) {
         Log("SaveGame refused: an event dialog is open");
         return false;
     }
+    if (g_saveDepth > 0) {  // (a call from the message loop of the game's box during a save: its result would be the outer's)
+        Log("SaveGame refused: a save is in progress (the game's box of a failed save is open)");
+        return false;
+    }
     if (PocDiag()) PocHeapCheck("before SaveBuildCampaign");
     uint32_t beforeBattle = 0;
+    uint32_t fails = SaveFailCount();
+    g_saveQuietInUse = quietInUse;
     dl::Call(A.mSave, (uint32_t)(uintptr_t)f, 0xFFFFFFFFu, 0, 1, &beforeBattle);
-    return true;
+    g_saveQuietInUse = false;
+    return SaveFailCount() == fails;  // (without the hook: true, as before 0.7.1)
 }
 
 // pocHeapCheck (diagnosis only, RTW3MP_DIAG or the bridge's `pocheapcheck`): the campaign's objects from frmBuildCamp
@@ -4280,6 +4662,115 @@ void SetPlayerNation(int idx) {
     RefreshUI();
 }
 
+// 0.7.1 (fix-av109): the game needs a whole campaign. A save cut short (a full disk) holds only the nations before the
+// cut: LoadBuildCampaign leaves its nation loop at the first missing [Nation<i>] (1.01.44: 0xc9a41d) and its design
+// loop then hands GetBNation(i) = nil to LoadDesignsFromLargeFile ("Error loading game! Access violation ... Read of
+// address 00000004"); the strategic screen keeps fewer than nine nations, and the map's hint (WorldGlobeMouseMove) and
+// area details call GetNationAreaShipString for GetBNation(0..8) unchecked: the bare "Access violation ... Read of
+// address 00000109" box (rva 0x42d52a). The game writes [VERSION] last, so a file cut short has none.
+// One rule for both features: LoadCampaign refuses such a file, and the save's check (SaveEnd) counts a save that
+// leaves one as failed.
+static std::string CampaignFileProblem(const std::wstring& path) {
+    std::string b;
+    if (!ReadFileBytes(path, b)) return "the file can't be read";
+    auto has = [&b](const std::string& sec) {
+        std::string h = "[" + sec + "]";
+        for (size_t p = b.find(h); p != std::string::npos; p = b.find(h, p + 1)) {
+            size_t e = p + h.size();
+            if ((p == 0 || b[p - 1] == '\n' || (p == 3 && b.compare(0, 3, "\xEF\xBB\xBF") == 0)) &&
+                (e == b.size() || b[e] == '\r' || b[e] == '\n'))
+                return true;
+        }
+        return false;
+    };
+    int nations = 0;
+    while (nations < 9 && has("Nation" + std::to_string(nations))) nations++;
+    if (nations < 9 || !has("VERSION")) {
+        char m[160];
+        snprintf(m, sizeof(m), "%zu bytes, %d of 9 nations%s: a save cut short (a full disk?)", b.size(), nations,
+                 has("VERSION") ? "" : ", no [VERSION] section");
+        return m;
+    }
+    return "";
+}
+
+bool CampaignComplete(std::string* why) {
+    void* l = NationList();
+    void* pn = PlayerNation();
+    int n = dl::ListCount(l), bad = -1;
+    for (int i = 0; i < n && i < 9 && bad < 0; i++)
+        if (!dl::ListItem(l, i)) bad = i;
+    if (l && n >= 9 && bad < 0 && pn && NationIndex(pn) >= 0) return true;
+    if (why) {
+        char m[120];
+        snprintf(m, sizeof(m), "%d nation(s)%s, PlayerNation %s", n, bad >= 0 ? " with a nil entry" : "",
+                 !pn ? "nil" : NationIndex(pn) < 0 ? "not in the list" : "ok");
+        *why = m;
+    }
+    return false;
+}
+
+// The map's hint (WorldGlobeMouseMove, ret 8), a click on the map (WorldGlobeMouseUp, ret 12) and its menu's Details
+// (Details1Click): nothing while the campaign in memory is incomplete (a load of a save cut short failed).
+static void *o_GlobeMove = nullptr, *o_GlobeUp = nullptr, *o_MapDetails = nullptr;
+extern "C" int __stdcall CB_MapNeedsWhole() {
+    static DWORD lastLog = 0;
+    if (CampaignComplete(nullptr)) return 1;
+    if (GetTickCount() - lastLog > 60000) {
+        lastLog = GetTickCount();
+        Log("the map's hint and details are off: the campaign in memory is incomplete (a failed load)");
+    }
+    return 0;
+}
+extern "C" __declspec(naked) void d_GlobeMove() {
+    __asm {
+        push eax
+        push edx
+        push ecx
+        call CB_MapNeedsWhole
+        test eax, eax
+        pop ecx
+        pop edx
+        pop eax
+        jz skip
+        jmp dword ptr [o_GlobeMove]
+    skip:
+        ret 8
+    }
+}
+extern "C" __declspec(naked) void d_GlobeUp() {
+    __asm {
+        push eax
+        push edx
+        push ecx
+        call CB_MapNeedsWhole
+        test eax, eax
+        pop ecx
+        pop edx
+        pop eax
+        jz skip
+        jmp dword ptr [o_GlobeUp]
+    skip:
+        ret 12
+    }
+}
+extern "C" __declspec(naked) void d_MapDetails() {
+    __asm {
+        push eax
+        push edx
+        push ecx
+        call CB_MapNeedsWhole
+        test eax, eax
+        pop ecx
+        pop edx
+        pop eax
+        jz skip
+        jmp dword ptr [o_MapDetails]
+    skip:
+        ret
+    }
+}
+
 bool LoadCampaign(int slot, int playerIdx, bool modReload) {
     void* f = BuildCamp();
     if (!f) {
@@ -4293,6 +4784,20 @@ bool LoadCampaign(int slot, int playerIdx, bool modReload) {
     std::wstring path = SaveDir(slot) + L"RTWGame" + std::to_wstring(slot) + L".bcs";
     if (!FileExists(path)) {
         Log("LoadCampaign: missing %s", W2U(path).c_str());
+        return false;
+    }
+    std::string bad = CampaignFileProblem(path);
+    static int noCheck = -1;  // TEST ONLY (RTW3MP_TEST_NOLOADCHECK=1): the game's own load of such a file
+    if (noCheck < 0) {
+        char b[8];
+        noCheck = GetEnvironmentVariableA("RTW3MP_TEST_NOLOADCHECK", b, sizeof(b)) > 0 && b[0] == '1' ? 1 : 0;
+    }
+    if (!bad.empty() && noCheck == 1) {
+        Log("test: slot %d's campaign file is incomplete (%s); loaded anyway (RTW3MP_TEST_NOLOADCHECK)", slot, bad.c_str());
+        bad.clear();
+    }
+    if (!bad.empty()) {  // the campaign in memory stays as it is
+        Log("LoadCampaign refused: slot %d's campaign file is incomplete (%s)", slot, bad.c_str());
         return false;
     }
     uint32_t self = (uint32_t)(uintptr_t)f;
@@ -4310,6 +4815,11 @@ bool LoadCampaign(int slot, int playerIdx, bool modReload) {
         ~DivNation() { g_divNation = 0; }
     } dn(playerIdx);
     bool ok = (dl::Call(A.mLoad, self, s.ptr()) & 0xFF) != 0;
+    std::string whole;
+    if (ok && !CampaignComplete(&whole)) {
+        Log("LoadCampaign: the loaded campaign is incomplete (%s)", whole.c_str());
+        ok = false;
+    }
     if (dl::At<int>(f, A.fBattleOpponentIdx) == -1) dl::Call(A.mShow, self);
     if (ok) {
         dl::Call(A.mAdjustTechs, self);
@@ -5030,6 +5540,76 @@ extern "C" __declspec(naked) void d_ResearchExecute() {
     }
 }
 
+// TfrmBuildCamp.ShowShipData(Self, aShip, aNationIdx, Correct, ShowPicture): the ship data window of "View data" (the
+// ship list's popup menus, a double click, the move-ships and area dialogs). Those callers pass nation 0 for the player's
+// own ships (the player's nation in single player); ShowShipData looks the ship's design up in that nation's design list
+// (GetShipDesignFromId: design ids are per nation) and shows that nation's flag and name. On a joined player's PC nation
+// 0 is the host's nation: the window showed the host's design with the same id (a German cruiser as a British
+// battleship) or nothing. A ship of the player's own nation K asked for as nation 0's is shown as nation K's.
+extern "C" void* o_ShowShipData = nullptr;
+static struct {
+    int calls = 0, owner = -1, asked = -1, used = -1;
+    void* ship = nullptr;
+} g_sd;
+
+static int ShipOwnerIndex(void* ship) {
+    for (int n = 0; ship && n < NationCount() && n < 10; n++)
+        for (int i = 0, c = ShipCount(Nation(n)); i < c; i++)
+            if (Ship(Nation(n), i) == ship) return n;
+    return -1;
+}
+
+extern "C" int __stdcall CB_ShowShipDataNation(void* ship, int idx) {
+    __try {
+        g_sd.calls++;
+        g_sd.ship = ship;
+        g_sd.asked = g_sd.used = idx;
+        g_sd.owner = ShipOwnerIndex(ship);
+        int K = idx == 0 ? ShownNationIndex() : 0;
+        if (K > 0 && g_sd.owner == K) {
+            g_sd.used = K;
+            Log("ship data: a ship of the player's nation %d shown with its own designs (the game asked for nation 0's)",
+                K);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return g_sd.used;
+}
+
+extern "C" __declspec(naked) void d_ShowShipData() {
+    __asm {
+        push eax
+        push edx
+        push ecx
+        push edx
+        call CB_ShowShipDataNation
+        mov ecx, eax
+        pop edx
+        pop eax
+        jmp dword ptr [o_ShowShipData]
+    }
+}
+
+std::string DebugShipData() {
+    static int fDes = dl::Field("TCampaignShip", "DesignRefId"), fName = dl::Field("TCampaignShip", "ShipName"),
+               fCls = dl::Field("Tship", "Name"), fNat = dl::Field("Tship", "Nation");
+    static void* mDes = dl::Method("TBuilderNation", "GetShipDesignFromId");
+    if (!o_ShowShipData) return "error unavailable";
+    std::string s = "ok calls=" + std::to_string(g_sd.calls);
+    if (!g_sd.calls) return s;
+    void* ship = g_sd.ship;
+    bool live = ship && g_sd.owner >= 0 && ShipOwnerIndex(ship) == g_sd.owner;  // (not a ship of an older load)
+    void* d = nullptr;
+    if (live && mDes && fDes >= 0 && Nation(g_sd.used))
+        d = (void*)(uintptr_t)dl::Call(mDes, (uint32_t)(uintptr_t)Nation(g_sd.used), (uint32_t)dl::At<int>(ship, fDes));
+    s += " ship=" + (live && fName >= 0 ? W2U(dl::ReadUStr(dl::At<void*>(ship, fName))) : std::string("?")) +
+         " owner=" + std::to_string(g_sd.owner) + " asked=" + std::to_string(g_sd.asked) +
+         " used=" + std::to_string(g_sd.used) +
+         " design=" + (d && fCls >= 0 ? W2U(dl::ReadUStr(dl::At<void*>(d, fCls))) : std::string("-"));
+    if (d && fNat >= 0) s += " dnation=" + std::to_string(dl::At<int>(d, fNat));
+    return s;
+}
+
 // The relations view's display routines (see KViewBegin).
 extern "C" void* o_ShowTension = nullptr;
 extern "C" void* o_StrengthBars = nullptr;
@@ -5332,6 +5912,9 @@ bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& a
     return ok && (r & 0xFF) != 0;
 }
 
+static bool TestNoForcePlainBegin();  // TEST ONLY (fix-selforce): an armed `battles testnoforce` makes the attempt plain
+static long TestNoForcePlainEnd();
+
 bool StartPlayerBattle(int attacker, int defender, const std::wstring& areaName) {
     void* f = BuildCamp();
     void* na = Nation(attacker);
@@ -5343,10 +5926,15 @@ bool StartPlayerBattle(int attacker, int defender, const std::wstring& areaName)
     }
     uint32_t stack[1] = {(uint32_t)(uintptr_t)area};
     int ok = 0;
+    bool plain = TestNoForcePlainBegin();
     bool r = (GuardedCall(A.mCheckAttack, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)na, (uint32_t)(uintptr_t)nd, 1,
                           stack, &ok) & 0xFF) != 0 && ok;
-    Log("StartPlayerBattle %d attacks %d in %s -> %s", attacker, defender, W2U(areaName).c_str(),
-        !ok ? "exception" : r ? "battle" : "none");
+    long answers = plain ? TestNoForcePlainEnd() : 0;
+    Log("StartPlayerBattle %d attacks %d in %s -> %s%s", attacker, defender, W2U(areaName).c_str(),
+        !ok ? "exception" : r ? "battle" : "none",
+        plain ? (" (TEST: plain, the computer's decline and the caught-out test answered False " +
+                 std::to_string(answers) + "x)").c_str()
+              : "");
     return r;
 }
 
@@ -5915,9 +6503,9 @@ extern "C" __declspec(naked) void d_CaughtOut() {
 
 // Installed on the switch's first use (main thread), never in normal play.
 static bool Hook(void* target, void* detour, void** orig, const char* name);
-bool SetTestInvasionPlain(bool on) {
+static bool EnsurePlainHooks() {
     static bool tried = false;
-    if (on && !tried && InvasionReplayAvailable()) {
+    if (!tried) {
         tried = true;
         void* ad = dl::Method("TfrmBuildCamp", "AIDeclinesBattle");
         void* co = dl::Method("TfrmBuildCamp", "CheckCaughtOut");
@@ -5934,7 +6522,11 @@ bool SetTestInvasionPlain(bool on) {
         }
         if (!h2) o_AIDeclines = o_CaughtOut = nullptr;
     }
-    if (on && (!o_AIDeclines || !o_CaughtOut)) return false;
+    return o_AIDeclines && o_CaughtOut;
+}
+
+bool SetTestInvasionPlain(bool on) {
+    if (on && (!InvasionReplayAvailable() || !EnsurePlainHooks())) return false;
     g_testInvPlain = on;
     return true;
 }
@@ -6010,16 +6602,41 @@ extern "C" __declspec(naked) void d_ShowMessage() {
         jne record
         cmp byte ptr [g_boxCap], 0
         jne record
+        cmp dword ptr [g_saveDepth], 0
+        jne savebox
         jmp dword ptr [o_ShowMessage]
     record:
         push eax
         call CB_B6Box
         ret
+    savebox:  // 0.7.1: a box during the campaign's save is the game's report of a failed save (the first is shown)
+        push eax
+        push eax
+        call CB_SaveBox
+        test al, al
+        pop eax
+        jz quiet
+        jmp dword ptr [o_ShowMessage]
+    quiet:
+        ret
     }
 }
 
 // CheckForBattles2's except handler: mov edx, 'Error in CheckForBattles procedure!'; call <concat>; mov eax, [ebp-0x14];
-// call ShowMessage.
+// call ShowMessage. SaveBuildCampaign's: mov edx, 'Error in SaveBuildCampaign procedure!'#13; call <concat>; mov eax,
+// [ebp-0x7c]; call ShowMessage (1.01.44: 0xc8f450).
+static void* FindErrorBox(uint8_t* fn, int len, const wchar_t* text) {
+    size_t n = wcslen(text);
+    for (int i = 0; fn && i < len; i++) {
+        uint8_t* p = fn + i;
+        uintptr_t s = *(uint32_t*)(p + 1);
+        if (p[0] != 0xBA || !InImage(s) || wcsncmp((const wchar_t*)s, text, n) != 0) continue;
+        if (p[5] == 0xE8 && p[10] == 0x8B && p[11] == 0x45 && p[13] == 0xE8 && InImage((uintptr_t)CallTarget(p + 13)))
+            return CallTarget(p + 13);
+    }
+    return nullptr;
+}
+
 static void* FindGeneratorErrorBox(uint8_t* fn) {
     for (int i = 0; fn && i < 0x800; i++) {
         uint8_t* p = fn + i;
@@ -6030,6 +6647,20 @@ static void* FindGeneratorErrorBox(uint8_t* fn) {
             return CallTarget(p + 13);
     }
     return nullptr;
+}
+
+// The game's ShowMessage, hooked once for both uses: the battle generator's box in a joined nation's view (B6) and the
+// boxes of a failed save (0.7.1). Found from SaveBuildCampaign's error box, else from the generator's.
+static bool HookShowMessage() {
+    if (g_showMessageHooked) return true;
+    void* fromSave = FindErrorBox((uint8_t*)A.mSave, 0x1400, L"Error in SaveBuildCampaign procedure!");
+    void* fromGen = A.mCheckForBattles ? FindGeneratorErrorBox((uint8_t*)A.mCheckForBattles) : nullptr;
+    if (fromSave && fromGen && fromSave != fromGen)
+        Log("WARNING: ShowMessage found at rva %#x (SaveBuildCampaign) and rva %#x (CheckForBattles2); the save's is used",
+            (unsigned)((uintptr_t)fromSave - dl::g_base), (unsigned)((uintptr_t)fromGen - dl::g_base));
+    void* box = fromSave ? fromSave : fromGen;
+    g_showMessageHooked = box && Hook(box, (void*)&d_ShowMessage, &o_ShowMessage, "ShowMessage");
+    return g_showMessageHooked;
 }
 
 void TestGeneratorFault() { g_b6Fault = true; }
@@ -6912,6 +7543,471 @@ bool SetTestCoup(int mode) {
 bool AmbushFixAvailable() { return g_afbOk; }
 long TestCoupRuns() { return g_afbForcedRuns; }
 
+// ---------------------------------------------------------------------------------------------
+// 0.7.1 (fix-selforce): the battle setup's force builder SelectForce (unnamed; its except box "Error in SelectForce
+// procedure!"; 1.01.44 rva 0x3b7c18), which the setup calls for side 0 and, if that side got a force, for side 1. A side
+// whose nation has no ship that can fight in the area (after its tries and a random ship of any status there) gets its
+// ally's division: the nested fallback (rva 0x3b776c, at SelectForce's no-force step) builds a division of the side's
+// ally (the setup's pick: an ally of the player at war with the opponent for side 0, another enemy of the player for
+// side 1) and looks for a division of the same side for it to join. There is none: unless Random(100) < 10 (the ally's
+// division then leads) it reads that nil division's ships ("Access violation ... Read of address 0000000D" at rva
+// 0x3b7a62), the except box shows, SelectForce answers False and DoBattle 0. Without such an ally (or without its ships
+// there) the game's no-force rule runs instead (rva 0x3b6f84: "Friendly ships not available to oppose the enemy in the
+// area! Enemy gains N VP!" for side 0, "Enemy unable to challenge our forces in the area! Gain N VP!" for side 1).
+// The mod's guard (any PC: the host's own battles, a joined player's battle slot, live battles): where the fallback
+// would read the missing division, the force build ends with no force (SelectForce False, DoBattle 0) as after the
+// game's handled exception, without the box; the ally's ships the fallback marked Used are unused again. No rule's VP.
+extern "C" {
+void* o_SelectForce = nullptr;  // SelectForce(EAX mission, EDX side, ECX size; area, ship type pushed), ret 8
+void* o_SfAlly = nullptr;       // the ally fallback (nested: SelectForce's frame pushed, plain ret)
+void* o_SfNoForce = nullptr;    // the no-force rule (nested: SelectForce's frame pushed, plain ret)
+void* o_SfRead = nullptr;       // the ally fallback's read of the side's division (the hook's trampoline)
+uintptr_t g_sfRetNoForce = 0;   // the ally fallback's return address at SelectForce's no-force step
+uintptr_t g_sfEndFalse = 0;     // SelectForce's no-force exit (mov byte ptr [ebp-0x231], 0; its try's end): False
+uintptr_t g_sfIndependent = 0;  // the fallback's own branch where the ally's division leads (no read)
+uintptr_t g_sfAllyStart = 0, g_sfAllyEnd = 0;  // the fallback's code (TEST: its own draws)
+uintptr_t g_sfRandOrig = 0;     // TEST: Random's procedure while the switch's draws are forced
+}
+static uint8_t* g_sfFn = nullptr;
+static void** g_sfAllyCell[2] = {};  // the setup's ally of side 0 and of side 1 (SelectForce's two `mov eax, [cell]`)
+static uint32_t* g_sfRandCell = nullptr;
+static bool g_sfOk = false, g_sfGuardOk = false;
+static volatile long g_sfNoForceFalse = 0;
+static NoForceCounts g_sfCounts;
+static std::vector<std::pair<void*, uint8_t>> g_sfAllyUsed;  // the ally's ships' Used when the fallback began
+static uint8_t* g_sfAllyFrame = nullptr;                     // ... in this SelectForce call
+
+// SelectForce's frame: [ebp-4] the side, [ebp+8] the area, [ebp-0x210] the side's ally, [ebp-0x260] the side's nation.
+static int SfSide(uint8_t* frame) { return *(int*)(frame - 4); }
+static void* SfArea(uint8_t* frame) { return *(void**)(frame + 8); }
+static void* SfAlly(uint8_t* frame) { return *(void**)(frame - 0x210); }
+static void* SfNation(uint8_t* frame) { return *(void**)(frame - 0x260); }
+
+static std::string SfNationText(void* n) {
+    int i = NationIndex(n);
+    return i < 0 ? std::string("none") : std::to_string(i) + " " + W2U(NationName(i));
+}
+
+// TEST ONLY (session `battles testnoforce <0|1|2> [ally]`): the next force build of side 0 on this PC runs without the
+// side's own ships in the battle's area (they read Used for it) and with an ally there: the setup's ally of side 0, or
+// else nation `ally` (or the first computer nation with ships) put in its cell; one of the ally's active ships of each
+// of the types CA, CL, DD, BB, B, BC it lacks there is moved into the area; the fallback's own draws read high (its 10 %
+// branch not taken). 2: the mod's guard off (the game's own path: its box). All of it is put back when SelectForce
+// returns (not the ally's ships the game's fallback marked Used: that is the game's).
+static struct {
+    int mode = 0, ally = -1;  // armed for `count` force builds of side 0
+    int count = 0;
+    bool on = false;          // this SelectForce call runs it
+    bool guardOff = false;
+    void* allyWas = nullptr;
+    void* allyNation = nullptr;
+    std::vector<std::pair<void*, uint8_t>> held;  // side 0's ships held back (their Used)
+    std::vector<std::pair<void*, void*>> moved;   // the ally's ships moved into the area (their LocationArea)
+} g_sfTest;
+static volatile long g_sfTestRuns = 0;
+
+// While the switch is armed, StartPlayerBattle's attempt is plain (the computer does not decline the battle, the player
+// is not caught out: `battles testinv`'s answers), so the attempt comes to the battle setup.
+static long g_sfPlainHits0 = 0;
+static bool TestNoForcePlainBegin() {
+    if (g_sfTest.mode == 0 || g_sfTest.count <= 0 || !EnsurePlainHooks()) return false;
+    g_sfPlainHits0 = g_invPlainHits;
+    g_invPlainNow = true;
+    return true;
+}
+static long TestNoForcePlainEnd() {
+    g_invPlainNow = false;
+    return g_invPlainHits - g_sfPlainHits0;
+}
+
+extern "C" __declspec(naked) void SfTestRandHigh() {
+    __asm {
+        mov edx, [esp + 8]  // Random's caller
+        cmp edx, [g_sfAllyStart]
+        jb orig
+        cmp edx, [g_sfAllyEnd]
+        jae orig
+        mov eax, 0xFFFFFFFF  // Random(n) = n - 1
+        ret
+    orig:
+        jmp dword ptr [g_sfRandOrig]
+    }
+}
+
+struct SfShipFields {
+    int st = -1, loc = -1, used = -1, inPlay = -1, type = -1;
+    void* op = nullptr;
+    SfShipFields() {
+        st = dl::Field("TCampaignShip", "Status");
+        loc = dl::Field("TCampaignShip", "LocationArea");
+        used = dl::Field("TCampaignShip", "Used");
+        inPlay = dl::Field("TCampaignShip", "InPlay");
+        type = dl::Field("TCampaignShip", "ShipType");
+        op = dl::Method("TCampaignShip", "IsOperational");
+    }
+    bool ok() const { return st >= 0 && loc >= 0 && used >= 0 && inPlay >= 0 && type >= 0 && op; }
+    // active, in play, operational (not under repair, interned or a museum) and not used in a battle yet
+    bool Usable(void* s) const {
+        return s && dl::At<uint8_t>(s, st) == 0 && dl::At<uint8_t>(s, inPlay) && !dl::At<uint8_t>(s, used) &&
+               (dl::Call(op, (uint32_t)(uintptr_t)s) & 0xFF) != 0;
+    }
+};
+static const SfShipFields& SFF() {
+    static SfShipFields f;
+    return f;
+}
+
+static std::string SfTestSetup(void* area) {
+    const SfShipFields& F = SFF();
+    void* f = BuildCamp();
+    void* pn = PlayerNation();
+    if (!F.ok() || !f || !pn || !area || !g_sfAllyCell[0] || A.fBattleOpponentIdx < 0) return "unavailable";
+    int opp = dl::At<int>(f, A.fBattleOpponentIdx), own = NationIndex(pn);
+    for (int i = 0, n = ShipCount(pn); i < n; i++) {
+        void* s = Ship(pn, i);
+        if (!s || dl::At<void*>(s, F.loc) != area || dl::At<uint8_t>(s, F.used)) continue;
+        g_sfTest.held.push_back({s, dl::At<uint8_t>(s, F.used)});
+        dl::At<uint8_t>(s, F.used) = 1;
+    }
+    g_sfTest.allyWas = *g_sfAllyCell[0];
+    void* ally = g_sfTest.allyWas;
+    auto usableAnywhere = [&](void* n) {
+        for (int i = 0, c = ShipCount(n); i < c; i++)
+            if (F.Usable(Ship(n, i))) return true;
+        return false;
+    };
+    if (!ally) {
+        int want = g_sfTest.ally;
+        if (want >= 1 && want <= 8 && want != own && want != opp && want < NationCount()) ally = Nation(want);
+        for (int n = 1; !ally && n <= 8 && n < NationCount(); n++)
+            if (n != own && n != opp && usableAnywhere(Nation(n))) ally = Nation(n);
+        if (!ally) return "no nation for the ally";
+        *g_sfAllyCell[0] = ally;
+    }
+    g_sfTest.allyNation = ally;
+    int there = 0;
+    for (int t : {3, 4, 9, 0, 2, 1}) {
+        void* pick = nullptr;
+        bool have = false;
+        for (int i = 0, n = ShipCount(ally); i < n && !have; i++) {
+            void* s = Ship(ally, i);
+            if (!F.Usable(s) || dl::At<uint8_t>(s, F.type) != t) continue;
+            if (dl::At<void*>(s, F.loc) == area)
+                have = true;
+            else if (!pick)
+                pick = s;
+        }
+        if (have) {
+            there++;
+        } else if (pick) {
+            g_sfTest.moved.push_back({pick, dl::At<void*>(pick, F.loc)});
+            dl::At<void*>(pick, F.loc) = area;
+            there++;
+        }
+    }
+    if (g_sfRandCell) {
+        g_sfRandOrig = *g_sfRandCell;
+        *g_sfRandCell = (uint32_t)(uintptr_t)&SfTestRandHigh;
+    }
+    return "side 0 (nation " + SfNationText(pn) + ") without its ships in " + W2U(AreaNameOf(area)) + " (" +
+           std::to_string(g_sfTest.held.size()) + " held back), its ally " + SfNationText(ally) +
+           (g_sfTest.allyWas ? " (the setup's)" : " (the switch's)") + " with " + std::to_string(there) +
+           " ship type(s) there (" + std::to_string(g_sfTest.moved.size()) + " ship(s) moved in), the fallback's draws " +
+           (g_sfRandCell ? "high" : "NOT forced (Random's cell not found)") +
+           (g_sfTest.guardOff ? "; the mod's guard off (the game's own path)" : "");
+}
+
+static std::string SfTestTeardown() {
+    const SfShipFields& F = SFF();
+    int used = 0, back = 0, held = 0;
+    if (g_sfRandCell && g_sfRandOrig) *g_sfRandCell = (uint32_t)g_sfRandOrig;
+    g_sfRandOrig = 0;
+    if (g_sfAllyCell[0]) *g_sfAllyCell[0] = g_sfTest.allyWas;
+    for (auto& m : g_sfTest.moved) {
+        void* nat = g_sfTest.allyNation;
+        if (!nat || !ShipStillListed(nat, m.first)) continue;
+        if (dl::At<uint8_t>(m.first, F.used)) used++;
+        dl::At<void*>(m.first, F.loc) = m.second;
+        back++;
+    }
+    void* pn = PlayerNation();
+    for (auto& h : g_sfTest.held) {
+        if (!pn || !ShipStillListed(pn, h.first) || !dl::At<uint8_t>(h.first, F.used)) continue;
+        dl::At<uint8_t>(h.first, F.used) = h.second;
+        held++;
+    }
+    std::string s = std::to_string(held) + " of side 0's ships unused again, " + std::to_string(back) +
+                    " of the ally's ships back in their area (" + std::to_string(used) +
+                    " marked Used by the game's fallback), the ally's cell and Random back";
+    g_sfTest.held.clear();
+    g_sfTest.moved.clear();
+    g_sfTest.allyNation = g_sfTest.allyWas = nullptr;
+    g_sfTest.on = false;
+    return s;
+}
+
+extern "C" void __stdcall CB_BeforeSelectForce(int side, void* area) {
+    if (side != 0 || g_sfTest.mode == 0 || g_sfTest.count <= 0) return;
+    try {
+        g_sfTest.guardOff = g_sfTest.mode == 2;
+        if (--g_sfTest.count <= 0) g_sfTest.mode = 0;
+        g_sfTest.on = true;
+        g_sfTestRuns++;
+        Log("battle setup: TEST: %s (%d more armed)", SfTestSetup(area).c_str(), g_sfTest.count);
+    } catch (...) {
+        Log("battle setup: TEST: exception in its setup");
+    }
+}
+
+extern "C" void __stdcall CB_AfterSelectForce(int side, int result) {
+    bool formed = (result & 0xFF) != 0;
+    try {
+        if (!formed) g_sfNoForceFalse++;
+        if (!formed || g_sfTest.on)
+            Log("battle setup: SelectForce side %d -> %s", side, formed ? "a force" : "no force (no battle)");
+        if (g_sfTest.on && side == 0) Log("battle setup: TEST: put back: %s", SfTestTeardown().c_str());
+    } catch (...) {
+        Log("exception after SelectForce");
+    }
+}
+
+// SelectForce's wrapper: the TEST before it (side 0), the log and the TEST's teardown after it.
+extern "C" __declspec(naked) void d_SelectForce() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push dword ptr [esp + 16]  // the area
+        push edx                   // the side
+        call CB_BeforeSelectForce
+        pop edx
+        pop ecx
+        pop eax
+        push edx                   // the side, for after
+        push dword ptr [esp + 12]  // the ship type
+        push dword ptr [esp + 12]  // the area
+        call dword ptr [o_SelectForce]
+        pop edx
+        push eax
+        push eax                   // the result
+        push edx                   // the side
+        call CB_AfterSelectForce
+        pop eax
+        ret 8
+    }
+}
+
+extern "C" void __stdcall CB_SfAllyEnter(uint8_t* frame, uintptr_t ret) {
+    if (ret != g_sfRetNoForce) return;
+    try {
+        void* ally = SfAlly(frame);
+        g_sfAllyUsed.clear();  // the guard puts back what the fallback marks Used
+        g_sfAllyFrame = frame;
+        const SfShipFields& F = SFF();
+        for (int i = 0, n = ally && F.ok() ? ShipCount(ally) : 0; i < n; i++)
+            if (void* s = Ship(ally, i)) g_sfAllyUsed.push_back({s, dl::At<uint8_t>(s, F.used)});
+        Log("battle setup: side %d (nation %s) has no ship that can fight in %s: the game's fallback gives it its ally's "
+            "division (%s)",
+            SfSide(frame), SfNationText(SfNation(frame)).c_str(), W2U(AreaNameOf(SfArea(frame))).c_str(),
+            ally ? ("nation " + SfNationText(ally)).c_str() : "no ally: the game's no-force rule follows");
+    } catch (...) {
+    }
+}
+
+// The ally fallback's start (nested routine: SelectForce's frame pushed). Its code reads no register at its start.
+extern "C" __declspec(naked) void d_SfAlly() {
+    __asm {
+        push dword ptr [esp]      // the return address
+        push dword ptr [esp + 8]  // SelectForce's frame
+        call CB_SfAllyEnter
+        jmp dword ptr [o_SfAlly]
+    }
+}
+
+extern "C" void __stdcall CB_SfNoForce(uint8_t* frame) {
+    try {
+        int side = SfSide(frame);
+        g_sfCounts.rule++;
+        g_sfCounts.ruleSide = side;
+        Log("battle setup: side %d (nation %s) has no ship that can fight in %s: the game's no-force rule (%s)", side,
+            SfNationText(SfNation(frame)).c_str(), W2U(AreaNameOf(SfArea(frame))).c_str(),
+            side == 0 ? "\"Friendly ships not available to oppose the enemy in the area! Enemy gains N VP!\""
+                      : "\"Enemy unable to challenge our forces in the area! Gain N VP!\"");
+    } catch (...) {
+    }
+}
+
+// The no-force rule's start (nested routine: SelectForce's frame pushed). Its code reads no register at its start.
+extern "C" __declspec(naked) void d_SfNoForce() {
+    __asm {
+        push dword ptr [esp + 4]  // SelectForce's frame
+        call CB_SfNoForce
+        jmp dword ptr [o_SfNoForce]
+    }
+}
+
+// The fallback found no division of the side for the ally's division `div` to join. 1: end SelectForce with no force
+// (the guard), 2: the game's read (TEST: the guard off), 0: the fallback's own branch where the ally's division leads
+// (only off SelectForce's no-force step, where the side has divisions).
+extern "C" int __stdcall CB_SfNilMain(uint8_t* frame, uintptr_t ret, void* div) {
+    try {
+        int side = SfSide(frame);
+        if (ret != g_sfRetNoForce) {
+            Log("battle setup: the ally fallback of side %d found no division of its side to join outside the no-force "
+                "step: the ally's division leads (the game's own branch)", side);
+            return 0;
+        }
+        if (g_sfTest.on && g_sfTest.guardOff) {
+            Log("battle setup: TEST: the mod's guard off: the game reads the missing division (its box follows)");
+            return 2;
+        }
+        const SfShipFields& F = SFF();
+        void* ally = SfAlly(frame);
+        static int fShips = dl::Field("TDivision", "Ships");
+        int ships = div && fShips >= 0 ? dl::ListCount(dl::At<void*>(div, fShips)) : -1, back = 0;
+        if (g_sfAllyFrame == frame && F.ok())
+            for (auto& u : g_sfAllyUsed) {
+                if (u.second || !ShipStillListed(ally, u.first) || !dl::At<uint8_t>(u.first, F.used)) continue;
+                dl::At<uint8_t>(u.first, F.used) = 0;
+                back++;
+            }
+        g_sfAllyUsed.clear();
+        g_sfAllyFrame = nullptr;
+        void* nat = SfNation(frame);
+        std::wstring area = AreaNameOf(SfArea(frame));
+        g_sfCounts.guard++;
+        g_sfCounts.guardSide = side;
+        g_sfCounts.guardWhy = W2U(NationName(NationIndex(nat))) + " had no ship that could fight in " + W2U(area);
+        Log("battle setup: side %d (nation %s) has no ship that can fight in %s and its ally %s's division (%d ship(s)) "
+            "has no division of the side to join: the game's SelectForce would read that missing division (\"Error in "
+            "SelectForce procedure! Access violation ... Read of address 0000000D\"); the mod ends the force build "
+            "there: no battle, as after the game's box (%d of the ally's ships unused again)",
+            side, SfNationText(nat).c_str(), W2U(area).c_str(), SfNationText(ally).c_str(), ships, back);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// The fallback's read of the side's division (`mov eax, [ebp+8]; mov eax, [eax-0x228]; mov eax, [eax+0xd]`): ESI is
+// SelectForce's [ebp-0x21c] (the ally's new division), the fallback's frame holds its saved EBX and ESI.
+extern "C" __declspec(naked) void d_SfRead() {
+    __asm {
+        mov eax, [ebp + 8]
+        mov eax, [eax - 0x228]
+        test eax, eax
+        jz nilmain
+        jmp dword ptr [o_SfRead]  // (reads it again and goes on)
+    nilmain:
+        push dword ptr [esi]      // the ally's division
+        push dword ptr [ebp + 4]  // the return address into SelectForce
+        push dword ptr [ebp + 8]  // SelectForce's frame
+        call CB_SfNilMain
+        cmp eax, 1
+        je endforce
+        cmp eax, 2
+        je gameread
+        jmp dword ptr [g_sfIndependent]
+    gameread:
+        jmp dword ptr [o_SfRead]
+    endforce:
+        mov esi, [ebp - 8]  // the fallback's saved registers
+        mov ebx, [ebp - 4]
+        mov esp, ebp
+        pop ebp             // SelectForce's frame
+        add esp, 8          // the return address and the pushed frame (the caller's pop ecx)
+        jmp dword ptr [g_sfEndFalse]
+    }
+}
+
+static bool SfCodeAt(const uint8_t* p, std::initializer_list<int> b) { return AfbCodeIs(p, b); }
+
+// Found by SelectForce's prologue (unique in 1.01.44) and checked against its error text and the setup's two calls.
+static bool InstallSelectForceHooks() {
+    uint8_t* base = (uint8_t*)dl::g_base + 0x1000;
+    size_t len = dl::g_size - 0x1000;
+    std::vector<int> head = {0x55, 0x8B, 0xEC, 0x81, 0xC4, 0xD8, 0xFC, 0xFF, 0xFF, 0x53, 0x56,
+                             0x57, 0x33, 0xDB, 0x89, 0x9D, 0xD8, 0xFC, 0xFF, 0xFF};
+    uint8_t* fn = dl::FindPattern(base, len, head);
+    if (!fn || dl::FindPattern(fn + 1, (size_t)(base + len - (fn + 1)), head)) return false;
+    const wchar_t* text = L"Error in SelectForce procedure!";
+    std::vector<int> pat = {0xB0, 0x04, 0x02, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, -1, -1, 0x00, 0x00};
+    for (const wchar_t* c = text; *c; c++) {
+        pat.push_back(*c & 0xFF);
+        pat.push_back((*c >> 8) & 0xFF);
+    }
+    uint8_t* lit = dl::FindPattern(base, len, pat);
+    if (!lit) return false;
+    uint32_t chars = (uint32_t)(uintptr_t)(lit + 12);
+    std::vector<int> mov = {0xBA};
+    for (int i = 0; i < 4; i++) mov.push_back((chars >> (8 * i)) & 0xFF);
+    uint8_t* handler = dl::FindPattern(fn, 0x4800, mov);
+    // the setup's calls: ...; xor edx, edx; call fn (side 0) and ...; mov edx, 1; call fn (side 1)
+    int calls = 0;
+    for (uint8_t* p = fn - 0x6000; p < fn; p++)
+        if (p[0] == 0xE8 && CallTarget(p) == fn) calls++;
+    if (!handler || calls < 2) return false;
+    // its two ally cells: mov eax, [cell]; mov [ebp-0x210], eax (side 0 first)
+    std::vector<int> cellPat = {0xA1, -1, -1, -1, -1, 0x89, 0x85, 0xF0, 0xFD, 0xFF, 0xFF};
+    uint8_t* c0 = dl::FindPattern(fn, 0x100, cellPat);
+    uint8_t* c1 = c0 ? dl::FindPattern(c0 + 1, 0x100, cellPat) : nullptr;
+    if (!c1) return false;
+    g_sfAllyCell[0] = *(void***)(c0 + 1);
+    g_sfAllyCell[1] = *(void***)(c1 + 1);
+    // its no-force step: mov cl, 1; mov edx, [ebp-4]; mov al, 0x16; call <count>; test eax, eax; jne +7; push ebp;
+    // call <the ally fallback>; pop ecx; then the no-force rule: ... push ebp; call <rule>; pop ecx; mov byte ptr
+    // [ebp-0x231], 0 (SelectForce's result False)
+    uint8_t* p = dl::FindPattern(fn, 0x4800, {0xB1, 0x01, 0x8B, 0x55, 0xFC, 0xB0, 0x16, 0xE8, -1, -1, -1, -1, 0x85, 0xC0,
+                                               0x75, 0x07, 0x55, 0xE8, -1, -1, -1, -1, 0x59});
+    if (!p || !SfCodeAt(p + 23, {0x83, 0xBD, 0xAC, 0xFD, 0xFF, 0xFF, 0x08, 0x7E, 0x0B, 0x8B, 0x06, 0x8B, 0x40, 0x0D,
+                                 0x83, 0x78, 0x08, 0x00, 0x74, 0x0C, 0x81, 0xBD, 0x8C, 0xFD, 0xFF, 0xFF, 0xC8, 0x00,
+                                 0x00, 0x00, 0x75, 0x1B, 0x55, 0xE8, -1, -1, -1, -1, 0x59, 0xC6, 0x85, 0xCF, 0xFD,
+                                 0xFF, 0xFF, 0x00}))
+        return false;
+    uint8_t* ally = (uint8_t*)CallTarget(p + 17);
+    uint8_t* rule = (uint8_t*)CallTarget(p + 56);
+    if (!InImage((uintptr_t)ally) || !InImage((uintptr_t)rule) || ally >= fn || fn - ally > 0x800 ||
+        !SfCodeAt(ally, {0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0x75, 0x08, 0x81, 0xC6, 0xE4, 0xFD, 0xFF, 0xFF}) ||
+        !SfCodeAt(rule, {0x55, 0x8B, 0xEC, 0x33, 0xC9, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x53}))
+        return false;
+    g_sfFn = fn;
+    g_sfRetNoForce = (uintptr_t)(p + 22);
+    g_sfEndFalse = (uintptr_t)(p + 62);
+    g_sfAllyStart = (uintptr_t)ally;
+    g_sfAllyEnd = (uintptr_t)fn;
+    // Random's cell (TEST): the fallback's mov eax, 100; call Random (push eax; call [cell])
+    uint8_t* rc = dl::FindPattern(ally, (size_t)(fn - ally), {0xB8, 0x64, 0x00, 0x00, 0x00, 0xE8});
+    uint8_t* r = rc ? (uint8_t*)CallTarget(rc + 5) : nullptr;
+    if (r && InImage((uintptr_t)r) && r[0] == 0x50 && r[1] == 0xFF && r[2] == 0x15) g_sfRandCell = *(uint32_t**)(r + 3);
+    // the guard's place: cmp eax, 10; jl <its own branch>; mov eax, [ebp+8]; mov eax, [eax-0x228]; mov eax, [eax+0xd];
+    // cmp dword ptr [eax+8], 0; jle (unique in the fallback)
+    std::vector<int> readPat = {0x83, 0xF8, 0x0A, 0x7C, -1, 0x8B, 0x45, 0x08, 0x8B, 0x80, 0xD8, 0xFD,
+                                0xFF, 0xFF, 0x8B, 0x40, 0x0D, 0x83, 0x78, 0x08, 0x00, 0x7E};
+    uint8_t* q = dl::FindPattern(ally, (size_t)(fn - ally), readPat);
+    if (q && !dl::FindPattern(q + 1, (size_t)(fn - (q + 1)), readPat)) {
+        g_sfIndependent = (uintptr_t)(q + 5 + (int8_t)q[4]);
+        g_sfGuardOk = g_sfIndependent > (uintptr_t)(q + 5) && g_sfIndependent < (uintptr_t)fn &&
+                      SfCodeAt((uint8_t*)g_sfIndependent, {0x8B, 0x06, 0xC6, 0x40, 0x3A, 0x00}) &&
+                      Hook(q + 5, (void*)&d_SfRead, &o_SfRead, "SelectForce's ally fallback, its read of the division");
+    }
+    return Hook(fn, (void*)&d_SelectForce, &o_SelectForce, "SelectForce") &&
+           Hook(ally, (void*)&d_SfAlly, &o_SfAlly, "SelectForce's ally fallback") &&
+           Hook(rule, (void*)&d_SfNoForce, &o_SfNoForce, "SelectForce's no-force rule");
+}
+
+bool SelectForceHooksAvailable() { return g_sfOk; }
+bool SelectForceGuardAvailable() { return g_sfOk && g_sfGuardOk; }
+NoForceCounts NoForce() { return g_sfCounts; }
+
+bool SetTestNoForce(int mode, int ally, int count) {
+    if (mode != 0 && (!g_sfOk || !g_sfRandCell)) return false;
+    g_sfTest.mode = mode == 1 || mode == 2 ? mode : 0;
+    g_sfTest.ally = ally;
+    g_sfTest.count = g_sfTest.mode ? std::max(1, std::min(8, count)) : 0;
+    return true;
+}
+long TestNoForceRuns() { return g_sfTestRuns; }
+
 // TEST ONLY (env RTW3MP_TEST_PREFS, docs/TESTING.md "Two-PC conditions"): this copy's own preferences without touching
 // the shared Preferences file. The game's reader (TdlgPrefs.LoadPrefs(Self, DoSetStyle), register arguments only) is
 // followed by the overrides; its writer (TdlgPrefs.SavePrefs(Self)) does nothing.
@@ -6959,12 +8055,24 @@ bool InstallHooks() {
     if (A.diplomacy && A.mDoPeace && A.fPrestige >= 0) Hook(A.mDoPeace, (void*)&d_DoPeace, &o_DoPeace, "DoPeace");
     if (A.mCopyGame) Hook(A.mCopyGame, (void*)&d_CopyGame, &o_CopyGame, "CopyGameToOtherSlot");
     if (A.mResearchExecute) Hook(A.mResearchExecute, (void*)&d_ResearchExecute, &o_ResearchExecute, "TfrmResearch.Execute");
+    if (void* ssd = dl::Method("TfrmBuildCamp", "ShowShipData"))  // 0.7.1: "View data" of the player's own ships
+        Hook(ssd, (void*)&d_ShowShipData, &o_ShowShipData, "ShowShipData");
+    else
+        Log("WARNING: ShowShipData not found: on a joined player's PC View data shows the host's designs");
     if (A.mDoResearch && A.fResearchAreas >= 0) Hook(A.mDoResearch, (void*)&d_DoResearch, &o_DoResearch, "DoResearch");
     if (A.mAdvanceDesignStudies && A.fDesignList >= 0 && A.fReadyForBuild >= 0)
         Hook(A.mAdvanceDesignStudies, (void*)&d_DesignStudies, &o_DesignStudies, "AdvanceDesignStudies");
     bool loadHook = false;
     if (A.fIntelReports >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 && A.mSLClear && A.mSLAdd)
         loadHook = Hook(A.mLoad, (void*)&d_Load, &o_Load, "LoadBuildCampaign");
+    // 0.7.1 (fix-av109): the map's hint and details need the nine nations (CB_MapNeedsWhole)
+    Hook(dl::Method("TfrmBuildCamp", "WorldGlobeMouseMove"), (void*)&d_GlobeMove, &o_GlobeMove, "WorldGlobeMouseMove");
+    Hook(dl::Method("TfrmBuildCamp", "WorldGlobeMouseUp"), (void*)&d_GlobeUp, &o_GlobeUp, "WorldGlobeMouseUp");
+    Hook(dl::Method("TfrmBuildCamp", "Details1Click"), (void*)&d_MapDetails, &o_MapDetails, "Details1Click");
+    // 0.7.1: a failed save (the game's boxes during SaveBuildCampaign and the files it wrote)
+    bool saveHook = Hook(A.mSave, (void*)&d_SaveCampaign, &o_SaveCampaign, "SaveBuildCampaign");
+    Log("Failed saves: %s", !saveHook ? "UNAVAILABLE (a failed save goes unnoticed, as before 0.7.1)"
+                            : HookShowMessage() ? "ok" : "only the files are checked (the game's ShowMessage was not found)");
     // 0.6.1: campaign divisions (CB_BeforeLoad/CB_AfterLoad of the load's hook, and LoadCampaignDivisions)
     A.divisions = loadHook && A.fCampaignDivisions >= 0 && A.fDivId >= 0 && A.fDivName >= 0 && A.fDivShips >= 0 &&
                   A.fDivLead >= 0 && A.fLvDivisions >= 0 && A.mFillDivisionList && A.mObjFree &&
@@ -7091,8 +8199,7 @@ bool InstallHooks() {
         }
         A.battleGen = gen;
         if (gen) {  // decision 3: the generator's error box in the view goes to the log (else it shows, as before)
-            void* box = FindGeneratorErrorBox((uint8_t*)A.mCheckForBattles);
-            bool hooked = box && Hook(box, (void*)&d_ShowMessage, &o_ShowMessage, "ShowMessage");
+            bool hooked = HookShowMessage();
             Log("Player's battle generator: its error box in a joined nation's view %s",
                 hooked ? "goes to the log" : "NOT CAPTURED (the pattern was not found)");
         }
@@ -7169,6 +8276,15 @@ bool InstallHooks() {
         g_afbOk ? "ok" : "UNAVAILABLE (the game's own: its box after some intelligence coups)",
         g_afbOk ? (unsigned)(g_afbRet1 - 5 - dl::g_base) : 0u, g_afbOk ? (unsigned)(g_afbRet2 - 5 - dl::g_base) : 0u,
         g_afbFlag ? "found" : "not found");
+    // 0.7.1 (fix-selforce): the battle setup's force builder
+    g_sfOk = InstallSelectForceHooks();
+    Log("The battle setup's force builder (SelectForce): %s (rva %#x, the ally fallback's return rva %#x, Random's cell "
+        "%s)",
+        !g_sfOk        ? "UNAVAILABLE (the game's own: its box when a side without ships there gets an ally's division)"
+        : g_sfGuardOk ? "ok, the ally fallback guarded"
+                      : "hooked, the ally fallback NOT guarded (its read not found: the game's box as before)",
+        g_sfOk ? (unsigned)((uintptr_t)g_sfFn - dl::g_base) : 0u, g_sfOk ? (unsigned)(g_sfRetNoForce - dl::g_base) : 0u,
+        g_sfRandCell ? "found" : "not found");
     nplay::InstallHooks();
     if (lockstep::TestPrefsWanted()) {  // TEST ONLY
         Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");

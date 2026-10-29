@@ -18,7 +18,13 @@ static DWORD g_mainTid = 0;
 static HWND g_dispatcher = nullptr;
 static HHOOK g_msgHook = nullptr;
 static std::mutex g_callMx;
-static std::deque<std::function<void()>> g_calls;
+struct MainCall {
+    std::function<void()> fn;
+    const char* site;  // where RunOnMainThread was called (function and line)
+    int line;
+};
+static std::deque<MainCall> g_calls;
+static bool GuardedRun(void (*fn)(void*), void* arg, const char* site, int line);
 static uint32_t g_dispBaseSp = 0, g_dispCurSp = 0;  // the dispatcher's outermost / current stack position
 
 DWORD MainThreadId() { return g_mainTid; }
@@ -34,10 +40,10 @@ std::string DispatchDepthText() {
     return b;
 }
 
-void RunOnMainThread(std::function<void()> fn) {
+void RunOnMainThread(std::function<void()> fn, const char* site, int line) {
     {
         std::lock_guard<std::mutex> lk(g_callMx);
-        g_calls.push_back(std::move(fn));
+        g_calls.push_back({std::move(fn), site ? site : "?", line});
     }
     if (g_dispatcher)
         PostMessageW(g_dispatcher, WM_MP_CALL, 0, 0);
@@ -45,22 +51,34 @@ void RunOnMainThread(std::function<void()> fn) {
         PostThreadMessageW(g_mainTid, WM_NULL, 0, 0);
 }
 
+static void RunCall(void* p) {
+    MainCall* c = (MainCall*)p;
+    try {
+        c->fn();
+    } catch (...) {
+        Log("exception in main-thread call (%s, line %d)", c->site, c->line);
+    }
+}
+
 static void DrainCalls() {
     while (true) {
-        std::function<void()> fn;
+        MainCall c;
         {
             std::lock_guard<std::mutex> lk(g_callMx);
             if (g_calls.empty()) return;
-            fn = std::move(g_calls.front());
+            c = std::move(g_calls.front());
             g_calls.pop_front();
         }
-        try {
-            fn();
-        } catch (...) {
-            Log("exception in main-thread call");
-        }
+        GuardedRun(RunCall, &c, c.site, c.line);
     }
 }
+
+static void RunTick(void*) {
+    mp::Tick();
+    ui::Tick();
+}
+static void RunNet(void*) { mp::OnNet(); }
+static void RunPrune(void*) { lockstep::PruneStale(); }
 
 static LRESULT CALLBACK DispatcherProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // The dispatcher's stack depth: the outermost message loop calls it at the highest address (it is reached the same
@@ -73,14 +91,13 @@ static LRESULT CALLBACK DispatcherProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     } depth{g_dispCurSp};
     g_dispCurSp = sp;
     try {
-        lockstep::PruneStale();  // battle routines an exception unwound (their hook frames never closed)
+        GuardedRun(RunPrune, nullptr, "dispatcher: lockstep::PruneStale", 0);  // battle routines an exception unwound
         switch (m) {
             case WM_TIMER:
-                mp::Tick();
-                ui::Tick();
+                GuardedRun(RunTick, nullptr, "timer: mp::Tick/ui::Tick", 0);
                 return 0;
             case WM_MP_NET:
-                mp::OnNet();
+                GuardedRun(RunNet, nullptr, "network: mp::OnNet", 0);
                 return 0;
             case WM_MP_CALL:
                 DrainCalls();
@@ -197,6 +214,50 @@ static void DiagAccessViolation(EXCEPTION_POINTERS* ep) {
         n += snprintf(buf + n, sizeof(buf) - n, " (stack unreadable)");
     }
     Log("%s", buf);
+}
+
+// 0.7.1 (fix-av109): the mod's main-thread work (its timer, network and queued calls) runs under this guard. A game
+// exception no game routine handled (a Delphi exception, 0x0EEDFADE, or a processor fault) would otherwise reach
+// TApplication.Run's handler: the game's bare "Access violation ..." box, with no trace. The guard logs it with the
+// mod's call site and the RTW3MP_DIAG trace (registers, objects, the game's return addresses) and drops that piece of
+// work; the mod's C++ exceptions stay with its own catch blocks.
+static void DelphiExceptionText(void* obj, char* out, int n) {
+    out[0] = 0;
+    __try {
+        const char* cls = dl::ClassNameOf(obj);
+        const wchar_t* msg = *(const wchar_t**)((const uint8_t*)obj + 4);  // Exception.FMessage
+        int len = msg ? *(const int*)((const uint8_t*)msg - 4) : 0, k = snprintf(out, n, "%s: ", cls ? cls : "?");
+        for (int i = 0; i < len && k > 0 && k < n - 1; i++) out[k++] = msg[i] >= 32 && msg[i] < 127 ? (char)msg[i] : ' ';
+        if (k > 0 && k < n) out[k] = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = 0;
+    }
+}
+
+static int MainGuardFilter(EXCEPTION_POINTERS* ep, const char* site, int line) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == 0xE06D7363 || code == 0x40010006 || code == 0x4001000A || code == 0x406D1388)
+        return EXCEPTION_CONTINUE_SEARCH;  // C++ exceptions and debugger notices
+    char what[400] = "";
+    if (code == 0x0EEDFADE && ep->ExceptionRecord->NumberParameters >= 2)
+        DelphiExceptionText((void*)ep->ExceptionRecord->ExceptionInformation[1], what, sizeof(what));
+    uint32_t at = (uint32_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+    if (code == 0x0EEDFADE && ep->ExceptionRecord->NumberParameters >= 1)
+        at = (uint32_t)ep->ExceptionRecord->ExceptionInformation[0];  // where the game raised it
+    Log("ERROR: game exception %08lx at %s%x%s%s in the mod's main-thread work (%s, line %d): caught, that work dropped",
+        code, DiagGameCode(at) ? "rva " : "", DiagGameCode(at) ? at - (uint32_t)dl::g_base : at, what[0] ? " " : "",
+        what, site ? site : "?", line);
+    DiagAccessViolation(ep);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static bool GuardedRun(void (*fn)(void*), void* arg, const char* site, int line) {
+    __try {
+        fn(arg);
+        return true;
+    } __except (MainGuardFilter(GetExceptionInformation(), site, line)) {
+        return false;
+    }
 }
 
 static LONG CALLBACK DiagVeh(EXCEPTION_POINTERS* ep) {

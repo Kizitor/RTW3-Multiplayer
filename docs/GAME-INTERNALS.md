@@ -107,6 +107,60 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   creates new ones: part of the memory growth per reload), so an old unit's `HomeBase` still points to the old ship
   object: base-matched code (the air group dialog's base views, `CheckAirGroupNumbers`, the battle setup) sees the
   old copies only after a save and a reload resolve their base ids, which are right.
+- **What else a load appends to** (static reading of 1.01.44, 2026-10-28, 0.7.1: every list add reachable from
+  `LoadBuildCampaign` four calls deep, 117 routines). Besides the three lists above, only `DesignStudyList` (+0xaec) is
+  appended to without clearing: a `TDesignStudy` per `[DesignStudies] DS<i>ShipClass` (i < 21) that isn't `XXX`
+  (0xc9a47e-0xc9a503). Nothing writes `[DesignStudies]` (the string's only user is the load; `TDesignStudy.SaveMe` has no
+  caller), so the list stays empty. `MonthRecords` (+0x4adf) is a fixed array (71 years x 13 x 9 nations) that
+  `LoadMonthRecords` fills by index, so the `.sta` keeps its size; the nations, their designs and officers, the map
+  areas and the campaign's ships are new objects at every load, and `TurnMessages`/`RaiderSummary` are not saved. Live
+  (0.7.0, `disk_growth`): six save and reload cycles change no list count and no line count of the `.bcs`, `.off` and
+  `MapData` on the host or the client.
+- **A failed save carries on as if it had worked** (static reading of 1.01.44, 2026-10-28; seen live with the mod's
+  simulated full disk). `SaveBuildCampaign` (0xc8e5c4: Self, ScenarioInProgress in EDX, Autosave in CL, BeforeBattle
+  on the stack, `ret 4`) first writes, when no battle is in progress (ScenarioInProgress = -1), every nation's design
+  file: `ClearUnusedDesignFiles(n)` and `SaveDesignFilesInOneFile(n, dir)` (0xd481ac) for n = 0-8, a TStringList
+  (`v10139`, the design count, each design's `SaveMeToBigFile`) saved with `SaveToFile` (vmt +0x84) as
+  `DesignFiles<n>.des`. Then the `.bcs` sections, `SaveAircraftData`, `SaveMonthRecords` (always `RTWGame<slot>.sta`),
+  the `.bcs` (`Autosave.bcs` for an autosave), the `.off` (`Autosave.off`) and, with BeforeBattle, `BattleInfo.bbi`.
+  Each of these has an `except` handler that shows the error with `ShowMessage` (0xab7970) and goes on:
+  "Error in SaveBuildCampaign procedure!"#13 + the message (0xc8f450), "Error in SaveDesignFiles procedure!" + the
+  message (0xd4836c; its result stays `[ebp-0xd]`, True when every design was listed, so it returns True after a failed
+  write), the same for SaveMapData, SaveGameMapData, SaveAircraftData, SaveMeToBigFile, SaveHallOfFame and SaveLogs.
+  `SaveToFile` opens with `fmCreate`, which empties the file before the write. On a full disk a save therefore shows
+  up to ten boxes (nine design files, then the `.bcs`), returns as usual, and leaves the design files empty and the
+  `.bcs` and `.off` empty or old; nothing tells its caller. Loading such a slot gives a campaign without designs. Since
+  0.7.1 the mod hooks `SaveBuildCampaign`, counts the boxes during it (ShowMessage, found from its handler) and checks
+  the files it had to write (the `.bcs` by the load's rule of *A campaign file cut short* below: the nine
+  `[Nation<i>]` and `[VERSION]`).
+- **A file of the save in use makes it fail at once, in the system's words** (live, 1.01.44, 2026-10-28, the mod's
+  TEST `savelock`; [MODLOG](../MODLOG.md#fix-2026-10-28-a-failed-save-is-not-always-a-full-disk-a-file-in-use-is-saved-again-by-itself-v071-dev)).
+  The game creates each file with `fmCreate` (CreateFile without sharing), so any other open handle on it (OneDrive's
+  sync and antivirus scanners read a file just written; the suite's runner did once) fails it with error 32:
+  `EFCreateError` 'Cannot create file "<path>". <the system's text>', in `SaveBuildCampaign`'s handler "Error in
+  SaveBuildCampaign procedure!"#13"Cannot create file "...\Game1\RTWGame1.bcs". The process cannot access the file
+  because it is being used by another process", about 20 ms into the save. By the order above, the design files and
+  the `.sta` are new then and the `.bcs` and `.off` old. The system's part is in the user's language (Delphi's
+  `SysErrorMessage`: `FormatMessage`, the trailing dot cut); "Cannot create file", "Stream write error" and the
+  "Error in ..." prefixes are the game's own English texts. The same save a moment later, the file free again, works.
+- **A campaign file cut short loads as fewer than nine nations** (static reading and live runs, 2026-10-28;
+  [MODLOG](../MODLOG.md#fix-2026-10-28-the-bare-access-violation--read-of-address-00000109-box-a-campaign-save-cut-short-v071-dev)).
+  `LoadBuildCampaign` adds one nation per `[Nation<i>]` section and leaves its loop at the first missing one (`IndexOf
+  = -1`, 0xc9a41d), without an error. Its "Loading ship designs" loop then calls `LoadDesignsFromLargeFile` (0xd49c5c)
+  for `GetBNation(i)`, i = 0..8, which is nil past the list's end (`GetBNation`, 0xc80040: nil for -1 and for
+  i >= Count): "Error loading game! Access violation at address <base+0x519cb9> ... Read of address 00000004" (its own
+  box), and it returns False with the nations before the cut in `BuilderNations` and `PlayerNation` = nation 0. The
+  game writes `[VERSION]` last, so a file cut short has none. With fewer than nine nations the strategic map's hint
+  (`WorldGlobeMouseMove` -> 0xce8d10 -> 0xcec8e8, "Map area: ...") and its area details (`WorldGlobeMouseUp` and
+  `Details1Click` -> 0xcea020) call `TBuilderNation.GetNationAreaShipString` (0xc5d4e0) for `GetBNation(0..8)`
+  without a check; its first use of Self reads `ShipList` +0x109 (0xc5d52a, rva 0x42d52a). These event handlers have
+  no handler of the game's own, so the fault reaches `TApplication.Run`'s handler: the bare box "Access violation at
+  address <base+0x42d52a> ... Read of address 00000109" (title "Rule the Waves III", no "Error in X procedure!"). The
+  map's hint needs map areas, which exist once any campaign was loaded. `DoPossessionBattle`, `DoHomeAreaBattle` and
+  `CheckSurpriseAttack` call it for `PlayerNation` inside the game's error handlers. Since 0.7.1 the mod refuses such
+  a file before the game's load, checks the nine nations after it, keeps the three map handlers idle while the
+  campaign in memory is incomplete, and catches a game exception in its own main-thread work (log line "ERROR: game
+  exception ... in the mod's main-thread work (<function>, line <n>)" with the game's return addresses).
 - **The last battle's area and possession outlive a load** (static reading and live runs, 2026-10-23;
   [MODLOG](../MODLOG.md#fix-2026-10-23-the-joined-players-savebuildcampaign-access-violation-060)).
   `TfrmBuildCamp.BattleArea` (+0x4a3b, a `TMapArea`) and `BattlePossession` (+0x4a36, a `TPossession`) are set by
@@ -341,6 +395,45 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   and run (the box's own address is the run's base + 0xC748; reproduced live, MODLOG 2026-10-26); the handler shows
   the box and the battle goes on without the reinforcements. The mod gives the routine `PlayerNation` at those two
   calls (game.cpp `InstallAfbFix`; MODLOG 2026-10-26).
+- **The battle setup's force builder `SelectForce` and a side without ships that can fight there (a game bug, single
+  player too)** (2026-10-28, static and live, for 0.7.1; the 0.7.1 RC's NO-GO). `SelectForce` (0xbe7c18, rva
+  0x3b7c18, unnamed; its except box "Error in SelectForce procedure!"#13 + the message, `ShowMessage` 0xab7970, result
+  False) is called by the setup 0xbe2de0 (DoBattle -> 0xbdbccc) for side 0 (0xbe3a64, EDX 0) and, only when that side
+  got a force, side 1 (0xbe3aa1); EAX the mission, ECX the size, area and ship type pushed, ret 8. A False ends the
+  setup cleanly (0xbe3c96: `ClearData(2, True)`, `ResetUsedShips`, DoBattle 0: no preview). Its frame: [ebp-4] the
+  side, [ebp-0x260] the side's nation (side 0 `PlayerNation`, side 1 `GetBNation(BattleOpponentIdx)`), [ebp-0x210]
+  the side's ally (the setup's pick 0xbdbe14, cells 0xf4c5e0/0xf4c5e4: for side 0 a nation with `Allied` +0x29a > 0
+  whose cell with the opponent is above 40, i.e. an ally of the player at war with the opponent; for side 1 another
+  nation with `Tension` > 40, at war with the player; the stronger in the area), [ebp-0x21c] the division being made,
+  [ebp-0x228] the side's main division (nil at the start), [ebp-0x254] the tries. When the side's nation has no ship
+  for a division after 8 tries it tries ship types 7/4/3/9/10 and `GetRandomShipInArea` with the empty status set (the
+  word at 0xd10e1c: any status; operational, in the area) nine times (InPlay, not `Used`, not CV/CVL/AMC). Still none
+  and no division of the side (0xbe6ee8: ships of the side's divisions that are not `AIControlled` +0x30): the nested
+  **ally fallback** 0xbe776c (`push ebp; call; pop ecx` at 0xbe9eba) returns at once without an ally; else it builds
+  the ally's division (`CreateDivisionForBCBattle` 0xbecfd0, `Side` +0x23 := the side; it marks the campaign ships it
+  takes `Used` +0x37 := 1, which `ResetUsedShips` never clears for an ally; a division without ships is not listed),
+  and when that has ships it walks the global division list ([0xf274ec], only divisions with ships) for another one of
+  the same side to join and sets [ebp-0x228] to it. There is none (the side has no division): [new+0x3c] := nil, then
+  `Random(100) < 10` -> 0xbe7a8f (the ally's division leads: Role 0, no lead; the battle goes on with the ally's ships
+  alone), else 0xbe7a59 reads `[[ebp-0x228]+0xd]`: "Access violation ... Read of address 0000000D" at 0xbe7a62 (the
+  box's address is the run's base + 0x3b7a62: 00777A62 with base 0x3C0000), the except box, SelectForce False, DoBattle
+  0, no consequences. Without such an ally, or without its ships there, the nested **no-force rule** 0xbe6f84 (at
+  0xbe9ee2; also at 0xbec18a) runs: side 0 "Friendly ships not available to oppose the enemy in the area! Enemy gains
+  N VP!" (`ShowMessagePos`; EnemyVP += the penalty +0x32fd + 5, `DeclineCount` + 1, and for an enemy's landing "With
+  our fleet unable to interfere, enemy troops invade <p>!": Invaded := the enemy, Support -1, the plan cleared), side 1
+  "Enemy unable to challenge our forces in the area! Gain N VP!" (`PlayerNation.VP` += N, `EnemyDeclineCount` + 1, and
+  for the player's own landing the question "With no enemy forces available, we could make a surprise landing in <p>.
+  Should we go ahead?"), then False. In single player either way DoBattle answers False, `DoPossessionBattle` and
+  `CheckAttackLocation` False, and `CheckForBattles2` goes on with its next candidate. A side gets here because
+  `CheckAttackLocation`'s presence test is the **attacker's** only (`GetStrengthInArea(area, False, ActiveOnly =
+  True, False)` > 3, Status 0 ships; below): an enemy attacking the player's possession where the player has no ship,
+  or the player attacking one where the enemy has none; with an ally (or a co-belligerent) of the empty side that has
+  ships there, 90 % of such setups show the box. The mod (0.7.1, game.cpp `InstallSelectForceHooks`, any PC) hooks the
+  read at 0xbe7a59: with no division to join, at the no-force step, it unwinds the fallback and ends SelectForce at its
+  no-force exit (0xbe9ee8: `mov byte ptr [ebp-0x231], 0`; result False) as after the game's handled exception, without
+  the box and without the rule's points, and puts back the ally's ships the fallback marked `Used`; the 10 % branch
+  stays the game's. Live (MODLOG 2026-10-28): the TEST switch `battles testnoforce` (the side's ships held back, the
+  ally's there, the fallback's draws high) showed the box with the guard off and none with it.
 - **`AIDeclinesBattle`** 0xcd2188 (from `CheckAttackLocation`): when the AI side declines, "The <nation> navy declines
   battle! You gain N VP!" and PlayerNation's VP += N (`add [eax+0x175], edx`), before any preview (the battle setup
   `DoBattle` is not entered). The player's own decline in the preview gives the enemy VP ("Decline will give the enemy
@@ -350,7 +443,11 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   helpers (IsHomeArea, GetStrengthInArea, GetRandomHomeArea, the strongest-area helper 0xceca88), so a view that puts
   another record at index 0 and as PlayerNation, with that nation's relation cells and war counter, runs it for that
   nation. Every candidate goes through `CheckAttackLocation(attacker, defender, area)` 0xced17c (ret 4; area nil at
-  0xcecddf: it picks one), and the search stops at the first True: at most one battle a month; a False goes on.
+  0xcecddf: it picks one: a random `MapAreas` entry, another one when the defender's `CountPossessions(area, True)`
+  there is below `Random(4)`, and others while that count is 0; then the possession (25 % the closest, else a random one
+  of the defender's there), the attacker's active strength there above 3 (the defender's ships are not looked at) and
+  `DoPossessionBattle`, or at a home area of both sides that is one's build area sometimes `DoHomeAreaBattle`), and the
+  search stops at the first True: at most one battle a month; a False goes on.
   `CheckForInvasionBattles` 0xd10228 reads the form's invasion state (+0x4a8c..+0x4a98, nation 0's);
   `CheckRaiderVsPatrols` 0xcce6bc the pending raider battle (+0x4a1b) and every raider and patrol of the player and its
   enemies (0.7.0: recorded in the view as an attempt of its own and run on the joined player's PC; see *Raider vs
@@ -358,7 +455,14 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   question's No in `DoPossessionBattle` 0xcedfcb, and TfrmQuickBattle) adds to EnemyVP (+0x4a63), counts declines
   (+0x32ec; "High command demands action", Prestige -1 +0x198, FleetMorale -1 +0x19c) and may let the enemy invade the
   possession (+0x75 := the enemy, +0x7d InvadedThisTurn := 1, form +0x4a94/+0x4a98). A decline in the battle preview
-  returns from `DoBattle` without it; its consequences there showed as the enemy's VP (live run: "VP 0/63").
+  runs it too (corrected 2026-10-28: this said that the preview's Decline returns from `DoBattle` without it). Live,
+  the preview's Decline once raised `DeclineCount`, which only `DoPlayerDecline` raises
+  ([MODLOG, B6 decisions](../MODLOG.md#investigation-2026-10-23-b6-decisions-attempts-decline-counts-generator-errors-wording-v060-dev),
+  decline counts), let an enemy's pending landing in with InvadedThisTurn set
+  ([MODLOG, invasions for joined nations](../MODLOG.md#feature-2026-10-26-invasions-for-joined-nations-v070-dev),
+  e2), and moved the mod's count of `DoPlayerDecline` calls (the client's "the player's decline" line,
+  [MODLOG, the 0.7.0 release candidate](../MODLOG.md#testing-2026-10-26-the-070-release-candidate-dist_rc070_1-v070));
+  its consequences showed as the enemy's VP (live run: "VP 0/63").
 - **The generator's own error box** (static, 2026-10-23; live with the mod's test fault): `CheckForBattles2` has its own
   try/except; the handler (0xced047) calls `ShowMessage('Error in CheckForBattles procedure!'#13 + E.Message)` (the
   literal at 0xced04f, the concatenation at 0xced054, `ShowMessage` 0xab7970 called at 0xced05c) and returns normally.
@@ -731,10 +835,13 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
     `CheckAIvsAISubmarineSinking(A, B)` 0xd31e68 (from `CheckAIvsAIBattles` 0xd32aa1): one of A's submarines sunk by B
     (15 %).
   - `GetStrengthInArea` counts Status {0,1,3,4,6} with reserves, {0} active only, else {0,3,4,6} (never interned):
-    `CheckAttackLocation`'s presence test. The battle setup's `SelectForce` (0xbe7c18, unnamed, its except box "Error in
-    SelectForce procedure!") forms each side's forces from ships in the area (InPlay, operational, not Used); when a
-    side has none after 8 tries, its fallback 0xbe776c reads the main division [ebp-0x228] while it is nil ("Access
-    violation ... Read of address 0000000D" at 0xbe7a62): the battle does not start (DoBattle 0).
+    `CheckAttackLocation`'s presence test is `GetStrengthInArea(area, False, True, False)` > 3 for the attacker only
+    (active ships; trade protection and raiders do not count), the defender's ships are not tested. The battle setup's
+    `SelectForce` (0xbe7c18, unnamed, its except box "Error in SelectForce procedure!") forms each side's forces from
+    ships in the area (InPlay, operational, not Used); a side without any gets its ally's division, whose search for a
+    division of the side to join reads a nil one ("Access violation ... Read of address 0000000D" at 0xbe7a62, 90 %),
+    or else the game's no-force rule: [the force builder](#the-other-relation-and-war-routines) above (corrected
+    2026-10-28: this said the fallback runs after 8 tries whenever a side has none).
 - **War help from allies (0.6.0: game.cpp runs it for K in K's view on K's PC).** `WarHelpFromAllies` 0xcd4454
   (`DoStrategicTurn` 0xce218f after the war step, War > 1): for each ally i (Allied > 0): enemy = `GetRandomEnemy`
   0xccd5cc (201 tries of `Random(8) + 1` with Tension > 40, else nil); the ally at war with it: Random(100) < 60 (only
@@ -912,6 +1019,46 @@ Which routines act for nation 0 (the save's player) only: `CheckTurnEvents` and 
   - `GetTonnageInArea(area)` (0xc61210) counts the operational ships in the area with Status 0, 3 or 6 (active, trade
     protection, foreign stations); ships under way count where they are, so a shortfall can close by itself when they
     arrive (seen with the USA in the 1900 test campaign).
+- **Ship statuses: the player's orders and the game's own changes** (static reading of 1.01.44 and a live probe of
+  2026-10-28, [MODLOG](../MODLOG.md#fix-2026-10-28-a-joined-players-trade-protection-and-raiders-and-view-data-of-the-players-own-ships-v071-dev)).
+  - The ship list's popup (`PopupShip`): its OnPopup (`PopupShipPopup` 0xc8e48c) enables *Trade protection*
+    (`Patrol1`) and *Raider* only while the war counter is above 0 (0xccd5fc) and renames the first item "Active
+    fleet". Every status item calls 0xcc4054 (DL = the status: `ActiveFleet1Click` 0, `ReserveFleet1Click` 1,
+    `Mothballed1Click` 2, `Patrol1Click` 3, `Raider1Click` 4 through `PutShipInRaiderStatus` (which may set 5, a raider
+    that must break out), `ForeignStations1Click` 6), which sets `Status` (+0xac) of every selected row at once (not
+    interned or a museum, in play): Reserve and Mothballed only in a home area (else "...: Cannot put ship in reserve
+    or mothballed if not in home area"), a foreign station not for a damaged ship; with more than one row selected it
+    first asks "Do you want to put all these N ships in X status?". Status 6 also clears the destination and the
+    ordered area.
+  - **The peace reset:** `TBuilderNation.GetShipMaintenanceCost(aShip, AllActive)` (0xc59b60) sets a ship with Status
+    3, 4 or 5 to 0 (0xc59f39) when `NationIsAtWar` of its nation is false: trade protection and raiders return to
+    active service as a side effect whenever a nation's maintenance is computed at peace (`GetMonthlyBalance` ->
+    `GetMonthlyExpenses` -> `GetTotalMonthlyMaintenanceCost`, ComputeExpenses, ReduceTimeLimits' halt loop of the
+    computer's nations, the ship list's cost column). `NationIsAtWar` (0xc634f8): PlayerNation while the war counter
+    is above 0; any nation whose `Tension` (+0x256, with nation 0) is above 40; `IsAtAIWar` (0xc68ecc: never for
+    PlayerNation; any AI tension cell 1..8 above 40). `GetTotalMonthlyMaintenanceCost` (0xc4f6f4) also sets Status 0 for
+    every ship not in play (under construction) that is not interned or a museum.
+  - `RecordOldStatusForShips` (0xd2a5e0, the first call of `DoEndOfTurn`) copies `Status` into `OldStatus` (+0xad) for
+    the ships of nations 0-8 (saved as `Ship<i>OldStatus`; `AreaMoveShips` compares the two).
+  - The AI's own status routines take a nation argument: `PutAIShipsInStatus` (only from ReduceTimeLimits; it calls
+    `ReviseASWEffort`, which moves ships between active, trade protection and foreign stations),
+    `CheckAINationShipsOnTradePatrol`, `AINationAssignRaiders`, `PutShipOnASWPatrol`/`PutShipOnAntiRaiderPatrol` (from
+    CheckPatrols for nations at war with nation 0 and CheckSubmarineActivity); `Mobilization` changes only reserve and
+    mothballed ships (0 or 10).
+- **The ship data window ("View data").** `Data1Click` (0xca2f5c, both popup menus of the ship lists),
+  `lvShipsDblClick` (0xcd38a4), `TdlgMoveShips.Viewdata1Click`, `TdlgMapDetails.D1Click` and `Shipdata1Click` pass
+  nation index 0 for the player's own ships to `ShowShipDataFromLV` (0xcd38b8; index 0 also shows the player's ships
+  under construction, "Correct" data) and `ShowShipData(aShip, aNationIdx, Correct, ShowPicture)` (0xcb3528, register
+  call with two stack arguments, `ret 8`): `GetBNation(idx).GetShipDesignFromId(aShip.DesignRefId)` (nil: nothing is
+  shown), the design's `Nation` (+0x14) := idx, the flag and the name of nation idx (`DesignRefId` <= 0: the class file
+  of nation idx), then the modal `TdlgShipStatus.ExecuteShipStatusStrategic` (the form's global at [0xf2750c];
+  +0x6d0 theShip, +0x6dc theCampaignShip). Design ids are per nation (2..N in the 1900 fixture), so where PlayerNation
+  is not nation 0 the window showed nation 0's design with the same id (a German light cruiser as the British
+  battleship Collingwood, with the British flag). `Tship`: +0x04 Name (the class), +0x14 Nation, +0x18 DesignID.
+- **Finding the code that changes a field (technique, 2026-10-28).** A thread that polls the byte from the start of
+  DoStrategicTurn and, on a change, suspends the main thread (no allocation or logging while it is suspended), reads
+  its EIP and the stack's return addresses (a dword in the image preceded by an E8/FF call), resumes it and logs them:
+  the change and its call chain in one processed month (MODLOG entry above; the probe was removed afterwards).
 - **AI routines the mod doesn't skip that still change a joined nation's money** (observed in the 2026-10-20 proofs):
   `ComputeExpenses` (the monthly AI money and the BaseResources floor, above), `CheckBBNumbers` (0xccb6d8, from
   `CheckTurnEvents` for nations 1-8, at peace before 1940, 1 in 10 a month when a rival has two more battleships:

@@ -418,6 +418,22 @@ def samples():
           al == [(232, 232)] and re.search(R.AIR_REPAIR_RE, 'air units: 116 repeated units of the save dropped (232 -> '
                                                          '116; a save of an earlier version)').groups()
           == ('116', '232', '116'), al)
+    race = ("20:59:39.313 [ 3764] battle 34: the nation's invasions after it: plan -/0, enemy plan -/-1, 0 invasion(s)\r\n"
+            "20:59:39.313 [ 3764] battle 34: fought\r\n20:59:39.549 [ 3764] LoadCampaign slot 77 player 1 -> ok\r\n"
+            "20:59:39.787 [ 3764] player copy in slot 87: Germany is the player nation, Great Britain is nation 1 (AI)\r\n")
+    drv = type('Drv', (), {'cmark': 0})()
+    saved = R.log_since
+    try:
+        R.log_since = lambda port, mark=0: race
+        br1, br2 = R.battle_slot_race(drv, 34), R.battle_slot_race(drv, 35)
+        R.log_since = lambda port, mark=0: race.replace('20:59:39.787', '20:59:44.787')
+        br3 = R.battle_slot_race(drv, 34)
+    finally:
+        R.log_since = saved
+    check('battle_slot_race (0.7.1 RC): the next battle\'s copy into the battle slot within 3 s of "battle N: fought" '
+          '(the times named); no "fought" line or a later copy: None',
+          br1 and '"fought" at 20:59:39.313' in br1 and 'slot 87 at 20:59:39.787' in br1 and br2 is None and br3 is None,
+          (br1, br2, br3))
     check('GAME_ERROR_RE: the game\'s own error boxes, not its ordinary ones', R.GAME_ERROR_RE.search(
         'Error in SaveBuildCampaign procedure! Access violation at address 00B3F2A1') and R.GAME_ERROR_RE.search(
         'Out of memory') and not R.GAME_ERROR_RE.search('CV Furious aircraft capacity exceeded!'))

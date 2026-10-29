@@ -9,6 +9,85 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.7.1 (2026-10-29)
+Fixes of the bugs that players reported on 0.7.0: a joined player's ships on trade protection or raiding were back in
+active service every month, *View data* of a joined player's own ships showed nothing or another nation's ship, a full
+disk on the host left broken save files that the mod went on with, and loading a campaign file cut short that way led
+to the bare box "Access violation ... Read of address 00000109". The mod now notices every failed save, says why, and
+saves again by itself when another program (OneDrive's sync, an antivirus scan) held a file of the save for a moment.
+Also fixed: the game's own box "Error in SelectForce procedure!" before a battle where the player's nation had no
+ships but an ally had.
+**Update the host and every player:** the ships' orders are fixed by 0.7.1 on the host, *View data* by 0.7.1 on the
+player's own PC. The protocol is still 3 and the live-battle engine still 18: players on 0.6.1, 0.7.0 and 0.7.1 play a
+campaign and fight their live battles together.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.7.1)
+
+### Fixed
+- **A joined player's ships on trade protection or raiding** were back in active service the next month. In one of
+  the game's routines that the host's month runs, a joined nation looked at peace with the computer's nations, and at
+  peace the game sends such ships back to active service. The host now gives these ships their orders back while the
+  nation is at war; at peace the game's own rule applies, as in single player.
+- ***View data* of a joined player's own ships** showed nothing, or another nation's ship (for example a German light
+  cruiser as the British battleship *Collingwood*, with the British flag): the game looked the ship's design up among
+  the host's nation's designs. It now shows the player's own ships.
+- **A full disk on the host** ("Error in SaveDesignFiles procedure! Stream write error: There is not enough space on
+  the disk"): the game shows such a box and carries on as if it had saved, with the files it couldn't write empty, cut
+  short or old, and the mod then merged, sent and loaded these files. The mod now checks every save, and a failed save
+  of the month stops it where it is: nothing is merged, sent or loaded from the broken files, the campaign in the game
+  stays as it was, and the notice and the chat say why ("The host's disk is full (... MB free on drive C:): the month
+  stopped; the last good state is kept. Free space and save again (the game's Save button): it goes on then."). Once a
+  save works (the game's *Save* button), the month goes on by itself. A joined player's turn waits the same way, and a
+  battle's result is never taken from a failed save. The game's box shows once per save instead of up to ten times.
+  Below 500 MB free, the mod warns before the month's saves ("Low disk space on drive C: ... MB free; the game may fail
+  to save. Free some space."); the host's warning goes to every player.
+- **A file of the save held by another program** ("Error in SaveBuildCampaign procedure! Cannot create file
+  "...\RTWGame1.bcs". The process cannot access the file because it is being used by another process", its second
+  sentence in the language of Windows): another program, usually OneDrive's sync or an antivirus scan, had the file
+  open at that moment. The mod now saves again by itself, up to five times 2 seconds apart, without the game's box
+  until the last try, and the month waits meanwhile ("A file of the host's campaign save was in use by another program
+  (for example OneDrive or antivirus): the month waits; it saves again by itself."). If the file is still held after
+  that, the month stops: "A file of the host's campaign save is still in use by another program (RTWGame1.bcs): the
+  month stopped; the last good state is kept. Close that program or pause OneDrive's sync, then save (the game's Save
+  button): it goes on then." A joined player's save of a battle's result is tried again up to five times, 1 second
+  apart. Any other failed save stops the month with the game's own words ("The host's save failed (...): ...").
+- **A bare box "Access violation at address ... in module 'RTW3.exe'. Read of address 00000109."** It comes from a
+  campaign file cut short, as a save on a full disk leaves it: the game loads only the nations before the cut, and the
+  strategic map's hint then fails. The mod now refuses to load such a file (the load fails, and the campaign in the
+  game stays as it was), and the map's hint and area details do nothing while the campaign in the game is incomplete.
+  A game error during the mod's own work now goes to the log, with where it happened, instead of a bare box.
+- **"Error in SelectForce procedure! Access violation at address ... Read of address 0000000D"** before a battle
+  (found by the release tests; single player has it too): when the enemy attacked in an area where your nation had no
+  ship that could fight but an ally at war with that enemy had, the game gave your side the ally's ships and then read
+  a division of yours that wasn't there. The battle never started, and a joined player's month counted it as the
+  player's declined battle. The mod now ends that battle's setup without the box, and the month's battle search goes
+  on with its next chance, as single player's does when an attack finds nothing. When neither your nation nor an ally
+  has ships there, the game's own rule applies as before ("Friendly ships not available to oppose the enemy in the
+  area! Enemy gains N VP!", or "Enemy unable to challenge our forces in the area! Gain N VP!" when the enemy has none):
+  a joined player's month now reports it as that, with its points, instead of as the player's decline.
+- **The mod's own files:** its logs now start over at 32 MB, also during a long session (the earlier lines go to
+  `rtw3mp.prev.log`), and a file that the mod writes on a full disk keeps its old content instead of being emptied.
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0 and 0.7.1 can join each other's hosts and
+  play the campaign together.
+- 0.7.1 keeps the live-battle engine of 0.6.1 and 0.7.0 (18): players on these versions fight their live battles
+  live, with each other and under a host on any of them. A player on 0.6.0 (engine 17) or older can't fight a live
+  battle with a host or player on 0.7.1.
+- Each fix works on the PC that runs 0.7.1, so update the host and every player:
+  - the ships on trade protection or raiding: the host's fix. A host on 0.7.1 keeps them for players on any version;
+    a host on 0.7.0 still sends them back to active service every month, also for a player on 0.7.1;
+  - *View data*: the player's own fix, under a host on any version;
+  - the checks of failed saves and of campaign files cut short, the low-disk warning and saving again by itself: each
+    PC for its own saves and loads. The host's notices reach every player as chat lines;
+  - the SelectForce box: each PC for its own battles. A player on 0.7.0 still gets the box in such a battle (there is
+    no battle either way); under a host on 0.7.0, the game's no-force rule is still announced as the player's decline,
+    with the same points.
+- Existing campaigns go on from where they are. Ships that went back to active service before the host's update stay
+  there: set them on trade protection or raiding again.
+
+### Known issues
+- The known issues of 0.7.0 remain.
+
 ## 0.7.0 (2026-10-26)
 Joined players get three things of single player that their nations didn't have: the manual build of the legacy
 fleet in a new campaign, the battles between raiders and patrols, and invasions. Also fixed: the host's own

@@ -14,7 +14,7 @@
 #include <deque>
 #include <functional>
 
-#define MP_MOD_VERSION "0.7.0"
+#define MP_MOD_VERSION "0.7.1"
 #define MP_PROTOCOL 3
 // The live-battle engine level (lockstep.cpp): a live battle is fought only between two PCs with the same level, while
 // the rest of the session stays compatible within MP_PROTOCOL. A client announces it in its hello (`ls=<level>`;
@@ -82,9 +82,26 @@ std::string Trim(const std::string& s);
 std::vector<std::string> Split(const std::string& s, char sep);
 
 bool ReadFileBytes(const std::wstring& path, std::string& out);
+// Writes a temporary file and renames it over `path` (retried ~3 s on sharing errors, then written in place). A full
+// disk (0.7.1) is never written in place: the old file stays as it was. False on failure (GetLastError: the error).
 bool WriteFileBytes(const std::wstring& path, const std::string& data);
+bool WriteFailedDiskFull();  // a WriteFileBytes of the calling thread failed on a full disk since ResetWriteFailed
+void ResetWriteFailed();
 bool FileExists(const std::wstring& path);
 void EnsureDir(const std::wstring& path);
+
+// 0.7.1: the free space on the drive of `dir` in MB (-1 unknown). TEST: SetTestFreeSpaceMB(n >= 0) makes it report n
+// (the bridge's `diskfree`), -1 measures again.
+long long FreeSpaceMB(const std::wstring& dir);
+void SetTestFreeSpaceMB(long long mb);
+// Below this the month's saves warn the player (a notice and a chat line). The largest test campaign's slot is 11.6 MB
+// (1958); a month writes the slot, the autosave and (a joined player) the battle slot, briefly twice while a file is
+// replaced: about 50 MB at most at once. 500 MB leaves room for ten times that before a save can fail.
+const long long kLowDiskMB = 500;
+// TEST ONLY (the bridge's `diskfull on|off`): while on, every write into a file under the game's Save folder fails as on
+// a full disk (ERROR_DISK_FULL from WriteFile; the file was already created or truncated, as a real full disk leaves it).
+bool SetTestDiskFull(bool on);
+bool TestDiskFull();
 
 // "<Documents>\My Games\Rule the Waves 3\RTW3MP\" (created on demand).
 std::wstring ModDataDir();
@@ -98,7 +115,7 @@ int KVInt(const KV& kv, const char* key, int def = 0);
 std::string KVStr(const KV& kv, const char* key, const std::string& def = "");
 
 // Runs a function on the game's main (VCL) thread at the next message-loop iteration.
-void RunOnMainThread(std::function<void()> fn);
+void RunOnMainThread(std::function<void()> fn, const char* site = __builtin_FUNCTION(), int line = __builtin_LINE());
 DWORD MainThreadId();
 HWND DispatcherHwnd();
 // True inside a dispatcher message that came from the game's outermost message loop (not from a modal dialog, a menu,

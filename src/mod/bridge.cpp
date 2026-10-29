@@ -93,6 +93,17 @@ static std::string Execute(const std::string& line) {
         return "ok";
     }
     if (cmd == "researchopen") return RunOnMainThread([] { game::OpenResearch(); }), "ok";  // the Research button (modal)
+    if (cmd == "pocguard") {  // TEST ONLY (0.7.1): a game exception in the mod's main-thread work is caught and logged:
+        // GetNationAreaShipString with Self = nil faults as the map's hint did (rva 0x42d52a, read of 0x109)
+        void* fn = dl::Method("TBuilderNation", "GetNationAreaShipString");
+        if (!fn) return "error no GetNationAreaShipString";
+        RunOnMainThread([fn] {
+            uint32_t res = 0, st[2] = {0, (uint32_t)(uintptr_t)&res};
+            dl::Call(fn, 0, 0, 0, 2, st);
+            Log("pocguard: no exception");
+        });
+        return "ok";
+    }
     if (cmd == "loadasync") {  // loadasync <slot> [player]: `load` without waiting (a battle in progress may ask first)
         int slot = atoi(arg(1, "0").c_str()), player = atoi(arg(2, "0").c_str());
         if (slot <= 0) return "error slot";
@@ -232,7 +243,28 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "limit") return mp::SetTurnLimit(atoi(arg(1).c_str())), "ok";
         if (cmd == "chat") return mp::SendChat(line.size() > 5 ? line.substr(5) : ""), "ok";
         if (cmd == "turn") return game::ClickTurnButton(), "ok";
-        if (cmd == "save") return game::SaveGame() ? "ok" : "error save";
+        if (cmd == "save") return game::SaveGame() ? "ok" : "error save " + game::LastSaveError();
+        // 0.7.1 (the disk): savestate (read only) "ok saves=<ok> fails=<n> last=<ok|failed> slot=<s> hook=<0|1>
+        // box=<0|1> cause=<none|full|inuse|other> why=<text>"; diskinfo (read only) "ok free=<MB> threshold=<MB>
+        // low=<0|1> full=<0|1>" for the save folder's drive; TEST: diskfree <MB>|off (what the free-space check
+        // reports), diskfull on|off (writes under the Save folder fail as on a full disk)
+        if (cmd == "savestate") return game::SaveState();
+        if (cmd == "diskinfo") {
+            long long fr = FreeSpaceMB(game::SaveDir(game::CurrentSlot() > 0 ? game::CurrentSlot() : 1));
+            return "ok free=" + std::to_string(fr) + " threshold=" + std::to_string(kLowDiskMB) +
+                   " low=" + (fr >= 0 && fr < kLowDiskMB ? "1" : "0") + " full=" + (TestDiskFull() ? "1" : "0");
+        }
+        if (cmd == "diskfree") {
+            SetTestFreeSpaceMB(arg(1) == "off" ? -1 : atoll(arg(1, "0").c_str()));
+            Log("TEST: the free-space check reports %s", arg(1) == "off" ? "the drive's own value again"
+                                                                         : (arg(1, "0") + " MB").c_str());
+            return "ok";
+        }
+        if (cmd == "diskfull") return SetTestDiskFull(arg(1) == "on") ? "ok" : "error the simulation is unavailable";
+        // TEST: savelock <seconds>|off [file]: the next save finds a file of its slot (default RTWGame<slot>.bcs) held
+        // open without sharing for <seconds> s from its start, as OneDrive's sync or an antivirus scan holds one
+        if (cmd == "savelock")
+            return game::SetTestSaveLock(arg(1) == "off" ? 0 : atoi(arg(1, "0").c_str()), U2W(arg(2, "")));
         // battleptrs (read only): the last battle's area and possession the game holds (nil after every load, 0.6.0)
         if (cmd == "battleptrs") return game::BattlePointersState();
         if (cmd == "load")  // load <slot> [player] [mod]: as the player's own load; `mod`: as the mod's own reload
@@ -476,6 +508,7 @@ static std::string ExecuteOnMain(const std::string& line) {
                    " status=" + std::to_string(dl::At<uint8_t>(ship, dl::Field("TCampaignShip", "Status")));
         }
         if (cmd == "econ") return economy::BridgeCommand(args);  // econ <K>: the player's economy rules (economy.cpp)
+        if (cmd == "shipdata") return game::DebugShipData();    // the last View data window's ship and design (0.7.1)
         // TEST ONLY: econrand <v>: the player's economy rules for joined nations draw min(v, n - 1) for Random(n); -1 off
         if (cmd == "econrand") return economy::TestRandom(args);
         // TEST ONLY: econtreaty [<chance> [blind]|cancel]: the arms-control conference at the next month's end; cancel

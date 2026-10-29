@@ -1,11 +1,18 @@
 #include "common.h"
 #include <shlobj.h>
 #include <cstdarg>
+#include <cwctype>
+#include "../../third_party/minhook/include/MinHook.h"
 
 static CRITICAL_SECTION g_logCs;
 static volatile LONG g_logCsInit = 0;
 static volatile DWORD g_logOwner = 0;
 static FILE* g_log = nullptr;
+static std::wstring g_logPath, g_logPrev;
+static unsigned long long g_logBytes = 0;
+// 0.7.1: a log is at most this long; then it becomes the .prev.log and a new one starts (a session of many months and
+// live battles could otherwise fill the disk: at most two files of this size per log tag).
+static const unsigned long long kLogMax = 32ull * 1024 * 1024;
 
 static void LogLockInit() {
     if (InterlockedCompareExchange(&g_logCsInit, 1, 0) == 0) InitializeCriticalSection(&g_logCs);
@@ -17,11 +24,24 @@ void LogInit(const std::wstring& dir) {
     wchar_t tag[32] = {};
     GetEnvironmentVariableW(L"RTW3MP_LOG_TAG", tag, 32);
     std::wstring base = tag[0] ? L"rtw3mp_" + std::wstring(tag) : L"rtw3mp";
-    std::wstring path = dir + base + L".log";
-    std::wstring old = dir + base + L".prev.log";
-    DeleteFileW(old.c_str());
-    MoveFileW(path.c_str(), old.c_str());
-    g_log = _wfopen(path.c_str(), L"wb");
+    g_logPath = dir + base + L".log";
+    g_logPrev = dir + base + L".prev.log";
+    DeleteFileW(g_logPrev.c_str());
+    MoveFileW(g_logPath.c_str(), g_logPrev.c_str());
+    g_log = _wfopen(g_logPath.c_str(), L"wb");
+}
+
+// (inside the log's lock)
+static void LogRotate() {
+    fclose(g_log);
+    DeleteFileW(g_logPrev.c_str());
+    MoveFileW(g_logPath.c_str(), g_logPrev.c_str());
+    g_log = _wfopen(g_logPath.c_str(), L"wb");
+    g_logBytes = 0;
+    if (g_log) {
+        fputs("(the log reached its size limit: the earlier lines are in the .prev.log)\r\n", g_log);
+        fflush(g_log);
+    }
 }
 
 void Log(const char* fmt, ...) {
@@ -43,6 +63,8 @@ void Log(const char* fmt, ...) {
         fputs(buf, g_log);
         fputs("\r\n", g_log);
         fflush(g_log);
+        g_logBytes += strlen(buf) + 2;
+        if (g_logBytes > kLogMax) LogRotate();
     }
     g_logOwner = 0;
     LeaveCriticalSection(&g_logCs);
@@ -122,6 +144,11 @@ static bool WriteWhole(const std::wstring& path, const std::string& data, DWORD&
     return ok && put == data.size();
 }
 
+static bool DiskFullError(DWORD e) { return e == ERROR_DISK_FULL || e == ERROR_HANDLE_DISK_FULL; }
+static thread_local bool t_writeDiskFull = false;  // sticky until ResetWriteFailed
+bool WriteFailedDiskFull() { return t_writeDiskFull; }
+void ResetWriteFailed() { t_writeDiskFull = false; }
+
 bool WriteFileBytes(const std::wstring& path, const std::string& data) {
     std::wstring tmp = path + L".mptmp";
     DWORD err = 0;
@@ -137,6 +164,15 @@ bool WriteFileBytes(const std::wstring& path, const std::string& data) {
         if (!TransientFileError(err) || (int)(GetTickCount() - kDeadline) >= 0) break;
         Sleep(attempt < 5 ? 50 : 200);
     }
+    // A full disk (0.7.1): the file stays as it was (writing it in place would cut it short first).
+    if (DiskFullError(err)) {
+        DeleteFileW(tmp.c_str());
+        t_writeDiskFull = true;
+        Log("write %s FAILED: the disk is full (error %lu; %lld MB free); the file is left as it was",
+            W2U(path).c_str(), err, FreeSpaceMB(path));
+        SetLastError(err);
+        return false;
+    }
     // Last resort: write the file in place (works when the other program allows shared writing).
     DWORD direct = 0;
     if (WriteWhole(path, data, direct)) {
@@ -145,10 +181,83 @@ bool WriteFileBytes(const std::wstring& path, const std::string& data) {
         return true;
     }
     DeleteFileW(tmp.c_str());
+    if (DiskFullError(direct)) t_writeDiskFull = true;
     Log("write %s FAILED: error %lu (in place: %lu)", W2U(path).c_str(), err, direct);
     SetLastError(err);
     return false;
 }
+
+// ---------------------------------------------------------------------------------------------
+// 0.7.1: the disk.
+static volatile long long g_testFreeMB = -1;
+void SetTestFreeSpaceMB(long long mb) { g_testFreeMB = mb; }
+
+long long FreeSpaceMB(const std::wstring& dir) {
+    if (g_testFreeMB >= 0) return g_testFreeMB;
+    if (dir.empty()) return -1;
+    std::wstring d = dir;
+    size_t p = d.find_last_of(L"\\/");
+    if (p != std::wstring::npos && p + 1 < d.size() && d.find(L'.', p) != std::wstring::npos) d = d.substr(0, p + 1);
+    ULARGE_INTEGER avail = {};
+    if (!GetDiskFreeSpaceExW(d.c_str(), &avail, nullptr, nullptr)) return -1;
+    return (long long)(avail.QuadPart / (1024 * 1024));
+}
+
+// TEST ONLY: a full disk for the files under the game's Save folder. WriteFile (kernel32) is hooked on the first `on`;
+// while on, a write to such a file fails with ERROR_DISK_FULL and writes nothing.
+namespace {
+typedef BOOL(WINAPI* WriteFile_t)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+WriteFile_t o_WriteFile = nullptr;
+volatile bool g_diskFull = false;
+std::wstring g_saveRoot;  // "\\?\...\My Games\Rule the Waves 3\Save\" (upper case), as GetFinalPathNameByHandleW gives it
+
+bool UnderSave(HANDLE h) {
+    wchar_t buf[1024];
+    DWORD n = GetFinalPathNameByHandleW(h, buf, 1024, FILE_NAME_NORMALIZED);
+    if (n == 0 || n >= 1024) return false;
+    std::wstring s(buf, n);
+    for (auto& c : s) c = towupper(c);
+    return s.compare(0, g_saveRoot.size(), g_saveRoot) == 0;
+}
+
+BOOL WINAPI d_WriteFile(HANDLE h, LPCVOID data, DWORD n, LPDWORD written, LPOVERLAPPED ov) {
+    if (g_diskFull && n > 0 && GetFileType(h) == FILE_TYPE_DISK && UnderSave(h)) {
+        if (written) *written = 0;
+        SetLastError(ERROR_DISK_FULL);
+        return FALSE;
+    }
+    return o_WriteFile(h, data, n, written, ov);
+}
+}  // namespace
+
+bool SetTestDiskFull(bool on) {
+    if (on && !o_WriteFile) {
+        std::wstring d = ModDataDir();  // "...\My Games\Rule the Waves 3\RTW3MP\"
+        std::wstring root = d.substr(0, d.size() - 7) + L"Save\\";
+        wchar_t full[1024];
+        HANDLE h = CreateFileW(root.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        DWORD n = h != INVALID_HANDLE_VALUE ? GetFinalPathNameByHandleW(h, full, 1024, FILE_NAME_NORMALIZED) : 0;
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (n == 0 || n >= 1024) return false;
+        g_saveRoot.assign(full, n);
+        if (g_saveRoot.back() != L'\\') g_saveRoot += L'\\';
+        for (auto& c : g_saveRoot) c = towupper(c);
+        void* target = nullptr;
+        MH_STATUS st = MH_CreateHookApiEx(L"kernel32", "WriteFile", (void*)&d_WriteFile, (void**)&o_WriteFile, &target);
+        if (st == MH_OK) st = MH_EnableHook(target);
+        Log("TEST: the full-disk simulation for %s: %s", W2U(g_saveRoot).c_str(), st == MH_OK ? "ready" : "FAILED");
+        if (st != MH_OK) {
+            o_WriteFile = nullptr;
+            return false;
+        }
+    }
+    g_diskFull = on;
+    Log("TEST: the full-disk simulation is %s", on ? "ON (writes under Save\\ fail with ERROR_DISK_FULL)" : "off");
+    return true;
+}
+
+bool TestDiskFull() { return g_diskFull; }
 
 bool FileExists(const std::wstring& path) {
     DWORD a = GetFileAttributesW(path.c_str());

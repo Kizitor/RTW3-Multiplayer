@@ -1,6 +1,6 @@
 # Architecture
 
-How RTW3 Multiplayer works in the current version (0.7.0, protocol 3, live-battle engine level 18) on Rule the Waves 3
+How RTW3 Multiplayer works in the current version (0.7.1, protocol 3, live-battle engine level 18) on Rule the Waves 3
 1.01.44. This is the developer view; players read the [README](../README.md). The history of each part, with the
 measurements and the dead ends, is in [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game
 facts (calling convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing
@@ -16,6 +16,7 @@ is in [TESTING.md](TESTING.md).
 - [The session: roles, phases, players](#the-session-roles-phases-players)
 - [The monthly flow](#the-monthly-flow)
 - [Save slots and files](#save-slots-and-files)
+- [The disk (0.7.1)](#the-disk-071)
 - [The save merge](#the-save-merge)
 - [Per-player intelligence, trade protection and foreign stations](#per-player-intelligence-trade-protection-and-foreign-stations)
 - [Each joined player's campaign divisions (0.6.1)](#each-joined-players-campaign-divisions-061)
@@ -126,13 +127,18 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `HandleBattleAftermath`, `DoBattleBetweenAINations`, `QuickResolveRaiderBattle` | Victory points per battle (players' VP, war scores). `DoBattleBetweenAINations` also defers battles of joined players (see the battle phase). |
 | `DoStrategicTurn` | Skipped in battle-slot mode (a battle screen's close must not run a month). |
 | `DoBattle` | Counts battle setups (declined vs no battle) and tells the session that the host's battle screen opened (live battles). |
+| the battle setup's `SelectForce` (unnamed; its except box "Error in SelectForce procedure!"), its nested ally fallback and no-force rule, and the fallback's read of the side's division | 0.7.1: a side without ships that can fight in the area gets its ally's division, and the game read the division of the side it was to join, which doesn't exist ("... Read of address 0000000D", single player too). The guard ends the force build there with no force (SelectForce False, DoBattle 0) as after the game's handled exception, without the box and without the no-force rule's points, and the ally's ships the fallback marked Used are unused again. The game's own no-force rule ("Friendly ships not available ...", "Enemy unable to challenge ...") and the guard's ends are counted (`game::NoForce`) for the replay ([the battle phase](#joined-players-battles-against-ai-nations-the-battle-phase)). Any PC (the host's own battles, battle slots, live battles); TEST `battles testnoforce`. |
 | `AdvanceDesignStudies` | Counts down the joined players' design studies, once per month. |
 | `ReduceTimeLimits` | Counts down the joined players' pending doctrine changes, once per month. Relations v2: runs with the pairs of nations under the player's rules masked (its "separate peace" of a computer nation, B2). |
 | `DoResearch` | Puts a joined nation's research priorities back after the game's AI branch. |
 | `TfrmResearch.Execute` | On a joined player's PC, opens the Research screen for the player's nation instead of nation 0. |
+| `TfrmBuildCamp.ShowShipData` | 0.7.1: the ship data window ("View data" of the ship lists, a double click, the move-ships and area dialogs). Its callers pass nation 0 for the player's own ships, and it looks the design up in that nation's design list (ids are per nation); on a joined player's PC a ship of the player's nation K asked for as nation 0's is shown as nation K's (before, the host's design with the same id or nothing). A no-op where nation 0 is the player (the host, single player, the battle slot). The client's fix alone: any host version. Bridge `shipdata`. |
 | `EventLikelihoodCheck` | Vetoes events that need the host while a joined player's event is rolled. |
 | `LoadBuildCampaign` | Clears the intel report list before a load and drops empty or repeated entries after it. Drops (and frees) the air units the global list held before the load once the load succeeded, and repeated air units of the save (the same `AirUnitId`): the game's `LoadAircraftData` appends without clearing, and the mod reloads in the same process every month and at every live battle load (0.3.3). Clears the last battle's area and possession (`BattleArea`, `BattlePossession`) before every load: the load frees every map area and possession but sets the two again only for a save with a battle in progress, and the next save wrote their names from freed memory (the joined player's "Error in SaveBuildCampaign procedure! ..." box, 0.6.0; [GAME-INTERNALS](GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)). Takes the campaign divisions out of their list before every load and frees them after a successful one (the *Fleet organization* list view, whose rows point at them, filled again first when it has rows; a failed load that left the list empty gets them back): the game's `LoadCampaignDivisions` appends too, and the next save wrote every copy (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
 | `LoadCampaignDivisions` | After the call: repeated divisions of the save (the same `CDivId`) dropped and freed, nil ships packed out. For a joined player's own slot (`game::LoadCampaign` as nation K > 0) `PlayerNation` is nation K's during the call, so the divisions find K's ships and officers instead of the host's (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
+| `SaveBuildCampaign` | 0.7.1: every save (the game's own and the mod's) is checked: a box of the game during it, or a file it had to write (the `.bcs`, `.off` and `.sta`, the nine design files when no battle is in progress) missing, older than the save or cut short makes it a failed save (`game::SaveGame` false, `savestate`); the call runs inside `__try`/`__finally` ([the disk](#the-disk-071)). |
+| `ShowMessage` (unnamed; found from `SaveBuildCampaign`'s and `CheckForBattles2`'s except handlers) | During a save (0.7.1): the box is recorded as the save's failure; the first is shown, its repeats (a full disk fails each design file on its own) only logged; in a save the mod tries again (`SaveGame(true)`) a box about a file in use isn't shown either (the last try's is). In a joined nation's view (B6) and during its invasion month: recorded instead of shown. Elsewhere the original. |
+| `TfrmBuildCamp.WorldGlobeMouseMove`, `WorldGlobeMouseUp`, `Details1Click` | 0.7.1: the strategic map's hint, a click on the map and its menu's *Details* do nothing while the campaign in memory is incomplete (a failed load of a campaign file cut short): the game's handlers read every nation's ships without a check ([the disk](#the-disk-071)). |
 | `CheckBlockadeStatus` | Only the call of `LoadBuildCampaign` (told apart by its return address): the game's load credits every blockade between nation 0 and a nation at war with it (nation 0's VP, or EnemyVP) as the month does; the hook keeps the flags and the random draws and puts the loaded VP and EnemyVP back, so a load gives exactly the saved values (0.4.0). Only in multiplayer: every load while a session is up (hosting or joined) and the mod's own reloads (`game::LoadCampaign`; outside a session that is a joined player's return to its slot after a live battle that outlived the session). A load without a session (the title screen, the host's first load before hosting, the resume after a restart) is the game's own: one credit per start, as in single player, logged as `kept: no multiplayer session`. The month's own calls (`DoTurn`, `DoStrategicTurn`) are untouched. |
 | `CopyGameToOtherSlot` | A joined player's copy becomes the player's own campaign (`MakeNationPlayer`). |
 | `ShowTensionLevels`, `DrawAreaStrengthBars` | On a PC that plays nation K > 0 (a joined player's), run in the relations view (0.4.1): nation K at index 0, the host's nation at index K, every nation's `Tension`/`Allied` its relation with K; put back afterwards. The tension panel's flags are renamed for the view first. 0.6.1 (every PC in a session): afterwards the bars of the nations people play get, at peace, the hint that wars between players come only from the players (`PeoplesBarHints`). |
@@ -171,6 +177,14 @@ the game's 11 x87 transcendental routines in `x87.cpp`) with the first live batt
 - **Nested message loops.** A modal game dialog, a menu or a message box runs its own message loop, so the
   dispatcher keeps running under it: mod code must guard against re-entry. `AtOutermostDispatch()` compares the
   dispatcher's stack depth with the outermost loop's; the live battles free forms only from the outermost loop.
+- **The guard of the mod's main-thread work (0.7.1).** The dispatcher runs the timer, the network messages and every
+  `RunOnMainThread` call (so every bridge command) under an SEH guard (`GuardedRun`, `main.cpp`). A game exception
+  that no game routine handled (a Delphi exception or a processor fault) would otherwise reach `TApplication.Run`'s
+  handler: the game's bare box, with no trace. The guard logs it with the mod's call site (`RunOnMainThread` records
+  its caller's function and line) and the `RTW3MP_DIAG` trace (registers, objects, the game's return addresses; also
+  without `RTW3MP_DIAG`), and drops that piece of work: `ERROR: game exception <code> at rva <x> [<class>: <message>]
+  in the mod's main-thread work (<function>, line <n>): caught, that work dropped`. The mod's C++ exceptions stay with
+  its own catch blocks. Test only: the bridge's `pocguard`.
 - No implicit thread-local storage in the mod (`/Zc:threadSafeInit-`), see the
   [gotchas](../MODLOG.md#investigation-2026-10-04-gotchas-each-cost-a-debugging-round-v010).
 
@@ -248,6 +262,72 @@ the game's 11 x87 transcendental routines in `x87.cpp`) with the first live batt
 All paths are under `<Documents>\My Games\Rule the Waves 3\`. The mod treats slots below 50 as the player's own: the
 host hosts only from slots 1-49, and a client never writes a month package into a slot below 50 ("refusing to
 overwrite a regular save slot").
+
+## The disk (0.7.1)
+A 0.7.0 report: the host's "Error in SaveDesignFiles procedure! Stream write error: There is not enough space on the
+disk". The game's save shows such an error and carries on as if it had saved, leaving the files it could not write
+empty or old ([GAME-INTERNALS](GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)); the mod reads those
+files for the month's package, a turn and the merge, and loads them again.
+- **What grows.** Nothing of the mod's without bound: the save slots it writes (77, 87) are written over (the old save
+  files deleted first); its logs are at most 32 MB each, then the log becomes the `.prev.log` (`util.cpp`, two files
+  per log tag); the DESYNC reports keep the 12 newest (`PruneDesyncReports`); a `*.mptmp` is renamed or deleted. The
+  game's lists that a reload appended to were fixed in 0.2.2 (intel reports), 0.3.3 (air units) and 0.6.1 (campaign
+  divisions); the static audit of `LoadBuildCampaign` found no other one that the save writes, and the suite's
+  `disk_growth` measures it (save and reload cycles change no count; months grow the slot by what the campaign adds).
+- **Low disk space.** Before the month's saves (host: the Turn, the battles and the new month; client: its turn and
+  storing the received month) `LowDiskCheck` measures the free space of the save folder's drive (`FreeSpaceMB`); below
+  `kLowDiskMB` (500 MB) a notice and a chat line ("Low disk space on drive C: ... MB free; the game may fail to save"),
+  once a month. The host's line goes to everyone ("The host's disk: ..."), a player's to the host ("[disk] ...").
+- **A failed save** (`game::SaveGame` false; the `SaveBuildCampaign` hook: a box of the game during the save, or a
+  file it had to write missing, older than the save or cut short) stops the step that saved (`SaveStopped`): the host's
+  month (nothing merged, no reload; the turns stay), sending the new month, the battle phase, a player's turn, or a
+  player's save before a live battle. The campaign in memory is untouched (the last good state); the notice and the
+  chat line name the cause and what to do (below; a full disk: "... disk is full (... MB free on drive C:): <step>
+  stopped; the last good state is kept. Free space and save again (the game's Save button): it goes on then."). Once
+  any save works (`game::SaveOkCount` moved: the player's own Save), the step runs again by itself (`Tick`). A merge
+  whose write fails on a full disk stops the month the same way. A joined player's battle result is not read from a
+  failed save: the host gets the battle's outcome without a result, and the battle falls back as one that wasn't
+  fought (one of the computer's generator is resolved by the game, one of the player's generator is no battle that
+  month). A received month that a full disk could not store stays pending and is stored again every 15 s. A stopped
+  step is dropped when a new month goes out (host) or is loaded (a player's turn or live battle save). The game's box
+  of a failed save runs a message loop: meanwhile the session's `Tick` and network messages wait
+  (`game::SaveInProgress`), and a `SaveGame` from it is refused, so nothing saves, sends or loads inside the save.
+- **Why the save failed** (0.7.1, not only a full disk). `SaveEnd` names the cause (`game::LastSaveCause`) from the
+  game's boxes: a full disk ("not enough space on the disk", or the system's own words for errors 112 and 39), else a
+  file of the save in use by another program (OneDrive's sync, an antivirus scan: "being used by another process",
+  "sharing violation", "Cannot create file", the system's words for errors 32, 33 and 1224), else another error; with
+  no such text, less free space than the slot's files take means a full disk. The system's words come from
+  `FormatMessage` in the user's language, as Delphi's `SysErrorMessage` puts them into the game's message. The text
+  for the players leaves the folders out (`LastSaveText`, `LastSaveFile`: no user names in the chat).
+- **A file in use is saved again by itself.** The steps save with `StepSave` (`game::SaveGame(true)`: a box of the
+  game about a file in use stays off the screen). A failed save with that cause stops the step for now (`SaveStopped`):
+  "A file of the host's campaign save was in use by another program (for example OneDrive or antivirus): the month
+  waits; it saves again by itself." `SaveRetryTick` saves again into the same slot 2 s later, up to five times (the
+  last try shows the game's box: one box for the failure); once one works the step goes on with that save (`StepSave`
+  doesn't save a second time at once: the other program would meet the fresh file again). After five failed tries
+  the step stops as for a full disk: "A file of the host's campaign save is still in use by another program
+  (RTWGame1.bcs): the month stopped; the last good state is kept. Close that program or pause OneDrive's sync, then
+  save (the game's Save button): it goes on then." A full disk keeps its message; another error says "The host's save
+  failed (<the game's text>): ... Save again (the game's Save button) ...". A joined player's battle slot is saved
+  again at once (`SaveBattleSlot`: five times, 1 s apart) before the battle's result is given up.
+- **A campaign file cut short** (fix-av109; [GAME-INTERNALS](GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)).
+  A `.bcs` written to a full disk ends early, and the game writes `[VERSION]` last; the game's load of such a file
+  keeps only the nations before the cut, and the strategic map's hint and area details then call a routine for a nil
+  nation (the bare "Access violation ... Read of address 00000109" box of the report). `game::LoadCampaign` refuses a
+  `.bcs` without the nine `[Nation<i>]` sections or `[VERSION]` before the game's load (`CampaignFileProblem`;
+  `LoadCampaign refused: slot <n>'s campaign file is incomplete (...)`), so the campaign in memory stays whole, and
+  fails a load after which `game::CampaignComplete` (nine nations, none nil, `PlayerNation` one of them) is false;
+  every caller already handles a failed load. The save's check of the `.bcs` uses the same rule. The map's handlers
+  (`WorldGlobeMouseMove`, `WorldGlobeMouseUp`, `Details1Click`) do nothing while the campaign in memory is incomplete,
+  also after the player's own load of such a file. Test switch `RTW3MP_TEST_NOLOADCHECK=1` (the game's own load of
+  such a file).
+- **The mod's own writes.** `WriteFileBytes` writes a temporary file and renames it; on a full disk (ERROR_DISK_FULL,
+  ERROR_HANDLE_DISK_FULL) it no longer falls back to writing the file in place (which empties the old file first): the
+  old file stays as it was (`WriteFailedDiskFull`).
+- **Test hooks.** The bridge's `diskfree <MB>|off` (what the free-space check reports), `diskfull on|off` (a hook of
+  `WriteFile`: writes into files under the Save folder fail with ERROR_DISK_FULL, after the game's `fmCreate` emptied
+  the file, as on a full disk), `savelock <s>|off [file]` (the next save finds a file of its slot held open without
+  sharing for <s> s), `diskinfo` and `savestate`; the suite's `disk_full` and `disk_growth`.
 
 ## The save merge
 - **Save files:** the `.bcs` and `MapData<n>.dat` files are UTF-8 INI with CRLF (the `.bcs` with a BOM), and the
@@ -475,7 +555,7 @@ A joined player may build the nation's starting ("legacy") fleet by hand in a ne
 | `MSG_DIPLO` | client -> host | A diplomacy request (war, ally, peace, leave, cancel, claim). |
 | `MSG_EVENT` | client -> host | The result of the player's random event (relation changes, own fields), or (0.4.1, `intel=1`) of its monthly spying check. |
 | `MSG_RELATIONS` (40) | client -> host | Relations v2: what the player's relation routines changed for its nation this month (pairs before/after, alliances, per-relation state, other nations' budget changes, VP, war counter); B4: the peace with the computer's nations (`peace`, `pcode`, `pevent`, `pargs`, `paccepted`, `pwinner`, `penemies`, `pland`, `pships`, `ptaken`, `pdelta`, `plost`, `ptreaty`; 0.5.0: `self`, the nation's own BudgetModifier/Prestige/BaseResources/UnrestLevel changes; 0.6.0: `ally`, `allyvp`, `afunds`, `aships`, `lend`, the allies' war help; `bwar`, `bships`, the ship seizures of a war), also alone for a proposal (`kind=peace`; `test=1` from `peacetest`). 0.6.0 (to a `gen=2` host): `ksa` (the surprise attacks "a,b;") and `sland` (the takeovers of unowned possessions, pland's layout). |
-| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. 0.6.1: the battle's `divs=1` (the slot's `.off` holds the nation's own campaign divisions). |
+| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. 0.6.1: the battle's `divs=1` (the slot's `.off` holds the nation's own campaign divisions). 0.7.1: the result's `noforce` (the game's no-force rule gave the outcome: 0 the player's nation had no ships there that could fight, sent as `declined`; 1 the enemy had none, sent as `avoided`) and a `nobattle`'s reason in `why` for every kind (a battle setup without a side's force); older hosts ignore both. |
 | `MSG_LOCKSTEP` | both (the host relays between two clients) | Live battle traffic. |
 | `MSG_LEGACY` (41) | client -> host | 0.7.0: the player's legacy build started (`state=start`, `info`: the budget figures) or ended (`state=done`, `ships`, `funds`, `forced=1` when a forced submit ended it); notices only (the fleet comes with the turn). Older hosts ignore it. |
 | `MSG_PING`, `MSG_PONG`, `MSG_BYE` | both | Keep-alive and round-trip time; leaving. |
@@ -544,7 +624,8 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   view instead of shown: the run fails, K gets no request that month and the host's log has the box's text. The
   attempts against computer nations make one request of kind 1
   (`BattleReq.kind`: 0 the computer's generator, 1 the player's, 2 a surprise attack); the client replays them
-  in order in its battle slot until one gives a battle, a decline or the enemy's points, and returns which (`cand`) and
+  in order in its battle slot until one gives a battle, a decline or the enemy's points (0.7.1: a setup the mod's guard
+  ended for lack of a side's force gives none, below), and returns which (`cand`) and
   the battle's area. Kind 1 never falls back to the game's resolution. The computer's generator's battles of K against
   computer nations are dropped meanwhile (`HostDeferBattle`), so K has one generator. 0.5.0 clients keep kind 0.
 - **Surprise attacks and takeovers at a war's start for a joined nation (0.6.0, B6 piece 2).** With a host whose
@@ -576,6 +657,29 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   that can fight in the area, as the game's own caller does (`CountShipsInArea`), and passes those counts; with either
   at 0 it is no battle and the game's routine is not called (it would read a nil ship: "Error in
   DoBattleBetweenAINations procedure!", GAME-INTERNALS).
+- **A battle setup without a side's force (0.7.1).** The game's battle setup (`DoBattle`) can find no ship of a side
+  in the area that can fight: `CheckAttackLocation` tests only the attacker's ships there, so an enemy attacking the
+  player's possession where the player has none (or the reverse) comes to the setup. With an ally of that side with
+  ships there the game read a division that doesn't exist (its box "Error in SelectForce procedure! ... Read of
+  address 0000000D", the 0.7.1 RC's NO-GO; [GAME-INTERNALS](GAME-INTERNALS.md#the-other-relation-and-war-routines));
+  the mod's guard (hooks above) ends that setup with no battle and no points instead. Without such an ally the game's
+  no-force rule gives the other side the points ("Friendly ships not available to oppose the enemy in the area! Enemy
+  gains N VP!" / "Enemy unable to challenge our forces in the area! Gain N VP!"). The battle slot's replay counts these
+  setups apart from the battles it set up (`game::NoForce`; before 0.7.1 every setup without a preview read as the
+  player's decline): the guard's is no battle for that attempt and the replay goes on with the next one, as single
+  player's generator does after CheckAttackLocation's False (log "attempt i (...) found no battle (its setup found no
+  force: the next attempt, as single player)"); a request that ends without a battle is a `nobattle` with the reason
+  ("Germany had no ship that could fight in the Indian Ocean"; the host's chat "* No battle of Germany this month
+  (...)"), nothing is merged and no decline is counted (the map message's Accept before the setup resets the
+  player's own decline count, as in single player). The game's no-force rule ends the search with its points, as
+  0.7.0 did, but as what it is: the enemy's side without ships is `avoided` with the result (the player's points,
+  chat "* The <X> navy had no ships to challenge our forces in <area>: <nation> gains N VP."), the player's side
+  without ships is `declined` with the result (the enemy's points, the decline count and an enemy's landing merged as
+  a decline's consequences, chat "* Friendly ships not available to oppose the <X> navy in <area>: <X> gains N VP."),
+  both with the result key `noforce` (0 or 1), so a 0.7.1 host logs and words it ("* Germany had no ships to oppose
+  Russia in the Indian Ocean: Russia gains N VP.") instead of "declined battle"; a 0.7.0 host merges it as a decline
+  or the enemy's decline. Live battles between players keep their own path. TEST `battles testnoforce`, `battles
+  injectgen ... xN` (TESTING.md).
 - **The nation's own decline counts (0.6.0).** The game's `DeclineCount` is saved with the campaign (nation 0's) and
   `EnemyDeclineCount` lives in memory (saved, never loaded), so a battle slot held the host player's DeclineCount and
   the client PC's last EnemyDeclineCount. The host keeps
@@ -703,6 +807,18 @@ decided later). Done so far:
     computer nation joining the host's war, also against K), battles (`CheckAIvsAIBattles` sees K's real wars).
   - A game exception that unwinds through a routine still puts the mask back (`MaskedCall` runs the original inside
     `__try`/`__finally`); `ResetRelationMasks` at the month's end is the last safety net.
+  - *K's ships on trade protection and raiding (0.7.1).* The game returns a nation's ships with Status 3, 4 or 5 to
+    active service whenever it computes their maintenance while the nation is at peace (`GetShipMaintenanceCost`, see
+    [GAME-INTERNALS](GAME-INTERNALS.md#intelligence-trade-protection-and-foreign-stations)), and a masked K reads as
+    at peace with the computer's nations: ReduceTimeLimits' loop of the computer's nations computes K's monthly
+    balance, so up to 0.7.0 K's trade protection and raiders were back in active service every month. `AIMaskEnter`
+    notes K's ships with Status 3-5; `AIMaskLeave`, after the real relations are back, gives each of them that the
+    masked routine set to 0 its status again when K is at war (the game's `NationIsAtWar`: the player's war counter,
+    else K's tension with the host or any AI tension above 40; `relations v2: nation K at war: N ship(s) on trade
+    protection or raiding kept (<routine> saw it at peace)`). At peace the game's own rule applies, as for its player.
+    Only the host's month needs it (the player's PC runs the game's player rules with the player's own war counter;
+    the battle slot carries it too), so a 0.7.0 client is covered by a 0.7.1 host, and a 0.7.1 client under a 0.7.0
+    host still loses the statuses.
   - From B2 on, K's relations with the computer's nations change only by K's player routines (B3), the players'
     diplomacy and the events; a client that doesn't announce `rel` keeps the computer's rules (0.4.x behaviour).
 - **B3, the player's relation routines on K's PC.** The host tells a client whose nation follows the player's rules
@@ -1384,18 +1500,19 @@ decided later). Done so far:
 - The command reference, the runner and the scenario catalog are in [TESTING.md](TESTING.md).
 
 ## Versions and protocol
-- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.7.0
+- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.7.1
   starting (protocol 3)`).
 - The host refuses a client with another protocol or another game build. Protocol history: 1 = 0.1.0, 2 =
-  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1 and 0.7.0 (relations v2, 0.6.0, 0.6.1 and 0.7.0 keep
-  3: their new keys are ignored by older peers; 0.7.0's features go by the hello's and the welcome's `gen` and the
-  month's `legacy`, see [Network protocol](#network-protocol)).
+  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0 and 0.7.1 (relations v2, 0.6.0, 0.6.1 and
+  0.7.0 keep 3: their new keys are ignored by older peers; 0.7.0's features go by the hello's and the welcome's `gen`
+  and the month's `legacy`, see [Network protocol](#network-protocol); 0.7.1 adds only the battle result's optional
+  `noforce`).
   Within a protocol, versions can play together, but features may need both
   sides (see [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is not checked; the notices about
   another live-battle level quote it.
 - Live battles have their own version, the live-battle engine level `MP_LS_LEVEL` (`src/mod/common.h`): 1 = 0.3.0 to
-  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1 and 0.7.0. Levels 2 to 13 were development levels of
-  0.4.0 (the live-battle limits branch, whose MODLOG entries say "v0.4.0", "v0.5.0" and "v0.6.0" after the release
+  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1, 0.7.0 and 0.7.1. Levels 2 to 13 were development levels
+  of 0.4.0 (the live-battle limits branch, whose MODLOG entries say "v0.4.0", "v0.5.0" and "v0.6.0" after the release
   plan of 2026-10-16, but it shipped as one version, 0.4.0), and levels 15 and 16 were rounds of 0.4.1's two-PC fixes;
   none of them was released. A client announces its level in its hello (`ls=<level>`), and the host pairs a live battle
   only when the player's level (both players' levels for a relayed battle) equals its own. Otherwise the battle falls
@@ -1444,6 +1561,12 @@ decided later). Done so far:
   PC (17) and a 0.6.1 PC (18) are told apart by their levels: the engine notice ("live battles need the same
   live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0 (engine 17)"), not a data-file one.
   0.7.0 keeps level 18: the legacy fleet, the raider battles and the invasions of joined nations change no live-battle
-  path, so 0.6.1 and 0.7.0 PCs fight their live battles together.
+  path, so 0.6.1 and 0.7.0 PCs fight their live battles together. 0.7.1 keeps level 18 and protocol 3 as well: its fix
+  of the joined nations' trade protection and raiders is the host's month only, the View data fix the joined player's
+  screen only, and the checks of a campaign file cut short and of a failed save are each PC's own (the disk's notices
+  go to the other PCs as chat lines); the battle setup's guard (a side without ships that can fight and its ally's
+  division) is each PC's own too, and the battle result's new `noforce` key only words the outcome on a 0.7.1 host (a
+  0.7.0 host merges the same result as before); no message, header or live-battle path changes, so each fix works
+  whatever version the other PC has.
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

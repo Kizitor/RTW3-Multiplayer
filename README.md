@@ -54,7 +54,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 ## Install
 Every player:
 1. Close the game.
-2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.6.1-win32.zip`) from the
+2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.7.1-win32.zip`) from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract all its files into the
    game folder, next to `RTW3.exe`. When you update, replace the older files.
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
@@ -180,16 +180,21 @@ Your screen shows your own nation's side of the campaign:
   PC, with the game's own messages.
 - **Trade protection and foreign stations:** the budget panel shows your nation's trade protection requirement,
   **Submit** asks the game's questions (step 4), and the host's month gives your nation the game's warnings and
-  their consequences (for example lost prestige), which you get as notices with the new month.
+  their consequences (for example lost prestige), which you get as notices with the new month. Your ships on trade
+  protection or raiding keep these orders from month to month while your nation is at war; at peace the game sends
+  them back to active service, as in single player. (Before 0.7.1 the host's month sent them back every month.)
 - **Divisions:** the *Fleet organization* tab shows your own nation's divisions. Make and change them as in single
   player: they go to the host with your turn, come back with every new month, and the game sets up your side of your
   battles against computer nations with them. (Before 0.6.1 the tab showed the host's divisions, and yours were lost
   every month.)
+- **Ship data:** the game's *View data* (the ship lists' popup menu) shows your own ships' data. (Before 0.7.1 it
+  showed nothing, or another nation's ship.)
 
 Your relations on the screen need 0.4.1 or newer on your PC, and your own months at war need 0.5.0 or newer on your PC
-and on the host; your intelligence and the month's warnings need 0.4.1 or newer on the host too, and your own
-divisions 0.6.1 or newer on your PC (see [Upgrading from an older version](#upgrading-from-an-older-version)). What
-still comes from the host or the computer: see [Known limitations](#known-limitations).
+and on the host; your intelligence and the month's warnings need 0.4.1 or newer on the host too, your own divisions
+0.6.1 or newer on your PC, your ships' trade protection and raider orders 0.7.1 or newer on the host, and *View data*
+0.7.1 or newer on your PC (see [Upgrading from an older version](#upgrading-from-an-older-version)). What still comes
+from the host or the computer: see [Known limitations](#known-limitations).
 
 To test on one PC, run two copies of the game and join `127.0.0.1` (`RTW3MP_SecondCopy.bat` from the release starts
 the second copy). Both copies share one settings file, so the joining copy gets a numbered name (e.g. "Friend 2").
@@ -464,12 +469,12 @@ players in the battle need **Fight my battles** on (the host's own box makes no 
 joining a session). If it is off, the host fights its battle against that nation's ships under computer control, and a
 battle between two joined players' nations is resolved by the game.
 - **Same live-battle engine:** a live battle needs the same live-battle engine on both players' PCs. 0.4.1, 0.5.0 and
-  0.6.0 have the same one (17), 0.6.1 a new one (18), older versions others. A host on 0.4.0 or newer checks it for
-  every live battle: its own battle against a player with another engine is fought against the computer, and a battle
-  between two joined players is resolved by the game unless both have the host's engine. The chat and the players'
-  notices say why, naming both versions (from a host on 0.5.0 or newer, for example "live battles need the same
-  live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0 (engine 17)"; older hosts say "the
-  same mod version"), and the month goes on. A
+  0.6.0 have the same one (17), 0.6.1, 0.7.0 and 0.7.1 a new one (18), older versions others. A host on 0.4.0 or
+  newer checks it for every live battle: its own battle against a player with another engine is fought against the
+  computer, and a battle between two joined players is resolved by the game unless both have the host's engine. The
+  chat and the players' notices say why, naming both versions (from a host on 0.5.0 or newer, for example "live
+  battles need the same live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0 (engine 17)";
+  older hosts say "the same mod version"), and the month goes on. A
   host on 0.3.x checks no versions: when it fights its own battle against a player on 0.4.0 or newer, the player's
   game refuses the battle with a notice, its chat naming both live-battle levels, and the host's computer fights the
   player's side. Two joined players with the same engine (0.4.0 or newer) fight their battle against each other live
@@ -561,8 +566,8 @@ game resolves the battle.
 again first if it stopped; if you are still connected, press *Leave*, then *Join game*). You get your nation back,
 the battle loads on your PC (also from the title screen), and you command your ships again from its next minute. The
 battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0 or
-newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1 a new one);
-otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
+newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0 and 0.7.1 a
+new one); otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
 
 **When the host's game stops** (it crashes or is closed) during its live battle against a joined player, the joined
 player's game leaves the battle and the session. To go on:
@@ -697,9 +702,10 @@ players' nations for the rest of that month. A battle between two joined players
 - **Resigning** is not possible during a session: leave the session first.
 - **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
   play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same live-battle
-  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1 and 0.7.0 a newer one), and a host on
-  0.4.0 or newer pairs only players with its own (see [Battles between players](#battles-between-players-live)).
-  Joined players use save slot 77, and slot 87 for their battles.
+  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0 and 0.7.1 a newer one), and a
+  host on 0.4.0 or newer pairs only players with its own (see
+  [Battles between players](#battles-between-players-live)). Joined players use save slot 77, and slot 87 for their
+  battles.
 - **A host on 0.3.x** passes on the live battles between two joined players on 0.4.0, but can't start such a battle
   again for a player who dropped out: the computer keeps that player's ships to the end of the battle, although the
   other player's chat says they get them back by joining again. Update the host.
@@ -718,7 +724,7 @@ players' nations for the rest of that month. A battle between two joined players
 
 ## Troubleshooting
 - **The log** is `Documents\My Games\Rule the Waves 3\RTW3MP\rtw3mp.log`; `rtw3mp.prev.log` is the log of the start
-  before. Add it when you report a problem.
+  before, or the earlier part of a long session (a log starts over at 32 MB). Add them when you report a problem.
 - **No Multiplayer button:** check that `version.dll` and `RTW3MP.dll` are both next to `RTW3.exe`. Some antivirus
   programs quarantine `version.dll` (an unsigned DLL with a Windows DLL's name), and Windows Defender once removed a
   test build of `RTW3MP.dll` as `Trojan:Win32/Phonzy.A!ml` (a guess of its machine learning); restore the file or add
@@ -732,6 +738,39 @@ players' nations for the rest of that month. A battle between two joined players
 - **The host sees "...'s turn could not be applied":** another program (usually antivirus or OneDrive) held a
   save file for more than 3 seconds, so that nation keeps last month's orders. If it happens repeatedly, exclude
   `Documents\My Games\Rule the Waves 3\Save` from scanning/syncing.
+- **"Error in SaveDesignFiles procedure! Stream write error: There is not enough space on the disk"** (or another
+  "Error in Save... procedure!" box that says the disk has too little space): the drive that holds
+  `Documents\My Games\Rule the Waves 3` is full. The game shows its box (once for each file it can't write) and
+  carries on as if it had saved, leaving the save files it could not write empty, cut short or old. Since 0.7.1 the
+  mod notices it and shows the box once: the month stops where it is ("The host's disk is full (... MB free on drive
+  C:): the month stopped; the last good state is kept. Free space and save again (the game's Save button): it goes on
+  then."), nothing is sent, merged or loaded from the broken files, and the campaign in the game stays as it was.
+  Free some space, then press the game's *Save* button: once a save works, the month goes on by itself (a joined
+  player's turn goes to the host, or the received month is stored, by itself as well). Don't load the campaign or
+  leave the game before that: until a save works, the files on disk are the broken ones. Before the month's saves the
+  mod warns when less than 500 MB is free ("Low disk space on drive C: ... MB free; the game may fail to save. Free
+  some space."). The mod itself doesn't fill the disk: it keeps two logs of at most 32 MB each and the 12 newest
+  live-battle reports (`ls_desync_*.txt`) in `Documents\My Games\Rule the Waves 3\RTW3MP`, writes its slots (Game77,
+  Game87) over each time, and the campaign no longer grows with its reloads (an 8-month test session grew the host's
+  slot by about 12 KB a month, as single player does).
+- **"Error in SaveBuildCampaign procedure! Cannot create file "...\RTWGame1.bcs". The process cannot access the file
+  because it is being used by another process"** (the second sentence in the language of your Windows; the file can
+  be another file of the save): another program had that file open while the game saved, usually OneDrive's sync
+  (when your `Documents` folder is in OneDrive) or an antivirus scan. The game shows its box and carries on as if it
+  had saved, with part of the save left old. Since 0.7.1 the mod saves again by itself, up to five times 2 seconds
+  apart, and shows the game's box only if the last try fails too; meanwhile the month waits ("A file of the host's
+  campaign save was in use by another program (for example OneDrive or antivirus): the month waits; it saves again by
+  itself."; on a joined player's PC "A file of your campaign save ...: your turn waits ..."). A joined player's save
+  of a battle's result is tried again up to five times, 1 second apart. If the file is still in use after the last
+  try, the month stops ("A file of the host's campaign save is still in use by another program (RTWGame1.bcs): the
+  month stopped; the last good state is kept. Close that program or pause OneDrive's sync, then save (the game's Save
+  button): it goes on then."): close that program or pause OneDrive's sync, then press the game's *Save* button, and
+  the month goes on by itself. Don't load the campaign or leave the game before a save works. If it happens often,
+  exclude `Documents\My Games\Rule the Waves 3\Save` from scanning or syncing.
+- **Another "Error in Save... procedure!" box during a session:** since 0.7.1 the month stops the same way, and the
+  notice says what failed ("The host's save failed (...): the month stopped; the last good state is kept. Save again
+  (the game's Save button): it goes on then."). Remove the cause if the game's text names one, then press the game's
+  *Save* button: once a save works, the month goes on by itself. Add the log when you report it.
 - **The host's screen stays locked with "Battles in progress":** a player is fighting a battle. Each battle has a
   30-minute limit; after it (or if the player disconnects) the game resolves the battle and the month goes on.
 - **A live battle pauses and reloads:** the two PCs disagreed and were brought back in step. The chat lists the
@@ -750,12 +789,12 @@ players' nations for the rest of that month. A battle between two joined players
 - **"... your game data files differ ..." in the chat:** a file of the game's `Data` folder isn't the same on the two
   PCs (a mod, an older or damaged install), so the live battle is fought against the computer. The message names the
   files: make them the same on both PCs (Steam's *Verify integrity of game files* puts back the original ones). If it
-  names only `Data\tmpShip.ttp` (the ship designer's temporary file, which 0.4.1 to 0.6.0 compared), update everyone
-  to 0.6.1, which leaves that file out.
+  names only `Data\tmpShip.ttp` (the ship designer's temporary file, which 0.4.1 to 0.6.0 compared), update everyone:
+  0.6.1 and newer leave that file out.
 - **"... live battles need the same live-battle engine" in the chat** (from a host on 0.4.1 or older: "... the same
   mod version"): both players of a live battle need versions with the same live-battle engine (0.4.1, 0.5.0 and 0.6.0
-  have the same one; 0.6.1 has a new one), and a host on 0.4.0 or newer needs both on its own; until then, such
-  battles are fought against the computer or resolved by the game. See
+  have the same one; 0.6.1, 0.7.0 and 0.7.1 have a new one), and a host on 0.4.0 or newer needs both on its own; until
+  then, such battles are fought against the computer or resolved by the game. See
   [Upgrading from an older version](#upgrading-from-an-older-version).
 - **The computer took over your ships in a live battle, or the host's game stopped during one:** see
   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops).
@@ -769,17 +808,43 @@ players' nations for the rest of that month. A battle between two joined players
 - **"Error in SaveBuildCampaign procedure! Access violation ..." after battles or after joining a session:** fixed in
   0.6.0; update the host and your game (see *Joining a session on another campaign* in
   [Known limitations](#known-limitations)).
+- **A box "Access violation at address ... in module 'RTW3.exe'. Read of address 00000109." without "Error in ...
+  procedure!"** (reported with 0.7.0 after the host's disk was full): the game had loaded a campaign file cut short,
+  as a save on a full disk leaves it, without all of its nations, and the strategic map's hint then failed. Since
+  0.7.1 the mod doesn't load such a file (the load fails, and the campaign in the game stays as it was; the log says
+  "LoadCampaign refused: slot ...'s campaign file is incomplete"), a failed save stops the month before its files are
+  used (see the full disk above), and the map's hint and area details stay off if you load such a file yourself.
+  Update the host and every player.
+- **"Error in SelectForce procedure! Access violation at address ... Read of address 0000000D" before a battle:** a
+  fault of the game itself (single player has it too) when the enemy attacks in an area where your nation has no ship
+  that can fight but an ally at war with that enemy has: the battle doesn't start. Since 0.7.1 the mod ends that
+  battle's setup without the box, and the month's battle search goes on with its next chance. Each PC needs 0.7.1
+  for its own battles.
 - **The host's turn stops with "CV ... aircraft capacity exceeded!":** before 0.3.3, every reload of the campaign
   (every month and every live battle) added another copy of every squadron. Update the host (0.3.3 or newer) and load
   the campaign again: it removes the copies. If the message stays, that carrier really carries more aircraft than it
   has room for: open its air group and move squadrons to the reserve.
 - **Every division shows two or more times, or a joined player's *Fleet organization* shows the host's divisions or
   loses the player's own every month:** before 0.6.1 the divisions doubled each time multiplayer loaded the campaign
-  again, and a joined player's divisions never reached the host. Update the host and the joined players to 0.6.1 and
-  load the campaign again: it removes the copies (the first of each division stays). Divisions that a joined player
-  lost must be made again.
+  again, and a joined player's divisions never reached the host. Update the host and the joined players to 0.6.1 or
+  newer and load the campaign again: it removes the copies (the first of each division stays). Divisions that a
+  joined player lost must be made again.
+- **A joined player's ships on trade protection or raiding are back in active service every month, or *View data*
+  shows a joined player nothing or another nation's ship:** both are fixed in 0.7.1. The ships' orders need 0.7.1 on
+  the host, *View data* on the player's PC. Ships that an older host sent back to active service stay there: set them
+  again.
 
 ### Upgrading from an older version
+- **0.7.1** plays with 0.7.0, 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and every player:
+  - 0.7.1 has the live-battle engine of 0.6.1 and 0.7.0 (18): players on these versions fight their live battles
+    together, a player on 0.6.0 or older can't (see 0.6.1 below).
+  - Your ships on trade protection or raiding keep their orders in a war month only with 0.7.1 on the host, whatever
+    version you have. Ships that an older host sent back to active service stay there: set them again.
+  - *View data* of your own ships needs 0.7.1 on your PC, under a host on any version.
+  - The checks of failed saves and of campaign files cut short, the low-disk warning and saving again by itself work
+    on each PC with 0.7.1, for its own saves and loads; the host's notices reach every player in the chat.
+  - The game's "Error in SelectForce procedure!" box before some battles is gone on each PC with 0.7.1, for its own
+    battles.
 - **0.7.0** plays with 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and every player:
   - 0.7.0 has the live-battle engine of 0.6.1 (18): players on 0.6.1 and 0.7.0 fight their live battles together, a
     player on 0.6.0 or older can't (see 0.6.1 below).

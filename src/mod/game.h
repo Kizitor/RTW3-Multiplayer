@@ -41,7 +41,31 @@ int CurrentSlot();
 void SetCurrentSlot(int slot);
 std::wstring SaveDir(int slot);  // "...\Save\Game<slot>\"
 
-bool SaveGame();                             // same as the Save button (normal save into the current slot)
+// Same as the Save button (normal save into the current slot); false: it failed. quietInUse (0.7.1): a box of the game
+// that reports a file of the save in use by another program stays off the screen (the caller saves again).
+bool SaveGame(bool quietInUse = false);
+// 0.7.1: every SaveBuildCampaign (the game's own and the mod's) is checked: a box of the game during the save (its
+// "Error in Save... procedure!" handlers show the error and carry on) or a file it had to write that is missing, old or
+// cut short makes it a failed save. Counters of the saves that worked and failed; whether the last save (of `slot`, -1
+// any) failed and why; the bridge's `savestate`.
+uint32_t SaveOkCount();
+uint32_t SaveFailCount();
+bool SaveInProgress();  // inside SaveBuildCampaign (its box's message loop runs the mod's timer and network messages)
+bool LastSaveFailed(int slot = -1);
+std::string LastSaveError();
+std::string SaveState();
+// Why the last failed save failed: a full disk (the game's text "not enough space on the disk", or less free space
+// than the slot's files take), a file of the save in use by another program (OneDrive's sync, an antivirus scan: a
+// sharing violation, "being used by another process", "Cannot create file"), or another error. The texts are matched
+// in English and in the system's own words (FormatMessage, as Delphi's SysErrorMessage puts them into the message).
+enum class SaveCause { None, DiskFull, InUse, Other };
+SaveCause LastSaveCause();  // the last save's (None: it worked)
+const char* SaveCauseName(SaveCause c);  // "none", "full", "inuse", "other" (`savestate` cause=)
+std::string LastSaveText();  // the game's text of the last failed save, without folders (for the players' messages)
+std::string LastSaveFile();  // the file a box of the last failed save names ("RTWGame1.bcs"), or ""
+// TEST ONLY (the bridge's `savelock <seconds> [file]`): the next save finds a file of its slot (default
+// RTWGame<slot>.bcs) held open without sharing for <seconds> s, as OneDrive's sync or an antivirus scan holds it.
+std::string SetTestSaveLock(int seconds, const std::wstring& file);
 // pocHeapCheck (diagnosis only): RTW3MP_DIAG checks the campaign's objects before every save and after every load
 // (dl::HeapCheck; also the bridge's `pocheapcheck`), the summary and the first problems to the log.
 bool PocDiag();
@@ -53,6 +77,9 @@ std::string BattlePointersState();
 // Full load like the title screen, then optionally switch nation. modReload: the mod's own reload (its load keeps the
 // saved victory points even outside a multiplayer session); false = as the player's own load (the test bridge).
 bool LoadCampaign(int slot, int playerIdx, bool modReload = true);
+// 0.7.1: nine nations, none nil, and PlayerNation one of them (a failed load of a save cut short leaves fewer); `why`
+// says what is missing.
+bool CampaignComplete(std::string* why = nullptr);
 void SetPlayerNation(int idx);               // switch the human-controlled nation and refresh the UI
 void RefreshUI();
 bool IsBusy();          // modal dialog open, turn running, or form disabled by the game
@@ -220,6 +247,24 @@ bool SetTestInvasionPlain(bool on);
 bool AmbushFixAvailable();
 bool SetTestCoup(int mode);
 long TestCoupRuns();  // TEST ONLY: the setups the switch made an ambush
+// 0.7.1 (fix-selforce): the battle setup's force builder SelectForce (its ally fallback and its no-force rule) is hooked;
+// the guard: where the game's ally fallback would read a missing division ("Error in SelectForce procedure! Access
+// violation ... Read of address 0000000D"), the force build ends with no force (DoBattle 0) without the box. Counted on
+// this PC: the guard's ends and the game's own no-force rule ("Friendly ships not available ..." / "Enemy unable to
+// challenge ...", its VP to the other side), each with the side of the last one.
+struct NoForceCounts {
+    long guard = 0, rule = 0;
+    int guardSide = -1, ruleSide = -1;
+    std::string guardWhy;  // "<nation> had no ship that could fight in <area>" (the last guard's)
+};
+NoForceCounts NoForce();
+bool SelectForceGuardAvailable();
+// TEST ONLY (`battles testnoforce <0|1|2> [ally] [n]`): the next n force builds of side 0 on this PC run without the
+// side's own ships in the area and with an ally's ships there, the ally fallback's draws high (2: the mod's guard off);
+// StartPlayerBattle's attempts meanwhile plain (no computer decline, not caught out); false if unavailable.
+bool SelectForceHooksAvailable();
+bool SetTestNoForce(int mode, int ally, int count = 1);
+long TestNoForceRuns();  // TEST ONLY: the force builds the switch ran
 int RunHostInvasionCheck();  // TEST ONLY (host): the game's CheckForInvasionBattles for the host (1/0, -1 exception)
 int QuickRaiderCalls();            // how often the game's QuickResolveRaiderBattle ran
 // 0.6.0 (B6's view, shared with B5), host: K's view of the campaign (K at index 0 and as PlayerNation, the host's nation
@@ -325,6 +370,9 @@ void TestSetWarCounter(int months);                     // TEST ONLY (bridge `ar
 // The relations view: on a PC that plays nation K > 0 as the player (a joined player's PC) the game's tension panel,
 // war and alliance marks, flags, map strength bars and war state show nation K's relations (game.cpp, KViewBegin).
 int ShownNationIndex();     // K when PlayerNation is BuilderNations[K] with K in 1..8, else 0
+// 0.7.1: the last ship data window ("View data"): `ok calls=<n> ship=<name> owner=<nation> asked=<nation the game passed>
+// used=<nation shown> design=<class of the design it finds>|- dnation=<n>` (bridge `shipdata`, read only)
+std::string DebugShipData();
 std::string DebugRelView();  // tests: what the strategic screen's tension panel and war state show now
 // Relations v2, B2: the computer's relation rules leave the pairs of the nations under the player's rules alone
 // (hookcb::PlayerRulesNation; game.cpp, PlayerRules). A mask a game exception left in place is undone here (month end).

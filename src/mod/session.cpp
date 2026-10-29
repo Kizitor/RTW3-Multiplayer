@@ -244,6 +244,10 @@ struct BattleReq {
     // 0.7.0 (invasions, P3): the battle came of the request's invasion check (an attempt of type 2, hello `gen` 4);
     // `opp` is then the invasion battle's enemy
     bool invasion = false;
+    // 0.7.1 (fix-selforce): the outcome was the game's no-force rule on the player's PC (result key `noforce`): side 0
+    // (the player's nation had no ships there that could fight: "declined", the enemy's points merged) or side 1 (the
+    // enemy had none: "avoided", the player's points merged); -1 otherwise. vp: those points.
+    int noForce = -1, noForceVP = 0;
 };
 static std::vector<BattleReq> g_battles;
 static int g_battleNextId = 1;
@@ -276,6 +280,10 @@ static struct {
     bool inv = false;    // 0.7.0 (P3): the nation's invasions are in the battle slot (sent back with the result)
     int iopp = -1;       // ... and the invasion check gave a battle (or a decline) against this nation (real index)
     bool iatt = true;    // ... which the player's nation attacked (its own invasion) or defended against
+    // 0.7.1 (fix-selforce): the battle setup found no force for a side: the game's no-force rule ran (its side: 0 the
+    // player's nation, 1 the enemy; its VP to the other side; the search ends there), and the last guard's why
+    int noForce = -1;
+    std::string nfWhy;
 } g_cb;
 static struct {  // TEST ONLY (`battles testraid <side> <J>`): the next raider check forces an interception
     int side = -1, J = -1;
@@ -2469,11 +2477,214 @@ static int WarLineNews() {
     return told;
 }
 
+// ---------------------------------------------------------------------------------------------
+// 0.7.1: the disk (a 0.7.0 report: the host's "Error in SaveDesignFiles procedure! Stream write error: There is not
+// enough space on the disk"). Before the month's saves this PC checks the free space of its save folder's drive: below
+// kLowDiskMB a notice and a chat line, once a month. A save that failed (game::SaveGame false: the game's own box during
+// the save, or a file it had to write that is missing, old or cut short) stops the month's flow where it is: nothing is
+// sent, merged or loaded from the broken files, and the campaign in memory stays as it was. The player frees space and
+// saves again (the game's Save button); once a save works, the step that stopped runs again (SaveStopTick).
+// Not every failed save is a full disk (sr7): game::LastSaveCause tells a full disk, a file of the save in use by another
+// program (OneDrive's sync, an antivirus scan: "Cannot create file ... being used by another process") and another error
+// apart. A file in use is mostly free again in a moment: the step waits and its save is tried again by itself
+// (SaveRetryTick: kSaveRetries times, kSaveRetryMs apart, the same game::SaveGame into the same slot, the game's box of
+// such a try kept off the screen but for the last); only then the step stops as for a full disk.
+enum class SaveStep { None, Turn, Send, Battles, Submit, Plans };
+static SaveStep g_saveStop = SaveStep::None;
+static uint32_t g_saveStopOk = 0;  // game::SaveOkCount() when the step stopped
+static int g_lowDiskSeq = -2;      // the month whose low-disk notice was shown
+static const int kSaveRetries = 5;
+static const DWORD kSaveRetryMs = 2000;
+static int g_saveRetry = 0;         // the stopped step's saves again so far
+static DWORD g_saveRetryAt = 0;     // when the next is due (0: none)
+static int g_saveRetrySlot = -1;    // the slot the step saved into (a save again goes only there)
+static uint32_t g_saveRetryOk = 0;  // game::SaveOkCount() + 1 after a save again worked (0: none; StepSave)
+static uint32_t g_saveRetryFails = 0;
+static DWORD g_saveRetryOkTick = 0;
+static std::string g_saveSaid;      // what the notice and the chat said about the stopped step (once per kind)
+static const char* SaveStepName(SaveStep s) {
+    return s == SaveStep::Turn      ? "the month"
+           : s == SaveStep::Send    ? "sending the new month"
+           : s == SaveStep::Battles ? "the battles"
+           : s == SaveStep::Plans   ? "the live battle (your plans are saved first)"
+                                    : "your turn";
+}
+
+static std::wstring OwnSaveDir() { return game::SaveDir(g_role == Role::Host ? g_hostSlot : g_clientSlot); }
+
+static std::string DriveOf(const std::wstring& dir) {
+    if (dir.size() >= 2 && dir[1] == L':') return W2U(dir.substr(0, 2));  // "C:"
+    return W2U(dir.substr(0, 40));
+}
+
+static void LowDiskCheck(const char* when) {
+    std::wstring dir = OwnSaveDir();
+    long long mb = FreeSpaceMB(dir);
+    if (mb < 0 || mb >= kLowDiskMB) return;
+    int seq = g_role == Role::Host ? g_seq : g_clientSeq;
+    if (seq == g_lowDiskSeq) return;
+    g_lowDiskSeq = seq;
+    std::string line = "Low disk space on drive " + DriveOf(dir) + " " + std::to_string(mb) +
+                       " MB free; the game may fail to save. Free some space.";
+    Log("disk: %s (before %s; the warning is below %lld MB)", line.c_str(), when, kLowDiskMB);
+    Notice(line);
+    if (g_role == Role::Host) {
+        AddChat("* The host's disk: " + line);
+    } else {
+        AddLocalChat("* " + line);
+        KV c;
+        c["text"] = "[disk] Low disk space here: " + std::to_string(mb) + " MB free; my game may fail to save.";
+        net::Send(0, net::MSG_CHAT, KVEncode(c));
+    }
+}
+
+// Why the save just failed: the game's save that ran (game::LastSaveCause); none ran (SaveGame refused): the free space
+// tells, as before 0.7.1 sr7.
+static game::SaveCause FailedSaveCause(long long mb) {
+    if (game::LastSaveFailed() && game::LastSaveCause() != game::SaveCause::None) return game::LastSaveCause();
+    return mb >= 0 && mb < kLowDiskMB ? game::SaveCause::DiskFull : game::SaveCause::Other;
+}
+
+// A failed save stopped `step`. A file in use: it is saved again by itself (SaveRetryTick); otherwise, or once those
+// tries are used up, the notice and the chat line naming the cause, and the step waits for a save that works.
+// retried: the failure of such a try (its tries go on; the notice and the chat line once per kind). known: the cause when
+// it was no save of the game's (the merge's own write on a full disk).
+static void SaveStopped(SaveStep step, bool retried = false, game::SaveCause known = game::SaveCause::None) {
+    std::wstring dir = OwnSaveDir();
+    long long mb = FreeSpaceMB(dir);
+    game::SaveCause cause = known != game::SaveCause::None ? known : FailedSaveCause(mb);
+    bool host = g_role == Role::Host;
+    if (!retried) g_saveRetry = 0;  // a new failure: tries of its own
+    if (g_saveStop != step) g_saveSaid.clear();
+    g_saveStop = step;
+    g_saveStopOk = game::SaveOkCount();
+    g_saveRetryAt = 0;
+    std::string stepName = SaveStepName(step);
+    std::string kind, line, toHost;
+    if (cause == game::SaveCause::InUse && g_saveRetry < kSaveRetries) {
+        g_saveRetrySlot = game::CurrentSlot();
+        g_saveRetryAt = GetTickCount() + kSaveRetryMs;
+        if (!g_saveRetryAt) g_saveRetryAt = 1;
+        Log("disk: a save failed: a file of it is in use (%s); %s waits: it saves again in %lu s (%d of %d)",
+            game::LastSaveFile().empty() ? "?" : game::LastSaveFile().c_str(), stepName.c_str(), kSaveRetryMs / 1000,
+            g_saveRetry + 1, kSaveRetries);
+        kind = "retry";
+        line = std::string("A file of ") + (host ? "the host's" : "your") + " campaign save was in use by another "
+               "program (for example OneDrive or antivirus): " + stepName + " waits; it saves again by itself.";
+        toHost = "a file of the save was in use by another program): " +
+                 (step == SaveStep::Submit ? std::string("my turn") : stepName) + " waits; it saves again by itself.";
+    } else {
+        std::string who = host ? "The host's" : "Your";
+        std::string what, advice;
+        if (cause == game::SaveCause::InUse) {
+            std::string file = game::LastSaveFile();
+            what = std::string("A file of ") + (host ? "the host's" : "your") + " campaign save is still in use by "
+                   "another program" + (file.empty() ? "" : " (" + file + ")");
+            advice = "Close that program or pause OneDrive's sync, then save (the game's Save button): it goes on then.";
+            kind = "inuse";
+            toHost = "a file of the save is still in use by another program";
+        } else if (cause == game::SaveCause::DiskFull) {
+            what = who + " disk is full (" + std::to_string(mb) + " MB free on drive " + DriveOf(dir) + ")";
+            advice = "Free space and save again (the game's Save button): it goes on then.";
+            kind = "full";
+            toHost = "the disk is full";
+        } else {
+            std::string text = game::LastSaveText();
+            what = who + " save failed (" + (text.empty() ? "no reason given" : text) + ")";
+            advice = "Save again (the game's Save button): it goes on then.";
+            kind = "other";
+            toHost = "the save failed: " + (text.empty() ? "no reason given" : text);
+        }
+        line = what + ": " + stepName + " stopped; the last good state is kept. " + advice;
+        toHost += "): " + (step == SaveStep::Submit ? std::string("my turn") : stepName) + " waits until it can.";
+        Log("disk: a save failed; %s stopped (%lld MB free; the cause: %s): %s", stepName.c_str(), mb,
+            game::SaveCauseName(cause), game::LastSaveError().c_str());
+    }
+    bool again = g_saveSaid == kind;
+    if (again && retried) return;  // (a try again that failed alike: logged only)
+    g_saveSaid = kind;
+    Notice(line);
+    if (again) return;  // (the chat line once per stop and kind)
+    if (host) {
+        AddChat("* " + line);
+    } else {
+        AddLocalChat("* " + line);
+        KV c;
+        c["text"] = "[disk] My game could not save (" + toHost;
+        net::Send(0, net::MSG_CHAT, KVEncode(c));
+    }
+}
+
+static void SaveWorked(SaveStep step) {
+    if (g_saveStop != step) return;
+    g_saveStop = SaveStep::None;
+    g_saveRetryAt = 0;
+    g_saveSaid.clear();
+    Log("disk: the save works again; %s goes on", SaveStepName(step));
+    AddLocalChat(std::string("* The game saves again: ") + SaveStepName(step) + " goes on.");
+}
+
+// Waiting for a save that works (the player's own Save): true while the step must not run yet.
+static bool SaveStopWaiting(SaveStep step) { return g_saveStop == step && game::SaveOkCount() == g_saveStopOk; }
+
+// The save of a step that stops on a failed save. Right after a save again worked (SaveRetryTick) that save is the
+// step's: a second one at once would meet the file again while the other program reads what was just written.
+static bool StepSave() {
+    bool fresh = g_saveRetryOk && g_saveRetryOk == game::SaveOkCount() + 1 &&
+                 g_saveRetryFails == game::SaveFailCount() && game::CurrentSlot() == g_saveRetrySlot &&
+                 GetTickCount() - g_saveRetryOkTick < 5000;
+    g_saveRetryOk = 0;
+    if (fresh) {
+        Log("disk: the step goes on with the save that just worked");
+        return true;
+    }
+    return game::SaveGame(true);
+}
+
+// The stopped step's save tried again while a file of it was in use (SaveStopped); once one works, the step goes on as
+// after the player's own Save (SaveStopWaiting).
+static void SaveRetryTick(DWORD now) {
+    if (!g_saveRetryAt || (int)(now - g_saveRetryAt) < 0) return;
+    if (g_saveStop == SaveStep::None || !SaveStopWaiting(g_saveStop)) {  // over, or a save worked meanwhile
+        g_saveRetryAt = 0;
+        return;
+    }
+    // (as the steps save: the player's save before a live battle runs while the battle waits to load, lockstep busy)
+    if (game::IsBusy() || game::BattleActive() || game::EventActive() ||
+        (g_saveStop != SaveStep::Plans && lockstep::Busy()))
+        return;
+    SaveStep step = g_saveStop;
+    g_saveRetryAt = 0;
+    if (game::CurrentSlot() != g_saveRetrySlot) {  // another slot is loaded now: no save there
+        Log("disk: %s: no save again (slot %d is loaded, the step saved slot %d)", SaveStepName(step),
+            game::CurrentSlot(), g_saveRetrySlot);
+        g_saveRetry = kSaveRetries;
+        SaveStopped(step, true);
+        return;
+    }
+    g_saveRetry++;
+    Log("disk: %s: saving again (%d of %d)", SaveStepName(step), g_saveRetry, kSaveRetries);
+    if (game::SaveGame(g_saveRetry < kSaveRetries)) {  // (the last try's box is shown: one box for the failure)
+        g_saveRetryOk = game::SaveOkCount() + 1;
+        g_saveRetryFails = game::SaveFailCount();
+        g_saveRetryOkTick = GetTickCount();
+        Log("disk: the save worked again (%d of %d); %s goes on", g_saveRetry, kSaveRetries, SaveStepName(step));
+        return;
+    }
+    SaveStopped(step, true);
+}
+
 static void BroadcastState() {
     HostArmsTreatyCheck("the month going out");  // also a resent month and a campaign hosted again
-    if (!game::SaveGame()) {
-        Notice("Saving the game failed; cannot send the new month.");
+    LowDiskCheck("sending the new month");
+    if (!StepSave()) {
+        SaveStopped(SaveStep::Send);
         return;
+    }
+    SaveWorked(SaveStep::Send);
+    if (g_saveStop != SaveStep::None) {  // a new month goes out: an older stopped step is over
+        Log("disk: %s no longer waits (the new month goes out)", SaveStepName(g_saveStop));
+        g_saveStop = SaveStep::None;
     }
     std::wstring dir = game::SaveDir(g_hostSlot);
     int y = 0, m = 0;
@@ -2569,6 +2780,35 @@ static const char* BattleStateName(int s) {
 }
 
 static std::wstring HostBcsPath() { return game::SaveDir(g_hostSlot) + L"RTWGame" + std::to_wstring(g_hostSlot) + L".bcs"; }
+
+// Client: the battle slot saved and read for a battle's result. 0.7.1: false when the save failed (the disk is full):
+// a result read from a broken or old save would be wrong; the host lets the game resolve the battle instead. A file of
+// it in use by another program (sr7): saved again here at once, kSaveRetries times 1 s apart (the battle's end waits a
+// few seconds rather than lose the result).
+static bool SaveBattleSlot(std::string& after, std::string& err) {
+    bool ok = game::SaveGame(true);
+    for (int i = 1; !ok && game::LastSaveCause() == game::SaveCause::InUse && i <= kSaveRetries; i++) {
+        Log("battle: a file of the battle's save is in use (%s); saving again in 1 s (%d of %d)",
+            game::LastSaveFile().c_str(), i, kSaveRetries);
+        Sleep(1000);
+        ok = game::SaveGame(i < kSaveRetries);
+    }
+    if (!ok) {
+        long long mb = FreeSpaceMB(game::SaveDir(g_battleSlot));
+        game::SaveCause cause = FailedSaveCause(mb);
+        err = "the player's game could not save the battle (" +
+              (cause == game::SaveCause::DiskFull  ? "the disk is full, " + std::to_string(mb) + " MB free"
+               : cause == game::SaveCause::InUse ? "a file of the save is still in use by another program"
+                                                 : game::LastSaveText()) + ")";
+        AddLocalChat("* " + err + ".");
+        return false;
+    }
+    if (!ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", after)) {
+        err = "cannot read the saved battle";
+        return false;
+    }
+    return true;
+}
 
 // Host: a live battle between two players' nations is over (or abandoned): stop relaying it; the player still in it
 // (B, or A if B was the one who left) hears that the other one is gone.
@@ -2970,7 +3210,14 @@ static bool BattlesDone() {
 // strategic screen is locked meanwhile: the save file is the campaign's state until the results are loaded.
 static void BattlePhaseTick() {
     if (!g_battlePhase) {
-        if (!game::SaveGame() || !ReadFileBytes(HostBcsPath(), g_battlePhaseBytes)) {
+        if (SaveStopWaiting(SaveStep::Battles)) return;  // 0.7.1: after a failed save, until a save works
+        LowDiskCheck("the battles");
+        if (!StepSave()) {  // 0.7.1: the battles wait (their results go into the saved month)
+            SaveStopped(SaveStep::Battles);
+            return;
+        }
+        SaveWorked(SaveStep::Battles);
+        if (!ReadFileBytes(HostBcsPath(), g_battlePhaseBytes)) {
             for (auto& r : g_battles) BattleFallback(r, "the host could not save the month");
             return;
         }
@@ -3054,7 +3301,15 @@ static bool FinishBattlePhase() {
     }
     for (auto& r : g_battles) {
         if (r.state == 2) {
-            AddChat("* " + (r.avoided    ? "The " + CampaignNationName(r.opp) + " navy declined battle against " +
+            AddChat("* " + (r.noForce == 0 ? CampaignNationName(r.human) + " had no ships to oppose " +
+                                                 CampaignNationName(r.opp) + InArea(r.area) + ": " +
+                                                 CampaignNationName(r.opp) + " gains " + std::to_string(r.noForceVP) +
+                                                 " VP."
+                            : r.noForce == 1 ? CampaignNationName(r.opp) + " had no ships to challenge " +
+                                                   CampaignNationName(r.human) + InArea(r.area) + ": " +
+                                                   CampaignNationName(r.human) + " gains " +
+                                                   std::to_string(r.noForceVP) + " VP."
+                            : r.avoided  ? "The " + CampaignNationName(r.opp) + " navy declined battle against " +
                                             CampaignNationName(r.human) + InArea(r.area) + "."
                             : r.declined ? r.player + " declined battle for " + CampaignNationName(r.human) + " against " +
                                                CampaignNationName(r.opp) + InArea(r.area) + "."
@@ -3232,7 +3487,7 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         if ((outcome != "fought" && !avoided && !declined) || !b.Unpack(body)) {
             std::string why = KVStr(h, "why");
             BattleFallback(r, outcome == "declined"                    ? p.name + " declined it"
-                              : outcome == "nobattle" && r.kind == 2 && !why.empty() ? why  // the surprise attack's
+                              : outcome == "nobattle" && !why.empty()  ? why  // the surprise attack's; 0.7.1: no force
                               : outcome == "nobattle"                  ? "no battle came about"
                                                                        : "it was not fought (" + KVStr(h, "why", outcome) + ")");
             return;
@@ -3258,14 +3513,23 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         r.declined = declined;
         g_battleMerged = true;
         if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
-        Log("battle %d applied: %s (player: %s)%s", id, summary.c_str(), KVStr(h, "summary").c_str(),
-            avoided    ? "; the enemy declined battle"
-            : declined ? "; the player declined battle"
-            : r.raider == 2 ? "; a raider battle, auto-resolved"
-            : r.raider == 1 ? "; a raider battle"
-                            : "");
         const std::string* deltas = b.Get("deltas");
         KV dk = deltas ? KVDecode(*deltas) : KV();
+        int nfs = KVInt(h, "noforce", -1);  // 0.7.1 (fix-selforce): the game's no-force rule gave this outcome
+        if (!r.pvp && ((nfs == 0 && declined) || (nfs == 1 && avoided))) {
+            r.noForce = nfs;
+            r.noForceVP = KVInt(dk, nfs == 0 ? "dVP_J" : "dVP_K");
+        }
+        Log("battle %d applied: %s (player: %s)%s", id, summary.c_str(), KVStr(h, "summary").c_str(),
+            r.noForce == 0  ? "; the player's nation had no ships there that could fight (the game's no-force rule, not "
+                              "a decline): the enemy's points"
+            : r.noForce == 1 ? "; the enemy had no ships there that could fight (the game's no-force rule): the player's "
+                               "points"
+            : avoided        ? "; the enemy declined battle"
+            : declined       ? "; the player declined battle"
+            : r.raider == 2  ? "; a raider battle, auto-resolved"
+            : r.raider == 1  ? "; a raider battle"
+                             : "");
         CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K")), std::max(0, KVInt(dk, "dVP_J")));
         return;
     }
@@ -3297,20 +3561,24 @@ static void RunHostTurn() {
     g_turnStartTick = GetTickCount();
     BroadcastLobby();
     BroadcastStatus("The host is processing the turn...");
-    if (!game::SaveGame()) {
-        Notice("Saving failed; turn aborted.");
+    LowDiskCheck("the month");
+    if (!StepSave()) {
+        SaveStopped(SaveStep::Turn);
         g_phase = Phase::Planning;
         g_turnRunning = false;
         return;
     }
+    SaveWorked(SaveStep::Turn);
     g_relSavePending = false;  // this save holds the month's relation changes too
     std::wstring dir = game::SaveDir(g_hostSlot);
     nplay::HostAttach(dir, CampaignKey());
     int merged = 0;
+    bool diskFull = false;
     for (auto& s : g_submissions) {
         auto it = g_players.find(s.first);
         if (it == g_players.end()) continue;
         std::string err;
+        ResetWriteFailed();
         if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err)) {
             merged++;
             nplay::HostTakeSubmission(s.second, it->second.nation);  // its own intelligence spending and reports
@@ -3323,12 +3591,24 @@ static void RunHostTurn() {
                 AddChat("* " + it->second.name + "'s hand-built legacy fleet of " +
                         W2U(game::NationName(it->second.nation)) + " is in the campaign.");
             }
+        } else if (WriteFailedDiskFull()) {  // 0.7.1: the month stops (the merge left the save as it was)
+            Log("host turn: %s's turn NOT merged: the disk is full (%s); the month stops", it->second.name.c_str(),
+                err.c_str());
+            diskFull = true;
+            break;
         } else {
             Log("host turn: %s's turn NOT applied: %s", it->second.name.c_str(), err.c_str());
             AddChat("* Could not apply " + it->second.name + "'s turn: " + err);
             Notice(it->second.name + "'s turn could not be applied (" + err + "). Their nation keeps last month's "
                    "orders this month.");
         }
+    }
+    if (diskFull) {  // the turns stay; the next Turn saves the campaign in memory again and merges them all
+        SaveStopped(SaveStep::Turn, false, game::SaveCause::DiskFull);
+        g_phase = Phase::Planning;
+        g_turnRunning = false;
+        BroadcastLobby();
+        return;
     }
     g_submissions.clear();
     std::vector<std::wstring> marks = merged > 0 ? inv::MarkedThisTurn() : std::vector<std::wstring>();
@@ -3917,10 +4197,13 @@ static int OwnSlotDivisions(const std::wstring& dir, int nation, int year, int m
     return foreign;
 }
 
+static DWORD g_stateRetryAt = 0;  // 0.7.1: a month package that a full disk could not store is stored again then
+
 static void ClientApplyPendingState() {
     if (g_pendingState.empty() || game::IsBusy() || game::BattleActive()) return;
     if (g_cb.fighting || g_cb.starting || !g_battleIn.empty()) return;  // a battle slot is in use (see below)
     if (lockstep::Busy() || g_lsLeave) return;                          // a live battle uses the battle slot
+    if (g_stateRetryAt && (int)(GetTickCount() - g_stateRetryAt) < 0) return;
     std::string payload;
     payload.swap(g_pendingState);
     KV h;
@@ -3943,9 +4226,34 @@ static void ClientApplyPendingState() {
     // ships the Fleet organization dereferences): then an empty list, as a host sends to a client without `div`.
     if (!hostDivs && nation > 0 && !dir.empty() && game::DivisionsAvailable())
         ownForeign = OwnSlotDivisions(dir, nation, KVInt(h, "year"), KVInt(h, "month"), ownDivs);
+    if (!g_stateRetryAt) LowDiskCheck("storing the new month");
+    ResetWriteFailed();
     if (dir.empty() || !saveio::ApplyStateBundle(b, dir, g_clientSlot, err)) {
+        if (WriteFailedDiskFull()) {  // 0.7.1: kept and stored again; the game keeps the last month meanwhile
+            g_pendingState.swap(payload);
+            bool first = g_stateRetryAt == 0;
+            g_stateRetryAt = GetTickCount() + 15000;
+            Log("disk: the new month could not be stored (%s; %lld MB free); again in 15 s", err.c_str(),
+                FreeSpaceMB(dir));
+            if (first) {
+                std::string line = "Your disk is full (" + std::to_string(FreeSpaceMB(dir)) + " MB free on drive " +
+                                   DriveOf(dir) + "): the new month could not be stored. Free some space: it is stored "
+                                   "and loaded then by itself.";
+                Notice(line);
+                AddLocalChat("* " + line);
+                KV c;
+                c["text"] = "[disk] My disk is full: the new month waits on my PC until I free some space.";
+                net::Send(0, net::MSG_CHAT, KVEncode(c));
+            }
+            return;
+        }
         Notice("Cannot store the received game: " + err);
         return;
+    }
+    if (g_stateRetryAt) {
+        g_stateRetryAt = 0;
+        Log("disk: the new month is stored now");
+        AddLocalChat("* The new month is stored now.");
     }
     if (nation > 0) {
         int n = 0;
@@ -4044,6 +4352,10 @@ static void ClientApplyPendingState() {
         Notice("Loading the received game failed.");
         return;
     }
+    if (g_saveStop == SaveStep::Submit || g_saveStop == SaveStep::Plans) {  // 0.7.1: that month is over
+        Log("disk: %s no longer waits (a new month is loaded)", SaveStepName(g_saveStop));
+        g_saveStop = SaveStep::None;
+    }
     if (legacyNow) {
         std::string info;
         if (game::EnterLegacyBuild(info)) {
@@ -4131,12 +4443,14 @@ static void ClientApplyPendingState() {
 static int g_battleInId = -1;
 
 static void SendBattleResult(int id, const std::string& outcome, const std::string& why, const Bundle* b,
-                             const std::string& summary) {
+                             const std::string& summary, const KV* extra = nullptr) {
     KV h;
     h["id"] = std::to_string(id);
     h["outcome"] = outcome;
     h["why"] = why;
     h["summary"] = summary;
+    if (extra)
+        for (auto& kv : *extra) h[kv.first] = kv.second;
     if (id == g_cb.id && g_cb.kind != 0 && g_cb.cand >= 0) {  // 0.6.0: the attempt that gave it, and its sea area
         h["cand"] = std::to_string(g_cb.cand);
         h["area"] = W2U(g_cb.area);
@@ -4287,6 +4601,8 @@ static void ClientStartBattle() {
     g_cb.inv = false;
     g_cb.iopp = -1;
     g_cb.iatt = true;
+    g_cb.noForce = -1;
+    g_cb.nfWhy.clear();
     if (h.find("kinv") != h.end() && inv::Available()) {
         // 0.7.0 (invasions, P3): the nation's invasions and plan in place of the host's (the slot is the host's campaign)
         inv::KState one[9];
@@ -4331,6 +4647,25 @@ static void ClientStartBattle() {
     }
     int setups = game::DoBattleCalls(), declines = game::PlayerDeclineCalls();
     int vp0 = game::NationVP(0);  // the player's nation is nation 0 in the battle slot
+    int evp0 = game::EnemyVP();   // ... and EnemyVP its enemies' points
+    // 0.7.1 (fix-selforce): the battle setups (DoBattle) of this request that found no force for a side. The mod's guard
+    // of the game's ally fallback (no points): the attempt gave no battle, the next one is played (single player's
+    // CheckAttackLocation answers False and its generator goes on). The game's own no-force rule (its points to the
+    // other side): the request's outcome, sent as such (not as the player's decline); the search ends there.
+    int nfSetups = 0;
+    auto noForceOf = [&](game::NoForceCounts& before, int i) {
+        game::NoForceCounts now = game::NoForce();
+        int guardN = (int)(now.guard - before.guard), ruleN = (int)(now.rule - before.rule);
+        before = now;
+        if (guardN + ruleN <= 0) return;
+        nfSetups += guardN + ruleN;
+        if (ruleN > 0) g_cb.noForce = now.ruleSide;
+        if (guardN > 0) g_cb.nfWhy = now.guardWhy;
+        Log("battle %d: attempt %d: the battle setup found no force for a side (%s)", id, i,
+            ruleN > 0 ? (now.ruleSide == 0 ? "the game's no-force rule for our side: the enemy gains its points"
+                                           : "the game's no-force rule for the enemy's side: we gain its points")
+                      : ("the mod's guard of the game's ally fallback: " + now.guardWhy + "; no battle, no points").c_str());
+    };
     if (g_cb.kind == 2) {  // 0.6.0 (B6 piece 2): a surprise attack; the battle slot's year decides the game's path
         int y = 0, mo = 0;
         saveio::ReadDate(dir, g_battleSlot, y, mo);
@@ -4352,6 +4687,7 @@ static void ClientStartBattle() {
         g_cb.cand = i;
         g_cb.opp = t.a == K ? t.b : t.a;
         g_cb.area = t.area;
+        game::NoForceCounts nfA = game::NoForce();
         if (g_cb.kind == 2) {
             if (!game::AtWar(sw(t.a), sw(t.b))) {  // e.g. a peace came first: no surprise attack between them
                 Log("battle %d: attempt %d (%d strikes %d): not at war in the battle slot", id, i, t.a, t.b);
@@ -4364,7 +4700,7 @@ static void ClientStartBattle() {
             for (int tries = 0;; tries++) {
                 saTrue = game::StartSurpriseAttack(sw(t.a), sw(t.b));
                 if (g_role != Role::Client || g_cb.id != id || saTrue || game::BattleActive() ||
-                    game::DoBattleCalls() != setups || game::PlayerDeclineCalls() != declines ||
+                    game::DoBattleCalls() - nfSetups != setups || game::PlayerDeclineCalls() != declines ||
                     game::NationVP(0) != vp0 || tries >= g_testSaRetry)
                     break;
                 Log("battle %d: test: CheckSurpriseAttack asked again (%d of %d)", id, tries + 1, g_testSaRetry);
@@ -4377,7 +4713,10 @@ static void ClientStartBattle() {
             game::InvasionCheck ic = game::StartInvasionCheck(humans);
             for (auto& l : ic.news) g_cb.news.push_back(W2U(l));
             bool any = inv::PossessionBattles(&pb) != pb0;
-            bool gave = ic.result || game::BattleActive() || game::DoBattleCalls() != s0 ||
+            game::NoForceCounts nfI = game::NoForce();  // 0.7.1: its setups that found no force are no battle
+            int nfHere = (int)(nfI.guard - nfA.guard + nfI.rule - nfA.rule);
+            bool rule = nfI.rule != nfA.rule;
+            bool gave = ic.result || game::BattleActive() || game::DoBattleCalls() - s0 > nfHere || rule ||
                         game::PlayerDeclineCalls() != d0 || game::NationVP(0) != v0;
             if (any && gave) {
                 int e = pb.attacker == 0 ? pb.defender : pb.attacker;  // the enemy, this slot's index
@@ -4389,12 +4728,14 @@ static void ClientStartBattle() {
                     id, i,
                     ic.result || game::BattleActive()     ? "a battle"
                     : game::PlayerDeclineCalls() != d0     ? "the player's decline"
+                    : rule                                 ? "no force for a side (the game's no-force rule)"
                     : game::NationVP(0) != v0              ? "no battle (the points changed)"
                                                            : "a battle set up",
                     W2U(pb.poss).c_str(), W2U(pb.area).c_str(), g_cb.iopp,
                     g_cb.iatt ? " (our invasion)" : " (the enemy's invasion)", inv::PossessionBattlesText(pb0).c_str(),
                     ic.plain >= 0 ? (" (TEST: plain, " + std::to_string(ic.plain) + " answer(s))").c_str() : "");
             } else if (!gave && g_role == Role::Client && g_cb.id == id) {
+                noForceOf(nfA, i);
                 Log("battle %d: attempt %d (invasion check) gave no battle (possession battles: %s; %d turn message(s))",
                     id, i, inv::PossessionBattlesText(pb0).c_str(), (int)ic.news.size());
                 continue;
@@ -4418,6 +4759,7 @@ static void ClientStartBattle() {
                     rc.side == 0 ? "our raider intercepted:" : "our patrol intercepts:", ropp, W2U(rc.area).c_str(),
                     g_cb.raider == 2 ? "auto-resolved" : "fought");
             } else if (g_role == Role::Client && g_cb.id == id) {
+                noForceOf(nfA, i);
                 Log("battle %d: attempt %d (raider check) found no interception (%d turn message(s))", id, i,
                     (int)rc.news.size());
                 continue;
@@ -4426,15 +4768,18 @@ static void ClientStartBattle() {
             started = game::StartPlayerBattle(sw(t.a), sw(t.b), t.area);
         }
         if (g_role != Role::Client || g_cb.id != id) break;
-        if (started || game::BattleActive() || game::DoBattleCalls() != setups ||
+        long guards = game::NoForce().guard - nfA.guard;
+        noForceOf(nfA, i);
+        if (started || game::BattleActive() || game::DoBattleCalls() - nfSetups != setups || g_cb.noForce >= 0 ||
             game::PlayerDeclineCalls() != declines || game::NationVP(0) != vp0)
-            break;  // a battle, a decline (the player's or the enemy's) or its points: this attempt is the month's
-        Log("battle %d: attempt %d (%d attacks %d in %s) found no battle", id, i, t.a, t.b,
-            t.area.empty() ? "an area the game picks" : W2U(t.area).c_str());
+            break;  // a battle, a decline (the player's or the enemy's), its points or the no-force rule: the month's
+        Log("battle %d: attempt %d (%d attacks %d in %s) found no battle%s", id, i, t.a, t.b,
+            t.area.empty() ? "an area the game picks" : W2U(t.area).c_str(),
+            guards > 0 ? " (its setup found no force: the next attempt, as single player)" : "");
     }
-    bool entered = game::DoBattleCalls() != setups;  // the game set the battle up (its preview was shown)
+    bool entered = game::DoBattleCalls() - nfSetups != setups;  // the game set a battle up (its preview was shown)
     bool declinedHere = game::PlayerDeclineCalls() != declines;  // the player declined (the question or the preview)
-    if (entered && !game::LastBattleArea().empty()) g_cb.area = game::LastBattleArea();
+    if ((entered || g_cb.noForce >= 0) && !game::LastBattleArea().empty()) g_cb.area = game::LastBattleArea();
     opp = g_cb.opp;
     area = g_cb.area;
     if (g_role != Role::Client || g_cb.id != id) {  // the session ended during the battle preview
@@ -4452,9 +4797,7 @@ static void ClientStartBattle() {
     if (started && g_cb.raider == 2) {  // 0.7.0: the player chose "Auto resolve": QuickResolveRaiderBattle ran here
         std::string after, summary, err;
         Bundle res;
-        game::SaveGame();
-        if (ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", after) &&
-            saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err)) {
+        if (SaveBattleSlot(after, err) && saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err)) {
             SendBattleResult(id, "fought", "", &res, summary);
             AddChat("* Raider battle against the " + W2U(game::NationName(opp)) + " navy" +
                     (area.empty() ? "" : " in " + W2U(area)) + " auto-resolved; result sent to the host (" + summary + ").");
@@ -4469,22 +4812,44 @@ static void ClientStartBattle() {
         int gain = game::NationVP(0) - vp0;
         bool pvp = KVInt(h, "pvp") != 0;
         std::string resolves = g_cb.kind == 0 ? "; the game resolves it." : ".";
+        std::string in = area.empty() ? "" : " in " + W2U(area);
+        KV nf;  // 0.7.1 (fix-selforce): the game's no-force rule gave the outcome, of side 0 or 1 (older hosts: ignored)
+        if (g_cb.noForce >= 0 && !pvp && !declinedHere && !entered) nf["noforce"] = std::to_string(g_cb.noForce);
         if (!entered && !declinedHere && gain > 0 && !pvp) {
             // The enemy declined battle (the game's AIDeclinesBattle before any preview: "The <nation> navy declines
             // battle! You gain N VP!"): as in single player there is no battle and the player keeps the points. Before
             // 0.4.1 this was "no battle came about" and the host let the game resolve it as a battle between AI nations.
+            // 0.7.1: the same for the game's no-force rule of the enemy's side ("Enemy unable to challenge our forces
+            // in the area! Gain N VP!"; before 0.7.1 sent as the player's decline).
             std::string after, summary, err;
             Bundle res;
-            game::SaveGame();
-            if (ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", after) &&
-                saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err)) {
-                SendBattleResult(id, "avoided", "", &res, summary);
-                AddChat("* The " + W2U(game::NationName(opp)) + " navy declined battle: " + W2U(game::NationName(0)) +
-                        " gains " + std::to_string(gain) + " VP.");
+            if (SaveBattleSlot(after, err) && saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err)) {
+                SendBattleResult(id, "avoided", "", &res, summary, nf.empty() ? nullptr : &nf);
+                AddChat(g_cb.noForce == 1 && !nf.empty()
+                            ? "* The " + W2U(game::NationName(opp)) + " navy had no ships to challenge our forces" + in +
+                                  ": " + W2U(game::NationName(0)) + " gains " + std::to_string(gain) + " VP."
+                            : "* The " + W2U(game::NationName(opp)) + " navy declined battle: " +
+                                  W2U(game::NationName(0)) + " gains " + std::to_string(gain) + " VP.");
             } else {
                 SendBattleResult(id, "nobattle", "cannot read the result: " + err, nullptr, "");
                 AddChat("* No battle came about" + resolves);
             }
+            LeaveBattleSlot();
+            return;
+        }
+        if (g_cb.noForce == 0 && !nf.empty()) {
+            // 0.7.1 (fix-selforce): the game's no-force rule of our side ("Friendly ships not available to oppose the
+            // enemy in the area! Enemy gains N VP!", the decline count, an enemy's landing): not the player's decline,
+            // but its consequences go to the host the way a decline's do (merged; older hosts: as a decline).
+            std::string after, summary, err;
+            Bundle res;
+            int lost = game::EnemyVP() - evp0;
+            bool ok = g_hostGen >= 1 && SaveBattleSlot(after, err) &&
+                      saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err);
+            SendBattleResult(id, "declined", ok || g_hostGen < 1 ? "" : "cannot read the result: " + err,
+                             ok ? &res : nullptr, summary, &nf);
+            AddChat("* Friendly ships not available to oppose the " + W2U(game::NationName(opp)) + " navy" + in + ": " +
+                    W2U(game::NationName(opp)) + " gains " + std::to_string(lost) + " VP" + (ok ? "." : resolves));
             LeaveBattleSlot();
             return;
         }
@@ -4494,9 +4859,7 @@ static void ClientStartBattle() {
             // A host without it (welcome `gen`; 0.5.0) gets the decline alone and lets the game resolve the battle.
             std::string after, summary, err;
             Bundle res;
-            game::SaveGame();
-            bool ok = ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs",
-                                    after) &&
+            bool ok = SaveBattleSlot(after, err) &&
                       saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err);
             SendBattleResult(id, "declined", ok ? "" : "cannot read the result: " + err, ok ? &res : nullptr, summary);
             AddChat("* You declined the battle" + (ok ? " (" + summary + ")." : resolves));
@@ -4506,20 +4869,25 @@ static void ClientStartBattle() {
         if (g_cb.kind == 2 && !declined) {  // 0.6.0: a surprise attack that did not come about (the host does nothing)
             const game::BattleAttempt* t = g_cb.cand >= 0 && g_cb.cand < (int)atts.size() ? &atts[g_cb.cand] : nullptr;
             bool mine = t && t->a == K;
-            std::string why = !played            ? "the war is over"
+            std::string why = !played              ? "the war is over"
+                              : !g_cb.nfWhy.empty() ? g_cb.nfWhy  // 0.7.1: its setup found no force for a side
                               : saTrue && !entered ? "the player let the chance go"
-                              : mine             ? "no opportunity found for the surprise attack"
-                                                 : "the surprise attack did not come about";
+                              : mine               ? "no opportunity found for the surprise attack"
+                                                   : "the surprise attack did not come about";
             SendBattleResult(id, "nobattle", why, nullptr, "");
             AddChat(!played              ? "* No surprise attack: the war is over."
+                    : !g_cb.nfWhy.empty() ? "* No surprise attack: " + g_cb.nfWhy + "."
                     : saTrue && !entered ? "* You let the chance of a surprise attack go."
                     : mine               ? "* No opportunity found for a surprise attack."
                                          : "* No surprise attack came about.");
             LeaveBattleSlot();
             return;
         }
-        SendBattleResult(id, declined ? "declined" : "nobattle", "", nullptr, "");
-        AddChat((declined ? "* You declined the battle" : "* No battle came about") + resolves);
+        // 0.7.1 (fix-selforce): a setup that found no force (the mod's guard) gave no battle: its reason goes with it
+        std::string why = declined ? std::string() : g_cb.nfWhy;
+        SendBattleResult(id, declined ? "declined" : "nobattle", why, nullptr, "");
+        AddChat((declined ? "* You declined the battle" : "* No battle came about") +
+                (why.empty() ? std::string() : " (" + why + ")") + resolves);
         LeaveBattleSlot();
         return;
     }
@@ -4585,8 +4953,7 @@ static void ClientBattleTick() {
         } else {
             std::string after, summary, err;
             Bundle res;
-            game::SaveGame();
-            if (ReadFileBytes(game::SaveDir(g_battleSlot) + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", after) &&
+            if (SaveBattleSlot(after, err) &&
                 saveio::ExtractBattleResult(g_cb.before, after, g_cb.K, g_cb.opp, res, summary, err)) {
                 SendBattleResult(id, "fought", "", &res, summary);
                 AddChat("* Battle result sent to the host (" + summary + ").");
@@ -5272,7 +5639,15 @@ void Init() {
     };
     lh.loadReady = [] {  // a dialog or event of the player's game: the battle loads once it is closed
         if (game::IsBusy() || game::BattleActive() || game::EventActive()) return false;
-        if (g_haveState && !g_submitted && game::CurrentSlot() == g_clientSlot) game::SaveGame();  // keep the plans
+        if (g_haveState && !g_submitted && game::CurrentSlot() == g_clientSlot) {  // keep the plans
+            // 0.7.1: not from a failed save (the game comes back to this slot after the battle): it waits for a save
+            if (SaveStopWaiting(SaveStep::Plans)) return false;
+            if (!StepSave()) {
+                SaveStopped(SaveStep::Plans);
+                return false;
+            }
+            SaveWorked(SaveStep::Plans);
+        }
         return true;
     };
     lh.battleSlot = [] { return g_battleSlot; };
@@ -5502,6 +5877,22 @@ std::string DebugBattles(const std::vector<std::string>& a) {
             runs);
         return "ok testcoup=" + std::to_string(mode) + " forced=" + std::to_string(runs);
     }
+    if (cmd == "testnoforce" && a.size() > 2) {  // 0.7.1 (fix-selforce), tests (any PC): testnoforce <0|1|2> [ally] [n]
+        int mode = atoi(a[2].c_str()), ally = a.size() > 3 ? atoi(a[3].c_str()) : -1;
+        int n = a.size() > 4 ? atoi(a[4].c_str()) : 1;
+        if (mode < 0 || mode > 2 || n < 1 || n > 8) return "error usage: testnoforce <0|1|2> [ally] [n 1-8]";
+        if (!game::SetTestNoForce(mode, ally, n)) return "error not available";
+        Log("tests: the next %d force build(s) of side 0 on this PC %s (builds run by the switch so far: %ld)",
+            mode == 0 ? 0 : n,
+            mode == 0   ? "as the game has it"
+            : mode == 1 ? "run without the side's ships in the area and with an ally's there, the attempts plain"
+                        : "run without the side's ships in the area and with an ally's there, the attempts plain, the "
+                          "mod's guard off (the game's box)",
+            game::TestNoForceRuns());
+        return "ok testnoforce=" + std::to_string(mode) + " n=" + std::to_string(mode == 0 ? 0 : n) +
+               " runs=" + std::to_string(game::TestNoForceRuns()) +
+               " guard=" + (game::SelectForceGuardAvailable() ? "1" : "0");
+    }
     if (g_role != Role::Host) return "error host only";
     if (cmd == "list") {
         std::string s = "ok phase=" + std::string(g_battlePhase ? "1" : "0") + " timeout=" +
@@ -5563,11 +5954,18 @@ std::string DebugBattles(const std::vector<std::string>& a) {
             p->name.c_str());
         return "ok " + std::to_string(r.id);
     }
-    if (cmd == "injectgen" && a.size() > 3) {  // B6, tests: a request of the player's generator: K attacks J [in area]
+    if (cmd == "injectgen" && a.size() > 3) {  // B6, tests: a request of the player's generator: K attacks J [in area] [xN]
         if (g_afterTurnPending || g_battlePhase) return "error not while the month or its battles are processed";
         int K = atoi(a[2].c_str()), J = atoi(a[3].c_str());
+        size_t last = a.size();
+        int reps = 1;  // 0.7.1 (fix-selforce): xN: N attempts, the same each (a request whose first attempts give none)
+        if (last > 4 && a[last - 1].size() > 1 && a[last - 1][0] == 'x' &&
+            a[last - 1].find_first_not_of("0123456789", 1) == std::string::npos) {
+            reps = std::max(1, std::min(8, atoi(a[last - 1].c_str() + 1)));
+            last--;
+        }
         std::string areaName;
-        for (size_t i = 4; i < a.size(); i++) areaName += (i > 4 ? " " : "") + a[i];
+        for (size_t i = 4; i < last; i++) areaName += (i > 4 ? " " : "") + a[i];
         std::wstring area = U2W(areaName);
         auto names = game::AreaNames();
         if (!area.empty() && std::find(names.begin(), names.end(), area) == names.end())
@@ -5581,7 +5979,7 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         BattleReq r;
         r.id = g_battleNextId++;
         r.kind = 1;
-        r.attempts = {t};
+        r.attempts.assign(reps, t);
         r.a = K;
         r.b = J;
         r.area = area;
@@ -5589,8 +5987,8 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         r.opp = J;
         r.player = PlayerOfNation(K)->name;
         g_battles.push_back(r);
-        Log("battle request %d injected (the player's generator): nation %d attacks %d%s", r.id, K, J,
-            InArea(area).c_str());
+        Log("battle request %d injected (the player's generator): nation %d attacks %d%s, %d attempt(s)", r.id, K, J,
+            InArea(area).c_str(), reps);
         return "ok " + std::to_string(r.id);
     }
     if (cmd == "injectraid" && a.size() > 2) {  // 0.7.0, tests: a request of the player's generator: one raider check
@@ -5803,6 +6201,12 @@ void Leave() {
     nplay::HostDetach();
     nplay::ClientReset();
     g_pendingState.clear();
+    g_saveStop = SaveStep::None;  // 0.7.1
+    g_saveRetryAt = 0;
+    g_saveRetryOk = 0;
+    g_saveSaid.clear();
+    g_stateRetryAt = 0;
+    g_lowDiskSeq = -2;
     g_hostWantsTurn = g_turnRunning = g_afterTurnPending = false;
     g_autoStart = false;
     if (g_battlePhase) game::SetStrategicEnabled(true);
@@ -6072,7 +6476,12 @@ void SubmitTurn() {
         Log("submit: cancelled at a Turn warning");
         return;
     }
-    game::SaveGame();
+    LowDiskCheck("your turn");
+    if (!StepSave()) {  // 0.7.1: no turn from broken files; it is submitted once a save works
+        SaveStopped(SaveStep::Submit);
+        return;
+    }
+    SaveWorked(SaveStep::Submit);
     Bundle b;
     std::string err;
     if (!saveio::BuildSubmission(game::SaveDir(g_clientSlot), g_clientSlot, g_myNation, g_clientIdStart, b, err,
@@ -6458,6 +6867,7 @@ std::string DebugLockstep(const std::vector<std::string>& a) {
 }
 
 void OnNet() {
+    if (game::SaveInProgress()) return;  // 0.7.1: not inside the game's save (its box's message loop); Tick drains them
     net::Msg m;
     while (net::Pop(m)) {
         try {
@@ -6472,6 +6882,10 @@ void OnNet() {
 }
 
 void Tick() {
+    // 0.7.1: nothing of the session runs inside the game's save (the message loop of a failed save's box): it could
+    // save, send or load in the middle of it
+    if (game::SaveInProgress()) return;
+    OnNet();  // (messages that came during a save)
     DWORD now = GetTickCount();
     lockstep::Tick();
     // 0.7.0: a legacy build belongs to a joined player's session (its skips must not outlive it)
@@ -6490,6 +6904,7 @@ void Tick() {
         Log("battle slot mode ended (%s)", g_role == Role::Host ? "the host's test battle outside a month is over"
                                                                  : "no session: the battle that outlived it is over");
     }
+    SaveRetryTick(now);  // 0.7.1 (sr7): a step's save tried again while a file of it was in use
     if (g_role == Role::Host) {
         if (g_lsHost.opp >= 0 && lockstep::IsHolding() && now - g_lsHost.lastTry > 500) HostTryStartLockstep();
         // A rejoin that never got to start (given up at the boundary, cancelled): the host's battle has no player now.
@@ -6508,9 +6923,19 @@ void Tick() {
             AddChat("* Time is up for this month");
         }
         if (g_phase == Phase::Planning && g_forced &&
-            (AllSubmitted(nullptr) || now - g_forceTick > 30000) && !game::IsBusy())
+            (AllSubmitted(nullptr) || now - g_forceTick > 30000) && !game::IsBusy() &&
+            !SaveStopWaiting(SaveStep::Turn))  // 0.7.1: not again after a failed save until a save works
             RunHostTurn();
-        if (g_runTurnWhenIdle && g_phase == Phase::Planning && !game::IsBusy()) RunHostTurn();
+        if (g_runTurnWhenIdle && g_phase == Phase::Planning && !game::IsBusy() && !SaveStopWaiting(SaveStep::Turn))
+            RunHostTurn();
+        // 0.7.1: a step a failed save stopped goes on once a save works (the host's own Save)
+        if (g_saveStop != SaveStep::None && !SaveStopWaiting(g_saveStop) && !game::IsBusy() && !game::BattleActive() &&
+            !lockstep::Busy()) {
+            if (g_saveStop == SaveStep::Send)
+                BroadcastState();
+            else if (g_saveStop == SaveStep::Turn && g_phase == Phase::Planning)
+                RunHostTurn();
+        }
         if (g_relSavePending && g_phase == Phase::Planning && !g_turnRunning)
             SaveAfterRelations("the relation changes applied while the game was busy", 0);
         if (g_turnRunning) {
@@ -6578,7 +7003,11 @@ void Tick() {
         ClientBattleTick();
         if (g_lsClientA.pending && now - g_lsClientA.lastTry > 500) ClientTryStartLockstep();
         if (!g_pendingState.empty()) ClientApplyPendingState();
-        if (g_forceSubmitPending && !g_submitted && g_haveState && !game::IsBusy()) SubmitTurn();
+        if (g_forceSubmitPending && !g_submitted && g_haveState && !game::IsBusy() && !SaveStopWaiting(SaveStep::Submit))
+            SubmitTurn();
+        else if (g_saveStop == SaveStep::Submit && !SaveStopWaiting(SaveStep::Submit) && g_haveState && !g_submitted &&
+                 g_phase == Phase::Planning && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive())
+            SubmitTurn();  // 0.7.1: the turn a failed save stopped, once a save works
         // The messages of the player's economy rules the host ran for this nation, in the game's turn report, first.
         if (g_econNewsSeq >= 0 && g_econNewsSeq == g_clientSeq && g_haveState && g_pendingState.empty() &&
             !game::IsBusy() && !game::BattleActive() && !game::EventActive()) {
