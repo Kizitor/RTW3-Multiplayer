@@ -514,6 +514,9 @@ static std::string ExecuteOnMain(const std::string& line) {
         // TEST ONLY: econtreaty [<chance> [blind]|cancel]: the arms-control conference at the next month's end; cancel
         if (cmd == "econtreaty") return economy::TestTreaty(args);
         if (cmd == "warfx") return warfx::BridgeCommand(args);  // warfx [K]: the player's war effects (warfx.cpp)
+        // aibuilds [clear | patrol <J> [<K> [set]] | keep <0|1>]: the computer's ships laid down (0.7.2); `patrol ... set`
+        // and `keep 0` are TEST ONLY (keep 0: 0.7.1's mask and sea war frame)
+        if (cmd == "aibuilds") return warfx::AIBuildsCommand(args);
         // TEST ONLY: warfxblk <n> <-1|0|1>: the war effects' blockade test of nation n answers 1 / 0; -1 the game's
         if (cmd == "warfxblk") return warfx::TestBlockade(args);
         // TEST ONLY: warfxrand <v>: the war effects' own Random(n) draws min(v, n - 1); -1 the game's

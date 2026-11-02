@@ -134,7 +134,8 @@ static std::map<int, std::pair<int, int>> g_kDecl;        // 0.6.0: nation -> it
 static std::vector<std::wstring> g_invNews[9];            // 0.7.0: a joined nation's invasion texts for its next month
 static void ClearQueuedNews(const char* why);
 static int g_hostGen = 0;  // client: the host's battle requests (welcome `gen`; 1 = it merges a declined battle; 2 = it
-                           // takes surprise attacks (kind 2) and takeovers at a war's start; 3 = raider checks, 0.7.0)
+                           // takes surprise attacks (kind 2) and takeovers at a war's start; 3 = raider checks, 0.7.0;
+                           // 4 = invasions, 0.7.0; 5 = encounters without a battle and the search after them, 0.7.2)
 // 0.6.0 (B6 piece 2), client tests: the next relation turn's forced war plan of nation J with a surprise attack
 // (`battles testsa J [k] [land]`; 0.7.0 `land`: its surprise landing in this nation's possession, forced), and
 // CheckSurpriseAttack's random gates passed by asking again (`battles saretry n`).
@@ -214,6 +215,49 @@ static std::vector<DiploRow> g_peaceRows;
 // Tactical battles of joined players (see game.cpp). Host: battles of a joined player's nation against an AI nation are
 // recorded during the month instead of being resolved by the game; after the month the host sends each one to its
 // player (the month's files), waits for the results and merges them into the save, then sends the new month.
+// 0.7.2 (fix-battlesearch): an encounter of a request of the player's generator (kind 1) or of a surprise attack (kind
+// 2) on the player's PC, the result key `enc` ("att:kind:opp:dVP_K:dVP_J:area;..." in order; only to a host announcing
+// welcome `gen` 5): the attempt, what came of it ("avoided" the enemy declined, "declined" the player declined,
+// "noforce0"/"noforce1" the game's no-force rule for the player's/the enemy's side, "fought" the battle), the opponent
+// (real index), the points it gave the player's nation (its VP) and the player's enemies (EnemyVP there: the opponent's
+// on the host) and its sea area.
+struct BattleEnc {
+    int att = -1;
+    std::string kind;
+    int opp = -1, dK = 0, dJ = 0;
+    std::wstring area;
+};
+
+static std::string EncEncode(const std::vector<BattleEnc>& v) {
+    std::string s;
+    for (auto& e : v) {
+        std::string area = W2U(e.area);
+        for (char& c : area)
+            if (c == ':' || c == ';') c = ' ';
+        s += (s.empty() ? "" : ";") + std::to_string(e.att) + ":" + e.kind + ":" + std::to_string(e.opp) + ":" +
+             std::to_string(e.dK) + ":" + std::to_string(e.dJ) + ":" + area;
+    }
+    return s;
+}
+
+static std::vector<BattleEnc> EncDecode(const std::string& s) {
+    std::vector<BattleEnc> v;
+    for (auto& part : Split(s, ';')) {
+        auto f = Split(part, ':');
+        if (f.size() < 5 || f[0].empty() || f[2].empty()) continue;
+        BattleEnc e;
+        e.att = atoi(f[0].c_str());
+        e.kind = f[1].substr(0, 16);
+        e.opp = atoi(f[2].c_str());
+        e.dK = atoi(f[3].c_str());
+        e.dJ = atoi(f[4].c_str());
+        if (f.size() > 5) e.area = U2W(f[5]);
+        v.push_back(e);
+        if (v.size() >= 64) break;
+    }
+    return v;
+}
+
 struct BattleReq {
     int id = 0;
     int a = -1, b = -1, countA = 0, countB = 0;  // the game's call: a attacks b in `area`
@@ -248,6 +292,9 @@ struct BattleReq {
     // (the player's nation had no ships there that could fight: "declined", the enemy's points merged) or side 1 (the
     // enemy had none: "avoided", the player's points merged); -1 otherwise. vp: those points.
     int noForce = -1, noForceVP = 0;
+    // 0.7.2 (fix-battlesearch): the result's encounters (`enc`, a player's PC under welcome `gen` 5): each one's points
+    // went to its own opponent (VP, war score); the chat names each one
+    std::vector<BattleEnc> encs;
 };
 static std::vector<BattleReq> g_battles;
 static int g_battleNextId = 1;
@@ -281,9 +328,16 @@ static struct {
     int iopp = -1;       // ... and the invasion check gave a battle (or a decline) against this nation (real index)
     bool iatt = true;    // ... which the player's nation attacked (its own invasion) or defended against
     // 0.7.1 (fix-selforce): the battle setup found no force for a side: the game's no-force rule ran (its side: 0 the
-    // player's nation, 1 the enemy; its VP to the other side; the search ends there), and the last guard's why
+    // player's nation, 1 the enemy; its VP to the other side; under an older host the search ends there), and the last
+    // guard's why
     int noForce = -1;
     std::string nfWhy;
+    // 0.7.2 (fix-battlesearch): under a host announcing welcome `gen` 5 the search goes on after an encounter that gave
+    // no battle, as single player's CheckForBattles2 and DoSurpriseAttack do (`goOn`); the request's encounters in
+    // order (sent as `enc`); vpA/evpA: the points before the attempt that gave the battle (its own points at its end)
+    bool goOn = false;
+    std::vector<BattleEnc> encs;
+    int vpA = 0, evpA = 0;
 } g_cb;
 static struct {  // TEST ONLY (`battles testraid <side> <J>`): the next raider check forces an interception
     int side = -1, J = -1;
@@ -3083,21 +3137,66 @@ static int HostRunGenerator(int K, bool queue, std::string& out) {
     return r.id;
 }
 
+static bool g_invOldHost = false;  // TEST (bridge `inv oldhost 1`): the next month's orders as a 0.7.1 host takes them
+static std::map<int, std::wstring> g_invDroppedNow;  // 0.7.2: targets dropped with a turn this month (forms still hold them)
+
+// 0.7.2: why nation K's target can't go on ("" it can): the game offers a target only while the player is at war with
+// its owner and its month routine acts on one only then; invasions between players are not supported.
+static std::string InvasionTargetDrop(int K, const std::wstring& name) {
+    int owner = inv::PossessionOwner(name);
+    return owner == -2             ? std::string("no such possession")
+           : owner < 0             ? std::string("it has no owner")
+           : owner == K            ? std::string("it is the nation's own")
+           : IsHumanNation(owner)  ? std::string("a person plays its owner (invasions between players are not supported)")
+           : !game::AtWar(K, owner) ? CampaignNationName(K) + " is not at war with its owner"
+                                    : std::string();
+}
+
+// 0.7.2: nation K's target and its months end, as the game ends a plan that can't go on; its player is told.
+static void HostDropInvasionTarget(int K, const std::string& why, const char* when) {
+    inv::KState& st = inv::State(K);
+    std::string name = W2U(st.target), who = ClaimedBy(K);
+    Log("invasions: nation %d's target %s dropped %s (%s)", K, name.c_str(), when, why.c_str());
+    AddChat("* " + (who.empty() ? CampaignNationName(K) : who) + "'s invasion target " + name + " was dropped: " + why +
+            ".");
+    st.target.clear();
+    st.count = 0;
+    SaveReservations();
+}
+
 // Host, DoTurn2: the game is about to look for the host's battle of the month; each joined nation K under the player's
 // rules and at war looks for its own first (at most one a month each, as for the player in single player).
 // 0.7.0: the nation's invasion target from its turn (`kinvt`, "" none). The game's own checks ran on the player's PC
 // (not invaded, value below 10, only home areas while blockaded, the invasion range); the host takes a possession of a
-// computer nation, not invaded and below 10, and starts its months of preparation again when the target changes.
+// computer nation the nation is at war with, not invaded and below 10, and starts its months of preparation again when
+// the target changes. 0.7.2: the war is checked too (the game offers a target only for the player's enemies; 0.7.1's
+// button on a joined player's PC followed the host's wars, so an older PC may send another one), and an unchanged
+// target is checked again (dropped as at the month's start, HostCheckInvasionPlans).
 static void HostTakeInvasionOrder(const std::string& player, int K, const std::wstring& name) {
     inv::KState& st = inv::State(K);
-    if (name == st.target) return;
+    if (name == st.target) {  // 0.7.2: an unchanged target is checked again with today's relations
+        std::string why = name.empty() || g_invOldHost ? std::string() : InvasionTargetDrop(K, name);
+        if (!why.empty()) {
+            HostDropInvasionTarget(K, why, "with the turn");
+            g_invDroppedNow[K] = name;
+        }
+        return;
+    }
+    auto dn = g_invDroppedNow.find(K);
+    if (!name.empty() && dn != g_invDroppedNow.end() && dn->second == name) {  // the turn sent again before the month
+        Log("invasions: nation %d's target %s was dropped this month: not taken again", K, W2U(name).c_str());
+        return;
+    }
     std::string why;
+    bool noWar = false;
     if (!name.empty()) {
         int owner = inv::PossessionOwner(name);
+        noWar = owner >= 0 && owner != K && !game::AtWar(K, owner);
         why = owner == -2   ? "no such possession"
               : owner < 0   ? "it has no owner"
               : owner == K  ? "it is the nation's own"
               : IsHumanNation(owner) ? "a person plays its owner (invasions between players are not supported)"
+              : noWar && !g_invOldHost ? "the nation is not at war with its owner"
               : inv::PossessionValue(name) >= 10 ? "its value is 10 or more"
               : inv::PossessionInvader(name) != -1 ? "it is invaded already"
                                                     : "";
@@ -3107,11 +3206,33 @@ static void HostTakeInvasionOrder(const std::string& player, int K, const std::w
         Log("invasions: nation %d's target %s refused (%s)", K, W2U(name).c_str(), why.c_str());
         return;
     }
+    if (noWar)
+        Log("invasions: TEST: nation %d's target %s taken without the war check (as a 0.7.1 host)", K, W2U(name).c_str());
     Log("invasions: nation %d's target %s -> %s", K, st.target.empty() ? "-" : W2U(st.target).c_str(),
         name.empty() ? "-" : W2U(name).c_str());
     st.target = name;
     st.count = 0;
     SaveReservations();
+}
+
+// 0.7.2: the joined nations' targets before the month uses them (the battle generator's view, the battle requests,
+// the month's resolution, the target's cost), with the relations after the month's relation turns and peace: a target
+// a person's nation owns or one its nation is not at war with is dropped (one an older host took, a war that ended
+// without the nation's own peace, an owner that changed: never carried out, its cost paid every month; the nation's own
+// peace already ends its plan).
+static void HostCheckInvasionPlans() {
+    g_invDroppedNow.clear();
+    if (!inv::Available()) return;
+    if (g_invOldHost) {
+        g_invOldHost = false;
+        Log("invasions: TEST: this month's check of the targets skipped (as a 0.7.1 host); the switch is off again");
+        return;
+    }
+    for (int K = 1; K <= 8; K++) {
+        inv::KState& st = inv::State(K);
+        std::string why = st.target.empty() ? std::string() : InvasionTargetDrop(K, st.target);
+        if (!why.empty()) HostDropInvasionTarget(K, why, "before the month");
+    }
 }
 
 // 0.7.0: each joined nation's invasions, the game's CheckRebellionAndInvasions in its view (invasion.cpp), after the
@@ -3300,6 +3421,30 @@ static bool FinishBattlePhase() {
         return false;
     }
     for (auto& r : g_battles) {
+        if (r.state == 2 && !r.encs.empty()) {
+            // 0.7.2 (fix-battlesearch): the player's PC went on after encounters without a battle: one line each (the
+            // battle, if one came, is the last)
+            for (auto& e : r.encs) {
+                std::string K = CampaignNationName(r.human), J = CampaignNationName(e.opp);
+                std::wstring ar = e.area;
+                if (ar.empty() && e.att >= 0 && e.att < (int)r.attempts.size()) ar = r.attempts[e.att].area;
+                std::string in = InArea(ar);
+                AddChat("* " + (e.kind == "avoided"    ? "The " + J + " navy declined battle against " + K + in + "."
+                                : e.kind == "declined" ? r.player + " declined battle for " + K + " against " + J + in + "."
+                                : e.kind == "noforce0" ? K + " had no ships to oppose " + J + in + ": " + J + " gains " +
+                                                             std::to_string(e.dJ) + " VP."
+                                : e.kind == "noforce1" ? J + " had no ships to challenge " + K + in + ": " + K + " gains " +
+                                                             std::to_string(e.dK) + " VP."
+                                : e.kind == "fought"
+                                    ? (r.raider ? "The raider battle of " + K + " against " + J + in + " was " +
+                                                      (r.raider == 2 ? "auto-resolved" : "fought") + " by " + r.player + "."
+                                                : std::string(r.invasion ? "The invasion battle of " : "The battle of ") + K +
+                                                      " against " + J + in + " was fought by " + r.player + ".")
+                                    : "No battle of " + K + " against " + J + in + " (VP " + std::to_string(e.dK) + "/" +
+                                          std::to_string(e.dJ) + ")."));
+            }
+            continue;
+        }
         if (r.state == 2) {
             AddChat("* " + (r.noForce == 0 ? CampaignNationName(r.human) + " had no ships to oppose " +
                                                  CampaignNationName(r.opp) + InArea(r.area) + ": " +
@@ -3495,12 +3640,42 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         std::vector<int> allowed = {r.human, r.opp};  // and the AI nations allied to either side
         for (int n = 1; n <= 8 && n < game::NationCount(); n++)
             if (!hookcb::IsHumanRemoteNation(n)) allowed.push_back(n);
+        // 0.7.2 (fix-battlesearch): a result of several encounters (`enc`, the player's PC went on after an encounter
+        // without a battle): each one's points go to its own opponent. byOpp: opponent -> the points of its encounters
+        // (the player's nation's, its own); what no encounter accounts for goes with r.opp (the last one's). The
+        // deltas' dVP_J becomes r.opp's share, the others' are added to their VP.
+        std::vector<BattleEnc> encs;
+        if (!r.pvp && r.kind >= 1 && h.find("enc") != h.end()) encs = EncDecode(KVStr(h, "enc"));
+        std::map<int, std::pair<int, int>> byOpp;
+        std::map<int, int> otherVP;
+        if (!encs.empty()) {
+            KV d0;
+            if (const std::string* dp = b.Get("deltas")) d0 = KVDecode(*dp);
+            int totK = KVInt(d0, "dVP_K"), totJ = KVInt(d0, "dVP_J"), sumK = 0, sumJ = 0;
+            for (auto& e : encs) {
+                if (e.opp < 1 || e.opp > 8 || e.opp == r.human || IsHumanNation(e.opp)) e.opp = r.opp;
+                byOpp[e.opp].first += e.dK;
+                byOpp[e.opp].second += e.dJ;
+                sumK += e.dK;
+                sumJ += e.dJ;
+            }
+            byOpp[r.opp].first += totK - sumK;
+            byOpp[r.opp].second += totJ - sumJ;
+            for (auto& x : byOpp)
+                if (x.first != r.opp && x.second.second) otherVP[x.first] = x.second.second;
+            if (!otherVP.empty()) {
+                d0["dVP_J"] = std::to_string(byOpp[r.opp].second);
+                for (auto& f : b.files)
+                    if (f.first == "deltas") f.second = KVEncode(d0);
+            }
+        }
         std::string bytes, summary, err;
         IniDoc host;
         bool ok = ReadFileBytes(HostBcsPath(), bytes);
         if (ok) {
             host = ParseIni(bytes);
-            ok = saveio::ApplyBattleResult(host, r.sentBcs, r.human, r.opp, b, allowed, summary, err, r.raider != 0) &&
+            ok = saveio::ApplyBattleResult(host, r.sentBcs, r.human, r.opp, b, allowed, summary, err, r.raider != 0,
+                                           otherVP.empty() ? nullptr : &otherVP) &&
                  WriteFileBytes(HostBcsPath(), WriteIni(host));
         }
         if (!ok) {
@@ -3511,6 +3686,7 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         r.state = 2;
         r.avoided = avoided;
         r.declined = declined;
+        r.encs = encs;
         g_battleMerged = true;
         if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
         const std::string* deltas = b.Get("deltas");
@@ -3520,7 +3696,13 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
             r.noForce = nfs;
             r.noForceVP = KVInt(dk, nfs == 0 ? "dVP_J" : "dVP_K");
         }
-        Log("battle %d applied: %s (player: %s)%s", id, summary.c_str(), KVStr(h, "summary").c_str(),
+        std::string encText;  // (one encounter alone: the line of 0.7.1)
+        for (auto& e : encs)
+            if (encs.size() > 1)
+                encText += (encText.empty() ? "" : ", ") + std::to_string(e.att) + " " + e.kind + " nation " +
+                           std::to_string(e.opp) + " VP " + std::to_string(e.dK) + "/" + std::to_string(e.dJ) +
+                           InArea(e.area);
+        Log("battle %d applied: %s (player: %s)%s%s", id, summary.c_str(), KVStr(h, "summary").c_str(),
             r.noForce == 0  ? "; the player's nation had no ships there that could fight (the game's no-force rule, not "
                               "a decline): the enemy's points"
             : r.noForce == 1 ? "; the enemy had no ships there that could fight (the game's no-force rule): the player's "
@@ -3529,8 +3711,13 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
             : declined       ? "; the player declined battle"
             : r.raider == 2  ? "; a raider battle, auto-resolved"
             : r.raider == 1  ? "; a raider battle"
-                             : "");
-        CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K")), std::max(0, KVInt(dk, "dVP_J")));
+                             : "",
+            encText.empty() ? "" : ("; " + std::to_string(encs.size()) + " encounter(s): " + encText).c_str());
+        if (encs.empty())
+            CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K")), std::max(0, KVInt(dk, "dVP_J")));
+        else  // 0.7.2: each opponent's war score with its own encounters' points
+            for (auto& x : byOpp)
+                CreditWarScore(r.human, x.first, std::max(0, x.second.first), std::max(0, x.second.second));
         return;
     }
     Log("battle result %d from %s ignored", id, p.name.c_str());
@@ -3620,6 +3807,7 @@ static void RunHostTurn() {
     }
     if (!marks.empty())  // 0.7.0: InvadedThisTurn is not saved: the invasions begun last month keep their month
         Log("host turn: invaded this month kept across the reload: %d of %d", inv::RestoreMarked(marks), (int)marks.size());
+    HostCheckInvasionPlans();  // 0.7.2: the joined nations' targets with the month's relations, before the month uses them
     Log("host turn: %d submissions merged, running turn", merged);
     if (g_enemyVPSeen < 0) g_enemyVPSeen = game::EnemyVP();  // the points before this month (see ShareEnemyVP)
     game::RunOriginalTurn();
@@ -4025,7 +4213,9 @@ static void HostOnMessage(net::Msg& m) {
             // and takeovers at a war's start from a joined player's relation turn; 3 (0.7.0): raider checks in the
             // player's generator's requests, their battles' results and "thwarts" lines merged)
             // 4 (0.7.0): invasions for joined nations (the nation's plan in its turn `kinvt` and in the state `kinv`)
-            w["gen"] = inv::Available() ? "4" : "3";
+            // 5 (0.7.2, fix-battlesearch): the player's PC goes on after an encounter without a battle (the enemy's
+            // or the player's decline, the no-force rule) as single player does; its result names each one (`enc`)
+            w["gen"] = inv::Available() ? "5" : "3";
             net::Send(m.peer, net::MSG_WELCOME, KVEncode(w));
             AddChat("* " + name + " joined" + (p->nation > 0 ? " as " + CampaignNationName(p->nation) : ""));
             BroadcastLobby();
@@ -4442,6 +4632,29 @@ static void ClientApplyPendingState() {
 
 static int g_battleInId = -1;
 
+// 0.7.2 (fix-battlesearch): the battle of a request whose search went on is its last encounter; its own points (since
+// its attempt began) are counted at its end.
+static void PushBattleEnc() {
+    BattleEnc e;
+    e.att = g_cb.cand;
+    e.kind = "fought";
+    e.opp = g_cb.opp;
+    e.dK = game::NationVP(0) - g_cb.vpA;
+    e.dJ = game::EnemyVP() - g_cb.evpA;
+    e.area = g_cb.area;
+    g_cb.encs.push_back(e);
+}
+
+// The request's other opponents (real indices; a computer nation keeps its index in the battle slot): their ship
+// sections go into the result too (unchanged fields are not merged).
+static std::vector<int> EncOthers(int opp) {
+    std::vector<int> v;
+    for (auto& e : g_cb.encs)
+        if (e.opp >= 1 && e.opp <= 8 && e.opp != opp && e.opp != g_cb.K && std::find(v.begin(), v.end(), e.opp) == v.end())
+            v.push_back(e.opp);
+    return v;
+}
+
 static void SendBattleResult(int id, const std::string& outcome, const std::string& why, const Bundle* b,
                              const std::string& summary, const KV* extra = nullptr) {
     KV h;
@@ -4459,6 +4672,10 @@ static void SendBattleResult(int id, const std::string& outcome, const std::stri
             h["ropp"] = std::to_string(g_cb.opp);
         }
     }
+    // 0.7.2 (fix-battlesearch): the request's encounters, in order (a host announcing welcome `gen` 5 only)
+    if (id == g_cb.id && g_cb.goOn && !g_cb.encs.empty() && b &&
+        (outcome == "fought" || outcome == "avoided" || outcome == "declined"))
+        h["enc"] = EncEncode(g_cb.encs);
     if (id == g_cb.id && !g_cb.news.empty()) {  // 0.7.0: the raider checks' turn messages, for the player's news
         std::string all;
         for (auto& l : g_cb.news) all += l + kSepRec;
@@ -4603,6 +4820,8 @@ static void ClientStartBattle() {
     g_cb.iatt = true;
     g_cb.noForce = -1;
     g_cb.nfWhy.clear();
+    g_cb.goOn = false;  // 0.7.2: set with the attempts below
+    g_cb.encs.clear();
     if (h.find("kinv") != h.end() && inv::Available()) {
         // 0.7.0 (invasions, P3): the nation's invasions and plan in place of the host's (the slot is the host's campaign)
         inv::KState one[9];
@@ -4648,10 +4867,19 @@ static void ClientStartBattle() {
     int setups = game::DoBattleCalls(), declines = game::PlayerDeclineCalls();
     int vp0 = game::NationVP(0);  // the player's nation is nation 0 in the battle slot
     int evp0 = game::EnemyVP();   // ... and EnemyVP its enemies' points
+    // 0.7.2 (fix-battlesearch): the search goes on after an encounter that gave no battle (the enemy's decline, the
+    // player's decline, the game's no-force rule), as single player's CheckForBattles2 goes on with its next candidate
+    // and DoSurpriseAttack with its next attacker; each one is kept with its points and goes to the host with the
+    // result (`enc`). Only under a host that takes them (welcome `gen` 5); under an older host the first encounter ends
+    // the search, as before.
+    g_cb.goOn = (g_cb.kind == 1 || g_cb.kind == 2) && g_hostGen >= 5 && KVInt(h, "pvp") == 0;
+    g_cb.vpA = vp0;
+    g_cb.evpA = evp0;
+    int sLast = setups, dLast = declines, nfLast = 0;  // goOn: the last attempt's start (its own setups and declines)
     // 0.7.1 (fix-selforce): the battle setups (DoBattle) of this request that found no force for a side. The mod's guard
     // of the game's ally fallback (no points): the attempt gave no battle, the next one is played (single player's
     // CheckAttackLocation answers False and its generator goes on). The game's own no-force rule (its points to the
-    // other side): the request's outcome, sent as such (not as the player's decline); the search ends there.
+    // other side): an encounter, sent as such (not as the player's decline); under an older host the search ends there.
     int nfSetups = 0;
     auto noForceOf = [&](game::NoForceCounts& before, int i) {
         game::NoForceCounts now = game::NoForce();
@@ -4688,6 +4916,12 @@ static void ClientStartBattle() {
         g_cb.opp = t.a == K ? t.b : t.a;
         g_cb.area = t.area;
         game::NoForceCounts nfA = game::NoForce();
+        // 0.7.2: this attempt's own changes (an earlier encounter's stay with it)
+        int sA = game::DoBattleCalls(), dA = game::PlayerDeclineCalls(), vA = game::NationVP(0), eA = game::EnemyVP();
+        int nfS = nfSetups;
+        sLast = sA;
+        dLast = dA;
+        nfLast = nfS;
         if (g_cb.kind == 2) {
             if (!game::AtWar(sw(t.a), sw(t.b))) {  // e.g. a peace came first: no surprise attack between them
                 Log("battle %d: attempt %d (%d strikes %d): not at war in the battle slot", id, i, t.a, t.b);
@@ -4700,8 +4934,8 @@ static void ClientStartBattle() {
             for (int tries = 0;; tries++) {
                 saTrue = game::StartSurpriseAttack(sw(t.a), sw(t.b));
                 if (g_role != Role::Client || g_cb.id != id || saTrue || game::BattleActive() ||
-                    game::DoBattleCalls() - nfSetups != setups || game::PlayerDeclineCalls() != declines ||
-                    game::NationVP(0) != vp0 || tries >= g_testSaRetry)
+                    game::DoBattleCalls() - nfSetups != sA - nfS || game::PlayerDeclineCalls() != dA ||
+                    game::NationVP(0) != vA || tries >= g_testSaRetry)
                     break;
                 Log("battle %d: test: CheckSurpriseAttack asked again (%d of %d)", id, tries + 1, g_testSaRetry);
             }
@@ -4768,18 +5002,71 @@ static void ClientStartBattle() {
             started = game::StartPlayerBattle(sw(t.a), sw(t.b), t.area);
         }
         if (g_role != Role::Client || g_cb.id != id) break;
-        long guards = game::NoForce().guard - nfA.guard;
+        long guards = game::NoForce().guard - nfA.guard, rules = game::NoForce().rule - nfA.rule;
         noForceOf(nfA, i);
-        if (started || game::BattleActive() || game::DoBattleCalls() - nfSetups != setups || g_cb.noForce >= 0 ||
-            game::PlayerDeclineCalls() != declines || game::NationVP(0) != vp0)
-            break;  // a battle, a decline (the player's or the enemy's), its points or the no-force rule: the month's
+        if (!g_cb.goOn) {
+            if (started || game::BattleActive() || game::DoBattleCalls() - nfSetups != setups || g_cb.noForce >= 0 ||
+                game::PlayerDeclineCalls() != declines || game::NationVP(0) != vp0)
+                break;  // a battle, a decline (the player's or the enemy's), its points or the no-force rule: the month's
+        } else if (started || game::BattleActive()) {
+            // a battle (on screen, a raider battle fought or auto-resolved, an invasion battle), or the check's True
+            // (the player let a surprise attack's chance go): the month's, as single player's True ends its search
+            g_cb.vpA = vA;
+            g_cb.evpA = eA;
+            break;
+        } else {
+            // 0.7.2: an encounter that gave no battle is kept and the next attempt is played (single player: False)
+            bool shown = game::DoBattleCalls() - sA - (nfSetups - nfS) > 0;  // a setup (its preview), not a no-force one
+            bool pdecl = game::PlayerDeclineCalls() != dA || shown;
+            int dK = game::NationVP(0) - vA, dJ = game::EnemyVP() - eA;
+            if (pdecl || rules > 0 || dK != 0 || dJ != 0) {
+                BattleEnc e;
+                e.att = i;
+                e.kind = pdecl           ? "declined"
+                         : rules > 0     ? (g_cb.noForce == 0 ? "noforce0" : "noforce1")
+                         : dK > 0 && !dJ ? "avoided"
+                                         : "points";
+                e.opp = g_cb.opp;
+                e.dK = dK;
+                e.dJ = dJ;
+                e.area = (shown || rules > 0) && !game::LastBattleArea().empty() ? game::LastBattleArea() : g_cb.area;
+                g_cb.encs.push_back(e);
+                std::string what = e.kind == "declined"   ? "the player declined"
+                                   : e.kind == "noforce0" ? "the game's no-force rule for our side"
+                                   : e.kind == "noforce1" ? "the game's no-force rule for the enemy's side"
+                                   : e.kind == "avoided"  ? "the enemy declined battle"
+                                                          : "no battle, the points changed";
+                std::string head = t.type != 0      ? ""
+                                   : g_cb.kind == 2 ? " (" + std::to_string(t.a) + " strikes " + std::to_string(t.b) + ")"
+                                                    : " (" + std::to_string(t.a) + " attacks " + std::to_string(t.b) +
+                                                          " in " + (t.area.empty() ? std::string("an area the game picks")
+                                                                                   : W2U(t.area)) + ")";
+                Log("battle %d: attempt %d%s: %s against nation %d%s (VP %+d/%+d): no battle; the search goes on, as "
+                    "single player (encounter %d)", id, i, head.c_str(), what.c_str(), e.opp, InArea(e.area).c_str(), dK,
+                    dJ, (int)g_cb.encs.size());
+                continue;
+            }
+        }
         Log("battle %d: attempt %d (%d attacks %d in %s) found no battle%s", id, i, t.a, t.b,
             t.area.empty() ? "an area the game picks" : W2U(t.area).c_str(),
             guards > 0 ? " (its setup found no force: the next attempt, as single player)" : "");
     }
-    bool entered = game::DoBattleCalls() - nfSetups != setups;  // the game set a battle up (its preview was shown)
-    bool declinedHere = game::PlayerDeclineCalls() != declines;  // the player declined (the question or the preview)
-    if ((entered || g_cb.noForce >= 0) && !game::LastBattleArea().empty()) g_cb.area = game::LastBattleArea();
+    // the game set a battle up (its preview was shown); the player declined (the question or the preview). 0.7.2, goOn:
+    // the last attempt's own (an earlier encounter's are kept with it)
+    bool entered = g_cb.goOn ? game::DoBattleCalls() - sLast - (nfSetups - nfLast) > 0
+                             : game::DoBattleCalls() - nfSetups != setups;
+    bool declinedHere = g_cb.goOn ? game::PlayerDeclineCalls() != dLast : game::PlayerDeclineCalls() != declines;
+    bool encEnd = g_cb.goOn && !g_cb.encs.empty() && !game::BattleActive() &&
+                  !(started && g_cb.raider == 2);  // 0.7.2: encounters and no battle (the search's end)
+    if ((entered || (g_cb.noForce >= 0 && !g_cb.goOn)) && !game::LastBattleArea().empty() && !encEnd)
+        g_cb.area = game::LastBattleArea();
+    int endCand = g_cb.cand;  // the attempt the search ended at
+    if (encEnd) {  // 0.7.2: the result names the last encounter (its attempt, opponent and area)
+        const BattleEnc& last = g_cb.encs.back();
+        g_cb.cand = last.att;
+        g_cb.opp = last.opp;
+        g_cb.area = last.area;
+    }
     opp = g_cb.opp;
     area = g_cb.area;
     if (g_role != Role::Client || g_cb.id != id) {  // the session ended during the battle preview
@@ -4787,8 +5074,26 @@ static void ClientStartBattle() {
         return;
     }
     g_cb.starting = false;
+    bool invBattle = g_cb.cand >= 0 && g_cb.cand < (int)atts.size() && atts[g_cb.cand].type == 2;
+    // 0.7.2: the chat names an encounter that gave no battle (the earlier ones of a battle's request, or all of them;
+    // one alone in the words of 0.7.1)
+    auto encChat = [](const BattleEnc& e, bool multi) {
+        std::string me = W2U(game::NationName(0)), in = InArea(e.area);
+        std::string them = e.opp >= 1 && e.opp <= 8 ? W2U(game::NationName(e.opp)) : std::string("enemy");
+        std::string pts = " (VP " + std::to_string(e.dK) + "/" + std::to_string(e.dJ) + ").";
+        AddChat(e.kind == "avoided"    ? "* The " + them + " navy declined battle" + (multi ? in : "") + ": " + me +
+                                             " gains " + std::to_string(e.dK) + " VP."
+                : e.kind == "declined" ? "* You declined the battle against the " + them + " navy" + in + pts
+                : e.kind == "noforce0" ? "* Friendly ships not available to oppose the " + them + " navy" + in + ": " +
+                                             them + " gains " + std::to_string(e.dJ) + " VP."
+                : e.kind == "noforce1" ? "* The " + them + " navy had no ships to challenge our forces" + in + ": " + me +
+                                             " gains " + std::to_string(e.dK) + " VP."
+                                       : "* No battle against the " + them + " navy" + in + pts);
+    };
+    if (g_cb.goOn && started && (game::BattleActive() || g_cb.raider == 2))
+        for (auto& e : g_cb.encs) encChat(e, true);
     if (g_cb.kind == 1 && started && game::BattleActive())
-        AddChat(std::string(g_cb.raider ? "* Raider battle! " : g_cb.iopp >= 0 ? "* Invasion battle! " : "* Battle! ") +
+        AddChat(std::string(g_cb.raider ? "* Raider battle! " : invBattle ? "* Invasion battle! " : "* Battle! ") +
                 W2U(game::NationName(0)) + " meets " +
                 W2U(game::NationName(opp)) + (area.empty() ? "" : " in " + W2U(area)) + ".");
     if (g_cb.kind == 2 && started && game::BattleActive())
@@ -4797,12 +5102,54 @@ static void ClientStartBattle() {
     if (started && g_cb.raider == 2) {  // 0.7.0: the player chose "Auto resolve": QuickResolveRaiderBattle ran here
         std::string after, summary, err;
         Bundle res;
-        if (SaveBattleSlot(after, err) && saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err)) {
+        if (g_cb.goOn) PushBattleEnc();
+        if (SaveBattleSlot(after, err) &&
+            saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err, EncOthers(opp))) {
             SendBattleResult(id, "fought", "", &res, summary);
             AddChat("* Raider battle against the " + W2U(game::NationName(opp)) + " navy" +
                     (area.empty() ? "" : " in " + W2U(area)) + " auto-resolved; result sent to the host (" + summary + ").");
         } else {
             SendBattleResult(id, "failed", "cannot read the result: " + err, nullptr, "");
+        }
+        LeaveBattleSlot();
+        return;
+    }
+    if (encEnd) {
+        // 0.7.2 (fix-battlesearch): the search went on after each encounter and none gave a battle. The slot's changes
+        // since the request began (every encounter's consequences: the points, prestige, morale, decline counts, an
+        // enemy's landing after a decline) go to the host with the encounters (`enc`: each one's points for its own
+        // opponent); `cand` names the last one. "declined" if the player declined one or the game's no-force rule of
+        // our side ran in one (its consequences are merged as a decline's, as in 0.7.1), else "avoided".
+        bool player = false, nf0 = false;
+        for (auto& e : g_cb.encs) {
+            player |= e.kind == "declined";
+            nf0 |= e.kind == "noforce0";
+        }
+        std::string outcome = player || nf0 ? "declined" : "avoided";
+        KV nf;  // one encounter of the game's no-force rule: the key of 0.7.1 (the host's words for it)
+        const BattleEnc& one = g_cb.encs[0];
+        if (g_cb.encs.size() == 1 && (one.kind == "noforce0" || one.kind == "noforce1"))
+            nf["noforce"] = one.kind == "noforce0" ? "0" : "1";
+        if (started) Log("battle %d: attempt %d's check answered True without a battle (the player let it go)", id, endCand);
+        std::string after, summary, err;
+        Bundle res;
+        bool ok = SaveBattleSlot(after, err) &&
+                  saveio::ExtractBattleResult(g_cb.before, after, K, opp, res, summary, err, EncOthers(opp));
+        if (ok)
+            SendBattleResult(id, outcome, "", &res, summary, nf.empty() ? nullptr : &nf);
+        else
+            SendBattleResult(id, outcome == "declined" ? outcome : "nobattle", "cannot read the result: " + err, nullptr,
+                             "", nf.empty() ? nullptr : &nf);
+        if (g_cb.encs.size() > 1) {
+            for (auto& e : g_cb.encs) encChat(e, true);
+            AddChat(ok ? "* No battle came about after them; their results were sent to the host (" + summary + ")."
+                       : "* No battle came about after them; their results could not be read.");
+        } else if (one.kind == "declined") {
+            AddChat("* You declined the battle" + (ok ? " (" + summary + ")." : std::string(".")));
+        } else if (!ok && outcome == "avoided") {
+            AddChat("* No battle came about.");
+        } else {
+            encChat(one, false);
         }
         LeaveBattleSlot();
         return;
@@ -4950,11 +5297,16 @@ static void ClientBattleTick() {
         } else if (!game::BattleAftermathSeen()) {
             SendBattleResult(id, "failed", "the battle was left before its end", nullptr, "");
             AddChat(std::string("* The battle was left before its end") + (g_cb.kind == 0 ? "; the game resolves it." : "."));
+            if (g_cb.goOn && !g_cb.encs.empty())  // 0.7.2: the slot's state is the left battle's; no result of them
+                Log("battle %d: its %d earlier encounter(s) of the month are not sent (the battle was left)", id,
+                    (int)g_cb.encs.size());
         } else {
             std::string after, summary, err;
             Bundle res;
+            if (g_cb.goOn) PushBattleEnc();  // 0.7.2: its own points, after the request's earlier encounters
             if (SaveBattleSlot(after, err) &&
-                saveio::ExtractBattleResult(g_cb.before, after, g_cb.K, g_cb.opp, res, summary, err)) {
+                saveio::ExtractBattleResult(g_cb.before, after, g_cb.K, g_cb.opp, res, summary, err,
+                                            EncOthers(g_cb.opp))) {
                 SendBattleResult(id, "fought", "", &res, summary);
                 AddChat("* Battle result sent to the host (" + summary + ").");
             } else {
@@ -5463,7 +5815,8 @@ static void ClientOnMessage(net::Msg& m) {
             kv["rel"] = game::PlayerTurnAvailable() ? "1" : "0";  // relations v2: the player's relation routines run here
             kv["gen"] = !game::BattleReplayAvailable() ? "0"
                         : game::SurpriseAvailable() && game::RaiderReplayAvailable()
-                            ? inv::Available() ? "4"   // 0.7.0: invasions (the plan in the form, the target sent)
+                            ? inv::Available() ? "5"   // 0.7.0 (4): invasions too; 0.7.2 (5): the search goes on
+                                                       // after an encounter without a battle (`enc`)
                                                : "3"   // 0.7.0: raiders against patrols too (raider checks replayed)
                         : game::SurpriseAvailable() ? "2"   // 0.6.0 piece 2: surprise attacks and takeovers too
                                                     : "1";  // 0.6.0: replays the player's battle generator
@@ -5684,7 +6037,10 @@ bool LegacyWanted() { return g_legacyWanted; }
 // 0.7.0, bridge `inv ...`: joined nations' invasions. Host: `state [K]`, `marks`, `run K` (K's month resolution now),
 // TEST ONLY `set <poss> <invader|-1> [support] [itt]`, `target K <poss|->`, `plan K <count> <enemyPoss|-> <pending> [itt]`,
 // `rnd <0|1|2>` (the routine's own draws: off, low, high). Client: `form`, TEST ONLY `pick <poss|->` (the form's target
-// as the game's Invasion target button sets it). Possession names: '_' for ' '.
+// as the game's Invasion target button sets it). Any PC, read only (0.7.2): `range <poss>` (the game's InvasionPossible
+// for PlayerNation), `button` (the possession details' last "Set invasion target" decision). Host, TEST ONLY (0.7.2):
+// `oldhost [0|1]` (the next month's orders as a 0.7.1 host takes them: no war check, no check of the targets before the
+// month; off again at that month's start). Possession names: '_' for ' '.
 std::string DebugInvasions(const std::vector<std::string>& a) {
     std::string cmd = a.size() > 1 ? a[1] : "state";
     auto name = [&](size_t i) {
@@ -5704,6 +6060,13 @@ std::string DebugInvasions(const std::vector<std::string>& a) {
     };
     if (!inv::Available()) return "error invasions unavailable";
     if (cmd == "form") return "ok target=" + W2U(inv::FormTarget()) + " hostgen=" + std::to_string(g_hostGen);
+    if (cmd == "range") {  // 0.7.2 (read only): the game's InvasionPossible(PlayerNation, p) and GetInvasionRange here
+        int nm = 0, r = inv::RangeCheck(name(2), &nm);
+        if (r == -2) return "error no such possession or unavailable";
+        return "ok possible=" + std::to_string(r) + " range=" + std::to_string(nm) +
+               " nation=" + std::to_string(game::NationIndex(game::PlayerNation()));
+    }
+    if (cmd == "button") return "ok last=" + inv::DetailsButtonLast();  // 0.7.2: the possession details' last decision
     if (cmd == "pick") {
         inv::KState s;
         s.target = name(2);
@@ -5724,6 +6087,13 @@ std::string DebugInvasions(const std::vector<std::string>& a) {
         return e.empty() ? "ok " + inv::Describe(-1) : "error " + e;
     }
     if (g_role != Role::Host) return "error host only";
+    if (cmd == "oldhost") {  // TEST ONLY (0.7.2): the next month's orders as a 0.7.1 host takes them
+        if (a.size() > 2) {
+            g_invOldHost = a[2] != "0";
+            Log("invasions: TEST: the next month's orders %s", g_invOldHost ? "as a 0.7.1 host takes them" : "as usual");
+        }
+        return std::string("ok oldhost=") + (g_invOldHost ? "1" : "0");
+    }
     if (cmd == "hostpeace") {  // TEST ONLY: the game's DoPeace for the host's nation (through the hook; async: its box)
         RunOnMainThread([] {
             if (void* m = dl::Method("TfrmBuildCamp", "DoPeace"))
@@ -5893,6 +6263,17 @@ std::string DebugBattles(const std::vector<std::string>& a) {
                " runs=" + std::to_string(game::TestNoForceRuns()) +
                " guard=" + (game::SelectForceGuardAvailable() ? "1" : "0");
     }
+    if (cmd == "testdecline") {  // 0.7.2 (fix-battlesearch), tests (any PC): testdecline [<n> [m]]
+        if (a.size() > 2) {
+            int n = atoi(a[2].c_str()), m = a.size() > 3 ? atoi(a[3].c_str()) : 0;
+            if (n < 0 || n > 8 || m < 0 || m > 8) return "error usage: testdecline <n 0-8> [m 0-8]";
+            if (!game::SetTestDecline(n, m)) return "error not available";
+            Log("tests: in the battle slot's attempts the computer's next %d decision(s) decline as the game declines, "
+                "the next %d answer that it fights (the player not caught out meanwhile): %s", n, m,
+                game::TestDeclineState().c_str());
+        }
+        return "ok testdecline " + game::TestDeclineState();
+    }
     if (g_role != Role::Host) return "error host only";
     if (cmd == "list") {
         std::string s = "ok phase=" + std::string(g_battlePhase ? "1" : "0") + " timeout=" +
@@ -5955,40 +6336,63 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         return "ok " + std::to_string(r.id);
     }
     if (cmd == "injectgen" && a.size() > 3) {  // B6, tests: a request of the player's generator: K attacks J [in area] [xN]
+        // 0.7.2: [+ J2 [area2] [xM] ...]: then attempts against other opponents; "by J": J attacks K
         if (g_afterTurnPending || g_battlePhase) return "error not while the month or its battles are processed";
-        int K = atoi(a[2].c_str()), J = atoi(a[3].c_str());
-        size_t last = a.size();
-        int reps = 1;  // 0.7.1 (fix-selforce): xN: N attempts, the same each (a request whose first attempts give none)
-        if (last > 4 && a[last - 1].size() > 1 && a[last - 1][0] == 'x' &&
-            a[last - 1].find_first_not_of("0123456789", 1) == std::string::npos) {
-            reps = std::max(1, std::min(8, atoi(a[last - 1].c_str() + 1)));
-            last--;
+        int K = atoi(a[2].c_str());
+        std::vector<std::vector<std::string>> segs(1);
+        for (size_t i = 3; i < a.size(); i++) {
+            if (a[i] == "+") {
+                segs.emplace_back();
+                continue;
+            }
+            segs.back().push_back(a[i]);
         }
-        std::string areaName;
-        for (size_t i = 4; i < last; i++) areaName += (i > 4 ? " " : "") + a[i];
-        std::wstring area = U2W(areaName);
         auto names = game::AreaNames();
-        if (!area.empty() && std::find(names.begin(), names.end(), area) == names.end())
-            return "error no sea area '" + areaName + "'";
-        if (J < 1 || J > 8 || IsHumanNation(J)) return "error J must be an AI nation";
+        std::vector<game::BattleAttempt> atts;
+        std::string more;
+        for (size_t si = 0; si < segs.size(); si++) {
+            std::vector<std::string> sg = segs[si];
+            bool by = !sg.empty() && sg[0] == "by";
+            if (by) sg.erase(sg.begin());
+            if (sg.empty()) return "error usage: injectgen K [by] J [area] [xN] [+ [by] J2 [area2] [xN] ...]";
+            int J = atoi(sg[0].c_str());
+            size_t last = sg.size();
+            int reps = 1;  // 0.7.1 (fix-selforce): xN: N attempts, the same each (a request whose first attempts give none)
+            if (last > 1 && sg[last - 1].size() > 1 && sg[last - 1][0] == 'x' &&
+                sg[last - 1].find_first_not_of("0123456789", 1) == std::string::npos) {
+                reps = std::max(1, std::min(8, atoi(sg[last - 1].c_str() + 1)));
+                last--;
+            }
+            std::string areaName;
+            for (size_t i = 1; i < last; i++) areaName += (i > 1 ? " " : "") + sg[i];
+            std::wstring area = U2W(areaName);
+            if (!area.empty() && std::find(names.begin(), names.end(), area) == names.end())
+                return "error no sea area '" + areaName + "'";
+            if (J < 1 || J > 8 || IsHumanNation(J)) return "error J must be an AI nation";
+            game::BattleAttempt t;
+            t.a = by ? J : K;
+            t.b = by ? K : J;
+            t.area = area;
+            for (int r = 0; r < reps; r++) atts.push_back(t);
+            if (si > 0 || by)
+                more += std::string(si > 0 ? "; then " : "; ") + "nation " + std::to_string(t.a) + " attacks " +
+                        std::to_string(t.b) + InArea(area) + " x" + std::to_string(reps);
+        }
+        if (atts.size() > 16) return "error at most 16 attempts";
         if (!B6On(K)) return "error the player's battle generator is not on for nation " + std::to_string(K);
-        game::BattleAttempt t;
-        t.a = K;
-        t.b = J;
-        t.area = area;
         BattleReq r;
         r.id = g_battleNextId++;
         r.kind = 1;
-        r.attempts.assign(reps, t);
-        r.a = K;
-        r.b = J;
-        r.area = area;
+        r.attempts = atts;
+        r.a = atts[0].a;
+        r.b = atts[0].b;
+        r.area = atts[0].area;
         r.human = K;
-        r.opp = J;
+        r.opp = atts[0].a == K ? atts[0].b : atts[0].a;
         r.player = PlayerOfNation(K)->name;
         g_battles.push_back(r);
-        Log("battle request %d injected (the player's generator): nation %d attacks %d%s, %d attempt(s)", r.id, K, J,
-            InArea(area).c_str(), reps);
+        Log("battle request %d injected (the player's generator): nation %d attacks %d%s, %d attempt(s)%s", r.id, r.a, r.b,
+            InArea(r.area).c_str(), (int)atts.size(), more.c_str());
         return "ok " + std::to_string(r.id);
     }
     if (cmd == "injectraid" && a.size() > 2) {  // 0.7.0, tests: a request of the player's generator: one raider check
@@ -6492,7 +6896,16 @@ void SubmitTurn() {
     nplay::ClientAddSubmission(b, game::SaveDir(g_clientSlot), g_clientSlot, g_myNation);  // own intelligence
     KV h;
     h["seq"] = std::to_string(g_clientSeq);
-    if (g_hostGen >= 4) h["kinvt"] = W2U(inv::FormTarget());  // 0.7.0: the nation's invasion target ("" none)
+    if (g_hostGen >= 4) {  // 0.7.0: the nation's invasion target ("" none)
+        std::wstring t = inv::FormTarget();
+        h["kinvt"] = W2U(t);
+        // 0.7.2: the plan this PC puts back in its form after a battle slot is the one sent (the host's from the month's
+        // load had the target before this month's orders)
+        if (g_invPlanFromHost && t != g_invPlan.target) {
+            g_invPlan.target = t;
+            g_invPlan.count = 0;
+        }
+    }
     h["nation"] = std::to_string(g_myNation);
     net::Send(0, net::MSG_SUBMIT, PackHB(KVEncode(h), b.Pack()));
     g_submitted = true;
@@ -7259,6 +7672,24 @@ bool WarOnlyByPlayers(int idx) {
     for (int j = 0; j < 9; j++) human[j] = g_relSetup.human[j];
     MarkLobbyHumans(human);
     return human[idx];
+}
+
+bool PeoplesNation(int idx) {
+    using namespace mp;
+    if (idx < 0 || idx > 8) return false;
+    if (g_role == Role::Host) return IsHumanNation(idx);
+    if (g_role != Role::Client) return false;
+    if (idx == 0 || idx == g_myNation) return true;
+    bool human[9];
+    for (int j = 0; j < 9; j++) human[j] = g_relSetup.human[j];
+    MarkLobbyHumans(human);
+    return human[idx];
+}
+
+int JoinedInvasionOrders() {
+    using namespace mp;
+    if (g_role != Role::Client || g_myNation < 1) return -1;
+    return g_hostGen >= 4 ? 1 : 0;
 }
 
 void CreditWarVP(int gainer, int loser, int vp, const char* why) {

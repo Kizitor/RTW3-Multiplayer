@@ -437,6 +437,27 @@ def samples():
     check('GAME_ERROR_RE: the game\'s own error boxes, not its ordinary ones', R.GAME_ERROR_RE.search(
         'Error in SaveBuildCampaign procedure! Access violation at address 00B3F2A1') and R.GAME_ERROR_RE.search(
         'Out of memory') and not R.GAME_ERROR_RE.search('CV Furious aircraft capacity exceeded!'))
+    sk = R.parse_stance('ok fix=1 armed=0 side=-1 asks=3 none=3 forced=3 fixed=3 hooked=1')
+    sl = ("04:27:12.226 [51588] lockstep: minute box 'Error in AIDetermineTacticalStance2 procedure!\n"
+          "04:27:12.404 [51588] battle AI: the destroyer stance routine of division 'Germany Destroyer Division 2' (side "
+          "1) at t=13:54 asked twice for the closest dangerous big enemy ship: a ship, then none (the game's random draw); "
+          "IsBigShip answered as for the first (the game: \"Error in AIDetermineTacticalStance2 procedure!\")\n")
+    check('parse_stance / STANCE_BOX_RE (0.7.2): `ls teststance` counts as ints (side -1 included), an error gives {}; '
+          'the live minute box of the stance routine and the fix\'s line found in a log',
+          sk == dict(fix=1, armed=0, side=-1, asks=3, none=3, forced=3, fixed=3, hooked=1) and
+          R.parse_stance('error no live battle') == {} and len(R.log_lines(sl, R.STANCE_BOX_RE)) == 1 and
+          len(R.log_lines(sl, r'battle AI: the destroyer stance routine of division .* IsBigShip answered')) == 1, sk)
+    ab = R.parse_aibuilds('ok n=3 keep=1 | 1900-09:3:KE:escorts:K1:0/3 1900-09:5:DD:monthly:2/4 '
+                          'unknown:7:CL:other:-1/-1')
+    ap = R.parse_aib_patrol('ok nation=3 onPatrol=3 required=4 requiredK=3 put=2 ids=411,412 patrolIds=388,411,412')
+    check('parse_aibuilds / parse_aib_patrol (0.7.2): the lay-downs with their cause and view, the patrols and their '
+          'requirement; an error gives None / no fields', ab == [
+              dict(date='1900-09', nation=3, type='KE', cause='escorts', view=1, patrols=0, required=3),
+              dict(date='1900-09', nation=5, type='DD', cause='monthly', view=0, patrols=2, required=4),
+              dict(date='unknown', nation=7, type='CL', cause='other', view=0, patrols=-1, required=-1)]
+          and R.parse_aibuilds('error unknown command') is None and ap['onPatrol'] == 3 and ap['requiredK'] == 3
+          and ap['ids'] == ['411', '412'] and ap['patrolIds'] == ['388', '411', '412']
+          and R.parse_aib_patrol('error x')['ids'] == [] and 'onPatrol' not in R.parse_aib_patrol('error x'), (ab, ap))
     check('result_box_side: the second player\'s result box (engine level 12): heads and points of both texts across the '
           'box\'s line breaks; ok for the victory from its side with the points swapped, not for a head left as the game '
           'wrote it; None without the line', r1 and r1['ok'] and (r1['head'], r1['own'], r1['enemy'], r1['g_head'],
@@ -656,6 +677,50 @@ def intel_samples():
           (R.battle_area(rq, 3, 'x'), R.battle_area(rq, 1, 'x'), R.battle_area(rq, 5, 'x'), R.battle_area(rq, 9, 'x'))
           == ('Northern Europe', 'The Baltic', 'North Sea', 'x'),
           (R.battle_area(rq, 3, 'x'), R.battle_area(rq, 1, 'x'), R.battle_area(rq, 5, 'x')))
+    # battle_generator g)/h) (0.7.2, fix-battlesearch): a request's client lines, its encounter line, the war score
+    # lines after its merge line (the formats of session.cpp)
+    cl = ("19:00:00.000 [200] battle 7: the month's state in the battle slot: ship-type flags 010101 -> 111111\n"
+          "19:00:00.050 [200] StartPlayerBattle 0 attacks 3 in Northern Europe -> none (TEST testdecline: the computer "
+          "declined 0x, fought 1x, not caught out 1x; left 0/1)\n"
+          "19:00:00.100 [200] battle 7: attempt 0 (1 attacks 3 in Northern Europe): the player declined against nation "
+          "3 in Northern Europe (VP +0/+150): no battle; the search goes on, as single player (encounter 1)\n"
+          "19:00:00.200 [200] battle 7: fighting nation 1 vs 5 in The Mediterranean (slot 87)\n"
+          "19:01:00.000 [200] battle 7: fought\n"
+          "19:01:01.000 [200] battle 8: the month's state in the battle slot: ship-type flags 111111 -> 111111\n"
+          "19:01:01.100 [200] battle 8: attempt 0 (1 attacks 3 in The Baltic): the enemy declined battle against "
+          "nation 3 in The Baltic (VP +150/+0): no battle; the search goes on, as single player (encounter 1)\n")
+    seg = R.req_segment(cl, 7)
+    check('req_segment: a request\'s client lines from its battle slot\'s start to its outcome (not the next request\'s); '
+          'search_enc: its encounter line\'s points (the player\'s decline +0/+150; the enemy\'s decline of request 8 '
+          '+150/+0; none where attempt 0 was something else)',
+          seg.startswith("] battle 7: the month's state") and seg.endswith('battle 7: fought') and 'battle 8' not in seg
+          and R.search_enc(seg, 7, 1, 3, 'the player declined') == (0, 150)
+          and R.search_enc(R.req_segment(cl, 8), 8, 1, 3, 'the enemy declined battle') == (150, 0)
+          and R.search_enc(seg, 7, 1, 3, 'the enemy declined battle') is None and R.req_segment(cl, 9) == '',
+          (seg[:60], R.search_enc(seg, 7, 1, 3, 'the player declined')))
+    ap = ("19:01:02.000 [100] battle 7 applied: 9 ships changed (40 fields), 1 removed, VP 360/80, prestige 1, VP of the "
+          "other opponents: nation 3 +150 (player: VP 360/230, prestige 1, morale 0); 2 encounter(s): 0 declined nation 3 "
+          "VP 0/150 in Northern Europe, 1 fought nation 5 VP 360/80 in The Mediterranean\n"
+          "19:01:02.001 [100] war score 1-3 starts at 0:0\n"
+          "19:01:02.001 [100] war score 1-3: +0/+150 from a battle fought on a player's PC -> 0:150\n"
+          "19:01:02.002 [100] war score 1-5: +360/+80 from a battle fought on a player's PC -> 360:80\n"
+          "19:01:03.000 [100] battle 8 applied: 0 ships changed (0 fields), 0 removed, VP 150/0, prestige 0 (player: VP "
+          "150/0, prestige 0, morale 0); the enemy declined battle\n"
+          "19:01:03.001 [100] war score 1-3: +150/+0 from a battle fought on a player's PC -> 150:150\n")
+    m7 = re.search(R.APPLIED_RE, ap.splitlines()[0])
+    pe = R.parse_encounters(ap.splitlines()[0])
+    check('applied_war_scores: the war score lines right after a request\'s merge line (a new pair\'s "starts at" line '
+          'between them), not the next request\'s; APPLIED_RE on a merge line with "VP of the other opponents" and the '
+          'encounter list; parse_encounters: the list in order with each one\'s area (none on a line without a list)',
+          R.applied_war_scores(ap, 7) == [(1, 3, 0, 150), (1, 5, 360, 80)]
+          and R.applied_war_scores(ap, 8) == [(1, 3, 150, 0)] and R.applied_war_scores(ap, 9) == []
+          and m7 is not None and (m7[5], m7[6], m7[7]) == ('360', '80', '1')
+          and pe == [(0, 'declined', 3, 0, 150, 'Northern Europe'), (1, 'fought', 5, 360, 80, 'The Mediterranean')]
+          and R.parse_encounters(ap.splitlines()[4]) == []
+          and R.parse_encounters('x; 3 encounter(s): 0 avoided nation 7 VP 360/0 in Northern Europe, 1 noforce1 nation 3 '
+                                 'VP 158/0, 2 fought nation 7 VP 5/-2 in The Baltic')
+          == [(0, 'avoided', 7, 360, 0, 'Northern Europe'), (1, 'noforce1', 3, 158, 0, ''), (2, 'fought', 7, 5, -2, 'The Baltic')],
+          (R.applied_war_scores(ap, 7), R.applied_war_scores(ap, 8), pe))
 
 
 def relations_samples():

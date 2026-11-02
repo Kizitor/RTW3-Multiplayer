@@ -2061,4 +2061,7 @@ std::string TestTreaty(const std::vector<std::string>& args) {
            " calibre=" + std::to_string(t.cal);
 }
 
+int CurrentDate() { return GameDate(); }
+std::string DateString(int d) { return DateText(d); }
+
 }  // namespace economy

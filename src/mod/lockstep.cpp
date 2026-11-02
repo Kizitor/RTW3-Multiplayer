@@ -7234,13 +7234,15 @@ static void OnSimFrameUnwound(int idx) {
 // ---- The division stance routine's guard ----
 // AIDetermineTacticalStance2 (0xdc108c) runs one stance routine per ship type (0xdb726c / 0xdba690 / 0xdbd104 /
 // 0xdc0010). They read the flagship of the division's LeadDivision and TargetDiv without checking that this division
-// still has ships (the destroyer routine for drSupport/drScreen at 0xdbddc4: LeadDivision.GetFlagship.IsBigShip):
-// GetFlagship is nil then and IsBigShip reads +0x9d3 of it ("Error in AIDetermineTacticalStance2 procedure! ... Read of
-// address 000009D3"). The game keeps those references valid at the end of each minute: CheckAllDivAfterMove clears the
+// still has ships (e.g. the big-ship routine's LeadDivision.GetFlagship at 0xdb778d; the destroyer routine clears an
+// empty LeadDivision itself first, 0xdbd381): GetFlagship is nil then. The game keeps those references valid at the end
+// of each minute: CheckAllDivAfterMove clears the
 // LeadDivision of a division whose lead has no ships left (0xdb0cb5: LeadDivision := nil, Role := drIndependent) and
 // removes a division without ships (RemoveDivision -> RemoveAsDivTarget: every TargetDiv and LeadDivision pointing to it
 // := nil). The guard applies those rules to the division the routine is about to judge, so a reference to a division
-// whose ships are gone reads as none, as it will after CheckAllDivAfterMove; it changes nothing else.
+// whose ships are gone reads as none, as it will after CheckAllDivAfterMove; it changes nothing else. (The box "Error in
+// AIDetermineTacticalStance2 procedure! ... Read of address 000009D3" of destroyer divisions is the routine's second
+// ask, below.)
 static int g_fTargetDiv = -1, g_fDivRole = -1;
 
 static void* FindStanceRoutine() {
@@ -7293,6 +7295,401 @@ extern "C" void __stdcall LS_StanceGuard(void* self, void* div, void* ret) {
         if (++g_stanceFixes <= 20) StanceFixNote(div, ret, lead, target);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+}
+
+// ---- The destroyer stance routine's second ask (0.7.2, fix-stance2) ----
+// A game bug of every battle (single player too): the stance routine for destroyer divisions (0xdbd104, from
+// AIDetermineTacticalStance2) asks an unnamed routine (0xd94cd0: the closest dangerous big enemy ship its flagship sees)
+// twice in a row, `(F(flagship) <> nil) and not F(flagship).IsBigShip`, and uses the second answer unchecked. F is no
+// pure function: TFightingShip.IsDangerous draws Random for a ship with 70 % damage or more (its operational guns against
+// Random(all its guns) + 2). When the first answer is such a ship and the second none, IsBigShip reads +0x9d3 of nil:
+// "Error in AIDetermineTacticalStance2 procedure! Division: <a destroyer division> Access violation at address <image
+// base + 0x60b5c0> ... Read of address 000009D3", and the routine stops for that division. For a destroyer flagship F
+// answers only big ships (type < 4) or none, so IsBigShip of an answer is True: the mod's hook answers True for that one
+// call when the second answer is none, as for the first answer; the routine goes on as with two equal answers. No random
+// draw is added or skipped and only shared state is read: both PCs of a live battle do the same.
+extern "C" {
+void* g_lsOrigIsBig = nullptr;              // TFightingShip.IsBigShip (the fix's hook)
+uintptr_t g_ddBigRet = 0;                   // IsBigShip's return after the second ask
+void __stdcall LS_DDBigNil(void* div);
+// TEST ONLY and RTW3MP_DIAG (hooked on demand): F, the routine's way to its two asks, GetClosestEnemyShip
+void* g_lsOrigAsk = nullptr;
+void* g_lsOrigDDSight = nullptr;            // the routine's `cmp byte ptr [flagship+WithinMaxSightingRange], 0`
+void* g_lsOrigDDPath = nullptr;             // the routine's `test esi, esi; je <end>` before its out-of-range branch
+void* g_lsOrigClosest = nullptr;            // TfrmMain.GetClosestEnemyShip
+uintptr_t g_ddSite = 0;                     // the two asks (mov eax, ebx; call GetFlagship; ...)
+uintptr_t g_ddAsk1Ret = 0, g_ddAsk2Ret = 0; // F's two returns in the destroyer routine
+uintptr_t g_ddSightOn = 0;                  // where the routine goes on when its flagship is within sighting range
+uintptr_t g_ddClosest1Ret = 0, g_ddClosest2Ret = 0;  // its two GetClosestEnemyShip returns (flagship, trailing ship)
+void* g_ddAsk1Res = nullptr;                // the first answer of the last pair
+volatile long g_ddAskForce = 0;             // TEST ONLY: armed for the next n runs of the routine
+int __stdcall LS_DDTestOn(void* div);
+void* __stdcall LS_DDClosestAll(void* ship, void* div);
+void* __stdcall LS_DDAsk1(void* div, void* closest, void* first);
+void* __stdcall LS_DDAsk2(void* div, void* first, void* second);
+}
+static volatile long g_ddFixes = 0, g_ddAsks = 0, g_ddForced = 0, g_ddNone = 0;
+static bool g_ddSiteOk = false, g_ddBigHooked = false, g_ddFixOn = false;
+static bool g_ddAskHooked = false, g_ddAskTrace = false, g_ddTestHooked = false;
+static int g_ddTestSide = -1;  // TEST ONLY: the switch's divisions (-1: either side)
+
+// TFightingShip.IsBigShip (Self = EAX; Boolean in AL; it changes EAX only). Delphi's register convention leaves ECX and
+// EDX to the callee; EBX is the destroyer routine's division at that call.
+extern "C" __declspec(naked) void LS_dIsBigShip() {
+    __asm {
+        test eax, eax
+        jnz pass
+        mov ecx, [esp]
+        cmp ecx, [g_ddBigRet]
+        jne pass
+        push ebx
+        call LS_DDBigNil
+        mov eax, 1
+        ret
+    pass:
+        jmp dword ptr [g_lsOrigIsBig]
+    }
+}
+
+// F (Self = EAX, the ship = EDX; the answer in EAX; no stack arguments), hooked for the TEST switch and RTW3MP_DIAG:
+// the destroyer routine's two asks run the routine itself (its draws as without the hook), their answers go through
+// LS_DDAsk1 / LS_DDAsk2 (the routine's EBX: the division, ESI: its closest enemy ship; F keeps both).
+extern "C" __declspec(naked) void LS_dDDAsk() {
+    __asm {
+        mov ecx, [esp]
+        cmp ecx, [g_ddAsk1Ret]
+        je first
+        cmp ecx, [g_ddAsk2Ret]
+        je second
+        jmp dword ptr [g_lsOrigAsk]
+    first:
+        call dword ptr [g_lsOrigAsk]
+        push eax
+        push esi
+        push ebx
+        call LS_DDAsk1
+        mov dword ptr [g_ddAsk1Res], eax
+        ret
+    second:
+        call dword ptr [g_lsOrigAsk]
+        push eax
+        push dword ptr [g_ddAsk1Res]
+        push ebx
+        call LS_DDAsk2
+        ret
+    }
+}
+
+// TEST ONLY, while armed, for the switch's divisions: the destroyer routine's three ways out before its two asks are
+// passed over, so that any destroyer division of the computer comes to them in its next run: (1) no enemy within
+// sighting range (the routine's `cmp byte ptr [flagship+WithinMaxSightingRange], 0; jne <on>`: it goes on at <on>),
+// (2) no enemy ship sighted (its GetClosestEnemyShip answers the closest of all, LS_DDClosestAll), (3) its out-of-range
+// branch's conditions (at `test esi, esi; je <end>` it goes on at the two asks: the enemy beyond 0.9 of its guns' range,
+// the flagship under fire, no scout role, not withdrawing, the enemy no big ship, no bigger own ship within 20000
+// yards). Registers as the routine's own (the helper keeps EBX, ESI, EDI, EBP; flags are set again by the routine).
+extern "C" __declspec(naked) void LS_dDDSight() {
+    __asm {
+        cmp dword ptr [g_ddAskForce], 0
+        jle orig
+        push eax
+        push ecx
+        push edx
+        push ebx
+        call LS_DDTestOn
+        test eax, eax
+        pop edx
+        pop ecx
+        pop eax
+        jz orig
+        jmp dword ptr [g_ddSightOn]
+    orig:
+        jmp dword ptr [g_lsOrigDDSight]
+    }
+}
+
+extern "C" __declspec(naked) void LS_dDDPath() {
+    __asm {
+        cmp dword ptr [g_ddAskForce], 0
+        jle orig
+        test esi, esi
+        jz orig
+        push eax
+        push ecx
+        push edx
+        push ebx
+        call LS_DDTestOn
+        test eax, eax
+        pop edx
+        pop ecx
+        pop eax
+        jz orig
+        jmp dword ptr [g_ddSite]
+    orig:
+        jmp dword ptr [g_lsOrigDDPath]
+    }
+}
+
+// TfrmMain.GetClosestEnemyShip (Self = EAX, aShip = EDX, aSetofShipTypes = ECX; the answer in EAX)
+extern "C" __declspec(naked) void LS_dDDClosest() {
+    __asm {
+        cmp dword ptr [g_ddAskForce], 0
+        jle orig
+        push ecx
+        mov ecx, [esp + 4]
+        cmp ecx, [g_ddClosest1Ret]
+        je mine
+        cmp ecx, [g_ddClosest2Ret]
+        je mine
+        pop ecx
+    orig:
+        jmp dword ptr [g_lsOrigClosest]
+    mine:
+        pop ecx
+        push edx
+        call dword ptr [g_lsOrigClosest]
+        pop edx
+        test eax, eax
+        jnz done
+        push ebx
+        push edx
+        call LS_DDClosestAll
+    done:
+        ret
+    }
+}
+
+static std::string DDDivText(void* div) {
+    static int fName = dl::Field("TDivision", "Name"), fSide = dl::Field("TDivision", "Side");
+    return "'" + (fName > 0 ? W2U(dl::ReadUStr(dl::At<void*>(div, fName))) : std::string("?")) + "' (side " +
+           std::to_string(fSide > 0 ? dl::At<int>(div, fSide) : -1) + ")";
+}
+
+extern "C" void __stdcall LS_DDBigNil(void* div) {
+    long n = InterlockedIncrement(&g_ddFixes);
+    if (n > 20) return;
+    try {
+        if (!E.tried) Resolve();  // (the battle clock: a single-player battle may come before any session)
+        Log("battle AI: the destroyer stance routine of division %s at t=%s asked twice for the closest dangerous big enemy "
+            "ship: a ship, then none (the game's random draw); IsBigShip answered as for the first (the game: \"Error in "
+            "AIDetermineTacticalStance2 procedure!\")%s",
+            DDDivText(div).c_str(), ClockText().c_str(), n == 20 ? " (the last such line in this game)" : "");
+    } catch (...) {
+    }
+}
+
+extern "C" int __stdcall LS_DDTestOn(void* div) {
+    static int fSide = dl::Field("TDivision", "Side");
+    if (g_ddAskForce <= 0 || !div) return 0;
+    return g_ddTestSide < 0 || (fSide > 0 && dl::At<int>(div, fSide) == g_ddTestSide) ? 1 : 0;
+}
+
+// TEST ONLY: the closest enemy ship of `ship` among all ships afloat (sighted or not; the all-ships list's order on a tie)
+extern "C" void* __stdcall LS_DDClosestAll(void* ship, void* div) {
+    static void* range = dl::Method("TFightingShip", "GetRangeToShip");
+    static void* afloat = dl::Method("TFightingShip", "IsAfloat");
+    static int fSide = dl::Field("TFightingShip", "Side");
+    void* best = nullptr;
+    try {
+        if (!LS_DDTestOn(div) || !ship || !range || !afloat || fSide <= 0) return nullptr;
+        if (!E.tried) Resolve();
+        void* all = List(E.allShipsVar);
+        int side = dl::At<int>(ship, fSide), bestR = INT_MAX;
+        for (int i = 0; i < dl::ListCount(all); i++) {
+            void* s = dl::ListItem(all, i);
+            if (!s || !IsFightingShip(s) || dl::At<int>(s, fSide) == side || !(dl::Call(afloat, U(s)) & 0xFF)) continue;
+            int r = (int)dl::Call(range, U(ship), U(s));
+            if (r < bestR) bestR = r, best = s;
+        }
+    } catch (...) {
+        best = nullptr;
+    }
+    return best;
+}
+
+extern "C" void* __stdcall LS_DDAsk1(void* div, void* closest, void* first) {
+    if (!first && closest && LS_DDTestOn(div)) return closest;  // TEST: the second ask comes
+    return first;
+}
+
+extern "C" void* __stdcall LS_DDAsk2(void* div, void* first, void* second) {
+    long n = InterlockedIncrement(&g_ddAsks);
+    void* give = second;
+    bool forced = false;
+    if (LS_DDTestOn(div)) {
+        InterlockedDecrement(&g_ddAskForce);
+        InterlockedIncrement(&g_ddForced);
+        give = nullptr;
+        forced = true;
+    }
+    if (!second) InterlockedIncrement(&g_ddNone);
+    try {
+        if ((forced || (g_ddAskTrace && (n <= 200 || !second))) && !E.tried) Resolve();
+        if (forced)
+            Log("battle AI: TEST the destroyer stance routine of division %s at t=%s: its first answer %s, the second "
+                "none (instead of %s)%s",
+                DDDivText(div).c_str(), ClockText().c_str(), W2U(ObjName(first)).c_str(), W2U(ObjName(second)).c_str(),
+                g_ddFixOn ? "" : "; the fix is off: the game's box comes");
+        else if (g_ddAskTrace && (n <= 200 || !second))
+            Log("poc stance: second ask #%ld: division %s t=%s first=%s second=%s", n, DDDivText(div).c_str(),
+                ClockText().c_str(), W2U(ObjName(first)).c_str(), second ? W2U(ObjName(second)).c_str() : "NONE");
+    } catch (...) {
+    }
+    return give;
+}
+
+// The site in the destroyer routine (1.01.44: 0xdbd957): mov eax, ebx; call GetFlagship; mov edx, eax; mov eax, [ebp-4];
+// call F; test eax, eax; je L; mov eax, ebx; call GetFlagship; mov edx, eax; mov eax, [ebp-4]; call F; call IsBigShip;
+// test al, al; je C; L: mov eax, ebx; call GetFlagship; cmp dword ptr [eax+LightState], 1. Exactly one in the game.
+static uint8_t* FindDDAskSite() {
+    void* gf = dl::Method("TDivision", "GetFlagship");
+    void* big = dl::Method("TFightingShip", "IsBigShip");
+    int ls = dl::Field("TFightingShip", "LightState");
+    if (!gf || !big || ls <= 0) return nullptr;
+    std::vector<int> pat = {0x8B, 0xC3, 0xE8, -1,   -1,   -1,   -1,   0x8B, 0xD0, 0x8B, 0x45, 0xFC, 0xE8, -1,   -1,
+                            -1,   -1,   0x85, 0xC0, 0x74, 0x1A, 0x8B, 0xC3, 0xE8, -1,   -1,   -1,   -1,   0x8B, 0xD0,
+                            0x8B, 0x45, 0xFC, 0xE8, -1,   -1,   -1,   -1,   0xE8, -1,   -1,   -1,   -1,   0x84, 0xC0,
+                            0x74, -1,   0x8B, 0xC3, 0xE8, -1,   -1,   -1,   -1,   0x83, 0xB8, ls & 0xff, (ls >> 8) & 0xff,
+                            (ls >> 16) & 0xff, (ls >> 24) & 0xff, 0x01};
+    uint8_t* start = (uint8_t*)dl::g_base + 0x1000;
+    size_t len = dl::g_size - 0x1000;
+    uint8_t* hit = nullptr;
+    int hits = 0;
+    for (uint8_t* p = start; (size_t)(p - start) + pat.size() <= len;) {
+        uint8_t* q = dl::FindPattern(p, len - (size_t)(p - start), pat);
+        if (!q) break;
+        if (!hits++) hit = q;
+        p = q + 1;
+    }
+    if (hits != 1 || CallTarget(hit + 2) != gf || CallTarget(hit + 23) != gf || CallTarget(hit + 49) != gf ||
+        CallTarget(hit + 12) != CallTarget(hit + 33) || CallTarget(hit + 38) != big)
+        return nullptr;
+    return hit;
+}
+
+static void DDAskTraceOn();
+
+// The fix's hook on IsBigShip: on (created on first use) or off (TEST: the game's own IsBigShip, its box).
+static bool DDFix(bool on) {
+    void* big = dl::Method("TFightingShip", "IsBigShip");
+    if (!g_ddSiteOk || !big) return false;
+    if (!g_ddBigHooked) {
+        if (!on) return true;
+        if (MH_CreateHook(big, (void*)&LS_dIsBigShip, &g_lsOrigIsBig) != MH_OK) return false;
+        g_ddBigHooked = true;
+    }
+    MH_STATUS st = on ? MH_EnableHook(big) : MH_DisableHook(big);
+    if (st != MH_OK && st != (on ? MH_ERROR_ENABLED : MH_ERROR_DISABLED)) return false;
+    g_ddFixOn = on;
+    return true;
+}
+
+// Installed at the mod's start (game::InstallHooks): every battle on this PC.
+bool InstallStanceAskFix() {
+    uint8_t* site = FindDDAskSite();
+    if (site) {
+        g_ddSiteOk = true;
+        g_ddSite = (uintptr_t)site;
+        g_ddAsk1Ret = (uintptr_t)(site + 17);
+        g_ddAsk2Ret = (uintptr_t)(site + 38);
+        g_ddBigRet = (uintptr_t)(site + 43);
+    }
+    char v[8];
+    bool off = site && GetEnvironmentVariableA("RTW3MP_TEST_STANCEFIX", v, sizeof(v)) > 0 && v[0] == '0';
+    bool ok = site && (off || DDFix(true));
+    Log("The destroyer stance routine's second ask (AIDetermineTacticalStance2): %s (the ask at rva %#x, IsBigShip's return "
+        "rva %#x)",
+        off  ? "TEST: off (RTW3MP_TEST_STANCEFIX=0: the game's own path, its box when the second answer is none)"
+        : ok ? "ok"
+             : "UNAVAILABLE (the game's own: its box when the second answer is none)",
+        site ? (unsigned)((uintptr_t)site - dl::g_base) : 0u, site ? (unsigned)(g_ddBigRet - dl::g_base) : 0u);
+    if (site && game::PocDiag()) DDAskTraceOn();
+    return ok;
+}
+static bool DDHook(void* target, void* detour, void** orig, const char* what) {
+    MH_STATUS st = target ? MH_CreateHook(target, detour, orig) : MH_ERROR_NOT_EXECUTABLE;
+    if (st == MH_OK) st = MH_EnableHook(target);
+    Log("battle AI: the destroyer stance routine's %s hooked (rva %#x): %s", what,
+        target ? (unsigned)((uintptr_t)target - dl::g_base) : 0u, st == MH_OK ? "ok" : "FAILED");
+    return st == MH_OK;
+}
+
+// F's hook (TEST switch, RTW3MP_DIAG): installed once, on demand.
+static bool DDAskHook() {
+    if (!g_ddAskHooked && g_ddSiteOk)
+        g_ddAskHooked = DDHook(CallTarget((uint8_t*)g_ddAsk1Ret - 5), (void*)&LS_dDDAsk, &g_lsOrigAsk, "two asks");
+    return g_ddAskHooked;
+}
+
+static void DDAskTraceOn() {
+    g_ddAskTrace = DDAskHook();
+}
+
+// TEST ONLY, once, on the switch: the routine's ways out before its two asks (1.01.44, from the asks at 0xdbd957: the
+// sighting check 0x7fb bytes before them, it goes on 0x698 before; GetClosestEnemyShip's returns 0x5ef and 0x5d8
+// before; the out-of-range branch's `test esi, esi; je` 0x104 before, its je to the routine's end 0x1b8 after).
+static bool DDTestHooks() {
+    if (g_ddTestHooked) return true;
+    if (!DDAskHook()) return false;
+    uint8_t* site = (uint8_t*)g_ddSite;
+    int wsr = dl::Field("TFightingShip", "WithinMaxSightingRange"), sighted = dl::Field("TFightingShip", "SightedShips");
+    void* closest = dl::Method("TfrmMain", "GetClosestEnemyShip");
+    void* range = dl::Method("TFightingShip", "GetRangeToShip");
+    void* maxr = dl::Method("TFightingShip", "GetMaxRange");
+    uint8_t* s = site - 0x7fb;  // cmp byte ptr [edi+wsr], 0; jne <on>; mov eax, [ebp-0x10]; mov eax, [eax+SightedShips]
+    uint8_t* p = site - 0x104;  // test esi, esi; je <end>; mov edx, esi; mov eax, edi; call GetRangeToShip; ...
+    std::vector<int> ps = {0x80, 0xBF, wsr & 0xff, (wsr >> 8) & 0xff, (wsr >> 16) & 0xff, (wsr >> 24) & 0xff, 0x00, 0x0F,
+                           0x85, -1, -1, -1, -1, 0x8B, 0x45, 0xF0, 0x8B, 0x80, sighted & 0xff, (sighted >> 8) & 0xff,
+                           (sighted >> 16) & 0xff, (sighted >> 24) & 0xff};
+    std::vector<int> pp = {0x85, 0xF6, 0x0F, 0x84, -1,   -1,   -1,   -1,   0x8B, 0xD6, 0x8B, 0xC7, 0xE8, -1,   -1,   -1,  -1,
+                           0x89, 0x45, -1,   0xDB, 0x45, -1,   0xDB, 0x7D, -1,   0x9B, 0xBA, 0x01, 0x00, 0x00, 0x00, 0x8B,
+                           0xC7, 0xE8};
+    bool ok = wsr > 0 && sighted > 0 && closest && range && maxr && dl::FindPattern(s, ps.size(), ps) == s &&
+              s + 13 + *(int32_t*)(s + 9) == site - 0x698 && dl::FindPattern(p, pp.size(), pp) == p &&
+              p + 8 + *(int32_t*)(p + 4) == site + 0x1b8 && CallTarget(p + 12) == range && CallTarget(p + 34) == maxr &&
+              site[-0x5ef - 5] == 0xE8 && CallTarget(site - 0x5ef - 5) == closest && site[-0x5d8 - 5] == 0xE8 &&
+              CallTarget(site - 0x5d8 - 5) == closest;
+    if (!ok) {
+        Log("battle AI: TEST the destroyer stance routine's ways to its two asks were not found");
+        return false;
+    }
+    g_ddSightOn = (uintptr_t)(site - 0x698);
+    g_ddClosest1Ret = (uintptr_t)(site - 0x5ef);
+    g_ddClosest2Ret = (uintptr_t)(site - 0x5d8);
+    g_ddTestHooked = DDHook(s, (void*)&LS_dDDSight, &g_lsOrigDDSight, "sighting check (TEST)") &&
+                     DDHook(closest, (void*)&LS_dDDClosest, &g_lsOrigClosest, "closest enemy (TEST)") &&
+                     DDHook(p, (void*)&LS_dDDPath, &g_lsOrigDDPath, "out-of-range branch (TEST)");
+    return g_ddTestHooked;
+}
+
+// `ls teststance [<n> [side=<s>] [nofix]]` (TEST ONLY; any battle, between minutes, on both PCs of a live battle alike):
+// the next n runs of the destroyer stance routine for a computer's destroyer division (of side s; any side without it)
+// come to its two asks (DDTestHooks), the first answer is a ship (its closest enemy if F answers none) and the second
+// none (F's own draws as always): the game's moment of the box. `nofix` turns the fix off (the game's own IsBigShip:
+// its box) until the next `ls teststance`, which turns it on again; `ls teststance 0` disarms. The reply's counts:
+// asks= second asks, none= of them the game's own none, forced= the switch's, fixed= IsBigShip's answers by the fix.
+static std::string TestStanceCommand(const std::vector<std::string>& a) {
+    if (a.size() > 2) {
+        if (!DDTestHooks()) return "error the destroyer stance routine's asks were not found";
+        long n = atol(a[2].c_str());
+        int side = -1;
+        bool nofix = false;
+        for (size_t i = 3; i < a.size(); i++)
+            if (a[i] == "nofix")
+                nofix = true;
+            else if (a[i].rfind("side=", 0) == 0)
+                side = atoi(a[i].c_str() + 5);
+        if (!DDFix(!nofix)) return "error the fix's hook could not be turned " + std::string(nofix ? "off" : "on");
+        g_ddTestSide = side;
+        InterlockedExchange(&g_ddAskForce, n > 0 ? n : 0);
+        Log("battle AI: TEST the next %ld runs of the destroyer stance routine for a computer's destroyer division%s ask "
+            "twice, the second answer none; the fix %s",
+            n, side >= 0 ? (" of side " + std::to_string(side)).c_str() : "",
+            nofix ? "OFF (the game's own IsBigShip: its box)" : "on");
+    }
+    return "ok fix=" + std::to_string(g_ddFixOn ? 1 : 0) + " armed=" + std::to_string(g_ddAskForce) +
+           " side=" + std::to_string(g_ddTestSide) + " asks=" + std::to_string(g_ddAsks) +
+           " none=" + std::to_string(g_ddNone) + " forced=" + std::to_string(g_ddForced) +
+           " fixed=" + std::to_string(g_ddFixes) + " hooked=" + std::to_string(g_ddTestHooked ? 1 : 0);
 }
 
 static void AfterMinute() {
@@ -11207,6 +11604,7 @@ std::string Debug(const std::vector<std::string>& a) {
         return "ok shiptypes=" + TypeFlagsHex() + " sync=" + std::to_string(g_typeFlagsSync ? 1 : 0) +
                " hash=" + std::to_string(g_typeFlagsHash ? 1 : 0);
     }
+    if (c == "teststance") return TestStanceCommand(a);  // (TEST ONLY, any battle: the destroyer stance routine's asks)
     if (!S.on) return "error no live battle";
     NoteDispatchInSim(("bridge `ls " + c + "`").c_str());
     if (c == "run") {  // ls run [1|5|until|<n>]

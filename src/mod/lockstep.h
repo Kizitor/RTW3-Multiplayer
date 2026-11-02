@@ -34,6 +34,8 @@ bool SaveSac(const std::wstring& path);
 bool SetSideControl(int side, bool ai, bool human);
 bool SetPlayerSide(int side);   // the battle's human side (display test; the simulation depends on it)
 bool SetDivisionOrder(int idx, int course, int speed, int ai);  // as the course/speed boxes do (tests)
+// 0.7.2: the destroyer stance routine's second ask (a game bug); installed at the mod's start, every battle on this PC
+bool InstallStanceAskFix();
 
 // ---- live sessions ----
 typedef std::function<void(const std::string& payload)> SendFn;  // to the other PC (session routes it)

@@ -147,9 +147,12 @@ void HostUnhide() {
             }
             if (h.keepTaken) I(h.ps, fTaken) = h.taken;
         } else if (h.hidInv) {
-            if (cur == -1)
+            if (cur == -1) {
                 cur = h.inv;
-            else
+                // 0.7.2: the routine's monthly drift of InvasionSupport toward 0 (0xcf98d9) reaches every possession,
+                // the hidden ones too: a joined nation's invasion drifts in its own month only
+                I(h.ps, fSupport) = h.sup;
+            } else
                 Log("invasions: %s started nation %d's invasion of %s while nation %d's was hidden: nation %d's ends",
                     g_hideWhat, cur, W2U(NameOf(h.ps)).c_str(), h.inv, h.inv);
         }
@@ -330,6 +333,40 @@ extern "C" __declspec(naked) void d_MostImportant() {
     }
 }
 
+// 0.7.2: TdlgPossessionDetailsNew.FormShow(Self=EAX, Sender=EDX), from the dialog's ShowModal in the game's unnamed
+// ShowPossessionDetails (a click on a possession on the map, the areas tree's Details): that routine has set the "Set
+// invasion target" button just before (Visible: the owner is not PlayerNation; Enabled: not the form's target, the
+// owner's Tension > 40, value <= 15). The original first, then the button for a joined player's nation (DetailsButton).
+namespace inv {
+void DetailsButton(void* dlg);
+}
+
+extern "C" {
+void* o_PossDlgShow = nullptr;
+}
+
+static void DetailsButtonGuarded(void* dlg) {
+    __try {
+        inv::DetailsButton(dlg);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("invasions: possession details: exception in the mod's button check");
+    }
+}
+
+extern "C" void __stdcall CB_PossDlgShow(void* dlg, void* sender) {
+    dl::Call(o_PossDlgShow, (uint32_t)(uintptr_t)dlg, (uint32_t)(uintptr_t)sender);
+    DetailsButtonGuarded(dlg);
+}
+
+extern "C" __declspec(naked) void d_PossDlgShow() {
+    __asm {
+        push edx
+        push eax
+        call CB_PossDlgShow
+        ret
+    }
+}
+
 namespace inv {
 namespace {
 
@@ -385,6 +422,44 @@ int CallGuarded(void* fn, void* form) {
 }
 
 KState g_state[9];
+
+// 0.7.2: the possession details dialog's "Set invasion target" button (see d_PossDlgShow)
+int fDetailPoss = -1, fDlgBtn = -1, fCtlEnabled = -1, g_setEnabledSlot = -1;
+void *mInvPossible = nullptr, *mInvRange = nullptr, *g_showDetails = nullptr;
+bool g_detailsOk = false;
+std::string g_detailsLast;
+
+bool InstallDetails() {
+    fDetailPoss = dl::Field("TfrmBuildCamp", "CurrentDetailPossession");
+    fDlgBtn = dl::Field("TdlgPossessionDetailsNew", "bnInvasionTarget");
+    fCtlEnabled = dl::Field("TControl", "FEnabled");
+    mInvPossible = dl::Method("TfrmBuildCamp", "InvasionPossible");
+    mInvRange = dl::Method("TBuilderNation", "GetInvasionRange");
+    // ShowPossessionDetails (no RTTI name): the map menu's Details1Click calls it for a possession; its except handler
+    // names it. Its `mov eax, [eax+bnInvasionTarget]; mov ecx, [eax]; call [ecx+X]` is the button's SetEnabled (the
+    // VMT slot X of TControl.SetEnabled, 0x9c in 1.01.44).
+    if (uint8_t* d1 = (uint8_t*)dl::Method("TfrmBuildCamp", "Details1Click"))
+        for (uint8_t* t : dl::CallTargets(d1, 0x80))
+            if (HasErrorText(t, 0x900, L"Error in ShowPossessionDetails")) {
+                g_showDetails = t;
+                break;
+            }
+    if (g_showDetails && fDlgBtn > 0) {
+        std::vector<int> pat = {0x8B, 0x80, fDlgBtn & 0xFF, (fDlgBtn >> 8) & 0xFF, (fDlgBtn >> 16) & 0xFF,
+                                (fDlgBtn >> 24) & 0xFF, 0x8B, 0x08, 0xFF, 0x91, -1, -1, -1, -1};
+        if (uint8_t* hit = dl::FindPattern((uint8_t*)g_showDetails, 0x900, pat)) {
+            int slot = *(int32_t*)(hit + 10);
+            if (slot >= 0x40 && slot < 0x400 && slot % 4 == 0) g_setEnabledSlot = slot;
+        }
+    }
+    void* show = dl::Method("TdlgPossessionDetailsNew", "FormShow");
+    g_detailsOk = fDetailPoss > 0 && fDlgBtn > 0 && fCtlEnabled >= 0 && g_setEnabledSlot > 0 && show &&
+                  HookAt(show, (void*)&d_PossDlgShow, &o_PossDlgShow, "TdlgPossessionDetailsNew.FormShow");
+    Log("Invasion targets of joined nations (the possession details' button): %s (ShowPossessionDetails %p, SetEnabled "
+        "slot 0x%x, InvasionPossible %p)", g_detailsOk ? "ok" : "UNAVAILABLE; a joined player's button follows the "
+        "host's wars", g_showDetails, g_setEnabledSlot, mInvPossible);
+    return g_detailsOk;
+}
 }  // namespace
 
 KState& State(int K) { return g_state[K >= 0 && K < 9 ? K : 0]; }
@@ -462,10 +537,60 @@ bool Install() {
     Log("Invasions for joined nations: %s (fields %s, routine %p%s; the computer's escorts %s)",
         g_ok ? "ok" : "UNAVAILABLE", fieldsOk ? "ok" : "missing", g_resolve, code ? "" : ", code differs",
         esc ? "ok" : "UNAVAILABLE");
+    if (g_ok) InstallDetails();  // 0.7.2
     return g_ok;
 }
 
 bool Available() { return g_ok; }
+
+// 0.7.2: on a joined player's PC in a session (PlayerNation = BuilderNations[K]) the button follows nation K's own wars:
+// enabled for a possession of a nation K is at war with (its relation above 40), not K's target already, value <= 15
+// (the game's own test, with K's relation in place of nation 0's, the host's nation there), never for a nation a person
+// plays (the host refuses those), nor with a host that takes no invasion orders (below welcome `gen` 4). Elsewhere (the
+// host, single player, a battle slot, a joined player's copy outside a session) the game's state.
+void DetailsButton(void* dlg) {
+    g_detailsLast.clear();
+    int K = game::ShownNationIndex();
+    int orders = hookcb::JoinedInvasionOrders();
+    if (!g_detailsOk || !dlg || K < 1 || K > 8 || orders < 0 || game::EventActive()) return;
+    void* f = game::BuildCamp();
+    void* ps = f ? dl::At<void*>(f, fDetailPoss) : nullptr;
+    void* btn = dl::At<void*>(dlg, fDlgBtn);
+    void* owner = ps ? dl::At<void*>(ps, fOwner) : nullptr;
+    if (!ps || !btn || !owner || owner == game::PlayerNation()) return;  // nobody's (greyed) or the player's own (hidden)
+    int J = game::NationIndex(owner);
+    if (J < 0 || J > 8) return;
+    bool gameEn = dl::At<uint8_t>(btn, fCtlEnabled) != 0;
+    bool people = hookcb::PeoplesNation(J), war = game::AtWar(K, J);
+    bool target = ps == dl::At<void*>(f, fTarget);
+    int value = I(ps, fValue);
+    bool en = orders > 0 && war && !people && !target && value <= 15;
+    if (en != gameEn) {
+        void** vmt = *(void***)btn;
+        dl::Call(vmt[g_setEnabledSlot / 4], (uint32_t)(uintptr_t)btn, en ? 1u : 0u);
+    }
+    std::string why = orders <= 0 ? std::string("the host takes no invasion orders")
+                      : people     ? std::string("a person plays its owner")
+                      : !war       ? "not at war with nation " + std::to_string(J)
+                      : target     ? std::string("the target already")
+                      : value > 15 ? "value " + std::to_string(value)
+                                   : "at war with nation " + std::to_string(J);
+    g_detailsLast = W2U(NameOf(ps)) + " (nation " + std::to_string(J) + "'s): " + (en ? "enabled" : "greyed out") + " (" +
+                    why + "; the game's test with nation 0's relation: " + (gameEn ? "enabled" : "greyed out") + ")";
+    Log("invasions: possession details of %s for nation %d's player: \"Set invasion target\" %s", g_detailsLast.c_str(), K,
+        en == gameEn ? "as the game set it" : "set by the nation's own war");
+}
+
+std::string DetailsButtonLast() { return g_detailsLast; }
+
+int RangeCheck(const std::wstring& name, int* rangeNm) {
+    void* f = game::BuildCamp();
+    void* pn = game::PlayerNation();
+    void* ps = g_ok && f ? FindPoss(name) : nullptr;
+    if (!ps || !pn || !mInvPossible || !mInvRange) return -2;
+    if (rangeNm) *rangeNm = (int)dl::Call(mInvRange, (uint32_t)(uintptr_t)pn);
+    return (int)dl::Call(mInvPossible, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)pn, (uint32_t)(uintptr_t)ps);
+}
 
 std::string Describe(int K) {
     std::string s;
@@ -546,7 +671,7 @@ namespace {
 struct PS {
     void* ps;
     void* owner;
-    int inv, taken, building;
+    int inv, taken, building, sup;
     uint8_t itt;
     bool vis;
 };
@@ -565,8 +690,8 @@ void RunInView(int K, const bool hv[9], KState& st, int armyOff, int enemyDecl, 
     std::map<std::wstring, void*> byName;
     g_ps.clear();
     ForEachPoss([&](void* ps) {
-        PS s{ps, dl::At<void*>(ps, fOwner), I(ps, fInvaded), I(ps, fTaken), I(ps, fBuilding), dl::At<uint8_t>(ps, fITT),
-             false};
+        PS s{ps, dl::At<void*>(ps, fOwner), I(ps, fInvaded), I(ps, fTaken), I(ps, fBuilding), I(ps, fSupport),
+             dl::At<uint8_t>(ps, fITT), false};
         int vi = s.inv >= 0 ? sw(s.inv) : -1, ov = OwnerIdx(ps);  // view indices (K's record is index 0 now)
         s.vis = vi >= 0 && ((vi == 0 && ov > 0 && !hv[ov]) || (ov == 0 && vi > 0 && !hv[vi]));
         I(ps, fInvaded) = s.vis ? vi : -1;
@@ -579,6 +704,23 @@ void RunInView(int K, const bool hv[9], KState& st, int armyOff, int enemyDecl, 
     for (auto& n : st.itt) {
         auto it = byName.find(n);
         if (it != byName.end() && I(it->second, fInvaded) >= 0) dl::At<uint8_t>(it->second, fITT) = 1;
+    }
+    // 0.7.2: K's target invaded by another nation (the host's invasion, another joined nation's) is hidden in K's view:
+    // the routine would take it for free, and K's start there would end that invasion. K's plan ends first, as the
+    // game's CheckForInvasionBattles ends a player's target that is invaded (single player's battle check before it).
+    if (!st.target.empty()) {
+        auto it = byName.find(st.target);
+        const PS* tp = nullptr;
+        for (auto& x : g_ps)
+            if (it != byName.end() && x.ps == it->second) tp = &x;
+        if (tp && tp->inv >= 0 && tp->inv != K) {
+            Log("invasions: nation %d's target %s is invaded by nation %d (hidden in its view): its plan ends (the game's "
+                "rule for an invaded target)", K, W2U(st.target).c_str(), tp->inv);
+            r.news.push_back(L"Invasion of " + st.target + L" cancelled: " + st.target +
+                             L" is already invaded by the forces of " + game::NationName(sw(tp->inv)) + L".");
+            st.target.clear();
+            st.count = 0;
+        }
     }
     FormSave fs{dl::At<void*>(f, fTarget), dl::At<void*>(f, fEnemyTarget), dl::At<void*>(f, fSAPoss),
                 dl::At<void*>(f, fMsgs),   I(f, fCount),                    I(f, fPending),
@@ -652,6 +794,9 @@ void RunInView(int K, const bool hv[9], KState& st, int armyOff, int enemyDecl, 
             }
         } else {
             I(s.ps, fInvaded) = s.inv;
+            // 0.7.2: an invasion hidden here (the host's, another nation's) keeps its InvasionSupport: the routine's
+            // monthly drift toward 0 (0xcf98d9) reaches every possession; that invasion drifts in its own month only
+            if (s.inv != -1) I(s.ps, fSupport) = s.sup;
         }
         int t = I(s.ps, fTaken);
         I(s.ps, fTaken) = t >= 0 ? sw(t) : t;

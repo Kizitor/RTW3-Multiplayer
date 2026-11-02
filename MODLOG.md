@@ -237,6 +237,16 @@ belong to 0.4.0.
   - Testing:
     [the 0.7.1 release candidate dist_rc071_1](#testing-2026-10-28-the-071-release-candidate-dist_rc071_1-v071);
     [the 0.7.1 release candidate 2 dist_rc071_2](#testing-2026-10-29-the-071-release-candidate-2-dist_rc071_2-v071)
+- **0.7.2** (fixes of bugs reported on 0.7.1; its entries carry "0.7.2-dev" or "0.7.2")
+  - Fix:
+    [the joined player's battle search goes on after an encounter without a battle](#fix-2026-11-01-the-joined-players-battle-search-goes-on-after-an-encounter-without-a-battle-v072-dev)
+    [a joined player's own invasion targets: the game's button followed the host's wars](#fix-2026-11-01-a-joined-players-own-invasion-targets-the-games-button-followed-the-hosts-wars-v072-dev)
+    [the computer's corvettes against a joined player's submarines: an escort class every month](#fix-2026-11-01-the-computers-corvettes-against-a-joined-players-submarines-an-escort-class-every-month-v072-dev)
+    [the destroyer stance routine's second ask](#fix-2026-11-02-the-destroyer-stance-routines-second-ask-v072)
+  - Investigation:
+    ["one battle at a time": battles per month, the host's battle first, several players](#investigation-2026-11-01-one-battle-at-a-time-battles-per-month-the-hosts-battle-first-several-players-v072-dev)
+  - Testing:
+    [the 0.7.2 release candidates dist_rc072_1 and dist_rc072_2](#testing-2026-11-02-the-072-release-candidates-dist_rc072_1-and-dist_rc072_2-v072)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -7269,6 +7279,11 @@ auto-run), not in two runs here.
   host copy went on against the computer after "Captain disconnected" (minute 11), and the guard cleared the lead of
   'G9 *' (t=17:17) and 'G8 *' (t=17:43), detached torpedo-boat escorts whose leads 'Gefion *' and 'Stettin *' had no
   ships left, both in the StartMinute loop (return rva 0x565c6d = 0xd95c6d). The game was open 42 minutes in all.
+- **Correction (0.7.2).** The destroyer routine's box did not come from this read: the routine sets an empty
+  `LeadDivision` to nil itself (0xdbd381) before it, its closest-enemy routine is not deterministic (a random draw for
+  badly damaged ships) and its second answer, used unchecked, can be none; and the box shows at most once in 20
+  minutes, not once per battle screen. See [the destroyer stance routine's second ask](#fix-2026-11-02-the-destroyer-stance-routines-second-ask-v072).
+  The guard stays for the other stance routines.
 
 ## Testing 2026-10-26: the 0.7.0 release candidate 2 dist_rc070_2 (v0.7.0)
 The release candidate dist_rc070_2 (dev-070 1e4c1a6: 0.7.0, live-battle engine 18, protocol 3; RTW3MP.dll SHA-256
@@ -7983,3 +7998,660 @@ backup after every run, the save folders as before (Game1, Game2, Game9), no gam
   SelectForce box is guarded: `battle_generator` f) three times, three `war_effects` runs without it), 0.7.1's fixes
   passed, the mixed versions passed, and every failure was the suite's (fixed, passed again) or the game's choice
   (passed when run again).
+
+## Investigation 2026-11-01: "one battle at a time": battles per month, the host's battle first, several players (v0.7.2-dev)
+- **The report** (players on 0.7.1, the host and one joined player on two PCs): "The non-host player can only generate 1
+  battle at a time." Three readings were checked: A) at most one battle a month for the joined player, B) its battle
+  waits until the host's own battle is over, C) with several joined players only one battle runs at a time. Research
+  only; the plan with the proposed changes is in the developers' session files (`ib72\battles-plan.md`).
+- **Single player's battles in a month (static, 1.01.44).**
+  - `CheckForBattles2` 0xcecb10 tests its result (`[ebp-5]`) after every step and returns at the first True; a False
+    goes on with the next candidate (invasion check, 30 % raider check, the area passes, `GetRandomEnemy`'s candidates,
+    the second raider check, the home areas). True comes only from a battle on screen (`DoBattle` True), a raider
+    check's interception (fought or auto-resolved) or an invasion battle.
+  - `DoPossessionBattle` 0xced48c takes its result (`[ebp-0x11]`, 0 at 0xced4c4) only from `DoBattle` (0xcedfc2);
+    `DoHomeAreaBattle` 0xcee638 (`[ebp-0xd]`) only from `DoBattle` (0xceef3c). Their other exits answer False: the
+    computer's decline (`AIDeclinesBattle` with Implement: 0xcede99 -> 0xcedfd0, 0xceeecd -> 0xcef14c; "The <nation>
+    navy declines battle! You gain N VP!"), the map question's decline (`DoPlayerDecline` 0xcedfcb, DoHomeAreaBattle's
+    own at 0xceef44; 1.01.44 shows no Decline there). The preview's Decline (`TdlgBattlePreview.Execute` False,
+    0xbe404e) runs `DoPlayerDecline` (0xbe4066), `ClearData`, `ResetUsedShips` and sets the setup's result to 0
+    (0xbe4097, returned at 0xbe5784): 0xbdbccc answers False (0xbdbddd), so does `DoBattle`. The no-force rule and the
+    mod's SelectForce guard end in `DoBattle` False too. So the search goes on after every non-battle encounter.
+  - `CheckAttackLocation` 0xced17c answers False at once while the battle screen is visible (`mov eax, [0xf273e4]`, the
+    TfrmMain cell; `cmp byte ptr [eax+0x69], 0`, `FVisible`; 0xced193..0xced19e).
+  - A war started from peace can add a battle: `CheckForWar` (from `DoEndOfTurn`, after the month's date moved) keeps
+    the surprise index only while `War` <= 0 (0xc8549b `cmp [0xf52ff4], 0; jg`) and calls `DoSurpriseAttack` at its end
+    (0xc85a64) -> `CheckSurpriseAttack` -> `DoBattle`; `TfrmMain.FormClose` then sees the surprise flag `[0xf52ffc]`
+    (cell 0xf275c4) and runs `AdvanceDesignStudies` instead of `DoStrategicTurn` (0xdcda03..0xdcda21). So a war's first
+    month can hold two battles (the surprise attack at its start, the generator's at its end); a Turn holds both only
+    when a peace in its `DoStrategicTurn` set `War` to 0 before the new declaration. `DoBattle`'s callers:
+    DoPossessionBattle 0xcedfbd, DoHomeAreaBattle 0xceef37, CheckSurpriseAttack 0xcfdcc7/0xcfdd11/0xcfe0c3/0xcfe122,
+    `Testbattle1Click` 0xd595b3 (debug menu) and 0xbca528 (the load routine of the load dialog `TfrmSelectNation2`
+    after `LoadBuildCampaign`: a save's battle in progress set up again from its starting parameters, the same battle).
+    The battle screen's other openers (`TfrmMain.Execute` 0xdc2f8c): `LoadScenarioInProgress`, `HoldFleetExercise` and
+    the scenario forms.
+  - `CheckAIvsAIBattles` 0xd32a50 (the computer's battles, also a joined nation's with Fight my battles off): per pair
+    at war Random(100) < 15 `CheckAIvsAISubmarineSinking` (the first sinking ends nation i's pairs, 0xd32aa8); then each
+    nation i passes with Random(100) < 50 (0xd32ac8): per nation j it is at war with an area scan (from the first or the
+    last area, 50 %) until `CheckAivsAIBattleInArea` gives a battle, and until i's first battle of the month i's, then
+    j's build area (a battle there ends i's pass, 0xd32bd2/0xd32c0c). So two nations at war meet at most twice a month.
+  - `DoTurn2` 0xce1644: `PlayerChecksBeforeTurn`, the turn's autosave (`SaveBuildCampaign(-1, True, False)` 0xce16c7),
+    the surprise flag and `PendingRaiderBattle` := 0, the officers, "Strategic ship moves" (`ResetUsedShips` 0..8,
+    0xcf024c, `StopBlockadedMoves`, `AreaMoveShips`, `MovePlayerShipsOnForeignStations`), "Checking for battles"
+    `CheckForBattles2` (0xce180e), and `DoStrategicTurn` (0xce181a) when it answered False.
+- **Probe (POC, not committed; its patch is with the session files: `ib72\probe.patch`).** `battles probe 1` (any PC):
+  the hooks of `CheckForBattles2`, `CheckAttackLocation`, `CheckRaiderVsPatrols` and `CheckForInvasionBattles`
+  (outside a joined nation's view) and `CheckSurpriseAttack` log every call with its result and the battle setups
+  (`DoBattle` calls), the player's declines (`DoPlayerDecline` calls) and the VP and EnemyVP changes around it ("probe:
+  CheckAttackLocation(0 attacks 6 in The Mediterranean) -> 0 after 641 ms: battle setups +0, the player's declines +0,
+  VP +300, ..."); `CB_DeferAIBattle` logs the computer's generator's battles ("probe: DoBattleBetweenAINations(1 vs 7 in
+  Northern Europe, 29:17 ships) -> taken by the mod").
+- **Live run** (the probe build on 0.7.2-dev; host, Captain (nation 1) and Bot (nation 2) on one PC; the 1900 fixture;
+  every map message and preview accepted, every battle on auto-run; game open 15 min, the released 0.7.1 reinstalled
+  and its hash checked after it, slots 1 and 9 and the Preferences identical, the run's slots deleted):
+  - *Single player* (no session; slot 1 copied to a throwaway slot, Great Britain at war with Germany, `armstreaty war
+    1`): 3 Turns, 3 battles; in the second "CheckAttackLocation(1 attacks 0, area by the game) -> 0" (no encounter),
+    then "0 attacks 1 in Northern Europe -> 1".
+  - *The host in the session* (Great Britain at war with Italy; the game's own generator): 5 Turns, 5 battles. In three
+    a non-battle encounter came first and the search went on to the next candidate's battle: "The Italian navy declines
+    battle! You gain 300 VP!" (VP +300, no setup) then "0 attacks 6, area by the game -> 1" (Turns 1 and 4); "Enemy
+    unable to challenge our forces in the area! Gain 215 VP!" (a setup, `DoBattle` 0, VP +215) then a battle (Turn 5).
+    Turn 2: an enemy invasion battle (Malta) from `CheckForInvasionBattles`.
+  - *Captain* (Germany at war with Spain, Fight my battles on): requests 1, 3, 5, 7 of 9, 6, 8 and 6 attempts; 1, 3
+    and 5 ended at their first encounter, Spain's decline (+150, +160, +300 VP; `avoided`), with 7, 5 and 7 attempts
+    never played; 7 was fought: one battle in four months. *Bot* (France at war with Italy): requests 2, 4, 6, 8, 9, all
+    fought. *Captain with fightbattles 0* (one month): no request; the computer's generator had no battle of nation 1
+    that month (with Fight my battles on it logged one in months 1 and 3, "left to the player's generator").
+  - *The month's timeline* (month 1): 17:58:40.405 the joined nations' generators at the entry of the host's
+    `CheckForBattles2` (requests 1 and 2, the chat's "* Battle? ... plays it after the month."); 17:58:41 the host's
+    encounter, 17:58:44.494 its battle screen; the players see "The host is fighting a battle..."; about 18:00:29 the
+    host leaves its battle (`FormClose` -> `DoStrategicTurn` -> `DoEndOfTurn`); 18:00:33.479 "DoEndOfTurn finished";
+    18:00:33.615 "battle phase: 2 battle(s)" (the host's screen "Battles in progress"); 18:00:33.630 and .646 sent to
+    Captain and Bot; 18:01:30.952 the last result merged; 18:01:31.541 the new month. From the request to the send:
+    113, 83, 64, 42 and 89 s in the five months (auto-run battles of 35 to 105 s).
+  - *Two players*: every month the two requests were sent 14 to 18 ms apart; in month 4 both battle screens were up
+    together (Bot 18:06:56.6 to 18:07:29.7, Captain 18:06:57.5 to 18:07:30.8; merged 18:07:29.757 and 18:07:30.824).
+- **A (one battle a month): a difference from single player, not the limit itself.** Single player's generator gives at
+  most one battle a month too (plus a surprise attack at a war's start). But a joined player's PC replays the request's
+  attempts only until the first encounter of any kind (`ClientStartBattle`: "a battle, a decline (the player's or the
+  enemy's), its points or the no-force rule: the month's"), while single player goes on to the next candidate after
+  the computer's decline, the player's decline and the no-force rule. With an enemy that often declines, the joined
+  player sees one map message and "The ... navy declines battle!" and no battle, where the host got the next
+  candidate's battle (3 of 3 times in the run). The README says so only for invasion battles. Kind 2 (surprise
+  attacks) stops the same way (`DoSurpriseAttack` tries the next attacker after a computer's decline). Proposed: the
+  replay goes on after a non-battle encounter, the result carries every encounter (with each one's opponent and
+  points); not changed here.
+- **B (the host's battle first): a design limit.** The battle phase runs after `DoEndOfTurn`: the merge needs the
+  month-end save and a reload, and the host's own battle is inside its month (single player's order). A joined nation's
+  request of the player's generator exists before the host's battle starts; sending it then (a mid-month save after
+  `AreaMoveShips`, the result held and merged after the month-end save, `ApplyBattleResult` being a three-way merge
+  against the request's own `sentBcs`) is possible, with risks (a live battle against the host in the same month, a
+  surprise attack before it, the month's changes to the same ships, a host restart, saving mid-`DoTurn2` into another
+  slot). Not changed here.
+- **C (several players): not a bug.** `BattlePhaseTick` sends a request when its player has none in flight ("one
+  battle per player at a time (a live battle occupies both players)"), so different players fight at the same time; a
+  player's own requests (a surprise attack, then the generator's) and a live battle between two joined players are
+  serial, and every battle phase waits for the host's month (B).
+
+## Fix 2026-11-01: the joined player's battle search goes on after an encounter without a battle (v0.7.2-dev)
+Branch fix-battlesearch from inv-battles 00f572a: plan A1 of [the investigation of "one battle at a
+time"](#investigation-2026-11-01-one-battle-at-a-time-battles-per-month-the-hosts-battle-first-several-players-v072-dev)
+(players on 0.7.1: "the non-host player can only generate 1 battle at a time"). Single player's battle search
+(`CheckForBattles2`) ends only at a battle; every encounter without one (the computer's decline "The X navy declines
+battle! You gain N VP!", the player's decline, the no-force rule's points) answers False and the search tries its next
+candidate. The joined player's replay (`ClientStartBattle`) stopped at the first encounter of any kind, so with an enemy
+that often declines the player got no battle where the host got the next candidate's.
+- **Client** (`session.cpp` `ClientStartBattle`). Under a host whose welcome has `gen` 5 (`g_cb.goOn`: requests of kind
+  1, the player's generator, and kind 2, surprise attacks; not live battles; kind 0 has one attempt) each attempt is
+  judged by its own changes: the `DoBattle` setups other than the no-force ones (`game::NoForce`), the `DoPlayerDecline`
+  calls, the no-force rule's count and the VP of nation 0 and EnemyVP around it. A battle (on screen; a raider battle
+  fought or auto-resolved; an invasion battle) or a check's True (the player let a surprise attack's chance go) ends the
+  search, as single player's True does; `CheckAttackLocation`'s refusal while the battle screen is up is never asked
+  (the battle ends the loop). An encounter without a battle is kept (`g_cb.encs`: attempt, kind `avoided` the enemy
+  declined, `declined` the player declined (also a setup shown without a battle, as 0.6.0 read it), `noforce0`/
+  `noforce1` the no-force rule for the player's/the enemy's side, `points` any other change of the points; opponent, the
+  points to the player's nation and to its enemies, area) and the next attempt is played; log `battle N: attempt i (1
+  attacks 7 in Northern Europe): the enemy declined battle against nation 7 in Northern Europe (VP +360/+0): no battle;
+  the search goes on, as single player (encounter 1)` (one `attempt i (` line per attempt, as the replay-order check
+  reads them; an invasion check's encounter `attempt i: ...` after its own line). After the loop: a battle is fought as
+  before and at its end (`ClientBattleTick`, or at once when auto-resolved) its own points since its attempt began are
+  its encounter `fought`; without a battle the result is sent at once: `declined` if the player declined one or the
+  no-force rule of the player's side ran in one (merged as a decline's consequences, as in 0.7.1), else `avoided`. The
+  bundle is the battle slot's diff from the request's start (every encounter's points, prestige, morale, decline counts
+  `dc`, an enemy's landing after a decline `kinv`, the ship sections of every opponent of the request:
+  `ExtractBattleResult`'s `more`); `cand`/`area` name the last encounter; the new key `enc` lists them in order
+  (`att:kind:opp:dVP_K:dVP_J:area;...`). One encounter alone keeps 0.7.1's keys (`noforce`) and chat lines; several get
+  a chat line each ("* The Spain navy declined battle in Northern Europe: Germany gains 360 VP.", "* You declined the
+  battle against the Spain navy in ... (VP 0/63).") before "* Battle! ..." or before "* No battle came about after them;
+  their results were sent to the host (...)". Kind 2 is the same loop: `DoSurpriseAttack` tries its next attacker after
+  a computer's decline (GAME-INTERNALS), so the replay goes on to the next pair.
+- **Host** (`HostOnBattleResult`, `FinishBattlePhase`; `saveio::ApplyBattleResult`'s `otherVP`). With `enc` the enemies'
+  points are split by opponent: `dVP_J` of the merge is the last encounter's opponent's share (plus what no encounter
+  accounts for), the others' are added to their own VP (the merge line "..., VP of the other opponents: nation 7 +63");
+  each pair's war score gets its own encounters' points (`CreditWarScore` per opponent: the war score per pair, the B4
+  ledger of a nation under the player's rules); with two or more the merge line ends "; 2 encounter(s): 0 declined
+  nation 7 VP 0/63 in Northern Europe, 1 fought nation 3 VP ..." (one alone keeps 0.7.1's line); the battle phase's chat
+  has one line per encounter in 0.7.1's words ("* The Spain navy declined battle against Germany in Northern Europe.",
+  "* Captain declined battle for Germany against Spain in ...", "* Germany had no ships to oppose ...: Spain gains N
+  VP.", then "* The battle of Germany against Russia in ... was fought by Captain."). Welcome `gen` 5 (with invasions;
+  else 3 as before), hello `gen` 5 (where it was 4).
+- **Version mixes** (protocol 3 and live-battle engine 18 stay). A 0.7.2 player under a 0.7.1 host (welcome `gen` 4)
+  keeps the first-encounter stop and sends no `enc`: the host never gets a combined result it would credit to one
+  opponent. A 0.7.1 player under a 0.7.2 host keeps its stop (hello `gen` 4) and the host merges its results as before
+  (no `enc`: 0.7.1's chat line and war score). Older players as before.
+- **Limits.** A battle left before its end (or resolved by the host after the time limit) sends no result, so the
+  earlier encounters of its request are lost with it (before, the first encounter ended the search and was sent; log
+  `battle N: its n earlier encounter(s) of the month are not sent`). A battle phase now takes as long as single player's
+  search (several map messages, boxes and previews a month).
+- **TEST** (`game.cpp`, `session.cpp`; TESTING.md). `battles testdecline [<n> [m]]` (any PC): during a battle slot's
+  replayed attempts (`StartPlayerBattle`, `StartSurpriseAttack`) the next n calls of `AIDeclinesBattle` with Implement
+  decline as the game declines, the next m answer False; meanwhile `CheckCaughtOut` answers False. The plain hooks'
+  detour on `AIDeclinesBattle` (`battles testinv`) calls the routine with a flag, and a hook at the decision's end
+  (0xcd2d1c, found by its bytes `8B 85 F4 FD FF FF 0F B6 80 <TestMenu> 22 85 F3 FD FF FF`) sets the decision
+  `[ebp-0x20d]`, so the game's own consequences follow (its box, the distance cuts, the VP, EnemyDeclineCount); its
+  early answers (a coup's ambush, an invasion battle pending) stand
+  ([GAME-INTERNALS](docs/GAME-INTERNALS.md#the-other-relation-and-war-routines)). `battles injectgen K J area + [by] J2
+  area2 ...`: attempts against other opponents (`by`: J2 attacks K). Client `battles hostgen 4`: as under a 0.7.1 host.
+- **Tests** (`tools/regression.py`). `battle_generator` g) to i) (`battle_search`): a request of three attempts, nation
+  1 attacks J (Spain), a second computer nation J2 attacks nation 1 where both have ships that can fight
+  (`search_pick`), nation 1 attacks J again (the battle when J2's attack gives none); g) `testdecline 1 2`: the enemy's
+  decline, then a battle; h) `testdecline 0 3` and the driver's new `decline_first`: the player's decline, then a
+  battle; both merged once with every encounter (`parse_encounters`), the war score per pair, the other opponents'
+  points split off, the chat lines; i) the version gate (`battles hostgen 4`: `avoided` at attempt 0, attempt 1 never
+  played, no encounter list). The hello/welcome `gen` checks of `battle_generator`, `battle_surprise`, `battle_raider`
+  and `battle_invasion` accept 5; `battle_raider` c)'s merge-line check accepts an encounter list after its "; a raider
+  battle" (a raider battle after other encounters). `regression_selftest.py`: `req_segment`, `search_enc`,
+  `applied_war_scores`, `parse_encounters` and `APPLIED_RE` with the new merge line (141 checks).
+- **Runs** (the 1900 fixture; host and Captain on one PC; each run inside the backed-up wrapper: the released 0.7.1 put
+  back after it and its hash checked, slots 1 and 9 and the Preferences identical, the run's slots deleted; no game
+  error box in any run; the game open 2 h 2 min in all, the nine runs).
+  - r0 (`--only battle_generator`, the first build): 122/126, game open 6 min 13 s. The fix worked in the natural
+    requests at once: c)'s first request, 6 attempts, "The Spanish navy declines battle! You gain 360 VP!" twice and
+    then a battle fought ("3 encounter(s): 1 avoided nation 7 VP 360/0 ..., 2 avoided ..., 3 fought nation 7 VP
+    755/694", merged as VP 1475/694); in f)'s month a request went from "Enemy unable to challenge our forces in the
+    area! Gain 215 VP!" on to a battle. The 4 failures were the test's: its attempt 1, Germany attacking Russia's
+    Northern Russia in Northern Europe, never came to `DoPossessionBattle` (`BattleOK`: out of the missions' range), so
+    attempt 1 became a second computer nation's attack on nation 1 where both have ships that can fight (`by`).
+  - r1 (`--only battle_generator`, the second build): 133/133, game open 6 min 1 s. g) try 1 a `SKIP-note` (attempt 0
+    caught out by the game's own draw: a battle at once), try 2 "2 encounter(s): 0 avoided nation 7 VP 300/0 ..., 1
+    fought nation 3 VP 0/0" (Russia attacking Germany); h) "0 declined nation 7 VP 0/63 ..., 1 fought nation 3 VP
+    83/146", the war scores 1-7 +0/+63 and 1-3 +83/+146, "VP of the other opponents: nation 7 +63"; i) `avoided` with
+    one StartPlayerBattle.
+  - r2 (`--only session,battles,battle_generator,battle_invasion`, the third build): 385/385 (17, 90, 147, 131), game
+    open 17 min 37 s. 21 merges with an encounter list (35 encounters on the client), among them natural requests that
+    went on to a battle ("1 declined ..., 2 fought nation 7 VP 133/12"; "0 noforce0 nation 3 VP 0/215 in Northern
+    Pacific, 2 noforce0 ... in The Baltic, 3 fought nation 3 VP 0/90 in Northeast Asia"; "1 avoided nation 3 VP 134/0 in
+    The Baltic, 4 fought nation 3 VP 131/0 in Northern Europe") and ones without ("1 declined ..., 2 declined ..., 3
+    avoided nation 7 VP 360/0, 5 declined ..."); g), h), i) at their first try.
+  - r3 (the same): 371/371 (17, 102, 121, 131), game open 14 min 21 s; 20 merges with an encounter list; g) "0 avoided
+    nation 7 VP 360/0, 1 fought nation 3" (war scores 1-7 +360/+0, 1-3 +766/+90), h) "0 declined nation 7 VP 0/63, 1
+    fought nation 3 VP 36/0" ("VP of the other opponents: nation 7 +63"), i) the gate, all at their first try.
+  - r4 (`--group relations`, the third build): 473/477, game open 17 min 35 s. `battle_raider` c)'s 4 merge checks
+    wanted the merge line to end with "; a raider battle[, auto-resolved]" and met "; 1 encounter(s): 0 fought nation 7
+    ...": the host now lists the encounters only when there are two or more (one alone keeps 0.7.1's line), and the
+    check accepts a list after its tail.
+  - r5 (`--group relations`, the final build): 478/478 (17, 34, 73, 66, 137, 39, 93, 19), game open 18 min 31 s; in
+    `battle_generator` g) and h) both tries were `SKIP-note`s (Russia's attack gave no battle: "found no battle" once,
+    the no-force rule for Russia's side three times), so the test request got a third attempt, nation 1 attacking J
+    again, and its checks read the encounter list whatever came between.
+  - r6 (`--only session,battles,battle_generator,battle_invasion`, the final build): 383/383 (17, 102, 134, 130), game
+    open 17 min 3 s; g) "0 avoided nation 7 VP 300/0, 1 fought nation 3" (war scores 1-7 +300/+0, 1-3 +103/+0), h) "0
+    declined nation 7 VP 0/63, 1 fought nation 3 VP 266/25" ("VP of the other opponents: nation 7 +63"), i) the gate,
+    all at their first try.
+  - r7 (`--only battle_generator`, the final build and test): 136/136 (17, 119), game open 6 min 57 s; g) "2
+    encounter(s): 0 avoided nation 7 VP 360/0 ..., 1 fought nation 3 VP 0/0" (war score 1-7 +360/+0), h) "0 declined
+    nation 7 VP 0/63 ..., 1 fought nation 3 VP 0/0" ("VP of the other opponents: nation 7 +63", war score 1-7 +0/+63),
+    i) the gate, all at their first try.
+  - r8 (`--group relations`, the final build and test): 485/485 (17, 34, 73, 66, 144, 39, 93, 19), game open 17 min 54
+    s; g) "2 encounter(s): 0 avoided nation 7 VP 360/0 ..., 2 fought nation 7 VP ..." (Russia's attack at attempt 1 gave
+    nothing, the battle came at attempt 2: a `SKIP-note` for the split), h) "0 declined nation 7 VP 0/75 ..., 1 fought
+    nation 3 VP 237/90" ("VP of the other opponents: nation 7 +75", war scores 1-7 +0/+75 and 1-3 +237/+90), i) the
+    gate.
+
+## Fix 2026-11-01: a joined player's own invasion targets: the game's button followed the host's wars (v0.7.2-dev)
+The report from a two-PC game on 0.7.1 (host = nation 0, one joined player): "The non-host player is unable to set their
+own invasion targets independent of the host."
+
+**Reproduced on the released 0.7.1** (the installed dist_rc071_2; the 1900 fixture: the host Great Britain = nation
+0, the joined player Germany = nation 1, host and client on one PC; the suite of this branch, `--only
+session,battle_invasion` with `RTW3_INV_UI_ONLY=1`, the target through the game's own screens: the strategic screen's
+Map tab, the map panel's "Possessions" tab, the possession's node of the areas tree, the tree's popup menu "Details",
+the dialog's "Set invasion target", all by window messages; game open 106 s): 62/68, the failures the report:
+- u1) Germany at war with Russia (3), the host at peace with Russia: the client's possession details of Kamchatka
+  showed "Set invasion target" greyed out (a PrintWindow capture of the game's dialog, kept in the session folder):
+  the player could not choose its own enemy's possession (the scenario went on with TEST `inv pick`).
+- u2) the USA (4) at war with the host, at peace with Germany: The Philippines' button enabled (captured too); such a
+  pick sent with a turn was taken by the 0.7.1 host (`invasions: nation 1's target - -> The Philippines`).
+- c) Kamchatka reached the host only as the TEST pick, replacing u2's The Philippines; u4) the host's invasion of
+  Sakhalin begun (TEST `inv set`) with Germany's target Sakhalin: Germany's month resolution kept the plan (`plan
+  Sakhalin/0`).
+- u3) failed for the suite's own reason (the host's candidates were beyond its 500 nm range: "Possession is beyond your
+  invasion range!"); its candidates are chosen by the game's `InvasionPossible` since (`inv range`).
+- The host's possession greyed out and Germany's own without the button were as expected already.
+
+**Cause: the game's dialog asks nation 0's relation** (static, 1.01.44;
+[GAME-INTERNALS](docs/GAME-INTERNALS.md#relations-wars-and-battles-nation-0s-and-the-others), *The player's target in
+the game's screens*).
+- A target is set in the possession details dialog (`TdlgPossessionDetailsNew`, "Set invasion target"), opened by the
+  unnamed `ShowPossessionDetails` 0xce93fc from a click on a possession on the map or from the map panel's areas tree
+  (its "Possessions" tab, the popup menu's Details, `Details1Click`). Right before `ShowModal` the routine sets the
+  button (0xce9b4c..0xce9ba5): Visible := Owner <> PlayerNation; Enabled := not the form's `InvasionTarget`, the
+  owner's `Tension` (+0x256) > 40, Value <= 15. `Tension` is a nation's relation with nation 0. On a joined player's PC
+  PlayerNation is BuilderNations[K] and nation 0 is the host's nation: the button is enabled exactly for the
+  possessions of the host's enemies. The click (`bnInvasionTargetClick` 0xc260f0) and everything after it use
+  PlayerNation (invaded, value, blockade, `InvasionPossible`/`GetInvasionRange`, the cost), so only the war decided by
+  the host.
+- So the joined player could not target its own enemy's possessions while the host was at peace with that nation, and
+  could target the possessions of the host's enemies it was not at war with: the host took them (it checked owner,
+  value, invaded, not the war), the month routine in K's view ignored them (its test, 0xcf95b6, is K's war there) and
+  K paid the target's monthly cost (`economy.cpp`, "invasion target -N").
+- The 0.7.0 tests set the form's target with the bridge (`inv pick`) and forced the war K-J only, so the button was
+  never pressed.
+
+**Found on the way (the plans' independence, both ways):**
+- K's month resolution (`inv::RunInView`) hides every invasion that is not K's. A K target that another nation invades
+  (the host's invasion started by the host's own routine earlier in the same month, or in an earlier month; another
+  joined nation's) looked free there: the routine could start K's invasion and end the other one ("nation K's month
+  started an invasion of p, where nation 0's was hidden: it ends"). In single player the game's
+  `CheckForInvasionBattles` (0xd10288..0xd102a2) ends a target that is invaded before the routine runs; the host's own
+  target meets that rule in its battle check (while the host is at war it runs before `DoStrategicTurn`), K's never did
+  (its battle slot has only K's invasions).
+- The client put back in its form after a battle slot the plan of the month's start (`g_invPlan`), not the target its
+  turn had sent: the form showed the old target until the next month arrived.
+- The month routine moves every possession's `InvasionSupport` one step toward 0 at war (0xcf98d9..0xcf98f2), whatever
+  its Invaded. The possessions the mod hides from a call (the host's own call hides K's invasions, K's run hides the
+  host's and the other nations') lost a point there too, and the mod put back only Invaded: the host's invasions drifted
+  twice a month while K was at war, K's twice while the host was at war (u4's first run on the fix: the host's
+  invasion of Sakhalin, support 1, had 0 after K's run).
+
+**Fix** (protocol 3 and the live-battle engine 18 unchanged; no message changes):
+- `invasion.cpp`: a hook of `TdlgPossessionDetailsNew.FormShow` (it runs inside the dialog's `ShowModal`, after the
+  routine set the button): on a joined player's PC in a session (PlayerNation = nation K > 0, `game::ShownNationIndex`)
+  the button is enabled for a possession of a nation K is at war with (`game::AtWar(K, J)`), not the target already,
+  worth at most 15 (the game's other tests), and greyed out for a nation a person plays (`hookcb::PeoplesNation`: the
+  host refuses those) and with a host below welcome `gen` 4 (`hookcb::JoinedInvasionOrders`: it takes no orders). The
+  setter is the game's own `TControl.SetEnabled`, its VMT slot (0x9c) read from the routine's call (found as
+  `Details1Click`'s call whose except handler names `ShowPossessionDetails`). Log, e.g. `invasions: possession details
+  of Finland (nation 3's): enabled (at war with nation 3; the game's test with nation 0's relation: greyed out) for
+  nation 1's player: "Set invasion target" set by the nation's own war`. Elsewhere (the host, single player, a battle
+  slot) nothing changes. Start-up line `Invasion targets of joined nations (the possession details' button): ok
+  (ShowPossessionDetails <address>, SetEnabled slot 0x9c, InvasionPossible <address>)` (the routine at RVA 0x4b93fc,
+  0xce93fc in the analysis image).
+- `invasion.cpp` (`RunInView`): a K target invaded by another nation ends K's plan first (target and months), the
+  game's rule for an invaded target: log `invasions: nation K's target <p> is invaded by nation n (hidden in its view):
+  its plan ends (the game's rule for an invaded target)`, in K's news "Invasion of <p> cancelled: <p> is already invaded
+  by the forces of <nation>."
+- `invasion.cpp` (`RunInView`, `HostUnhide`): a hidden invasion keeps its `InvasionSupport` across the call (each
+  invasion drifts in its own nation's call only).
+- `session.cpp` (`HostTakeInvasionOrder`): the host also refuses a target whose owner K is not at war with (an older
+  PC's button offered those): chat "* <player>'s invasion target <p> was not taken: the nation is not at war with its
+  owner.", log `invasions: nation K's target <p> refused (the nation is not at war with its owner)`.
+- `session.cpp` (the client's Submit): the plan put back after a battle slot carries the target the turn sent.
+- Bridge (read only): `inv range <p>` (the game's InvasionPossible and GetInvasionRange for PlayerNation), `inv button`
+  (the last decision).
+
+**Player-visible:** the joined player's "Set invasion target" follows its own wars (and is greyed out for the host's
+and other players' possessions); the host's wars no longer matter on the player's PC; the host's plan and the player's
+stay apart (a target another nation invades first ends the player's plan, with a line in its turn report; the host's
+ends by the game's own rule), and each side's invasions lose their support only in their own month.
+
+**Version mixes** (each change lives on one PC):
+- 0.7.2 host, 0.7.2 player: as above.
+- 0.7.1/0.7.0 host, 0.7.2 player: the player's button follows its own wars; the older host takes the target (it checks
+  no war; the player's button offers only its own enemies' possessions) and resolves it in the player's view as before;
+  the older host's month keeps the same-possession gap and the double drift of the support.
+- 0.7.2 host, 0.7.1/0.7.0 player: the player's button still follows the host's wars (a target of a nation the player is
+  at war with is still greyed out while the host is at peace with it); a target of a nation the player is not at war
+  with is refused with the chat line (no money spent on it).
+- 0.6.x hosts (welcome `gen` < 4): the 0.7.2 player's button is greyed out (no invasions for joined nations, as before).
+
+**Tests.** `battle_invasion` u) ([TESTING](docs/TESTING.md#scenario-catalog)), before c), the target through the
+game's own screens (`pick_invasion_target`, read-only bridge `inv range`, `inv button`; `RTW3_SHOTS` captures the
+dialogs): u2) J2 at war with the host only: greyed out; the host's possession greyed out, nation 1's own without the
+button; an older client's pick (TEST `inv pick`) with a turn refused; u1) J at war with nation 1 only: enabled, pressed,
+the form's target (candidates within the nation's range first); u3) J at war with both: the client's button enabled, the
+host sets its own target through its own dialog, each form its own, and after month 2 the host's plan is still its own
+and nation 1's its own; u4) the host's invasion of nation 1's target: nation 1's plan ends first, the host's invasion
+stays (its support kept); e1) the client's form after the battle slot holds the target its turn sent. Env
+`RTW3_INV_UI_ONLY=1` ends the scenario after u4) (a diagnosis).
+
+**Proof** (dist_it72_2 = the commit's code, RTW3MP.dll SHA-256 8863A330114AD277...): `--only session,battle_invasion`
+158/158 (game open 312 s) and 157/157 (341 s; i1's known SKIP-note: no computer start in 16 runs), `--group relations`
+431/431 (902 s; `battle_raider`'s four known SKIP-notes: the client had copied its next battle into the battle slot
+before the runner read the last one). On the way: dist_it72_1 (the button and the plan rule, without the support
+fix) `RTW3_INV_UI_ONLY=1` 68/69 in 102 s: u4) showed the support drift (the host's invasion of Sakhalin 1 -> 0
+after nation 1's run) and the news line's nation name taken in nation 1's view ("the forces of Germany"; now the
+real nation, "Great Britain"). Every run: no game error box, the released 0.7.1 put back afterwards. The captures
+(kept in the session folder): on 0.7.1 Kamchatka's button greyed out and The Philippines' enabled; on the fix
+Russia's Finland enabled and The Philippines' greyed out.
+Game open this round: 106 + 102 + 312 + 341 + 902 s.
+
+**Review follow-up (2026-11-02, after the 0.7.2 release candidate 1): a target an older host took.** The host checked a
+target only when it changed. A target of a nation K is not at war with that a 0.7.0/0.7.1 host had taken (The
+Philippines in the reproduction) stayed in K's plan under a 0.7.2 host: never carried out (the month routine acts on a
+target only at war), its monthly cost paid, and at peace with its owner the player could not even replace it (the button
+is greyed out). Now (`session.cpp`; protocol 3, no new message key; one new chat line):
+- `HostCheckInvasionPlans`, in the host's turn after the merge reload and before `RunOriginalTurn` (so before the battle
+  generator's view, the battle requests, K's month resolution and the target's cost), and `HostTakeInvasionOrder` for an
+  unchanged target drop a target whose owner is a nation a person plays or one K is not at war with
+  (`InvasionTargetDrop`, the relations of the moment: after the month's relation turns and peace), with its months: log
+  `invasions: nation K's target <p> dropped before the month|with the turn (<why>)`, chat "* Captain's invasion target
+  The Philippines was dropped: Germany is not at war with its owner." The month package carries the empty plan
+  (`kinv`): K's form has no target and no cost is paid that month. The turn sent again before the month (its form still
+  holds the target) does not bring it back (`... was dropped this month: not taken again`, no "was not taken" line). K's
+  own peace with the owner ends the plan as before (P5, no message), so nothing is left to drop.
+- TEST `inv oldhost [0|1]` (host): the next month's orders as a 0.7.1 host takes them (no war check, no check before the
+  month; off again at that month's start).
+- Mixed versions: a 0.7.0/0.7.1 player under a 0.7.2 host gets the cleared plan with the month (`kinv`, as any plan
+  change: its form empty, no cost) and the chat line as any chat; a 0.7.0/0.7.1 host drops nothing: there a leftover
+  target stays as before.
+- `battle_invasion` v) after u4) (`RTW3_INV_UI_ONLY=1` now ends after v)), and f)'s check in g)'s month: after the peace
+  nothing is dropped or refused.
+- Proof (dist_it72_3, RTW3MP.dll SHA-256 67120D810F53A680A40B2C258682312D1DC9BA2870114899CE70C801865E3A99):
+  `--only battle_invasion` (session first, as `--only session,battle_invasion`) 186/186 (battle_invasion 169/169, i1's
+  known SKIP-note): v1) the old host's month took The Philippines (the USA's; Germany at peace with the USA) and charged
+  "invasion target -486", the client's form showed it; v2) the next turn's unchanged target dropped with the turn (the
+  chat line above once), the turn sent again logged "not taken again", the leftover United Kingdom (TEST `inv target`)
+  dropped before the month ("a person plays its owner (invasions between players are not supported)"), "invasion
+  target -0", the plan and the client's form empty; f) the month after the peace dropped and refused nothing.
+  `--group relations` 405/405 (battle_generator's c) needed one month instead of three this time: 26 checks fewer than
+  the 431 above; battle_raider's four known SKIP-notes; no drop, refusal or TEST line in the host log). No game error
+  box; the released 0.7.1 back after each run. Game open: 352 + 848 s.
+
+## Fix 2026-11-01: the computer's corvettes against a joined player's submarines: an escort class every month (v0.7.2-dev)
+A report on 0.7.1 (host + one joined player on two PCs, no other details): "The AI is spamming building corvettes in a
+seemingly random way." The joined player's turn report shows the computer's lay-downs, e.g. "Soviet Union has laid down a
+KE of Novgorod class!" three to five times a month.
+
+**Measured** (a diagnostic build, the record below; the 1935 test campaign `fixture1935` copied into throwaway slots,
+host Great Britain, Germany (nation 1, 11 submarines) the joined player or a computer nation, at war with the Soviet
+Union (nation 3: 9 destroyers and no corvette in service, a patrol requirement of 14 against Germany's submarines) from
+the third month, two months of peace first; the Soviet Union's lay-downs by cause over the whole run):
+
+| run | escorts (CheckSubmarineActivity) | AIMonthlyBuild | on trade protection (of 14), war months 1-8 | Soviet corvettes at the end |
+|---|---|---|---|---|
+| single player, the host alone (Germany a computer nation) | 0 | 1 corvette, 2 destroyers | 1 every month | 1 in service + 1 building |
+| single player, Germany the player (the mod's Copy game transform) | 10 corvettes, 1 destroyer (war months 1-4) | 19 corvettes, 2 destroyers | 7, 8, 8, 7, 14, 20, 23, 26 | 25 + 5 |
+| multiplayer, 0.7.1 (`aibuilds keep 0`) | 24 corvettes (war months 2-8) | 6 destroyers | 0 or 1 every month | 6 + 19 |
+| multiplayer, only the statuses kept (a first try) | 18 corvettes, 2 destroyers in 6 war months | 2 corvettes (at peace) | 0, 1, 1, 2, 2, 2 | 6 + 15 |
+| multiplayer, the fix (war from the first month, 10 months) | 20 corvettes, 2 destroyers (war months 2-7), then none | 1 corvette | 0, 7, 8, 6, 6, 8, 12, 14, 17, 19 | 14 + 8 |
+
+At peace every run laid down only the computer's monthly building. Germany's own war frame runs from its second war month
+(its war counter above 1), so the first war month has no escorts in multiplayer.
+- The record: `aibuild: 1935-08 nation 3 (Soviet Union) lays down a KE: escorts (CheckSubmarineActivity+0x1d89), in
+  nation 1's view; on trade protection 0 of 14 required, corvettes 1 in service of 8; chain 0x47eed3 0x499f59 ...`.
+  The escorts come from the rule "short of patrols" (return 0xcc9f59) and the rule "fewer destroyers and corvettes in
+  service than the player's submarines" (0xcc9fcf); `AIBuildShip` lays down up to three corvettes per decision (the
+  returns 0xcaeed3, 0xcaef5e, 0xcaefa8 of a new design: the second and third at Random(100) < 10 x FleetSize + 40 while at
+  war with nation 0, here Germany in its view). In 0.7.1 the Soviet patrols were 0 or 1 of 14 in every month (`relations v2: nation 3 ...
+  in ReduceTimeLimits: statuses 3->0, 3->1, 0->1, 1->2`: its maintenance and `PutAIShipsInStatus`' peace branch), so the
+  first rule laid down a class every month while its corvettes went into service one after the other.
+- So the corvettes themselves are the game's single-player reaction to a player's submarines (with Germany as the player
+  the Soviet Union lays down even more, mostly by `AIMonthlyBuild`'s war rule), which 0.6.0 (B5 (c)) gave a joined
+  player's computer enemies. What multiplayer added: the escorts never stopped.
+- Two more eras (run m1958c: multiplayer only, 0.7.1 (`aibuilds keep 0`) against the fix, five war months each from the
+  first month):
+  - the missile-era test campaign (`fixture_missile`, May 1958: Germany with 14 submarines at war with France, a
+    requirement of 17): with 0.7.1 France's ships on trade protection were 0, 1, 1, 1, 1 of 17 and its frames laid down
+    2 corvettes as escorts (war month 5; those of months 2-4 none); with the fix 0, 7, 14, 17, 17 of 17 and no escort
+    (`AIMonthlyBuild`: 1 and 4 corvettes);
+  - the 1900 legacy campaign (`fixture_legacy1900`, no submarines in any navy; Russia's requirement against Germany 5):
+    with 0.7.1 1 of 5 every month and 11 corvettes as escorts (3, 3, 3, 2 in war months 2-5: the rule needs no
+    submarines); with the fix 0, 5, 5, 5, 5 of 5 and none. No other nation laid down a corvette in either part.
+
+**Cause** (static reading, [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-computers-escorts-against-the-players-submarines)):
+- K's sea war frame (`CheckSubmarineActivity(K)` in K's view, warfx.cpp) runs the game's escorts rule for K's computer
+  enemy J: below its patrol requirement (`GetPatrolRequirement`: against K's submarines in the view) an escort class and
+  one ship put on patrol; the rule stops when J's ships on trade protection reach the requirement.
+- In single player the player's enemy gets there: `CheckPatrols` puts up to six of its ships a month on patrol while it is
+  short, `PutAIShipsInStatus` (at war) runs `ReviseASWEffort` (every corvette on trade protection), and its patrols stay
+  (its war with nation 0 makes `NationIsAtWar` true).
+- On the host J's war with K is invisible to the game's month: `CheckPatrols` serves only nation 0's enemies, and the
+  relations mask (B2) hides J's only war inside `ReduceTimeLimits`, so J is at peace there: no `ReviseASWEffort`, its
+  maintenance returned its trade protection to active service and its peace branch put ships in reserve, every month (the
+  0.7.1 fix kept K's own statuses only). J's patrols never reached the requirement, and every frame laid down another
+  class for the whole war.
+
+**Fix** (game.cpp, warfx.cpp; protocol 3 and the live-battle engine 18 unchanged; host only):
+- The mask (`AIMaskEnter`/`AIMaskLeave`) also notes the ships with Status 3-5 of a computer nation whose wars are all with
+  nations under the player's rules (`HiddenWarsOnly`: none with the host's nation or another computer nation) and gives
+  each of them in play that the masked routine set to 0, 1 or 2 its status again while it is at war: `relations v2:
+  nation 3 at war (a computer nation, its wars with nations people play): 7 ship(s) on trade protection or raiding kept
+  (ReduceTimeLimits saw it at peace)`.
+- K's sea war frame runs, before the submarine loop and in K's view, what the game's month does for a nation at war with
+  its player: `CheckPatrols`' loop for each such enemy (six times: below the requirement `PutShipOnASWPatrol`, then
+  `CheckAINationShipsOnTradePatrol`; reproduced after a check of the game's code) and `ReviseASWEffort`; the frame's line
+  ends with `ASW effort of the enemies at war only with nations people play ...: 3: 0 -> 7 of 14;`.
+  `AINationAssignRaiders` (CheckPatrols' last step: the enemy's raiders against K) is left out.
+- The record: `LayDownAIShip` hooked on every PC, log `aibuild:` and bridge `aibuilds` (TEST `aibuilds keep 0`: the
+  0.7.1 behaviour; `aibuilds patrol J K [set]`).
+- Left as they are (observed): `AIMonthlyBuild`'s corvette rules read nation 0's war and submarines only (K's war doesn't
+  trigger them: fewer corvettes than single player with K as the player); J's `PutAIShipsInStatus` still sees peace in
+  the host's month (it puts other ships in reserve and mothballs them while at war with K); J assigns no raiders against
+  K. Each would be its own change.
+
+**Version mixes**: the masks and the sea war frame run on the host, no message changes. A 0.7.2 host fixes it for 0.7.1 and
+0.7.0 clients; under a 0.7.1 host a 0.7.2 client sees the old behaviour. `aibuilds` answers on any 0.7.2 PC.
+
+**Tests**: the scenario `ai_escorts` (group `relations`; TESTING.md): J's trade protection set to its requirement before a
+war month stays there, the host keeps it and K's frame lays down no escort; the same month with `aibuilds keep 0` returns
+it to active service (the check catches 0.7.1). Self-test 140/140 (`parse_aibuilds`, `parse_aib_patrol`).
+- `--group relations` on dist_fix3 (the fix, `ai_escorts` included), 871 s with the game open: 448/449, every relations
+  scenario passed (session 17/17, relations_peace 34/34, war_effects 73/73, arms_treaty 66/66, battle_generator 78/78,
+  battle_surprise 39/39, battle_raider 94/94, relations_war 19/19), no game error box. `ai_escorts` 28/29: a)'s setup put
+  none of Russia's ships on patrol (`aibuilds patrol 3 1 set` took only ships in active service; at peace the computer
+  keeps them in reserve), and the month showed the fix at work instead: Russia's patrols 0 -> 4 of 4 by the frame's
+  `CheckPatrols` loop, no escort laid down. b) (keep 0) passed: of the four ships on patrol two back in active service,
+  one in reserve, three corvettes laid down at 0 of 4. The helper takes Status 0-2 now (as `PutShipOnASWPatrol`).
+
+**Runs** (the game open, each inside a backed-up run, v0.7.1 reinstalled afterwards; no game error box in any):
+m1935a 4.5 min (stopped: the host's month waited at the aircraft prototype choice "Select one of the prototypes", which the
+measurement now answers with Cancel), m1935b 15.4 min (single player alone, 0.7.1, statuses kept; the host's nation was
+sacked in its tenth month of the third part: "The government has lost confidence ...", the measurement now keeps its
+funds positive), m1935c 6.9 min (Germany the player; the statuses kept and `ReviseASWEffort`), m1935d 6.6 min (the fix;
+stopped at a fought battle's "Add to history record" question: the measurement now uses the suite's BattleDriver),
+m1935e 3.8 min (the fix, 10 months), m1958 6.9 min (stopped: the single-player part's second month waited at the
+aircraft choice "New model" (`TfrmAircraftTypes.ExecuteNewModel`, nil whatever the answer) and the next part loaded the
+1900 campaign inside that dialog and hung; the run's two game copies were stopped by PID and the run cleaned up; the
+measurement answers "New model" with Cancel now and starts no further part while the host shows a dialog), m1958c 9.0 min
+(the 1958 and 1900 campaigns, multiplayer, 0.7.1 and the fix). In all about 53 minutes with the game open for the
+measurements, plus the suite runs above.
+
+## Fix 2026-11-02: the destroyer stance routine's second ask (v0.7.2)
+A full default run of the suite on 0.7.1 + the officers (1 of 3 runs): the host's four boxes in `war_effects`' live battle
+100000 (1902/8/25) after the scripted drop of the joined player at minute 12, while the host's battle ran on auto-run with
+the computer commanding the dropped player's ships: "Error in AIDetermineTacticalStance2 procedure! Division: Germany
+Destroyer Division 11 Access violation at address 0082B5C0 in module 'RTW3.exe'. Read of address 000009D3", then the same
+for "G8 *", "G9 *" and "G8 *" within 19 seconds of auto-run, before the end by scenario length ("Enemy major victory
+Own VP: 476 Enemy VP: 1,386"). Image base 0x220000 in that run: rva 0x60b5c0 = `TFightingShip.IsBigShip`, whose first
+instruction reads `ShipType` +0x9d3 of Self: Self was nil. The same box in older runs: 0.6.1's default run on the client in
+its own single-player battle on auto-run ("Germany Destroyer Division 5", "... 4": no live battle, no mod hook in that
+battle) and 0.7.0 RC1's "SU Destroyer Division 10" (the 0.7.0 fix below did not reach it).
+
+**Cause**, a game bug of every battle (single player too; [GAME-INTERNALS](docs/GAME-INTERNALS.md#tactical-battles)):
+- `AIDetermineTacticalStance2` (0xdc108c) runs one stance routine by the division's flagship; destroyer and MTB divisions
+  get 0xdbd104. Every `IsBigShip` call in its call tree tests its ship or reads it first, but one: in the branch for a
+  closest enemy beyond 0.9 of the guns' range (the enemy no big ship, the flagship under fire, no scout role, not
+  withdrawing, no own bigger ship type within 20000 yards: lone and detached destroyers such as "G8 *") the routine
+  evaluates `(F(flagship) <> nil) and not F(flagship).IsBigShip` (0xdbd957: F called twice, the second answer unchecked).
+- F (0xd94cd0, unnamed) answers the closest ship the flagship sights that is dangerous to it within a range by year: for a
+  destroyer flagship a big ship (`ShipType` < 4) or none. It is no pure function: `TFightingShip.IsDangerous` (0xe3e3e8)
+  draws `Random(CountGunsF(False))` for a ship with 70 % damage or more (dangerous while its operational guns > the draw +
+  2). The first answer a badly damaged big ship, the second none: `IsBigShip(nil)`, the box, and the routine stops for that
+  division. Late in long battles with heavy damage: the report's battle went on for more than 40 minutes on auto-run
+  and ended by scenario length.
+- The box shows at most once in 20 minutes (`TfrmMain` +0x73d, cleared at the end of a move interval when the battle's
+  minute count is a multiple of 20; the 0.7.0 entry's "once per battle screen" was wrong): the four boxes came over more
+  than 40 minutes of the host's battle.
+- The 0.7.0 fix (an empty `LeadDivision`, `LS_StanceGuard`) blamed the destroyer routine's
+  `LeadDivision.GetFlagship.IsBigShip` (0xdbddd6) and took F for deterministic. That read never sees an empty lead: the
+  routine sets an empty `LeadDivision` to nil itself (0xdbd381) before it. The guard stays (the other stance routines read
+  the lead's flagship unchecked); its lines in the runs come from detached escorts whose lead division emptied and from the
+  end-of-minute walk's 0xdb1258, which gives a single-ship independent division its flagship's `InitialDivision` as lead
+  without checking that division's ships.
+- Not the mod's drop or takeover: `SetSideControl` writes only flags (no division list or ship reference); the drop made
+  the dropped player's destroyers the computer's (the stance routines run only for `AIControlled` divisions) and the
+  host's auto-run ran the battle long enough. No sunk, removed or never-loaded ship is involved: F's second answer is
+  simply none.
+
+**Fix** (lockstep.cpp `InstallStanceAskFix`, called by `game::InstallHooks` at the mod's start: every battle on every PC;
+protocol 3 and the live-battle engine 18 unchanged):
+- A hook on `TFightingShip.IsBigShip`: at the one call after the second ask (its return address, rva 0x58d982; the site
+  found by its bytes, exactly one match, the call targets checked) a nil answers True, as the first answer (a big ship)
+  does: the routine goes on as with two equal answers (`LightState` = 1 skips, else `ClosingStrategy` and tsClose). Any
+  other call of `IsBigShip` runs the game's code. Log `battle AI: the destroyer stance routine of division '<name>' (side
+  <s>) at t=<time> asked twice for the closest dangerous big enemy ship: a ship, then none (the game's random draw);
+  IsBigShip answered as for the first (the game: "Error in AIDetermineTacticalStance2 procedure!")` (at most 20 a game);
+  at the start `The destroyer stance routine's second ask (AIDetermineTacticalStance2): ok (the ask at rva 0x58d957,
+  IsBigShip's return rva 0x58d982)`.
+- Determinism: no random draw is added or skipped (F still runs twice) and only shared state is read: both PCs of a live
+  battle do the same. A 0.7.1 PC stops the routine at that moment (in a live minute its box is answered by the mod): with a
+  0.7.1 player that minute can differ (a DESYNC, then the resync), as with 0.7.0's guard; the engine stays 18.
+
+**TEST switch** `ls teststance [<n> [side=<s>] [nofix]]` (TESTING.md; its hooks made on first use): the next n runs of the
+destroyer routine for a computer's destroyer division (of side s) come to the two asks past the routine's ways out (no
+enemy within sighting range; none sighted: the closest enemy of all ships afloat then; the out-of-range branch's
+conditions), the first answer a ship, the second none, the game's own draws as always. `nofix` turns the fix's hook off
+(the game's own `IsBigShip`: its box). `RTW3MP_TEST_STANCEFIX=0` starts a copy without the fix; `RTW3MP_DIAG` also traces
+the second asks (`poc stance: second ask #n ...`). Suite: `war_effects` M4 arms it on both copies at the live battle's
+start and, after the live minutes, on the host for side 1 (the dropped player's destroyers, the report's case); two checks
+(TESTING.md); `RTW3_STANCE_NOFIX=1` turns them into one DIAGNOSIS check that passes on the game's boxes.
+
+**Evidence**
+- Natural: diag2 (the fix off, `RTW3MP_DIAG`, every second ask traced; `--only session,war_effects,lockstep_rejoin`):
+  132/132, no second ask at all (the `--only` campaign's M4 battle in November 1900 had no contact). Too rare to wait for.
+- Before the fix (the switch with `nofix`): nofix1 (an earlier build whose `nofix` passed the nil to the game's code):
+  `TEST ... division 'GB Destroyer Division 9' (side 0) at t=13:53: its first answer V1, the second none` and the game's
+  box on both copies alike, answered as a live minute's box (`lockstep: minute box 'Error in AIDetermineTacticalStance2
+  procedure! Division: GB Destroyer Division 9 Access violation at address 01B905A0 ... Read of address 000009D3'`, the
+  address in MinHook's copy of `IsBigShip`'s first instruction), the 12 minutes equal on both copies; the next forced runs
+  at 13:54 and 13:55 and after the drop at 14:05-14:07 showed none (the 20-minute flag). nofix2 (the final
+  build, `nofix` = its hook off: the game's own `IsBigShip`; `RTW3MP_DIAG`; `--only session,war_effects`): in the live
+  battle (begun t=09:28) the forced runs alike on both copies, the live minute box on both, the 12 minutes equal; the
+  DIAG trace of each forced run: `diag: exception c0000005 at rva 60b5c0 (read 000009d3, ...): eax=00000000 ...` and
+  `diag:   stack (return rvas from esp+0): +0:58d982 +14c:59112f +184:565c6d ...` (`IsBigShip`'s return after the
+  second ask, `AIDetermineTacticalStance2`'s call of the destroyer routine, the StartMinute loop). After the drop
+  (minute 12, t=09:40) the host's 45 forced runs for side 1 up to t=10:19 showed the report's box twice, at the first
+  forced runs after minutes 20 and 40: "Error in AIDetermineTacticalStance2 procedure! Division: Germany Destroyer
+  Division 5 Access violation at address 0082B5C0 in module 'RTW3.exe'. Read of address 000009D3" (the report's
+  address: image base 0x220000 again). 90/92: the DIAGNOSIS check passed; the two failures are the suite's "no game
+  error box" checks on those boxes.
+- After the fix: in the two `--only` runs (below) M4's battles (1900/11/5 21:39, a night action, and 1900/11/26
+  10:07) had the forced runs 3/3 on both copies alike in the live minutes (e.g. `battle AI: the destroyer stance
+  routine of division 'GB Destroyer Division 21' (side 0) at t=21:39 asked twice for the closest dangerous big enemy
+  ship: a ship, then none (the game's random draw); IsBigShip answered as for the first ...` on both copies) and 3 on
+  the host after the drop (the dropped player's 'Germany Destroyer Division 2', 25, 26, 28), each answered by the fix:
+  no box, every minute equal, no DESYNC, the host's battle fought to its end and the month on. M4 of the group
+  `relations` run passed both checks too.
+
+**Tests**: `war_effects` M4 (two checks, TESTING.md); self-test 143/143 (`parse_stance`, `STANCE_BOX_RE`).
+
+**Runs** (each inside a backed-up run, v0.7.1 reinstalled afterwards; the game open about 91 minutes in all):
+- diag2 (a diagnostic build: the fix off, the second asks traced) `--only session,war_effects,lockstep_rejoin`: 132/132,
+  1094 s.
+- nofix1 (an earlier build of the switch) `--only session,war_effects` with `RTW3_STANCE_NOFIX=1`: 199 s; the live part
+  as above, the check's after-drop part failed (no box before minute 20: the flag), which led to 45 runs there.
+- dist_st72_1 (the fix commit's build; RTW3MP.dll SHA-256 68724F11FD5A3EBB...):
+  - nofix2 `RTW3MP_DIAG=1 --only session,war_effects` with `RTW3_STANCE_NOFIX=1`: 90/92 (the DIAGNOSIS check passed;
+    the two failures are the boxes it shows), 286 s.
+  - `--only session,lockstep_rejoin,lockstep_resume,war_effects` twice: 179/179 (1122 s) and 179/179 (1595 s); both
+    stance checks passed, no game error box, no DESYNC (the 0.7.0 guard's one line in the second: 'G9 *', a detached
+    escort whose lead 'Wittelsbach *' had no ships left).
+  - `--group relations`: 488/491 (1156 s): war_effects 75/75 with both stance checks, no game error box; the three
+    failures are `battle_surprise` b)'s takeover (`test: the takeover picks (none in the area)`, "Japan has taken
+    control of None!": no unowned possession left in the area; that month the game gave Shanghai to Russia as a
+    concession from China), the same three failures as in two runs of 2026-10-23 before this change: not this fix.
+
+## Testing 2026-11-02: the 0.7.2 release candidates dist_rc072_1 and dist_rc072_2 (v0.7.2)
+The final regression of 0.7.2 on its release candidate dist_rc072_1 (int-072 511e76a: 0.7.2, live-battle engine 18,
+protocol 3; RTW3MP.dll SHA-256 C0CDB35DAA45CBC7..., version.dll 1FF6F450820EE07B...) and, from 07:31, on its second
+candidate dist_rc072_2 (int-072 9837446 = the first with [the host's drop of a target it can't
+pursue](#fix-2026-11-01-a-joined-players-own-invasion-targets-the-games-button-followed-the-hosts-wars-v072-dev)
+(50c3ad1, `battle_invasion` v)) and [the destroyer stance routine's second
+ask](#fix-2026-11-02-the-destroyer-stance-routines-second-ask-v072) (ce2a86e, `war_effects` M4); RTW3MP.dll
+7FFE8EE4D4B6A82E..., version.dll 365AC08D901CFD74...). Run on the reg-072 runner (int-072 511e76a, from 07:33 merged
+with int-072 9837446, and the suite fixes below), installed from the frozen snapshots (`--dist`), the released 0.7.1
+(dist_rc071_2) put back after every run (hash checked); slots 1 and 9 and the Preferences identical to their backup
+after every run (the backup identical to the 0.7.1 regression's), the save folders as before (Game1, Game2, Game9), no
+folder copy, `python` or `RTW3.exe` left, the game lock released. Five other agents shared the game through the lock;
+the logs of every run are kept with the developers' session files (`r721\logs_*`).
+- **Runs** (checks, seconds with the game open):
+  - dist_rc072_1: `--group relations` 489/489 (1212 s); the default run (`--legacy-fixture`, 35 scenarios) 1683/1687
+    (3749 s; the suite's faults below); mixed a) 85/85 (183 s) and 74/74 (376 s); mixed b) not started twice (7/8, 199 s
+    each: the start-up condition below). The `--stress` run moved to the second candidate before it started.
+  - dist_rc072_2: `--group relations` 530/530 (1135 s, `war_effects` 75/75 with M4's stance checks); the whole
+    `--stress` run (42 scenarios, `--missile-fixture`, `--legacy-fixture`) 2197/2204 (7759 s; the game's conditions
+    below); mixed a) 87/87 (496 s), mixed b) 76/76 (374 s; once not started, 260 s); run again: `--stress --only
+    battles,battle_surprise,lockstep_limits,lockstep_data,lockstep_pvp,lockstep_strike,disk_full,disk_growth` 419/420
+    (2429 s; `disk_growth` 6, the suite's fault below) and `--stress --only battles,disk_full,disk_growth` 303/303
+    (508 s; `disk_full` 89/89, `disk_growth` 107/107). The first candidate's default run and the second's `--stress` run
+    cover every default scenario.
+  - With the game open: 19069 s (5 h 18 min): 5918 s with the first candidate, 13151 s with the second (a start-up probe
+    of 180 s and a stopped start of about 10 s included).
+- **No game error box** in any run but `disk_full`'s own ("Error in SaveDesignFiles procedure! ... not enough space on
+  the disk" on both copies, "Error in SaveBuildCampaign procedure! Cannot create file ... being used by another process"
+  inside its file-in-use window); `session`'s whole-run check passed in every run.
+- **0.7.2's fixes as tested** (both candidates): the battle search (`battle_generator` g) to i) in four runs: 119/119,
+  133/133, 159/159 and 157/157, each part at its first or second try, the known `SKIP-note` of a try whose first attempt
+  was not the decline it needs or gave no battle); the invasion target through the game's own dialogs (`battle_invasion`
+  u), the default and `--stress` runs; u3) see below); the corvettes (`ai_escorts` 29/29 in all four runs: Russia's four
+  ships on trade protection kept through the war month, no escort laid down; with `aibuilds keep 0` back in active
+  service); the second candidate's target drop (`battle_invasion` v1/v2 in the `--stress` run: a target an older host
+  took, dropped with the next turn and its chat line, a leftover dropped before the month, no cost) and the stance
+  routine (`war_effects` M4 in `--group relations`: `ls teststance 3` in the live battle forced 3 second asks on both
+  copies, all answered by the fix; after the drop 3 more on the host, no box, the battle to its end; the `--stress`
+  run's M4 month had no live battle: a `SKIP-note`).
+- **Mixed versions** ([TESTING](docs/TESTING.md#mixed-versions), the driver `mixed_072.py`): the join line with the
+  player's `battle generator` 5 (0.7.2) or 4 (0.7.1) and its hostgen 5 or 4, two months merged once each, the host's
+  battle against the player in a real month fought live (424, 425, 468 and 424 minutes equal, no DESYNC, agreed end); a)
+  the 0.7.2 host refused the 0.7.1 player's target Guam set by the player's own (0.7.1, host-war) button ("the nation is
+  not at war with its owner"), kept Russia's trade protection (4 of 4, no escort); expected differences: the 0.7.1
+  player's button enabled for the USA's Guam and The Philippines and greyed out for Russia's Liaotung Peninsula, its
+  request of two attempts stopped at its first encounter ("The Spanish navy declines battle!": avoided, VP 360/0 and
+  300/0); b) (the 0.7.1 host from the Steam folder, the 0.7.2 player from the folder copy `r721\game_a`) the 0.7.2
+  player's button greyed out for The Philippines and enabled for Liaotung Peninsula, which the 0.7.1 host took; its
+  request stopped at attempt 0's decline (TEST 1x), merged as in 0.7.1; expected difference: the 0.7.1 host returned
+  Russia's four ships on trade protection to active service and Russia laid down three corvettes (KE Vestnik, Gonets,
+  Plastun) in the war month.
+- **Start-up: no message hook in a new folder copy** (mixed b) on the first candidate; a test-environment condition, not
+  0.7.2's): the 0.7.1 host started from the new folder copy `r721\game_b` logged `init done: ... msg hook 00000000`, no
+  `dispatcher ready` and no Multiplayer button; its bridge answered but every command on the game's main thread timed
+  out (twice, 04:28 and 04:45). The RC2 player from the new copy `r721\game_b2` the same (11:13). A probe
+  (`r721\hookprobe.ps1`, each copy alone at its title screen, no session): the Steam folder installed the hook every
+  time (RC2, 0.7.1, first or second copy), every new folder copy never (`game_p`, `game_q`; 0.7.1 and RC2; fresh or 15 s
+  and more after the copy; first or second; Steam's overlay loaded in all), while `r721\game_a` (first used at 03:20)
+  worked all day. From Python in the same Windows session, `SetWindowsHookExW` with any module handle failed with
+  ERROR_MOD_NOT_FOUND (126) (a copied version.dll in two folders, System32's version.dll, Python's `_socket.pyd` and
+  `_ctypes.pyd`) and with no module (a thread hook of the same process, hMod NULL) worked; the user atom table had room.
+  Windows keeps the path of every module a hook was set with in a per-session table of fixed size; after dozens of
+  folder copies by several agents in one logon session it was full, so a module path not yet in it fails and the ones in
+  it (the Steam folder, `game_a`) work. main.cpp (the hook) is the same in 0.7.1 and 0.7.2; a player starts the game
+  from its Steam folder. A copy can only hit it from a new folder in a session whose table other software has filled;
+  hardening for a later version: when `SetWindowsHookExW` fails with the module, set the hook with hMod NULL (the same
+  process's thread). The mixed driver runs case b) with `--old-in-steam` and a folder path that worked before.
+- **Natural occurrences** (every log of the runs, each line counted once; `r721\nat_scan.py`, `inuse_scan.py`): merged
+  results with two or more encounters 79 (17, 19, 13, 19, 10 and 1 in the logs of the relations, default, relations,
+  `--stress` and the two re-runs), 11 more from injected requests (`battle_generator` g) to i), the mixed driver); "the
+  search goes on" 249 times, 25 more in injected requests; the possession dialog's button decided 9 times, all in
+  dialogs the tests opened (`battle_invasion` u) in the default and `--stress` runs, mixed b): 3 enabled and 3 greyed
+  out by the nation's own war, 1 enabled and 2 greyed out as the game set it); computer nations' trade protection kept
+  32 times (5, 9, 8 and 10 in the relations, default, relations and `--stress` logs), besides 9 after the TEST of
+  `ai_escorts` and the mixed driver and 4 TEST "not kept"; the SelectForce guard 8 times, all after a TEST build (none
+  natural); the stance fix 9 times, all in `war_effects` M4's battles with `ls teststance` (none natural); one real file
+  in use: the host's save at 05:32:58 in the default run's `battle_generator` c) M1 (`RTWGame1.bcs` in use, the cause
+  inuse, saved again 2 s later and the new month sent, no box), besides `disk_full`'s own.
+- **Failures and their classes:** no product fault. The default run (dist_rc072_1): `battle_invasion` u3) and e2)
+  (twice) and `disk_full` d), the suite's (627fa30, 6f175eb; passed in the second candidate's `--stress` run). The
+  `--stress` run (dist_rc072_2): `battles` b) (twice), `lockstep_data` b), `lockstep_pvp` b), `lockstep_strike` g) and
+  `disk_growth` 3 (twice), the game's conditions ([Known traps](docs/TESTING.md#known-traps)), all passed when run
+  again; the re-run's `disk_growth` 6 (the month outlived its limit with a battle fought on auto-run without the
+  runner's watch), the suite's (72402ad), passed in the third run. `battle_surprise` b)'s "Japan has taken control of
+  None!" did not come in these runs (the takeover passed in all five); from fix-stance2's run of the same day the
+  suite's: the test's pick found no unowned possession in the area (79ccd3f).
+- **Suite fixes** (reg-072): 627fa30 (`battle_invasion` u3), e2)), 6f175eb (`disk_full` d)), 79ccd3f (`battle_surprise`
+  b)), 72402ad (run_month's unplanned path: `unplanned_fight_poll`); self-test 143/143; TESTING.md (the catalog, the
+  game times, the `--list` estimates, Mixed versions, Known traps).
+- **Verdict: GO** for dist_rc072_2 (RTW3MP.dll 7FFE8EE4D4B6A82E..., version.dll 365AC08D901CFD74...): no product fault
+  and no game error box (but `disk_full`'s own) in either candidate; the default set on the first, every `--stress` and
+  `--group relations` scenario on the second (with its two fixes), mixed versions both ways with the expected
+  differences. The start-up condition above is the test machine's, not 0.7.2's.

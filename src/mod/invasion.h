@@ -55,6 +55,14 @@ int RestoreMarked(const std::vector<std::wstring>& names);
 std::string ClientSetForm(const KState& st, bool clear);
 std::wstring FormTarget();  // the form's InvasionTarget name ("" none)
 
+// 0.7.2: the game's InvasionPossible(PlayerNation, p) on this PC (0 beyond the nation's invasion range, else 1-5) and its
+// GetInvasionRange (nm); -2 no such possession or not available (bridge `inv range`, read only).
+int RangeCheck(const std::wstring& name, int* rangeNm);
+// 0.7.2: the possession details dialog's "Set invasion target" button on a joined player's PC follows the nation's own
+// wars (TdlgPossessionDetailsNew.FormShow hook; the game enables it by the owner's relation with nation 0, the host's
+// nation there). The last decision for tests: "" none yet.
+std::string DetailsButtonLast();
+
 // The game's monthly cost of an invasion target for nation n's record (GetModifiedBudget / 300 + 100).
 int TargetCost(void* nationRecord);
 

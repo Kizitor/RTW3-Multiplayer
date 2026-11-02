@@ -83,10 +83,14 @@ bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::v
 // sent, never the player's intel fields; ships no longer listed were sunk), for the nations in `allowed` only. It
 // changes `host` only if everything applies. keepUsed (0.7.0, raider battles): the ships' Used marks stay the host's
 // (the raider check's thwarts mark ships Used; the month's raider sinkings on the host came before the battle phase).
+// 0.7.2 (fix-battlesearch): a request whose search went on after encounters without a battle: `more` (Extract) are its
+// other opponents (real indices), whose sections go in too; `otherVP` (Apply) their points (nation -> VP added), the
+// deltas' dVP_J being J's own share then.
 bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterBcs, int K, int J, Bundle& out,
-                         std::string& summary, std::string& err);
+                         std::string& summary, std::string& err, const std::vector<int>& more = {});
 bool ApplyBattleResult(IniDoc& host, const std::string& sentBcs, int K, int J, const Bundle& result,
-                       const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed = false);
+                       const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed = false,
+                       const std::map<int, int>* otherVP = nullptr);
 
 // Campaign divisions (the strategic screen's Fleet organization): the [CampaignDivisions] section of a slot's .off as
 // TCampaignDivision.SaveMe writes it: CampDivNo=<n>, then for each division i < n the keys CampDiv<i><Field> with the

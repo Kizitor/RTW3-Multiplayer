@@ -1021,7 +1021,7 @@ static std::vector<std::string> SplitLines(const std::string& s) {
 }
 
 bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterBcs, int K, int J, Bundle& out,
-                         std::string& summary, std::string& err) {
+                         std::string& summary, std::string& err, const std::vector<int>& more) {
     out.files.clear();
     if (K < 1 || K > 8 || J < 1 || J > 8 || J == K) {
         err = "bad nations";
@@ -1030,7 +1030,7 @@ bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterB
     IniDoc before = ParseIni(beforeBcs), after = ParseIni(afterBcs);
     // In the battle slot K is nation 0, the host's nation is K and every other nation keeps its number. Besides K and
     // J, the nations allied to either side in this battle ([General] Battle(Enemy)AlliedNationIdx) are sent too; the
-    // host only takes those that are AI nations.
+    // host only takes those that are AI nations. 0.7.2: and `more` (the request's other opponents, real indices).
     auto toHost = [K](int slotIdx) { return slotIdx == 0 ? K : slotIdx == K ? 0 : slotIdx; };
     std::vector<int> slotNations = {0, J};
     for (const char* key : {"BattleAlliedNationIdx", "BattleEnemyAlliedNationIdx"}) {
@@ -1038,6 +1038,9 @@ bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterB
         if (s > 0 && s <= 8 && s != K && std::find(slotNations.begin(), slotNations.end(), s) == slotNations.end())
             slotNations.push_back(s);
     }
+    for (int s : more)
+        if (s > 0 && s <= 8 && s != K && std::find(slotNations.begin(), slotNations.end(), s) == slotNations.end())
+            slotNations.push_back(s);
     for (int slotIdx : slotNations) {
         int hostIdx = toHost(slotIdx);
         for (const char* suffix : kBattleSections) {
@@ -1081,7 +1084,8 @@ static bool IntelField(const std::string& f) {
 static std::string FieldKey(const std::string& f) { return f.substr(0, f.find('=')); }
 
 bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J, const Bundle& result,
-                       const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed) {
+                       const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed,
+                       const std::map<int, int>* otherVP) {
     IniDoc sent = ParseIni(sentBcs);
     IniDoc host = hostOut;  // committed only if everything applies
     std::vector<std::pair<std::string, const std::string*>> secs;
@@ -1189,11 +1193,20 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
     AddToKey(host, nk, "Prestige", KVInt(kv, "dPrestige_K"));
     AddToKey(host, nk, "FleetMorale", KVInt(kv, "dMorale_K"));
     AddToKey(host, nj, "VP", KVInt(kv, "dVP_J"));
+    std::string others;  // 0.7.2: the points of the request's other opponents (their encounters')
+    if (otherVP)
+        for (auto& o : *otherVP) {
+            if (o.first < 1 || o.first > 8 || o.first == K || o.first == J) continue;
+            AddToKey(host, "Nation" + std::to_string(o.first), "VP", o.second);
+            others += (others.empty() ? "" : ", ") + std::string("nation ") + std::to_string(o.first) + " " +
+                      (o.second >= 0 ? "+" : "") + std::to_string(o.second);
+        }
     hostOut = host;
     summary = std::to_string(changedShips) + " ships changed (" + std::to_string(changedFields) + " fields), " +
               std::to_string(removedShips) + " removed, VP " + KVStr(kv, "dVP_K", "0") + "/" + KVStr(kv, "dVP_J", "0") +
               ", prestige " + KVStr(kv, "dPrestige_K", "0") +
-              (skipped ? ", " + std::to_string(skipped) + " section(s) of other players skipped" : "");
+              (skipped ? ", " + std::to_string(skipped) + " section(s) of other players skipped" : "") +
+              (others.empty() ? "" : ", VP of the other opponents: " + others);
     return true;
 }
 

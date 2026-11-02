@@ -9,6 +9,101 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.7.2 (2026-11-02)
+Fixes of the bugs that players reported on 0.7.1: a joined player couldn't set their own invasion targets (the game's
+button followed the host's wars), a joined player's search for the month's battle stopped at the first encounter, so
+an enemy that declined battle left the player without one where single player goes on to the next chance, and a
+computer nation at war only with joined players laid down a new class of corvettes every month. Also fixed: a joined
+player's invasion could end another nation's invasion of the same possession, the support of invasions faded faster
+than in single player, an invasion target that an older host took could cost money for nothing, and the game's own
+"Error in AIDetermineTacticalStance2 procedure!" box in long battles.
+**Update the host and every player:** the battle search is fixed by 0.7.2 on the host and on the player's PC, the
+invasion button by 0.7.2 on the player's PC, the corvettes and the other invasion fixes by 0.7.2 on the host. The
+protocol is still 3 and the live-battle engine still 18: players on 0.6.1, 0.7.0, 0.7.1 and 0.7.2 play a campaign
+and fight their live battles together.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.7.2)
+
+### Fixed
+- **A joined player's own invasion targets** (reported as "unable to set their own invasion targets independent of
+  the host"): the game's *Set invasion target* button (in a possession's details on the strategic map) went by the
+  host's nation's relations. On a joined player's PC it was greyed out for the possessions of the player's own
+  enemies while the host was at peace with them, and it offered the possessions of the host's enemies, which the
+  player's nation wasn't at war with: the host took such a target, and the player paid its monthly cost for nothing.
+  The button now follows your own nation's wars: it is offered for the possessions of the computer nations at war
+  with your nation, and greyed out for the host's and the other players' possessions (invasions between players are
+  not supported). The host now also refuses a target whose owner your nation isn't at war with, which a player on an
+  older version can still send ("* Captain's invasion target The Philippines was not taken: the nation is not at war
+  with its owner.").
+- **Two invasions of one possession:** when another nation, the host's or another player's, already invaded the
+  possession that you had picked, your month could start your invasion there and end theirs. Now your invasion plan
+  ends instead, as in single player, with the game's line in your turn report: "Invasion of ... cancelled: ... is
+  already invaded by the forces of ...".
+- **The support of invasions** (the navy's support of the fighting on land, which the invasion battles change) faded
+  faster than in single player: the game's monthly step toward 0 also ran in the other nations' months while they
+  were at war, in the host's month for the joined players' invasions and in a joined player's month for the host's
+  and the other players' invasions. Each invasion's support now changes only in its own nation's month.
+- **The invasion target after your battles:** once a battle of the month was over, the target on a joined player's
+  screen went back to the one the month had started with until the next month came. It now stays the one you
+  submitted.
+- **An invasion target that an older host took:** a host on 0.7.0 or 0.7.1 took targets of nations your nation wasn't
+  at war with. Such a target was never carried out, its monthly cost was paid every month, and at peace with its owner
+  you couldn't even replace it. A host on 0.7.2 checks every joined nation's target before each month and drops one
+  that can't go on, with a chat line ("* Captain's invasion target The Philippines was dropped: Germany is not at war
+  with its owner.").
+- **A joined player's battle search stopped at the month's first encounter** (reported as "the non-host player can
+  only generate 1 battle at a time"): in single player, the month's search for a battle doesn't stop at an encounter
+  that brings none. When the computer's navy declines ("The ... navy declines battle! You gain N VP!"), when you
+  decline, or when a side has no ships there that can fight, the search goes on, and a later chance can still bring
+  the month's battle. A joined player's search stopped at the first encounter of any kind, so an enemy that often
+  declined left the player without battles, month after month. The search now goes on as in single player, also for
+  a surprise attack at a war's start (when one attacker declines, the next may strike), so a month can bring several
+  of the game's map messages, boxes and previews. Each encounter's points go to its own opponent, in the victory
+  points and in the war score, and the chat has a line for each encounter: on your PC before the battle ("* The Spain
+  navy declined battle in Northern Europe: Germany gains 360 VP."), and in everyone's chat after the month's battles
+  ("* The Spain navy declined battle against Germany in Northern Europe.", then "* The battle of Germany against
+  Russia in ... was fought by Captain."). One battle a month stays the game's own limit, in single player too (a
+  surprise attack at a war's start can add one), and different players already fight their battles at the same time.
+- **The computer's corvettes** (reported as "the AI is spamming building corvettes in a seemingly random way"): a
+  computer nation at war only with joined players' nations (not with the host's nation or another computer nation)
+  laid down a new class of escorts, mostly corvettes, every month of the war, and the turn reports showed "... has
+  laid down a KE of ... class!" several times a month. In single player the game lays down such escorts for the
+  player's enemy while it has fewer ships on trade protection than its requirement (which grows with the player's
+  submarines), and puts ships on trade protection every month until it has enough. In the host's month that nation
+  looked at peace: the game sent its ships on trade protection back to active service or into reserve every month,
+  so its patrols never filled. Now they stay and fill as in single player, and the escorts stop once it has enough.
+- **"Error in AIDetermineTacticalStance2 procedure! ... Read of address 000009D3"** in long battles (found by the
+  release tests; single player has it too): the computer's destroyer tactics ask twice in a row for the closest
+  dangerous big enemy ship and use the second answer without checking it, but a badly damaged ship may count as
+  dangerous only the first time. The box no longer shows, and the destroyers carry on as with the first answer. In a
+  live battle between a PC on 0.7.2 and one on an older version, a minute where this happens can differ between the
+  two PCs: the battle then synchronises again, as it does for other differences.
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1 and 0.7.2 can join each other's
+  hosts and play the campaign together.
+- 0.7.2 keeps the live-battle engine of 0.6.1, 0.7.0 and 0.7.1 (18): players on these versions fight their live
+  battles live, with each other and under a host on any of them. A player on 0.6.0 (engine 17) or older can't fight
+  a live battle with a host or player on 0.7.2.
+- Each fix works on the PCs that run 0.7.2, so update the host and every player:
+  - the battle search: 0.7.2 on the host and on the player's PC. With an older version on either PC, the month's
+    first encounter still ends the player's search;
+  - the *Set invasion target* button and the target after your battles: the player's own fix, under a host on 0.7.0
+    or newer (under an older host, which takes no invasions of joined nations, the button is greyed out). A player on
+    0.7.0 or 0.7.1 still gets the button of the host's wars, and a host on 0.7.2 refuses a target of a nation that
+    the player's nation isn't at war with, with the chat line above;
+  - the refusal of such a target, dropping a target an older host took, two invasions of one possession and the
+    support of invasions: the host's fixes, for players on 0.7.0 or newer;
+  - the computer's corvettes: the host's fix, for players on any version;
+  - the *AIDetermineTacticalStance2* box: each PC for its own battles.
+- Existing campaigns go on from where they are. The escorts that the computer laid down before stay in its fleet.
+
+### Known issues
+- When a joined player's battle comes after encounters without a battle in the same search, and the player leaves
+  that battle before its end, disconnects or doesn't finish it within the time limit, the earlier encounters are lost
+  with it: their points and the other consequences of a decline don't count.
+- The known issues of 0.7.1 remain, except two of 0.7.0's about invasions, fixed above: a newer invasion of a
+  possession replaced the older one, and a declined invasion battle ended the month's search for a battle.
+
 ## 0.7.1 (2026-10-29)
 Fixes of the bugs that players reported on 0.7.0: a joined player's ships on trade protection or raiding were back in
 active service every month, *View data* of a joined player's own ships showed nothing or another nation's ship, a full

@@ -32,5 +32,13 @@ std::string TestBuilder(const std::vector<std::string>& args);
 // enemy of K), up to n of R's operational ships in active service raid in the defender's build area (R = K: against its
 // first enemy; else against K) for that frame; put back afterwards. n <= 0: off.
 std::string TestSea(const std::vector<std::string>& args);
+// 0.7.2, bridge `aibuilds [clear | patrol <J> [<K> [set]] | keep <0|1>]` (any PC): the computer's ships laid down
+// (LayDownAIShip) since the last `aibuilds clear`, oldest first (the last 300): "ok n=<count> keep=<0|1> | <yyyy-mm>:
+// <nation>:<type>:<cause>[:K<k>]:<on trade protection>/<required> ..." (cause: monthly = AIMonthlyBuild, escorts =
+// CheckSubmarineActivity, initial, other; K<k>: in joined nation k's view). `patrol`: J's ships on trade protection and
+// its patrol requirement on the host's frame and in K's view (TEST ONLY `set`: put some on trade protection up to the
+// latter). `keep 0` (TEST ONLY): 0.7.1, the relations mask doesn't put back the trade protection and raiders of a
+// computer nation whose wars are all with nations people play, and the sea war frames run no ASW effort for it.
+std::string AIBuildsCommand(const std::vector<std::string>& args);
 
 }  // namespace warfx

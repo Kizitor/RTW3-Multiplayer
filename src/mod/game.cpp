@@ -18,6 +18,7 @@ struct Api {
         fCampaignStartYear = -1;
     int fNationName = -1, fShipList = -1, fFunds = -1;
     int fShipOrderedArea = -1, fShipLocationArea = -1, fShipStatus = -1;
+    int fShipInPlay = -1;  // 0.7.2 (the mask's computer nations at war with K: their ships in play)
     int fHandle = -1, fVisible = -1, fOwner = -1, fModalLevel = -1;
     // methods
     void *mTurnClick = nullptr, *mResignClick = nullptr, *mDoEndOfTurn = nullptr, *mDoTurn2 = nullptr,
@@ -446,6 +447,7 @@ bool Resolve() {
     REQ_FIELD(A.fShipOrderedArea, "TCampaignShip", "OrderedArea");
     REQ_FIELD(A.fShipLocationArea, "TCampaignShip", "LocationArea");
     REQ_FIELD(A.fShipStatus, "TCampaignShip", "Status");
+    A.fShipInPlay = dl::Field("TCampaignShip", "InPlay");
     REQ_FIELD(A.fHandle, "TWinControl", "FHandle");
     REQ_FIELD(A.fVisible, "TControl", "FVisible");
     REQ_FIELD(A.fOwner, "TComponent", "FOwner");
@@ -2452,6 +2454,7 @@ static int g_aiMaskDepth = 0;
 static struct {
     bool on;
     bool k[9];
+    bool c[9];  // 0.7.2: a computer nation whose wars are all with nations under the player's rules (HiddenWarsOnly)
     int t[9][9], al[9][9];
 } g_aiMask;
 
@@ -2461,11 +2464,20 @@ static struct {
 // above 40). The mask hides K's wars with the computer's nations, so a masked routine that computes K's monthly balance
 // (ReduceTimeLimits' loop of the computer's nations: GetMonthlyBalance) put K's trade protection and raiders back in
 // active service every month. Their statuses are put back when the mask ends while K is at war.
+// 0.7.2: the same for a computer nation whose wars are all with nations under the player's rules (the mask hides them all,
+// so inside the masked routines it is at peace; c[] below): its maintenance put its ships on trade protection back in
+// active service (Status 0) and PutAIShipsInStatus' peace branch put some in reserve (1); K's sea war frame (warfx.cpp,
+// CheckSubmarineActivity in K's view) then found it short of ships on ASW patrol every month and laid down another escort
+// class (corvettes in 80 %, else destroyers): without end, as long as the war lasted. In single player the patrols of a
+// nation at war stay. Its ships in play saved on trade protection or raiding (3, 4, 5) and found in active service, in
+// reserve or mothballed (0, 1, 2) are put back while it is at war (not ships under construction: the game puts those to 0
+// in any month).
 struct MaskShip {
     void* ship;
     uint8_t st;
 };
 static std::vector<MaskShip> g_aiMaskShips[9];
+static bool g_maskKeepAI = true;  // TEST ONLY (bridge `aibuilds keep 0`): a computer nation's not put back (0.7.1)
 
 static bool NationAtWarNow(int k) {  // the game's NationIsAtWar for nation k (real relations)
     if (Nation(k) == PlayerNation() && WarCounter() > 0) return true;
@@ -2487,22 +2499,46 @@ static void MaskShipsSave(int k) {
 
 static void MaskShipsRestore(int k, const char* routine) {
     if (g_aiMaskShips[k].empty()) return;
-    int kept = 0;
+    const bool computer = g_aiMask.c[k];
+    int kept = 0, lost = 0;
     if (NationAtWarNow(k)) {
         void* n = Nation(k);
         for (int i = 0, c = ShipCount(n); i < c; i++) {
             void* s = Ship(n, i);
-            for (const MaskShip& m : g_aiMaskShips[k])
-                if (s && s == m.ship && dl::At<uint8_t>(s, A.fShipStatus) == 0) {
-                    dl::At<uint8_t>(s, A.fShipStatus) = m.st;
-                    kept++;
+            uint8_t now = s ? dl::At<uint8_t>(s, A.fShipStatus) : 0;
+            for (const MaskShip& m : g_aiMaskShips[k]) {
+                if (!s || s != m.ship || !(now == 0 || (computer && now <= 2))) continue;
+                if (computer && (A.fShipInPlay < 0 || !dl::At<uint8_t>(s, A.fShipInPlay))) continue;
+                if (computer && !g_maskKeepAI) {
+                    lost++;
+                    continue;
                 }
+                dl::At<uint8_t>(s, A.fShipStatus) = m.st;
+                kept++;
+            }
         }
     }
     if (kept)
-        Log("relations v2: nation %d at war: %d ship(s) on trade protection or raiding kept (%s saw it at peace)", k,
-            kept, routine);
+        Log("relations v2: nation %d at war%s: %d ship(s) on trade protection or raiding kept (%s saw it at peace)", k,
+            computer ? " (a computer nation, its wars with nations people play)" : "", kept, routine);
+    if (lost)
+        Log("relations v2: nation %d at war (a computer nation, its wars with nations people play): %d ship(s) on trade "
+            "protection or raiding back in active service or reserve (%s saw it at peace; TEST: not kept)", k, lost,
+            routine);
     g_aiMaskShips[k].clear();
+}
+
+// 0.7.2: a computer nation whose wars are all with nations under the player's rules (real relations, before the mask):
+// at war with one of them, at peace with nation 0 and with every other computer nation.
+static bool HiddenWarsOnly(int c) {
+    if (c < 1 || c > 8 || g_aiMask.k[c] || TensionCell(c, 0) > 40) return false;
+    bool hidden = false;
+    for (int j = 1; j <= 8; j++) {
+        if (j == c || TensionCell(c, j) <= 40) continue;
+        if (!g_aiMask.k[j]) return false;
+        hidden = true;
+    }
+    return hidden;
 }
 
 static const char* g_aiMaskRoutine = "";
@@ -2516,8 +2552,9 @@ static void AIMaskEnter(const char* routine) {
         if (g_aiMask.k[k]) ks += " " + std::to_string(k);
     }
     if (ks.empty()) return;
+    for (int c = 1; c <= 8; c++) g_aiMask.c[c] = HiddenWarsOnly(c);
     for (int k = 1; k <= 8; k++)
-        if (g_aiMask.k[k]) MaskShipsSave(k);
+        if (g_aiMask.k[k] || g_aiMask.c[k]) MaskShipsSave(k);
     g_aiMaskRoutine = routine;
     for (int a = 1; a <= 8; a++)
         for (int b = 1; b <= 8; b++) {
@@ -2545,7 +2582,7 @@ static void AIMaskLeave() {
     g_aiMask.on = false;
     if (dropped) Log("relations v2: %d change(s) of the computer's rules to the masked pairs dropped", dropped);
     for (int k = 1; k <= 8; k++)
-        if (g_aiMask.k[k]) MaskShipsRestore(k, g_aiMaskRoutine);
+        if (g_aiMask.k[k] || g_aiMask.c[k]) MaskShipsRestore(k, g_aiMaskRoutine);
 }
 
 // The host's CheckForWar (kind 1) and RandomTensionChanges (kind 2) with K seen as a player; on a joined player's PC
@@ -2860,6 +2897,11 @@ static int PvRealOf(void* nation) {  // a record's real index (also while the vi
         if (g_pv.obj[r] == nation) return r;
     return -1;
 }
+
+int ViewNation() { return g_pvOn ? g_pv.K : 0; }
+int RealIndexOf(void* nation) { return g_pvOn ? PvRealOf(nation) : NationIndex(nation); }
+void TestMaskKeepAI(bool on) { g_maskKeepAI = on; }
+bool MaskKeepAI() { return g_maskKeepAI; }
 
 static void* PvRec(int v) { return g_pv.obj[PvReal(v)]; }  // the record at view index v
 
@@ -5914,6 +5956,8 @@ bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& a
 
 static bool TestNoForcePlainBegin();  // TEST ONLY (fix-selforce): an armed `battles testnoforce` makes the attempt plain
 static long TestNoForcePlainEnd();
+static bool TestDeclineBegin();  // TEST ONLY (0.7.2 fix-battlesearch): an armed `battles testdecline` acts meanwhile
+static std::string TestDeclineEnd();
 
 bool StartPlayerBattle(int attacker, int defender, const std::wstring& areaName) {
     void* f = BuildCamp();
@@ -5927,14 +5971,17 @@ bool StartPlayerBattle(int attacker, int defender, const std::wstring& areaName)
     uint32_t stack[1] = {(uint32_t)(uintptr_t)area};
     int ok = 0;
     bool plain = TestNoForcePlainBegin();
+    bool td = !plain && TestDeclineBegin();
     bool r = (GuardedCall(A.mCheckAttack, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)na, (uint32_t)(uintptr_t)nd, 1,
                           stack, &ok) & 0xFF) != 0 && ok;
     long answers = plain ? TestNoForcePlainEnd() : 0;
-    Log("StartPlayerBattle %d attacks %d in %s -> %s%s", attacker, defender, W2U(areaName).c_str(),
+    std::string tdText = td ? TestDeclineEnd() : "";
+    Log("StartPlayerBattle %d attacks %d in %s -> %s%s%s", attacker, defender, W2U(areaName).c_str(),
         !ok ? "exception" : r ? "battle" : "none",
         plain ? (" (TEST: plain, the computer's decline and the caught-out test answered False " +
                  std::to_string(answers) + "x)").c_str()
-              : "");
+              : "",
+        tdText.c_str());
     return r;
 }
 
@@ -5949,9 +5996,12 @@ bool StartSurpriseAttack(int attacker, int defender) {
         return false;
     }
     int ok = 0;
+    bool td = TestDeclineBegin();
     bool r = (GuardedCall(A.mCheckSurprise, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)na, (uint32_t)(uintptr_t)nd, 0,
                           nullptr, &ok) & 0xFF) != 0 && ok;
-    Log("StartSurpriseAttack %d attacks %d -> %s", attacker, defender, !ok ? "exception" : r ? "True" : "False");
+    std::string tdText = td ? TestDeclineEnd() : "";
+    Log("StartSurpriseAttack %d attacks %d -> %s%s", attacker, defender, !ok ? "exception" : r ? "True" : "False",
+        tdText.c_str());
     return r;
 }
 
@@ -6475,16 +6525,70 @@ extern "C" void* o_AIDeclines = nullptr;
 extern "C" void* o_CaughtOut = nullptr;
 extern "C" volatile long g_invPlainHits = 0;
 
+// TEST ONLY (session `battles testdecline <n> [m]`, 0.7.2 fix-battlesearch): during a battle slot's replayed attempts
+// (StartPlayerBattle, StartSurpriseAttack) the next n calls of AIDeclinesBattle that carry out the computer's decision
+// (Implement True: DoPossessionBattle's and DoHomeAreaBattle's after the map message, CheckSurpriseAttack's) decline
+// the way the game declines: the routine runs with its decision set to "decline" at its end (d_DeclineDecision), so its
+// own consequences follow (TestMenu's question, the distance cuts of the points, its box "The <nation> navy declines
+// battle! You gain N VP!", the player's VP, EnemyDeclineCount); its own early answers (an intelligence coup's ambush,
+// an invasion battle pending) stand. The next m such calls answer False (the computer fights). Meanwhile CheckCaughtOut
+// answers False (the player is not caught out, so the computer's decision is asked).
+extern "C" volatile long g_tdDecline = 0, g_tdFight = 0;                       // armed: declines, then fights
+extern "C" volatile long g_tdForced = 0, g_tdFought = 0, g_tdNotCaught = 0;    // what the switch did so far
+extern "C" volatile bool g_tdNow = false;       // a replayed attempt runs
+extern "C" volatile bool g_tdThisCall = false;  // this AIDeclinesBattle call declines (set at its decision)
+extern "C" void* o_DeclineDecision = nullptr;
+
 // AIDeclinesBattle(Self, anAINation, anArea, aMission, Implement, aPenalty, AIdefender, RealBattleTitle): Boolean, ret 0x14
+// (stack at entry: [esp+4] RealBattleTitle, +8 AIdefender, +0xc aPenalty, +0x10 Implement, +0x14 aMission)
 extern "C" __declspec(naked) void d_AIDeclines() {
     __asm {
         cmp byte ptr [g_invPlainNow], 0
         jne plain
+        cmp byte ptr [g_tdNow], 0
+        je orig
+        cmp byte ptr [esp + 0x10], 0
+        je orig
+        cmp dword ptr [g_tdDecline], 0
+        jg decline
+        cmp dword ptr [g_tdFight], 0
+        jg fight
+    orig:
         jmp dword ptr [o_AIDeclines]
     plain:
         lock inc dword ptr [g_invPlainHits]
         xor eax, eax
         ret 0x14
+    fight:
+        lock dec dword ptr [g_tdFight]
+        lock inc dword ptr [g_tdFought]
+        xor eax, eax
+        ret 0x14
+    decline:  // the game's routine with the same arguments (eax, edx, ecx untouched), its decision set at its end
+        lock dec dword ptr [g_tdDecline]
+        mov byte ptr [g_tdThisCall], 1
+        push dword ptr [esp + 0x14]
+        push dword ptr [esp + 0x14]
+        push dword ptr [esp + 0x14]
+        push dword ptr [esp + 0x14]
+        push dword ptr [esp + 0x14]
+        call dword ptr [o_AIDeclines]
+        mov byte ptr [g_tdThisCall], 0
+        ret 0x14
+    }
+}
+
+// AIDeclinesBattle at its decision's end (after AIAirSuperiorityCheck; the instruction `mov eax, [ebp-0x20c]` before
+// `movzx eax, byte ptr [eax+TestMenu]; and al, [ebp-0x20d]`): [ebp-0x20d] is the decision ("declines").
+extern "C" __declspec(naked) void d_DeclineDecision() {
+    __asm {
+        cmp byte ptr [g_tdThisCall], 0
+        je orig
+        mov byte ptr [g_tdThisCall], 0
+        mov byte ptr [ebp - 0x20d], 1
+        lock inc dword ptr [g_tdForced]
+    orig:
+        jmp dword ptr [o_DeclineDecision]
     }
 }
 
@@ -6493,9 +6597,20 @@ extern "C" __declspec(naked) void d_CaughtOut() {
     __asm {
         cmp byte ptr [g_invPlainNow], 0
         jne plain
+        cmp byte ptr [g_tdNow], 0
+        je orig
+        cmp dword ptr [g_tdDecline], 0
+        jg notcaught
+        cmp dword ptr [g_tdFight], 0
+        jg notcaught
+    orig:
         jmp dword ptr [o_CaughtOut]
     plain:
         lock inc dword ptr [g_invPlainHits]
+        xor eax, eax
+        ret
+    notcaught:
+        lock inc dword ptr [g_tdNotCaught]
         xor eax, eax
         ret
     }
@@ -6529,6 +6644,62 @@ bool SetTestInvasionPlain(bool on) {
     if (on && (!InvasionReplayAvailable() || !EnsurePlainHooks())) return false;
     g_testInvPlain = on;
     return true;
+}
+
+// The decision hook of `battles testdecline` (installed on the switch's first use, never in normal play): the
+// instruction at the decision's end, found by its bytes (mov eax, [ebp-0x20c]; movzx eax, byte ptr [eax+TestMenu];
+// and al, [ebp-0x20d]), so the hook's [ebp-0x20d] is the routine's decision.
+static bool EnsureDeclineTestHooks() {
+    static bool tried = false;
+    if (!tried && EnsurePlainHooks()) {
+        tried = true;
+        uint8_t* fn = (uint8_t*)dl::Method("TfrmBuildCamp", "AIDeclinesBattle");
+        int tm = dl::Field("TfrmBuildCamp", "TestMenu");
+        uint8_t* at = nullptr;
+        if (fn && tm > 0) {
+            std::vector<int> pat = {0x8B, 0x85, 0xF4, 0xFD, 0xFF, 0xFF, 0x0F, 0xB6, 0x80};
+            for (int i = 0; i < 4; i++) pat.push_back((tm >> (8 * i)) & 0xFF);
+            for (int b : {0x22, 0x85, 0xF3, 0xFD, 0xFF, 0xFF}) pat.push_back(b);
+            at = dl::FindPattern(fn, 0x1000, pat);
+        }
+        if (!at || !Hook(at, (void*)&d_DeclineDecision, &o_DeclineDecision, "AIDeclinesBattle's decision (TEST)") ||
+            MH_EnableHook(at) != MH_OK) {
+            Log("battles testdecline: AIDeclinesBattle's decision %s", at ? "not hooked" : "not found");
+            if (at && o_DeclineDecision) MH_RemoveHook(at);
+            o_DeclineDecision = nullptr;
+        }
+    }
+    return o_AIDeclines && o_CaughtOut && o_DeclineDecision;
+}
+
+bool SetTestDecline(int n, int m) {
+    if ((n > 0 || m > 0) && !EnsureDeclineTestHooks()) return false;
+    g_tdDecline = std::max(0, n);
+    g_tdFight = std::max(0, m);
+    return true;
+}
+
+std::string TestDeclineState() {
+    return "n=" + std::to_string(g_tdDecline) + " m=" + std::to_string(g_tdFight) + " forced=" +
+           std::to_string(g_tdForced) + " fought=" + std::to_string(g_tdFought) + " notcaught=" +
+           std::to_string(g_tdNotCaught);
+}
+
+// Around a replayed attempt: the switch acts (and its counts move) only meanwhile. The log text of what it did.
+static long g_td0[3];
+static bool TestDeclineBegin() {
+    if ((g_tdDecline <= 0 && g_tdFight <= 0) || !o_DeclineDecision) return false;
+    g_td0[0] = g_tdForced;
+    g_td0[1] = g_tdFought;
+    g_td0[2] = g_tdNotCaught;
+    g_tdNow = true;
+    return true;
+}
+static std::string TestDeclineEnd() {
+    g_tdNow = false;
+    return " (TEST testdecline: the computer declined " + std::to_string(g_tdForced - g_td0[0]) + "x, fought " +
+           std::to_string(g_tdFought - g_td0[1]) + "x, not caught out " + std::to_string(g_tdNotCaught - g_td0[2]) +
+           "x; left " + std::to_string(g_tdDecline) + "/" + std::to_string(g_tdFight) + ")";
 }
 
 InvasionCheck StartInvasionCheck(const std::vector<int>& mask) {
@@ -8285,6 +8456,8 @@ bool InstallHooks() {
                       : "hooked, the ally fallback NOT guarded (its read not found: the game's box as before)",
         g_sfOk ? (unsigned)((uintptr_t)g_sfFn - dl::g_base) : 0u, g_sfOk ? (unsigned)(g_sfRetNoForce - dl::g_base) : 0u,
         g_sfRandCell ? "found" : "not found");
+    // 0.7.2 (fix-stance2): the destroyer stance routine's second ask (a game bug: its box in long battles)
+    lockstep::InstallStanceAskFix();
     nplay::InstallHooks();
     if (lockstep::TestPrefsWanted()) {  // TEST ONLY
         Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");

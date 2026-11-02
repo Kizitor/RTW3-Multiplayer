@@ -1,10 +1,10 @@
 # Architecture
 
-How RTW3 Multiplayer works in the current version (0.7.1, protocol 3, live-battle engine level 18) on Rule the Waves 3
-1.01.44. This is the developer view; players read the [README](../README.md). The history of each part, with the
-measurements and the dead ends, is in [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game
-facts (calling convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing
-is in [TESTING.md](TESTING.md).
+How RTW3 Multiplayer works in the current version (0.7.2, protocol 3, live-battle engine level 18, battle generator
+level [`gen`](#network-protocol) 5) on Rule the Waves 3 1.01.44. This is the developer view; players read the
+[README](../README.md). The history of each part, with the measurements and the dead ends, is in
+[MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game facts (calling convention, objects,
+offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing is in [TESTING.md](TESTING.md).
 
 ## Contents
 - [Overview](#overview)
@@ -75,8 +75,8 @@ RTW3.exe (Delphi/VCL, Steam DRM stub)
 | `src/mod/datafiles.cpp`, `datafiles.h` | Live battles (engine level 16): the hash of the game's `Data` folder (but `Data\Graphics` and, since level 18, the game's temporary files `tmp*`), computed in a background thread when a session starts, and the list of files a start compares. |
 | `src/mod/nationplay.cpp`, `nationplay.h` | What the game does for its player only, for joined players' nations: intelligence, the Turn's trade protection and foreign stations questions, the month's consequences ([below](#per-player-intelligence-trade-protection-and-foreign-stations)); the host's store of their campaign divisions (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
 | `src/mod/economy.cpp`, `economy.h` | The player's economy rules for joined nations on the host (relations v2, B5 money): the computer's money and budget bonuses left out, MinHook at single instructions found by pattern. |
-| `src/mod/warfx.cpp`, `warfx.h` | The player's war effects for joined nations on the host (0.6.0, B5): blockades (their points, flags, effects and messages), war weariness, the build rules' war tests, and raiders, submarines and the trade war (a frame in K's view in DoStrategicTurn) for each joined nation at war. |
-| `src/mod/invasion.cpp`, `invasion.h` | Invasions of joined nations (0.7.0): the host's routines that must not see their invasions (`CheckRebellionAndInvasions`, its rebellion part, `DoPossessionBattle` from the host's invasion check, `DoPeace` through game.cpp), a nation's month resolution in its view, its plan (`kinv`), its invasions in its battle slot and back, the computer's fleets (`GetMostImportantArea`). |
+| `src/mod/warfx.cpp`, `warfx.h` | The player's war effects for joined nations on the host (0.6.0, B5): blockades (their points, flags, effects and messages), war weariness, the build rules' war tests, and raiders, submarines and the trade war (a frame in K's view in DoStrategicTurn) for each joined nation at war; 0.7.2: in that frame the patrols of K's computer enemies at war only with nations people play (`CheckPatrols`' loop, `ReviseASWEffort`), and on every PC the record of the computer's ships laid down (`LayDownAIShip`, `aibuilds`). |
+| `src/mod/invasion.cpp`, `invasion.h` | Invasions of joined nations (0.7.0): the host's routines that must not see their invasions (`CheckRebellionAndInvasions`, its rebellion part, `DoPossessionBattle` from the host's invasion check, `DoPeace` through game.cpp), a nation's month resolution in its view, its plan (`kinv`), its invasions in its battle slot and back, the computer's fleets (`GetMostImportantArea`); 0.7.2: the possession details' "Set invasion target" on a joined player's PC by the nation's own wars (`TdlgPossessionDetailsNew.FormShow`). |
 | `src/mod/bridge.cpp` | The test bridge. |
 | `src/mod/poc_battle.cpp`, `poc_battle.h` | The `poc*` research commands of the battle investigation (inactive unless used). |
 | `third_party/minhook/` | MinHook (BSD 2-Clause); `build.bat` compiles its core (`buffer.c`, `hook.c`, `trampoline.c`) with the 32-bit disassembler `hde32.c`. |
@@ -128,6 +128,7 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `DoStrategicTurn` | Skipped in battle-slot mode (a battle screen's close must not run a month). |
 | `DoBattle` | Counts battle setups (declined vs no battle) and tells the session that the host's battle screen opened (live battles). |
 | the battle setup's `SelectForce` (unnamed; its except box "Error in SelectForce procedure!"), its nested ally fallback and no-force rule, and the fallback's read of the side's division | 0.7.1: a side without ships that can fight in the area gets its ally's division, and the game read the division of the side it was to join, which doesn't exist ("... Read of address 0000000D", single player too). The guard ends the force build there with no force (SelectForce False, DoBattle 0) as after the game's handled exception, without the box and without the no-force rule's points, and the ally's ships the fallback marked Used are unused again. The game's own no-force rule ("Friendly ships not available ...", "Enemy unable to challenge ...") and the guard's ends are counted (`game::NoForce`) for the replay ([the battle phase](#joined-players-battles-against-ai-nations-the-battle-phase)). Any PC (the host's own battles, battle slots, live battles); TEST `battles testnoforce`. |
+| `TFightingShip.IsBigShip` (only its call after the destroyer stance routine's second ask, told apart by its return address; `lockstep::InstallStanceAskFix`) | 0.7.2: a bug of the game's battle AI (single player too): the stance routine for destroyer divisions (from `AIDetermineTacticalStance2`) asks an unnamed routine for the closest dangerous big enemy ship twice and uses the second answer unchecked; a random draw (`IsDangerous` of a ship with 70 % damage or more) can make it none, and `IsBigShip(nil)` showed "Error in AIDetermineTacticalStance2 procedure! Division: ... Read of address 000009D3". There a nil answers True, as for the first answer (always a big ship for a destroyer); no draw is added or skipped, so a live battle stays equal on both PCs. Any PC, every battle. TEST `ls teststance` hooks the unnamed routine, the destroyer routine's sighting check and out-of-range branch and `TfrmMain.GetClosestEnemyShip` on first use ([GAME-INTERNALS](GAME-INTERNALS.md#tactical-battles)). |
 | `AdvanceDesignStudies` | Counts down the joined players' design studies, once per month. |
 | `ReduceTimeLimits` | Counts down the joined players' pending doctrine changes, once per month. Relations v2: runs with the pairs of nations under the player's rules masked (its "separate peace" of a computer nation, B2). |
 | `DoResearch` | Puts a joined nation's research priorities back after the game's AI branch. |
@@ -151,6 +152,7 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `CheckRebellionAndInvasions` (unnamed; found as `DoStrategicTurn`'s call whose except handler names it) and its rebellion part | 0.7.0 (invasions), host: its own call hides the joined nations' invasions while it runs; a joined nation's month runs it in the nation's view without the base countdown and the rebellions (the rebellion part jumps to the next possession). |
 | `CheckForInvasionBattles`, `DoPossessionBattle` | 0.7.0: in a joined nation's view the invasion check is recorded (type 2) or answers False; `DoPossessionBattle` called from the host's own check at a joined nation's invasion answers False, and every call from the check is noted (the battle slot reports its enemy). |
 | `TBuilderNation.GetMostImportantArea` and its escort branch's Tension test | 0.7.0 (P7), host: a computer nation at war with a joined nation sees that nation's invasions of its possessions as the player's and the nation's possession in a plan of its side as the form's `EnemyInvasionTarget`. |
+| `TdlgPossessionDetailsNew.FormShow` (the possession details dialog of the map and its areas tree; the unnamed `ShowPossessionDetails` that opens it is found as `Details1Click`'s call whose except handler names it, for the VMT slot of `TControl.SetEnabled` it uses) | 0.7.2: on a joined player's PC (PlayerNation = nation K > 0) the dialog's "Set invasion target" button follows nation K's own wars after the game set it by the owner's relation with nation 0 (the host's nation there): enabled for a possession of a nation K is at war with, not the form's target already, worth at most 15 (the game's other tests); greyed out for a nation a person plays (the host refuses those) and under a host below welcome `gen` 4 (it takes no invasion orders). The game's checks of the button's click are PlayerNation's already. Elsewhere (the host, single player, a battle slot) the game's state. Bridge `inv button`, `inv range`. |
 | `AIDeclinesBattle`, `CheckCaughtOut`, `TBuilderNation.GetStrengthInArea` | TEST ONLY, installed on first use: a plain invasion check (`battles testinv 1`), a forced surprise landing (`battles testsa J land`). |
 | `NegotiatePeace`, `ChangePossessionOwner`, `TransferShipAsReparation`, `ShowPeaceTreaty` | Relations v2 (B4), only while a joined nation's peace part runs in its view on its PC: record the arguments, the possession owner changes, the ships handed over (id, new name, log line) and the treaty's lines for the host. `ChangePossessionOwner` also records the takeover at a war's start in the view (0.6.0, CheckForWar's call site). Elsewhere (the host's own peace and the players' treaties included) the originals. |
 | `CheckForWar`, `RandomTensionChanges` | Relations v2 (B2), host: the host's player routines see a nation under the player's rules (since 0.6.1 every nation reserved or claimed by a player) as a player: in CheckForWar its tension with the host reads 5 (at peace), it plans no war and has no alliances of its own; in RandomTensionChanges its tension reads at least 6 (no alliance offer in its name); the routines' own changes are kept. |
@@ -158,6 +160,7 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `GetIntelCostForPlayerNation`, `IntelToString`, `ChangeIntel` | Joined player's PC: the budget's Intelligence line, the labels and the +/- buttons of the politics panel are the player's own; the player's own flag stands for the host's nation (0.4.1). |
 | `GetPatrolRequirement` | Joined player's PC: the budget panel's trade protection requirement is the player's nation's, against its own enemies (0.4.1). |
 | `CheckShipsOnForeignStations` | Host: after it, the player's part of it and of `CheckPatrols` for each joined player's nation (0.4.1). |
+| `TfrmBuildCamp.LayDownAIShip` | 0.7.2, every PC: records each ship a computer nation lays down with its cause and frame (log `aibuild:`, bridge `aibuilds`; [B5 (c)](#each-joined-nations-relations-relations-v2)); the original runs unchanged. |
 
 The live battles add their own hooks (`Random32Proc`, the simulation and display routines, and since engine level 16
 the game's 11 x87 transcendental routines in `x87.cpp`) with the first live battle or `poc*` command; see
@@ -535,10 +538,11 @@ A joined player may build the nation's starting ("legacy") fleet by hand in a ne
 - **Handshake:** the client's `MSG_HELLO` carries `proto`, `mod`, `build`, `name`, `pw`, `battles` (Fight my battles),
   `ls` (live battles possible), since relations v2 `rel` (the player's relation routines run on that PC), since 0.6.0
   `gen` (1: the player's battle generator's requests replayed; 2: also surprise attacks, kind 2, and the view's
-  takeovers; 3, since 0.7.0: also raider checks; 4: also invasions: its plan, its invasion battles, landings) and since 0.6.1 `div` (1: the PC loads its nation's own campaign divisions and sends them with its turn,
+  takeovers; 3, since 0.7.0: also raider checks; 4: also invasions: its plan, its invasion battles, landings; 5, since
+  0.7.2: the search goes on after an encounter without a battle, [below](#joined-players-battles-against-ai-nations-the-battle-phase)) and since 0.6.1 `div` (1: the PC loads its nation's own campaign divisions and sends them with its turn,
   [above](#each-joined-players-campaign-divisions-061); the host logs it as `campaign divisions <d>`). The host answers
   `MSG_WELCOME` (the final name; since 0.6.0 `gen`: the host's battle requests, 1 = it merges a declined battle's
-  result, 2 = it also takes surprise attacks and takeovers, 3 = raider checks and their news, 0.7.0; 4 = the invasions of joined nations, 0.7.0) or `MSG_REJECT` with the reason:
+  result, 2 = it also takes surprise attacks and takeovers, 3 = raider checks and their news, 0.7.0; 4 = the invasions of joined nations, 0.7.0; 5 = a result of several encounters, `enc`, each one's points to its own opponent, 0.7.2) or `MSG_REJECT` with the reason:
   "protocol mismatch (host mod X)", "different game version than the host" or "wrong password".
 
 | Message | Direction | Content |
@@ -555,7 +559,7 @@ A joined player may build the nation's starting ("legacy") fleet by hand in a ne
 | `MSG_DIPLO` | client -> host | A diplomacy request (war, ally, peace, leave, cancel, claim). |
 | `MSG_EVENT` | client -> host | The result of the player's random event (relation changes, own fields), or (0.4.1, `intel=1`) of its monthly spying check. |
 | `MSG_RELATIONS` (40) | client -> host | Relations v2: what the player's relation routines changed for its nation this month (pairs before/after, alliances, per-relation state, other nations' budget changes, VP, war counter); B4: the peace with the computer's nations (`peace`, `pcode`, `pevent`, `pargs`, `paccepted`, `pwinner`, `penemies`, `pland`, `pships`, `ptaken`, `pdelta`, `plost`, `ptreaty`; 0.5.0: `self`, the nation's own BudgetModifier/Prestige/BaseResources/UnrestLevel changes; 0.6.0: `ally`, `allyvp`, `afunds`, `aships`, `lend`, the allies' war help; `bwar`, `bships`, the ship seizures of a war), also alone for a proposal (`kind=peace`; `test=1` from `peacetest`). 0.6.0 (to a `gen=2` host): `ksa` (the surprise attacks "a,b;") and `sland` (the takeovers of unowned possessions, pland's layout). |
-| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. 0.6.1: the battle's `divs=1` (the slot's `.off` holds the nation's own campaign divisions). 0.7.1: the result's `noforce` (the game's no-force rule gave the outcome: 0 the player's nation had no ships there that could fight, sent as `declined`; 1 the enemy had none, sent as `avoided`) and a `nobattle`'s reason in `why` for every kind (a battle setup without a side's force); older hosts ignore both. |
+| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. 0.6.1: the battle's `divs=1` (the slot's `.off` holds the nation's own campaign divisions). 0.7.1: the result's `noforce` (the game's no-force rule gave the outcome: 0 the player's nation had no ships there that could fight, sent as `declined`; 1 the enemy had none, sent as `avoided`) and a `nobattle`'s reason in `why` for every kind (a battle setup without a side's force); older hosts ignore both. 0.7.2 (to a welcome `gen` 5 host): the result's `enc`, the request's encounters in order (`attempt:kind:opponent:dVP_K:dVP_J:area;...`, kind `avoided`, `declined`, `noforce0`, `noforce1`, `points` or `fought`), its `cand` the last one's attempt. |
 | `MSG_LOCKSTEP` | both (the host relays between two clients) | Live battle traffic. |
 | `MSG_LEGACY` (41) | client -> host | 0.7.0: the player's legacy build started (`state=start`, `info`: the budget figures) or ended (`state=done`, `ships`, `funds`, `forced=1` when a forced submit ended it); notices only (the fleet comes with the turn). Older hosts ignore it. |
 | `MSG_PING`, `MSG_PONG`, `MSG_BYE` | both | Keep-alive and round-trip time; leaving. |
@@ -611,7 +615,8 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   any preview (the game's `AIDeclinesBattle`: "The <nation> navy declines battle! You gain N VP!"), there is no battle,
   as in single player: since 0.4.1 the client sends the slot's result with the outcome `avoided` (the player's VP
   gain), the host merges it and resolves nothing (before, it was "nobattle" and the game resolved the battle between AI
-  nations; a host on 0.4.0 still does so). Battles against another player's nation (live) are not affected.
+  nations; a host on 0.4.0 still does so; since 0.7.2, under a welcome `gen` 5 host, the player's generator's search
+  goes on after it, below). Battles against another player's nation (live) are not affected.
 - **The player's battle generator for a joined nation (0.6.0, B6).** For a nation K under the player's rules whose
   player's PC replays it (hello `gen=1`) and fights its battles, the host runs the game's `CheckForBattles2` for K once
   a month, right before its own (hook; `DoTurn2`), in K's view (`game::HostViewEnter`, the host-side view that B5's
@@ -625,7 +630,8 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   attempts against computer nations make one request of kind 1
   (`BattleReq.kind`: 0 the computer's generator, 1 the player's, 2 a surprise attack); the client replays them
   in order in its battle slot until one gives a battle, a decline or the enemy's points (0.7.1: a setup the mod's guard
-  ended for lack of a side's force gives none, below), and returns which (`cand`) and
+  ended for lack of a side's force gives none, below; 0.7.2: under a welcome `gen` 5 host only a battle ends the search,
+  the encounters without one are kept, below), and returns which (`cand`) and
   the battle's area. Kind 1 never falls back to the game's resolution. The computer's generator's battles of K against
   computer nations are dropped meanwhile (`HostDeferBattle`), so K has one generator. 0.5.0 clients keep kind 0.
 - **Surprise attacks and takeovers at a war's start for a joined nation (0.6.0, B6 piece 2).** With a host whose
@@ -644,19 +650,21 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   the player's battles). K's battle slot plays each pair with the game's `CheckSurpriseAttack(attacker, defender)`
   (`game::StartSurpriseAttack`: its map message, the "Mobilize all ships for the surprise attack?" question, the
   mobilization and the ships it moves, `DoBattle`) until a battle, a decline, the enemy's points or a True without a
-  battle (the player let the chance go); the slot's year is checked again. Results merge like kind 1 (`cand`); a
+  battle (the player let the chance go; 0.7.2: under a welcome `gen` 5 host a decline or the points go on to the next
+  pair, as `DoSurpriseAttack` goes on to its next attacker); the slot's year is checked again. Results merge like kind 1 (`cand`); a
   surprise attack that does not come about is a `nobattle` with its reason, and the host resolves nothing. Test hooks:
   `battles injectsa`, `testsa`, `sadry`, `saretry` (TESTING.md). Mixes: a 0.5.0 or gen=1 host -> B3's skips stay on the
   client (nothing recorded); a 0.5.0 or gen=1 client -> no `ksa`/`sland`, no kind 2 (as before).
 - **Declines and the game's resolution (0.6.0, risk 4).** A battle the player declines (the map question or the
   preview; the slot counts `DoPlayerDecline`) comes back as `declined` with the slot's result, merged like a battle
-  (the enemy's points of the decline, prestige, morale): the game resolves nothing. The battles the game still resolves
-  (kind 0 only: no battle, failed, time limit, the player gone, the host's decision, a 0.5.0 client's decline) have
-  their picture messages captured (`lockstep::BeginTextCapture`) and sent to the chat and the player's news instead
-  of a box on the host that would hold the new month. Since 0.6.1 `ResolveAIBattle` first counts both nations' ships
-  that can fight in the area, as the game's own caller does (`CountShipsInArea`), and passes those counts; with either
-  at 0 it is no battle and the game's routine is not called (it would read a nil ship: "Error in
-  DoBattleBetweenAINations procedure!", GAME-INTERNALS).
+  (the enemy's points of the decline, prestige, morale): the game resolves nothing (since 0.7.2, under a welcome
+  `gen` 5 host, the search goes on after it and the request's result carries it as an encounter, below). The battles
+  the game still resolves (kind 0 only: no battle, failed, time limit, the player gone, the host's decision, a 0.5.0
+  client's decline) have their picture messages captured (`lockstep::BeginTextCapture`) and sent to the chat and the
+  player's news instead of a box on the host that would hold the new month. Since 0.6.1 `ResolveAIBattle` first
+  counts both nations' ships that can fight in the area, as the game's own caller does (`CountShipsInArea`), and
+  passes those counts; with either at 0 it is no battle and the game's routine is not called (it would read a nil
+  ship: "Error in DoBattleBetweenAINations procedure!", GAME-INTERNALS).
 - **A battle setup without a side's force (0.7.1).** The game's battle setup (`DoBattle`) can find no ship of a side
   in the area that can fight: `CheckAttackLocation` tests only the attacker's ships there, so an enemy attacking the
   player's possession where the player has none (or the reverse) comes to the setup. With an ally of that side with
@@ -672,7 +680,8 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   ("Germany had no ship that could fight in the Indian Ocean"; the host's chat "* No battle of Germany this month
   (...)"), nothing is merged and no decline is counted (the map message's Accept before the setup resets the
   player's own decline count, as in single player). The game's no-force rule ends the search with its points, as
-  0.7.0 did, but as what it is: the enemy's side without ships is `avoided` with the result (the player's points,
+  0.7.0 did (0.7.2: only under an older host; under a welcome `gen` 5 host it is an encounter and the search goes on,
+  below), but as what it is: the enemy's side without ships is `avoided` with the result (the player's points,
   chat "* The <X> navy had no ships to challenge our forces in <area>: <nation> gains N VP."), the player's side
   without ships is `declined` with the result (the enemy's points, the decline count and an enemy's landing merged as
   a decline's consequences, chat "* Friendly ships not available to oppose the <X> navy in <area>: <X> gains N VP."),
@@ -680,6 +689,39 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   Russia in the Indian Ocean: Russia gains N VP.") instead of "declined battle"; a 0.7.0 host merges it as a decline
   or the enemy's decline. Live battles between players keep their own path. TEST `battles testnoforce`, `battles
   injectgen ... xN` (TESTING.md).
+- **The search goes on after an encounter without a battle (0.7.2, fix-battlesearch).** Single player's
+  `CheckForBattles2` ends only at a battle (on screen, a raider interception fought or auto-resolved, an invasion
+  battle); the computer's decline ("The <nation> navy declines battle! You gain N VP!"), the player's (the map
+  question or the preview) and the no-force rule answer False and it tries its next candidate, so a month brings any
+  number of such encounters and at most one battle; `DoSurpriseAttack` likewise tries its next attacker after a
+  computer's decline (GAME-INTERNALS). Before 0.7.2 the replay ended at the first encounter of any kind, so a joined
+  player whose enemy often declines got no battle where the host got the next candidate's. Now, under a host whose
+  welcome has `gen` 5 (requests of kind 1 and 2, not live battles), `ClientStartBattle` classifies each attempt by its
+  own changes (`DoBattle` setups other than the no-force ones, `DoPlayerDecline` calls, the no-force rule's count, the
+  VP of nation 0 and EnemyVP around it): a battle (or a check's True) ends the search; an encounter without one is
+  kept (`g_cb.encs`: attempt, kind `avoided`/`declined`/`noforce0`/`noforce1`/`points`, opponent, its points to the
+  player's nation and to its enemies, area; log "attempt i (...): the enemy declined battle against nation J in <area>
+  (VP +150/+0): no battle; the search goes on, as single player (encounter n)") and the next attempt is played. The
+  result is the battle slot's diff from the request's start (every encounter's points, prestige, morale, decline counts,
+  an enemy's landing after a decline; the sections of every opponent of the request); its outcome `fought` when a
+  battle came (its own points counted at its end and added as the last encounter `fought`), else `declined` when the
+  player declined one or the no-force rule of the player's side ran in one, else `avoided`; `cand` names the last
+  encounter; the key `enc` lists them all (`att:kind:opp:dVP_K:dVP_J:area;...`). The host (`HostOnBattleResult`)
+  splits the enemies' points by opponent: the merge's `dVP_J` is the last encounter's opponent's share (plus what no
+  encounter accounts for), the others' are added to their own VP (`ApplyBattleResult`'s `otherVP`; its line "...,
+  VP of the other opponents: nation 3 +150"); each pair's war score gets its own encounters' points (`CreditWarScore`
+  per opponent); with two or more the merge line ends "; 2 encounter(s): 0 avoided nation 3 VP 150/0 in <area>, 1 fought nation 5 VP
+  ..." and the battle phase's chat has one line per encounter ("* The Spain navy declined battle against Germany in
+  Northern Europe.", "* Captain declined battle for Germany against Spain in ...", "* Germany had no ships to oppose
+  ...", then "* The battle of Germany against Italy in ... was fought by Captain."). The client's chat names the
+  earlier encounters before "* Battle! ..." (one alone keeps 0.7.1's words). Version mixes: the client goes on only
+  under a welcome `gen` 5 (0.7.2) host; under an older one it keeps the first-encounter stop and sends no `enc`, so a
+  0.7.1 host never gets a combined result to credit to one opponent; a 0.7.1 client (hello `gen` 4) keeps the stop and
+  a 0.7.2 host merges its results as before (no `enc`). Limits: a battle left before its end (or resolved by the host
+  after the time limit) sends no result, so the earlier encounters of its request are lost with it (before 0.7.2 the
+  first encounter ended the search and was sent). Kind 0 (the computer's generator's battle, one attempt) and live
+  battles are as before. TEST `battles testdecline <n> [m]`, `battles injectgen K J area + J2 area2`, the client's
+  `battles hostgen 4` (TESTING.md).
 - **The nation's own decline counts (0.6.0).** The game's `DeclineCount` is saved with the campaign (nation 0's) and
   `EnemyDeclineCount` lives in memory (saved, never loaded), so a battle slot held the host player's DeclineCount and
   the client PC's last EnemyDeclineCount. The host keeps
@@ -726,13 +768,28 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   K's), K's plan (target, months, the enemy's target, the pending battle, the possessions invaded this month) in the
   session (`kinv`, `inv::State`). The host's own routines see only the invasions that involve nation 0: its
   `CheckRebellionAndInvasions` and `DoPeace` hide K's while they run (`inv::HostHide`; at peace their war state is put
-  back), and `DoPossessionBattle` called from the host's `CheckForInvasionBattles` at K's invasion answers False
+  back; since 0.7.2 also their `InvasionSupport` after the routine, whose monthly drift toward 0 reaches every
+  possession: each invasion drifts in its own nation's call only, K's run keeps the hidden ones' too), and
+  `DoPossessionBattle` called from the host's `CheckForInvasionBattles` at K's invasion answers False
   ("the host's invasion battles: none at ..."). The month ends with K's resolution in K's view (`HostRunInvasions`
   after the battle phase: `inv::RunForNation`, the game's routine with K as PlayerNation, K's plan in the form, its
   base countdown and rebellion tail left out, its boxes and turn messages to K's news, its EnemyVP to K's first
   computer enemy; K's pending battle ends with the month first, as `DoStrategicTurn`'s reset). K's PC sets its target
-  with the game's button (`kinvt` with the turn; the host refuses a person's possession, value >= 10 or invaded) and
-  shows K's plan (`kinv` with the month's state). Invasion battles (P3): the generator's view records the
+  with the game's button (`kinvt` with the turn; the host refuses a person's possession, value >= 10 or invaded, and
+  since 0.7.2 a possession of a nation K is not at war with) and shows K's plan (`kinv` with the month's state). Since
+  0.7.2 the host also checks K's target with the relations of the moment before every month uses it (after the turns'
+  merge, `HostCheckInvasionPlans`) and an unchanged target that a turn brings: one a person's nation owns, or one whose
+  owner K is not at war with (an older host took it, a war ended without K's own peace, the owner changed), is dropped
+  with its months, logged and told in the chat ("* <player>'s invasion target <p> was dropped: <nation> is not at war
+  with its owner."), so the month package clears K's form and no cost is paid; the turn sent again that month doesn't
+  bring it back (`g_invDroppedNow`); K's own peace still ends the plan by itself (P5, no message). 0.7.2:
+  the button of the game's possession details dialog follows K's own wars on K's PC (the game enabled it by nation 0's,
+  the host's, relation with the owner: the hook of the dialog's `FormShow` above); the client's own plan follows its
+  submitted target (`g_invPlan`, put back in the form after a battle slot); and K's month resolution ends K's plan first
+  when another nation (the host, another joined nation) invades K's target, as the game's `CheckForInvasionBattles` ends
+  an invaded target (hidden in K's view, the target looked free, and K's start there ended the other invasion; the
+  host's own target meets the game's rule in its battle check before its routine). Invasion battles (P3): the
+  generator's view records the
   `CheckForInvasionBattles` call as an attempt of type 2 (`att<i>=I`) for a K with invasions or a plan; every battle
   request of K (any kind, not live) carries `kinv` (the plan) and `kinvp` (K's invasions "name, invader, support"),
   which K's PC puts in its battle slot (`inv::SlotPut`: the save's invasions cleared, K's set, swapped to the slot's
@@ -749,7 +806,10 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   battle phase's reload (`inv::MarkedThisTurn`, `inv::RestoreMarked`); before 0.7.0 the host's new invasions were
   resolved a month early. Older versions: a 0.7.0 host records no
   invasion check and sends no `kinv` to a player below hello `gen` 4 (its nation has no invasions, as in 0.6.x); a
-  0.6.x host sends no `kinv`, and a 0.7.0 client then takes the host player's target out of its form.
+  0.6.x host sends no `kinv`, and a 0.7.0 client then takes the host player's target out of its form. 0.7.2's
+  invasion fixes change no message: a 0.7.2 player's button follows its nation's wars with a 0.7.0 or 0.7.1 host
+  too; a 0.7.0 or 0.7.1 player's button still follows the host's wars, and a 0.7.2 host refuses such a target with
+  its chat line (and drops one an older host had taken before the next month uses it).
 - **The merge (host):** `ApplyBattleResult` applies only what the battle changed, field by field, for the two
   nations and AI nations; ships missing from the result were sunk; the player's intel fields are never taken;
   nothing changes unless everything applies. A battle between two players' nations also counts for their war score
@@ -819,6 +879,17 @@ decided later). Done so far:
     Only the host's month needs it (the player's PC runs the game's player rules with the player's own war counter;
     the battle slot carries it too), so a 0.7.0 client is covered by a 0.7.1 host, and a 0.7.1 client under a 0.7.0
     host still loses the statuses.
+  - *K's computer enemies' trade protection and raiding (0.7.2).* A computer nation J whose wars are all with nations
+    under the player's rules (none with the host's nation or with another computer nation: `HiddenWarsOnly`, from the
+    real relations at `AIMaskEnter`) reads as at peace inside the masked routines too: ReduceTimeLimits returned its trade
+    protection to active service (its maintenance) or put it in reserve (`PutAIShipsInStatus`' peace branch) every
+    month, and K's sea war frame (B5 (c)) then found J short of patrols and laid down another escort class, every month
+    of the war. `AIMaskEnter` notes J's ships with Status 3-5; `AIMaskLeave` gives each of them in play that the masked
+    routine set to 0, 1 or 2 its status again while J is at war (`relations v2: nation J at war (a computer nation, its
+    wars with nations people play): N ship(s) on trade protection or raiding kept (<routine> saw it at peace)`). A J with
+    another war is at war for the game anyway (nothing to keep); ships under construction are left to the game (it sets
+    them to 0 in any month). TEST ONLY `aibuilds keep 0` (warfx.cpp): neither this nor B5 (c)'s ASW effort (0.7.1's
+    behaviour).
   - From B2 on, K's relations with the computer's nations change only by K's player routines (B3), the players'
     diplomacy and the events; a client that doesn't announce `rel` keeps the computer's rules (0.4.x behaviour).
 - **B3, the player's relation routines on K's PC.** The host tells a client whose nation follows the player's rules
@@ -991,6 +1062,24 @@ decided later). Done so far:
   runs) and its turn messages (fresh TurnMessages/RaiderSummary lists) go to K's report (`econnews`) with a summary
   line "Trade war this month: ..."; the host sees nothing. `CheckAIvsAISubmarineSinking` (hooked) answers False for
   K's computer pairs while their submarine war runs in K's frame. Bridge `warfx K` (`sea=`), TEST `warfxsea`.
+  0.7.2: before the submarine loop, for each computer enemy J whose wars are all with nations under the player's rules
+  (the host's month sees it at peace and runs none of this for it; B2's 0.7.2 bullet), the frame runs what the game's
+  month does for a nation at war with its player before that loop, in K's view (the patrol requirement against K's
+  submarines): `CheckPatrols`' loop for J (six times: below its requirement `PutShipOnASWPatrol`, then
+  `CheckAINationShipsOnTradePatrol`; reproduced after a check of the game's code: `mov edi, 6` and the four calls in this
+  order), then `ReviseASWEffort` (its corvettes on trade protection, destroyers above the requirement taken off).
+  `AINationAssignRaiders` is not run (J's raiders against K: not part of this fix). So the escorts rule of
+  `CheckSubmarineActivity` (a class of one to three corvettes or a destroyer while J's patrols are below the requirement,
+  [GAME-INTERNALS](GAME-INTERNALS.md#the-computers-escorts-against-the-players-submarines)) stops once they reach it, as
+  in single player; up to 0.7.1 J's patrols never did and it laid down escorts every month of the war. The frame's record
+  ends with `ASW effort of the enemies at war only with nations people play ...: J: before -> after of <requirement>`.
+- **The computer's ships laid down (0.7.2, `warfx.cpp`, every PC; diagnosis and tests).** `LayDownAIShip` is hooked at
+  its entry (it lays down every computer nation's ship): each lay-down is recorded with the nation (its real index, also
+  inside a view: `game::RealIndexOf`), the type, what asked for it (the first routine of the call chain other than
+  `AIBuildShip`, found by the routines' code ranges: `monthly` = AIMonthlyBuild, `escorts` = CheckSubmarineActivity,
+  `initial`, else `other`) and where it ran (`game::ViewNation`: the host's month or K's view), with the nation's ships on
+  trade protection, its patrol requirement and its corvettes then; log `aibuild: ...`, bridge `aibuilds` (the TEST knobs
+  `aibuilds keep 0` and `aibuilds patrol J K set`: TESTING).
 - **B5 (f), the arms-control conference and K's money (0.6.0, round 4, game.cpp `MaskedCall`, economy.cpp, host).**
   `CreateArmsControlTreaty` runs under B2's mask, but its first test (`AnyNationIsAtAIWar`: any tension above 40 among
   nations 1..8) sees the real wars of the masked pairs (`TreatyWarsEnter`/`TreatyWarsLeave`, also when it runs inside
@@ -1500,18 +1589,19 @@ decided later). Done so far:
 - The command reference, the runner and the scenario catalog are in [TESTING.md](TESTING.md).
 
 ## Versions and protocol
-- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.7.1
+- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.7.2
   starting (protocol 3)`).
 - The host refuses a client with another protocol or another game build. Protocol history: 1 = 0.1.0, 2 =
-  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0 and 0.7.1 (relations v2, 0.6.0, 0.6.1 and
-  0.7.0 keep 3: their new keys are ignored by older peers; 0.7.0's features go by the hello's and the welcome's `gen`
-  and the month's `legacy`, see [Network protocol](#network-protocol); 0.7.1 adds only the battle result's optional
-  `noforce`).
+  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1 and 0.7.2 (relations v2, 0.6.0, 0.6.1
+  and 0.7.0 keep 3: their new keys are ignored by older peers; 0.7.0's features go by the hello's and the welcome's
+  `gen` and the month's `legacy`, see [Network protocol](#network-protocol); 0.7.1 adds only the battle result's
+  optional `noforce`; 0.7.2 raises the hello's and the welcome's `gen` to 5 and adds the battle result's optional
+  `enc`, sent only to a `gen` 5 host).
   Within a protocol, versions can play together, but features may need both
   sides (see [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is not checked; the notices about
   another live-battle level quote it.
 - Live battles have their own version, the live-battle engine level `MP_LS_LEVEL` (`src/mod/common.h`): 1 = 0.3.0 to
-  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1, 0.7.0 and 0.7.1. Levels 2 to 13 were development levels
+  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1 and 0.7.0 to 0.7.2. Levels 2 to 13 were development levels
   of 0.4.0 (the live-battle limits branch, whose MODLOG entries say "v0.4.0", "v0.5.0" and "v0.6.0" after the release
   plan of 2026-10-16, but it shipped as one version, 0.4.0), and levels 15 and 16 were rounds of 0.4.1's two-PC fixes;
   none of them was released. A client announces its level in its hello (`ls=<level>`), and the host pairs a live battle
@@ -1567,6 +1657,13 @@ decided later). Done so far:
   go to the other PCs as chat lines); the battle setup's guard (a side without ships that can fight and its ally's
   division) is each PC's own too, and the battle result's new `noforce` key only words the outcome on a 0.7.1 host (a
   0.7.0 host merges the same result as before); no message, header or live-battle path changes, so each fix works
-  whatever version the other PC has.
+  whatever version the other PC has. 0.7.2 keeps level 18 and protocol 3 too: the search after an encounter without
+  a battle runs only on a 0.7.2 player's PC under a 0.7.2 host (hello and welcome `gen` 5, the result's `enc`); either
+  side older keeps 0.7.1's first-encounter stop and its results. Its other fixes change no message: the possession
+  details' button by the nation's own wars and the form's target after a battle slot are the joined player's PC's own
+  (the button under a 0.7.0 or newer host), and the refusal of a target outside the nation's wars, the end of a plan
+  whose target another nation invades, each invasion's support drifting in its own nation's call only and the patrols
+  of the computer enemies at war only with nations people play (the escorts) are the host's month; no live-battle path
+  changes.
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

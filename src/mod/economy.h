@@ -37,5 +37,8 @@ void TreatyAfter();
 // ComputeExpenses, before the month's funds are read); `blind`: without B5's view of the joined nations' wars (before
 // 0.6.0), a treaty cancelled at once; `cancel`: the game's CancelTreaty without its box.
 std::string TestTreaty(const std::vector<std::string>& args);
+// The campaign's month (Year * 12 + Month - 1; -1 unknown) and its text "yyyy-mm".
+int CurrentDate();
+std::string DateString(int d);
 
 }  // namespace economy

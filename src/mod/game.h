@@ -240,6 +240,14 @@ InvasionCheck StartInvasionCheck(const std::vector<int>& mask);
 // TEST ONLY: the next invasion check is plain (the computer does not decline, the player is not caught out); false if
 // the hooks for it are not available.
 bool SetTestInvasionPlain(bool on);
+// TEST ONLY (`battles testdecline <n> [m]`, 0.7.2 fix-battlesearch): during a battle slot's replayed attempts
+// (StartPlayerBattle, StartSurpriseAttack) the next n computer decisions that carry out a decline (AIDeclinesBattle with
+// Implement) decline as the game declines (its box "The <nation> navy declines battle! You gain N VP!", its points, the
+// enemy's decline count), the next m answer False (the computer fights); meanwhile CheckCaughtOut answers False (not
+// caught out). n = m = 0 disarms. False if unavailable. TestDeclineState: "n=<left> m=<left> forced=<total>
+// fought=<total> notcaught=<total>".
+bool SetTestDecline(int n, int m);
+std::string TestDeclineState();
 // 0.7.0 (fix-afb): the game's AdjustForcesForBattle gives the reinforcements of an intelligence coup's ambush the
 // player's nation (it left them an unset local: its access-violation box). TEST ONLY (`battles testcoup <0|1|2>`): the
 // next AdjustForcesForBattle on this PC runs as an ambush that finds the player's side the weaker (2: without the mod's
@@ -273,6 +281,15 @@ int QuickRaiderCalls();            // how often the game's QuickResolveRaiderBat
 // game calls inside go under __try. HostViewLeave puts everything back. Nation(i) answers view indices meanwhile.
 bool HostViewEnter(int K, int war, const bool human[9]);
 void HostViewLeave();
+// 0.7.2: the K of a view of a joined nation in place (B3 on its PC, B5/B6 on the host; 0 when none) and a nation record's
+// real index (also while a view is in place: Nation(i) answers view indices then).
+int ViewNation();
+int RealIndexOf(void* nation);
+// 0.7.2: the relations mask (B2) puts back the ships on trade protection or raiding of a computer nation whose wars are all
+// with nations under the player's rules (as K's own since 0.7.1), and K's sea war frame runs its ASW effort (warfx.cpp).
+// TEST ONLY (bridge `aibuilds keep 0`): neither (0.7.1).
+void TestMaskKeepAI(bool on);
+bool MaskKeepAI();
 // 0.7.0 (invasions): the game's ShowMessage boxes recorded instead of shown (on); off returns the last text ("" none).
 std::wstring SetBoxCapture(bool on);
 int PlayerDeclineCalls();          // how often the game's DoPlayerDecline ran (the player declined a battle)
@@ -577,4 +594,10 @@ bool JoinedPlayerPC();           // this PC plays a joined nation in a session: 
 // rules; a joined player's PC: the host's nation and the other nations people play, while the host runs the player's
 // rules for this PC's nation.
 bool WarOnlyByPlayers(int idx);
+// 0.7.2: nation idx (a real index) is played by a person: the host's IsHumanNation (its own nation, the joined and
+// reserved ones); on a joined player's PC the host's nation, its own and those the lobby and the month list as people's.
+bool PeoplesNation(int idx);
+// 0.7.2: a joined player's PC in a session: 1 its host takes the nation's invasion orders (welcome `gen` 4), 0 it
+// doesn't (an older host: the nation has no invasions); -1 not a joined player's PC in a session.
+int JoinedInvasionOrders();
 }  // namespace hookcb

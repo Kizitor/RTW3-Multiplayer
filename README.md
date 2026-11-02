@@ -54,7 +54,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 ## Install
 Every player:
 1. Close the game.
-2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.7.1-win32.zip`) from the
+2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.7.2-win32.zip`) from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract all its files into the
    game folder, next to `RTW3.exe`. When you update, replace the older files.
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
@@ -189,12 +189,16 @@ Your screen shows your own nation's side of the campaign:
   every month.)
 - **Ship data:** the game's *View data* (the ship lists' popup menu) shows your own ships' data. (Before 0.7.1 it
   showed nothing, or another nation's ship.)
+- **Invasion targets:** the game's *Set invasion target* button (in a possession's details on the strategic map) is
+  offered for the possessions of the computer nations at war with your own nation (see
+  [Battles against AI nations](#battles-against-ai-nations)). (Before 0.7.2 it went by the host's wars.)
 
 Your relations on the screen need 0.4.1 or newer on your PC, and your own months at war need 0.5.0 or newer on your PC
 and on the host; your intelligence and the month's warnings need 0.4.1 or newer on the host too, your own divisions
-0.6.1 or newer on your PC, your ships' trade protection and raider orders 0.7.1 or newer on the host, and *View data*
-0.7.1 or newer on your PC (see [Upgrading from an older version](#upgrading-from-an-older-version)). What still comes
-from the host or the computer: see [Known limitations](#known-limitations).
+0.6.1 or newer on your PC, your ships' trade protection and raider orders 0.7.1 or newer on the host, *View data*
+0.7.1 or newer on your PC, and the invasion button 0.7.2 or newer on your PC (see
+[Upgrading from an older version](#upgrading-from-an-older-version)). What still comes from the host or the computer:
+see [Known limitations](#known-limitations).
 
 To test on one PC, run two copies of the game and join `127.0.0.1` (`RTW3MP_SecondCopy.bat` from the release starts
 the second copy). Both copies share one settings file, so the joining copy gets a numbered name (e.g. "Friend 2").
@@ -405,8 +409,17 @@ computer, as in single player.
   player: battles in your home areas, at your possessions and on the game's missions, attacks and defences, at most
   one a month. With an older version on either PC, your battles come from the computer's battle rules, as before: when
   your ships and a computer nation's meet in an area during the month.
-- After the month, before the new month is sent, the host sends each player their battles, one at a time. The host's
-  screen shows "Battles in progress" and is locked until they are done.
+- **Encounters without a battle:** as in single player, the month's search for your battle doesn't stop at an
+  encounter that brings no battle. When the computer's navy declines, when you decline, or when a side has no ships
+  there that can fight, the search goes on, and a later chance can still bring the month's battle, so a month can
+  bring several of the game's map messages and previews. Each encounter counts with its points against its own
+  opponent. Your chat lists the encounters before the battle ("* The Spain navy declined battle in Northern Europe:
+  Germany gains 360 VP."), and everyone's chat names each one after the month's battles ("* The Spain navy declined
+  battle against Germany in Northern Europe."). This needs 0.7.2 on the host and on your PC; with an older version on
+  either PC, the month's first encounter ends the search.
+- After the month, before the new month is sent, the host sends each player their battles, one at a time for each
+  player (different players fight theirs at the same time). The host's screen shows "Battles in progress" and is
+  locked until they are done.
 - On your PC the battle opens as in single player, with the game's questions (for example on the map) and its battle
   preview, and since 0.6.1 with your side set up from your own divisions. Fight it to its end, close the results, and
   the result goes back to the host: damage, sinkings, crew experience, victory points and prestige. Then your own game
@@ -414,21 +427,24 @@ computer, as in single player.
 - **Declining:** with 0.6.0 on the host and on your PC, a battle you decline (on the map or in the preview) counts as
   in single player: the enemy gets its points, and after the game's warnings repeated declines cost prestige or fleet
   morale. The host keeps your nation's own count of declined battles. Everyone's chat shows it ("* Captain declined
-  battle for Germany against Spain in Northern Europe."). With an older version on either PC, the game resolves a
-  declined battle as one between computer nations.
+  battle for Germany against Spain in Northern Europe."). With 0.7.2 on the host and on your PC, the month's search
+  then goes on (see *Encounters without a battle* above). With an older version than 0.6.0 on either PC, the game
+  resolves a declined battle as one between computer nations.
 - If you leave the battle before its end, disconnect, or don't finish within the time limit (30 minutes per battle),
   a battle of the player's rules is dropped: no battle for you that month ("* No battle of Germany this month
-  (...)"). A battle of the computer's rules is resolved by the game the old way; from a host on 0.6.0 its messages
+  (...)"), and the encounters without a battle that its search found before it are dropped with it, with their
+  points. A battle of the computer's rules is resolved by the game the old way; from a host on 0.6.0 its messages
   come in the chat and in your turn report. With 0.6.1 on the host it is no battle when your nation or the enemy no
   longer has a ship there that can fight (for example after another battle of the month).
 - If the computer's navy declines the battle ("The ... navy declines battle! You gain N VP!"), there is no battle and
   you keep the points, as in single player (with 0.4.1 or newer on the host and on your PC; otherwise the game
-  resolves the battle as one between computer nations).
+  resolves the battle as one between computer nations). With 0.7.2 on both, the month's search then goes on.
 - **Surprise attacks:** with 0.6.0 on the host and on your PC, a war between your nation and a computer nation that
   starts at the start of your month can bring the game's surprise attack of single player: a nation with the game's
   surprise attack trait strikes you, or you it ("Mobilize all ships for the surprise attack?"). The chat announces it
   ("* Surprise attack? Japan may strike Germany at the war's start. Captain plays it after the month."), and you play
-  it with your battles after the month, not at once as in single player.
+  it with your battles after the month, not at once as in single player. With 0.7.2 on the host and on your PC, when
+  an attacker declines, the next one may strike, as in single player.
 - **Raiders and patrols:** with 0.7.0 on the host and on your PC and **Fight my battles** on, your raiders can be
   intercepted by enemy patrols and your patrols (ships on trade protection or on a foreign station) can intercept
   enemy raiders, with the game's chances of single player: the month's battle search checks the raiders up to twice
@@ -444,22 +460,27 @@ computer, as in single player.
   player. Raider battles against the host's or another player's nation don't happen. With an older version on either
   PC your nation has no raider battles (as with 0.6.x).
 - **Invasions:** with 0.7.0 on the host and on your PC, your nation invades and is invaded as the player is in single
-  player. Pick an invasion target with the game's own button (a possession of a computer nation you are at war with,
-  worth less than 10, within your invasion range); your turn sends it, and the host's chat says if it can't be taken
-  (for example a possession of the host's or another player's nation: invasions between players are not supported).
-  The target costs money every month, as in single player. After each month the host resolves your invasions with the
-  game's own rules, in your nation's view: the months of preparation, the weather, the strength of the fleets in the
-  area, landings, the fighting on land, captures, and the computer's invasions of your possessions (its landings, the
-  battles it plans and "Enemy fleets dominate the seas around ... Lose N VP!"). Its messages come in your turn report.
-  The invasion battles of single player come with your battles after the month (with **Fight my battles** on; without
-  it, an invasion battle that the month's invasions bring is dropped): your own invasion battle ("Our troops are
-  embarking for the invasion of ...!"), the enemy's landing in your possession ("The enemy is preparing to invade
-  ...!") and the battles in support of the land fighting. As in single player, a battle you decline, or one your
-  fleet can't fight ("Friendly ships not available to oppose the enemy in the area!"), lets the enemy land; a won
-  invasion battle lands your troops. A computer nation that starts a war on you with a surprise can land in your
-  possession at once, and the computer's fleets go to defend their possessions you invade and to escort their own
-  landings, as they do against the player. Your peace with a computer nation ends your invasions in that war and your
-  invasion plan; the host's peace leaves them alone.
+  player. Pick an invasion target with the game's own button, *Set invasion target* in a possession's details (a
+  possession of a computer nation you are at war with, worth less than 10, within your invasion range; before 0.7.2
+  the button on a joined player's PC went by the host's wars); your turn sends it, and the host's chat says if it
+  can't be taken (for example a possession of the host's or another player's nation: invasions between players are
+  not supported; with 0.7.2 on the host also a possession of a nation you aren't at war with). The target costs money
+  every month, as in single player. A possession has one invasion at a time: with 0.7.2 on the host, when another
+  nation (the host's or another player's) already invades your target, your invasion plan ends, as in single player
+  ("Invasion of ... cancelled: ... is already invaded by the forces of ..."); an older host let your new invasion
+  replace the other one. After each month the host resolves your invasions with the game's own rules, in your
+  nation's view: the months of preparation, the weather, the strength of the fleets in the area, landings, the
+  fighting on land, captures, and the computer's invasions of your possessions (its landings, the battles it plans
+  and "Enemy fleets dominate the seas around ... Lose N VP!"). Its messages come in your turn report. The invasion
+  battles of single player come with your battles after the month (with **Fight my battles** on; without it, an
+  invasion battle that the month's invasions bring is dropped): your own invasion battle ("Our troops are embarking
+  for the invasion of ...!"), the enemy's landing in your possession ("The enemy is preparing to invade ...!") and
+  the battles in support of the land fighting. As in single player, a battle you decline, or one your fleet can't
+  fight ("Friendly ships not available to oppose the enemy in the area!"), lets the enemy land; a won invasion battle
+  lands your troops. A computer nation that starts a war on you with a surprise can land in your possession at once,
+  and the computer's fleets go to defend their possessions you invade and to escort their own landings, as they do
+  against the player. Your peace with a computer nation ends your invasions in that war and your invasion plan; the
+  host's peace leaves them alone.
 - Your battles against the host's nation and against other players' nations are live battles (below).
 
 ### Battles between players (live)
@@ -469,7 +490,7 @@ players in the battle need **Fight my battles** on (the host's own box makes no 
 joining a session). If it is off, the host fights its battle against that nation's ships under computer control, and a
 battle between two joined players' nations is resolved by the game.
 - **Same live-battle engine:** a live battle needs the same live-battle engine on both players' PCs. 0.4.1, 0.5.0 and
-  0.6.0 have the same one (17), 0.6.1, 0.7.0 and 0.7.1 a new one (18), older versions others. A host on 0.4.0 or
+  0.6.0 have the same one (17), 0.6.1, 0.7.0, 0.7.1 and 0.7.2 a new one (18), older versions others. A host on 0.4.0 or
   newer checks it for every live battle: its own battle against a player with another engine is fought against the
   computer, and a battle between two joined players is resolved by the game unless both have the host's engine. The
   chat and the players' notices say why, naming both versions (from a host on 0.5.0 or newer, for example "live
@@ -566,8 +587,8 @@ game resolves the battle.
 again first if it stopped; if you are still connected, press *Leave*, then *Join game*). You get your nation back,
 the battle loads on your PC (also from the title screen), and you command your ships again from its next minute. The
 battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0 or
-newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0 and 0.7.1 a
-new one); otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
+newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1 and
+0.7.2 a new one); otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
 
 **When the host's game stops** (it crashes or is closed) during its live battle against a joined player, the joined
 player's game leaves the battle and the session. To go on:
@@ -610,15 +631,14 @@ players' nations for the rest of that month. A battle between two joined players
   when the enemy is the host's nation. What live battles do differently: see
   [Differences from single player](#differences-from-single-player).
 - **Invasions of joined nations** (0.7.0) differ from single player in a few ways. They are resolved while the player
-  is connected: in a month your PC isn't, they wait. One invasion per possession: a newer one replaces an older one
-  (the host's log names it). The host's battles may change the land fighting's support in your invasions, as an
-  ally's battles would. With several computer enemies, the points of "Enemy fleets dominate the seas around ..." go
-  to the first of them in the game's list of nations. After you decline an invasion battle, the month brings no
-  other battle (in single player it may). Your nation's base expansions are completed without their message, and the
-  game's rule that a base expansion worries a neighbour (tension) is not applied to joined nations. Invasions between
-  players' nations are not supported: you can't pick a possession of the host's or another player's nation, but in a
-  war with the host's nation the host's game may still let your nation invade the host's possessions, as it lets a
-  computer nation.
+  is connected: in a month your PC isn't, they wait. The host's battles may change the land fighting's support in your
+  invasions, as an ally's battles would. With several computer enemies, the points of "Enemy fleets dominate the seas
+  around ..." go to the first of them in the game's list of nations. Your nation's base expansions are completed
+  without their message, and the game's rule that a base expansion worries a neighbour (tension) is not applied to
+  joined nations. Invasions between players' nations are not supported: you can't pick a possession of the host's or
+  another player's nation, but in a war with the host's nation the host's game may still let your nation invade the
+  host's possessions, as it lets a computer nation. Under a host older than 0.7.2, a newer invasion of a possession
+  replaces the older one.
 - **Victory points:** a joined player's *VP* counts what their nation scored in its wars, including battles against
   the host; *Enemy VP* counts the points of the nations at war with them. (The game itself only keeps the host's view,
   so the mod fills in a joined player's.) Points the host's enemies score outside battles (blockades, sinkings,
@@ -677,7 +697,11 @@ players' nations for the rest of that month. A battle between two joined players
   game's rules for battles between computer nations, when your ships and theirs meet in an area. A surprise attack is
   played after the month, not at once as in single player, so a war that ends in that month drops it. A computer
   nation's takeover of an unowned possession at a war's start comes a little less often than in single player. When
-  the computer's navy declines a battle, there is no battle.
+  you leave a battle before its end, disconnect or don't finish it within the time limit, the encounters without a
+  battle that its search found before it are lost with it: their points and a decline's other consequences don't
+  count. With an older version than 0.7.2 on the host or on your PC, the month's first encounter without a battle
+  (the computer's navy declines, you decline, or a side has no ships there that can fight) ends the search, where
+  single player's goes on.
 - **With an older version on the host or on your PC** (0.4.1 or older), your relations with computer nations change
   by the game's rules for computer nations, not by the player's: tension moves in small steps without explanations on
   your screen, a war between your nation and a computer nation breaks out by the computer's rule and only while the
@@ -702,8 +726,8 @@ players' nations for the rest of that month. A battle between two joined players
 - **Resigning** is not possible during a session: leave the session first.
 - **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
   play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same live-battle
-  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0 and 0.7.1 a newer one), and a
-  host on 0.4.0 or newer pairs only players with its own (see
+  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1 and 0.7.2 a newer one),
+  and a host on 0.4.0 or newer pairs only players with its own (see
   [Battles between players](#battles-between-players-live)). Joined players use save slot 77, and slot 87 for their
   battles.
 - **A host on 0.3.x** passes on the live battles between two joined players on 0.4.0, but can't start such a battle
@@ -793,8 +817,8 @@ players' nations for the rest of that month. A battle between two joined players
   0.6.1 and newer leave that file out.
 - **"... live battles need the same live-battle engine" in the chat** (from a host on 0.4.1 or older: "... the same
   mod version"): both players of a live battle need versions with the same live-battle engine (0.4.1, 0.5.0 and 0.6.0
-  have the same one; 0.6.1, 0.7.0 and 0.7.1 have a new one), and a host on 0.4.0 or newer needs both on its own; until
-  then, such battles are fought against the computer or resolved by the game. See
+  have the same one; 0.6.1, 0.7.0, 0.7.1 and 0.7.2 have a new one), and a host on 0.4.0 or newer needs both on its
+  own; until then, such battles are fought against the computer or resolved by the game. See
   [Upgrading from an older version](#upgrading-from-an-older-version).
 - **The computer took over your ships in a live battle, or the host's game stopped during one:** see
   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops).
@@ -820,6 +844,9 @@ players' nations for the rest of that month. A battle between two joined players
   that can fight but an ally at war with that enemy has: the battle doesn't start. Since 0.7.1 the mod ends that
   battle's setup without the box, and the month's battle search goes on with its next chance. Each PC needs 0.7.1
   for its own battles.
+- **"Error in AIDetermineTacticalStance2 procedure! ... Read of address 000009D3" during a long battle:** a fault of
+  the game's destroyer tactics (single player has it too) when a badly damaged enemy ship counts as dangerous only
+  once. Since 0.7.2 the box no longer shows, on each PC with 0.7.2 for its own battles.
 - **The host's turn stops with "CV ... aircraft capacity exceeded!":** before 0.3.3, every reload of the campaign
   (every month and every live battle) added another copy of every squadron. Update the host (0.3.3 or newer) and load
   the campaign again: it removes the copies. If the message stays, that carrier really carries more aircraft than it
@@ -833,8 +860,39 @@ players' nations for the rest of that month. A battle between two joined players
   shows a joined player nothing or another nation's ship:** both are fixed in 0.7.1. The ships' orders need 0.7.1 on
   the host, *View data* on the player's PC. Ships that an older host sent back to active service stay there: set them
   again.
+- **A joined player gets a map message and "The ... navy declines battle! You gain N VP!" (or declines a battle) and
+  then no battle that month, again and again:** before 0.7.2 a joined player's battle search stopped at the month's
+  first encounter, while single player's goes on to its next chance. With 0.7.2 on the host and on the player's PC it
+  goes on (see [Battles against AI nations](#battles-against-ai-nations)). One battle a month stays the game's own
+  limit, in single player too.
+- ***Set invasion target* is greyed out for a possession of your enemy, or offered for a nation you aren't at war
+  with:** before 0.7.2 the button on a joined player's PC went by the host's wars. Update your game to 0.7.2; a host
+  on 0.7.2 also refuses a target of a nation that your nation isn't at war with.
+- **Your invasion target costs money every month but nothing happens:** a host on 0.7.0 or 0.7.1 took targets of
+  nations your nation isn't at war with, and never carried them out. A host on 0.7.2 drops such a target before the
+  next month, with a chat line ("... was dropped: ... is not at war with its owner."); pick a possession of a nation
+  you're at war with instead.
+- **A computer nation lays down a new class of corvettes every month** ("... has laid down a KE of ... class!"
+  several times a month in the turn report) while it is at war only with joined players' nations: fixed in 0.7.2 on
+  the host, whatever version the players have. The corvettes laid down before stay in its fleet.
 
 ### Upgrading from an older version
+- **0.7.2** plays with 0.7.1, 0.7.0, 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and every player:
+  - 0.7.2 has the live-battle engine of 0.6.1, 0.7.0 and 0.7.1 (18): players on these versions fight their live
+    battles together, a player on 0.6.0 or older can't (see 0.6.1 below).
+  - The battle search that goes on after an encounter without a battle needs 0.7.2 on the host and on your PC. With
+    an older version on either PC, the month's first encounter ends it, as before.
+  - The *Set invasion target* button that goes by your own nation's wars needs 0.7.2 on your PC, under a host on
+    0.7.0 or newer (under an older host it is greyed out: your nation has no invasions there). With 0.7.0 or 0.7.1 on
+    your PC it still goes by the host's wars, and a host on 0.7.2 refuses a target of a nation that your nation isn't
+    at war with.
+  - The end of your invasion plan when another nation already invades your target, invasion support that changes
+    only in its own nation's month, and dropping a target that an older host took from a nation you aren't at war
+    with, need 0.7.2 on the host (your PC needs 0.7.0 or newer for invasions anyway).
+  - A computer nation at war only with joined players' nations stops laying down a new class of corvettes every month
+    with 0.7.2 on the host, whatever version the players have. The corvettes laid down before stay in its fleet.
+  - The game's "Error in AIDetermineTacticalStance2 procedure!" box in long battles is gone on each PC with 0.7.2,
+    for its own battles.
 - **0.7.1** plays with 0.7.0, 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and every player:
   - 0.7.1 has the live-battle engine of 0.6.1 and 0.7.0 (18): players on these versions fight their live battles
     together, a player on 0.6.0 or older can't (see 0.6.1 below).

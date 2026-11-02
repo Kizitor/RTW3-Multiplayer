@@ -30,6 +30,7 @@
 // flags to every player's screen (`kblk`).
 #include "warfx.h"
 #include "delphi.h"
+#include "economy.h"
 #include "game.h"
 #include "lockstep.h"
 #include "../../third_party/minhook/include/MinHook.h"
@@ -984,6 +985,10 @@ int g_aiSubDrops = 0;              // the computer's submarine sinkings dropped 
 std::string g_aiSubPairs;
 int g_testSeaR = -1, g_testSeaN = 0;  // TEST ONLY (bridge `warfxsea R n`): n of R's ships raid in the next frame
 std::vector<std::wstring> g_boxes;
+// 0.7.2: the escorts of K's computer enemies (TBuilderNation / TfrmBuildCamp routines; see "The computer's ships laid
+// down" below)
+void *mPatrolReq = nullptr, *mOnPatrol = nullptr, *mCountType = nullptr, *mAIBuildShip = nullptr, *mRevise = nullptr,
+     *mPutPatrol = nullptr, *mTradePatrol = nullptr;
 }  // namespace
 
 extern "C" volatile char warfx_boxCap = 0;  // the frame records ShowMessagePos boxes (warfx_dMsgPos)
@@ -1007,6 +1012,7 @@ struct SeaRes {  // the frame's own numbers (plain data: filled in the view)
     int calls = 0, faults = 0, other = 0;
     int gainK[9] = {}, gainE[9] = {};  // K's trade VP from enemy j; j's from K
     int raidK[9] = {}, subK[9] = {}, raidE[9] = {}, subE[9] = {};  // merchants: j's sunk by K; K's sunk by j
+    int asw[9][3] = {};  // 0.7.2: enemy j's ASW revision: ships on trade protection before, after; its requirement
 };
 
 // Attributes `vp` to the nations whose merchant losses (field k) grew since `m0` (proportionally).
@@ -1030,10 +1036,38 @@ void Attribute(void* const rr[9], int k, const int m0[9], int K, int vp, int* ga
 }
 
 // In K's view (plain data only; each game call guarded): the game's submarine loop, CheckRaiderActivity's loops, then
-// CheckResultOfSinkings. `real(v)` of the view: 0 -> K, K -> 0.
-void RunSea(void* f, int K, void* const rr[9], SeaRes& r) {
+// CheckResultOfSinkings. `real(v)` of the view: 0 -> K, K -> 0. 0.7.2: first, for each enemy j whose wars are all with
+// nations people play (asw[j]: the host's month sees it at peace, so it runs none of this for it), what the game's month
+// does for a nation at war with the player before the submarine loop, here against K's submarines (the player's in the
+// view): CheckPatrols' loop for it (six times: short of its patrol requirement -> PutShipOnASWPatrol; then
+// CheckAINationShipsOnTradePatrol), then ReviseASWEffort (PutAIShipsInStatus at war: its corvettes on trade protection,
+// destroyers above the requirement taken off). Without them its patrols never reached the requirement and the escorts rule
+// of CheckSubmarineActivity laid down another escort class every month.
+void RunSea(void* f, int K, void* const rr[9], const bool asw[9], SeaRes& r) {
     void* k = rr[K];
     int m0[9];
+    auto onPatrol = [](void* n) { return mOnPatrol ? (int)dl::Call(mOnPatrol, (uint32_t)(uintptr_t)n, 0) : -1; };
+    auto required = [f](void* n) {
+        return mPatrolReq ? (int)dl::Call(mPatrolReq, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)n) : -1;
+    };
+    for (int j = 1; j < 9; j++) {
+        if (!asw[j]) continue;
+        r.asw[j][0] = onPatrol(rr[j]);
+        for (int i = 0; i < 6 && mPutPatrol && mTradePatrol; i++) {
+            if (onPatrol(rr[j]) < required(rr[j])) {
+                r.calls++;
+                if (!G1(mPutPatrol, rr[j])) r.faults++;
+            }
+            r.calls++;
+            if (!G1(mTradePatrol, f, rr[j])) r.faults++;
+        }
+        if (mRevise) {
+            r.calls++;
+            if (!G1(mRevise, rr[j])) r.faults++;
+        }
+        r.asw[j][1] = onPatrol(rr[j]);
+        r.asw[j][2] = required(rr[j]);
+    }
     for (int v = 0; v < 9; v++) {  // DoStrategicTurn's loop: i == 0 or at war with the player (K here)
         int n = v == 0 ? K : v == K ? 0 : v;
         if (v != 0 && Rel0(rr[n]) <= 40) continue;
@@ -1084,9 +1118,9 @@ void RunSea(void* f, int K, void* const rr[9], SeaRes& r) {
     if (!G1(mSinkResult, f)) r.faults++;
 }
 
-int RunSeaGuarded(void* f, int K, void* const rr[9], SeaRes& r) {
+int RunSeaGuarded(void* f, int K, void* const rr[9], const bool asw[9], SeaRes& r) {
     __try {
-        RunSea(f, K, rr, r);
+        RunSea(f, K, rr, asw, r);
         return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
@@ -1179,9 +1213,16 @@ void SeaFrame(void* f, int K, int kwar, const std::vector<int>& enemies) {
     g_boxes.clear();
     warfx_boxCap = 1;
     SeaRes r;
+    bool asw[9] = {};  // 0.7.2: the enemies whose wars are all with nations people play (real relations)
+    for (int j : enemies) {
+        bool hidden = game::MaskKeepAI() && j >= 1 && j <= 8 && !game::AtWar(j, 0);
+        for (int x = 1; x <= 8 && hidden; x++)
+            if (x != j && game::AtWar(j, x) && !hookcb::PlayerRulesNation(x)) hidden = false;
+        asw[j] = hidden;
+    }
     int ran = -1;
     if (game::HostViewEnter(K, kwar, human)) {
-        ran = RunSeaGuarded(f, K, rr, r);
+        ran = RunSeaGuarded(f, K, rr, asw, r);
         game::HostViewLeave();
     }
     warfx_boxCap = 0;
@@ -1251,11 +1292,19 @@ void SeaFrame(void* f, int K, int kwar, const std::vector<int>& enemies) {
     snprintf(hd, sizeof(hd), "war counter %d, war score %d:%d, %s%s; calls %d, faults %d", kwar, vp, evp,
              ran == 1 ? "its view" : ran == 0 ? "its view (an exception: stopped)" : "NO VIEW (nothing run)",
              FlagOf(rr[K]) ? ", blockaded (no enemy raiders)" : "", r.calls, r.faults);
+    std::string aswRec;
+    for (int j = 1; j < 9; j++)
+        if (asw[j])
+            aswRec += " " + std::to_string(j) + ": " + std::to_string(r.asw[j][0]) + " -> " + std::to_string(r.asw[j][1]) +
+                   " of " + std::to_string(r.asw[j][2]) + ";";
     rec = std::string(hd) + "; (raiders K/enemy, subs K/enemy, VP K/enemy)" + perEnemy + test +
           " messages " + std::to_string(news.size()) + " (pictures " + std::to_string(pl.size()) + ", boxes " +
           std::to_string(g_boxes.size()) + ", turn messages " + std::to_string(tm.size()) + ")" +
           "; unattributed VP " + std::to_string(r.other) + ", K's VP field " + std::to_string(kvp) + ", EnemyVP " +
-          std::to_string(devp) + "; fuel of others changed:" + (fuelLog.empty() ? " none" : fuelLog);
+          std::to_string(devp) + "; fuel of others changed:" + (fuelLog.empty() ? " none" : fuelLog) +
+          "; ASW effort of the enemies at war only with nations people play (patrols, revision: on trade protection "
+          "before -> after, of the requirement in its view):" +
+          (aswRec.empty() ? " none" : aswRec);
     g_sea[K] = rec;
     Log("warfx: sea war of nation %d (enemies %s): %s", K, Join(enemies).c_str(), rec.c_str());
     g_boxes.clear();
@@ -1385,6 +1434,28 @@ std::string InstallSea() {
     fShipUsed = dl::Field("TCampaignShip", "Used");
     mIsOper = dl::Method("TCampaignShip", "IsOperational");
     mSubAct = dl::Method(F, "CheckSubmarineActivity");
+    mRevise = dl::Method(B, "ReviseASWEffort");  // 0.7.2 (optional: without it the frame revises no ASW effort)
+    // 0.7.2: CheckPatrols' loop for a nation at war with the player as RunSea reproduces it: `mov edi,6`, then calls of
+    // CountShipsOnPatrol, GetPatrolRequirement, PutShipOnASWPatrol and CheckAINationShipsOnTradePatrol in this order
+    // (optional: without it the frame puts no ship on patrol for the computer's nations)
+    if (!mOnPatrol) mOnPatrol = dl::Method(B, "CountShipsOnPatrol");
+    if (!mPatrolReq) mPatrolReq = dl::Method(F, "GetPatrolRequirement");
+    if (uint8_t* cp = (uint8_t*)dl::Method(F, "CheckPatrols")) {
+        void* put = dl::Method(B, "PutShipOnASWPatrol");
+        void* trade = dl::Method(F, "CheckAINationShipsOnTradePatrol");
+        uint8_t* six = dl::FindPattern(cp, 0x200, {0xBF, 6, 0, 0, 0});
+        void* want[4] = {mOnPatrol, mPatrolReq, put, trade};
+        int w = 0;
+        for (int i = 0; six && i < 0x60 && w < 4; i++)
+            if (six[i] == 0xE8 && want[w] && CallTo(six + i) == (uint8_t*)want[w]) w++;
+        if (w == 4) {
+            mPutPatrol = put;
+            mTradePatrol = trade;
+        } else {
+            Log("warfx: CheckPatrols' loop for the player's enemies not as expected: the sea war frames put no ship on "
+                "patrol for the computer's nations");
+        }
+    }
     mRaidSink = dl::Method(F, "CheckRaiderSinkings");
     mSinkResult = dl::Method(F, "CheckResultOfSinkings");
     mSLNew = dl::MethodFewestParams("TStringList", "Create");
@@ -1457,6 +1528,205 @@ std::string InstallSea() {
         (unsigned)((uintptr_t)aisub - dl::g_base));
     return "";
 }
+
+// ---------------------------------------------------------------------------------------------
+// 0.7.2: the computer's ships laid down. LayDownAIShip (hooked at its entry) lays down every ship of a computer nation:
+// AIBuildShip calls it (from AIMonthlyBuild, CheckSubmarineActivity's escorts, the initial fleet) and AIMonthlyBuild
+// itself. Each lay-down is recorded with the nation (its real index, also in a view), the ship type, what asked for it
+// (the first routine of the call chain other than AIBuildShip, with the call site's offset) and where it ran (the host's
+// month, or a joined nation K's frame in its view), with the nation's ships on trade protection against its patrol
+// requirement (GetPatrolRequirement: the escorts' rule; in a view against K's submarines) and its corvettes in service
+// and in all at that moment. Log `aibuild: ...`, bridge `aibuilds`.
+struct AIBuild {
+    int date = -1, nation = -1, type = -1, frameK = 0, patrols = -1, req = -1, keIn = -1, keAll = -1;
+    std::string cause, site;
+};
+std::vector<AIBuild> g_aib;
+bool g_aibOn = false;
+struct Routine {
+    const char* name;
+    const char* cause;
+    uintptr_t start, end;
+};
+std::vector<Routine> g_routines;
+const int kShipTypeKE = 10;  // TShipType stK: the corvette ("KE" in the saves and the design screen)
+const char* const kShipTypeName[] = {"BB", "BC", "B", "CA", "CL", "CV", "CVL", "AMC", "AV", "DD", "KE", "TR",
+                                     "LT", "MTB", "SS", "SSC", "SSM", "XX", "BX", "CX", "CVX", "CAX"};
+std::string TypeName(int t) { return t >= 0 && t < 22 ? kShipTypeName[t] : std::to_string(t); }
+
+// A routine's code range: its start and its outer try block's handler (Delphi's `push ebp; push <handler>; push
+// fs:[eax]`: the handler follows the body), else the first 0x200 bytes.
+void AddRoutine(const char* cls, const char* name, const char* cause) {
+    uint8_t* p = (uint8_t*)dl::Method(cls, name);
+    if (!p) return;
+    uintptr_t end = (uintptr_t)p + 0x200;
+    for (int i = 0; i < 0x80; i++)
+        if (p[i] == 0x68 && p[i + 5] == 0x64 && p[i + 6] == 0xFF) {
+            uintptr_t h = *(uint32_t*)(p + i + 1);
+            if (h > (uintptr_t)p && h < (uintptr_t)p + 0x10000 && h > end) end = h;
+        }
+    g_routines.push_back({name, cause, (uintptr_t)p, end});
+}
+
+const Routine* RoutineOf(uintptr_t a) {
+    const Routine* best = nullptr;
+    for (const Routine& r : g_routines)
+        if (a > r.start && a < r.end && (!best || r.start > best->start)) best = &r;
+    return best;
+}
+
+void RecordLayDown(void* nation, int type, uintptr_t ret0, uintptr_t* ebp) {
+    AIBuild b;
+    b.date = economy::CurrentDate();
+    b.nation = game::RealIndexOf(nation);
+    b.type = type;
+    b.frameK = game::ViewNation();
+    uintptr_t chain[6] = {ret0};
+    int n = 1;
+    for (uintptr_t* fr = ebp; n < 6 && fr && !((uintptr_t)fr & 3); fr = (uintptr_t*)fr[0]) {
+        chain[n++] = fr[1];
+        if ((uintptr_t)fr[0] <= (uintptr_t)fr) break;  // the stack grows down: a caller's frame is higher
+    }
+    std::string addrs;
+    for (int i = 0; i < n; i++) {
+        char h[16];
+        snprintf(h, sizeof(h), " %#x", (unsigned)(chain[i] - dl::g_base));
+        addrs += h;
+        if (!b.cause.empty()) continue;
+        const Routine* r = RoutineOf(chain[i]);
+        if (r && r->start == (uintptr_t)mAIBuildShip) continue;
+        char s[96];
+        if (r)
+            snprintf(s, sizeof(s), "%s+%#x", r->name, (unsigned)(chain[i] - r->start));
+        else
+            snprintf(s, sizeof(s), "rva %#x", (unsigned)(chain[i] - dl::g_base));
+        b.cause = r ? r->cause : "other";
+        b.site = s;
+    }
+    void* f = game::BuildCamp();
+    if (mOnPatrol) b.patrols = (int)dl::Call(mOnPatrol, (uint32_t)(uintptr_t)nation, 0);
+    if (mPatrolReq && f) b.req = (int)dl::Call(mPatrolReq, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)nation);
+    if (mCountType) {
+        b.keIn = (int)dl::Call(mCountType, (uint32_t)(uintptr_t)nation, kShipTypeKE, 1);
+        b.keAll = (int)dl::Call(mCountType, (uint32_t)(uintptr_t)nation, kShipTypeKE, 0);
+    }
+    if (g_aib.size() >= 2000) g_aib.erase(g_aib.begin(), g_aib.begin() + 500);
+    g_aib.push_back(b);
+    std::string where = b.frameK ? "nation " + std::to_string(b.frameK) + "'s view" : "the host's frame";
+    std::wstring name = fNatName >= 0 ? dl::ReadUStr(dl::At<void*>(nation, fNatName)) : L"";
+    Log("aibuild: %s nation %d (%s) lays down a %s: %s (%s), in %s; on trade protection %d of %d required, corvettes %d "
+        "in service of %d; chain%s",
+        economy::DateString(b.date).c_str(), b.nation, W2U(name).c_str(), TypeName(type).c_str(),
+        b.cause.c_str(), b.site.c_str(), where.c_str(), b.patrols, b.req, b.keIn, b.keAll, addrs.c_str());
+}
+}  // namespace
+
+extern "C" void* warfx_oLayDown = nullptr;
+extern "C" void __stdcall warfx_LayDownCB(void* nation, uint32_t type, uintptr_t ret0, uintptr_t* ebp) {
+    __try {
+        RecordLayDown(nation, (int)(type & 0xFF), ret0, ebp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+// LayDownAIShip(Self=EAX, aNation=EDX, aShipType=CL, aShipClassName, aShipName, ExistingClass, aDesignId on the stack)
+extern "C" __declspec(naked) void warfx_dLayDown() {
+    __asm {
+        pushad
+        push ebp
+        push dword ptr [esp + 36]
+        push ecx
+        push edx
+        call warfx_LayDownCB
+        popad
+        jmp dword ptr [warfx_oLayDown]
+    }
+}
+
+namespace {
+int fShipTypeOf = -1, fInPlay = -1;
+
+int OnPatrol(void* rec) { return mOnPatrol ? (int)dl::Call(mOnPatrol, (uint32_t)(uintptr_t)rec, 0) : -1; }
+int Required(void* f, void* rec) {
+    __try {
+        return mPatrolReq ? (int)dl::Call(mPatrolReq, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)rec) : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// `aibuilds patrol <J> [<K> [set]]`: J's ships on trade protection and its patrol requirement on the host's frame (the
+// game's GetPatrolRequirement against the host's submarines) and in K's view (against K's: the escorts rule of K's sea war
+// frame). `set` (TEST ONLY): J's operational corvettes, then destroyers, in active service, reserve or mothballed (Status
+// 0-2, as PutShipOnASWPatrol takes them) put on trade protection until they reach the requirement in K's view.
+std::string Patrol(const std::vector<std::string>& args) {
+    int J = args.size() > 2 ? atoi(args[2].c_str()) : 0, K = args.size() > 3 ? atoi(args[3].c_str()) : 0;
+    void* f = game::BuildCamp();
+    void* rec = Rec(J);
+    if (!f || !rec || J < 1 || J > 8 || K < 0 || K > 8 || K == J)
+        return "error usage: aibuilds patrol <J 1-8> [<K 1-8> [set]]";
+    int host = Required(f, rec), inK = -1;
+    if (K >= 1) {
+        bool human[9] = {};
+        for (int n = 0; n < 9; n++) human[n] = n != K && (n == 0 || hookcb::IsHumanRemoteNation(n));
+        if (game::HostViewEnter(K, std::max(1, hookcb::KWarCounter(K)), human)) {
+            inK = Required(f, rec);
+            game::HostViewLeave();
+        }
+    }
+    int put = 0;
+    std::string ids;
+    if (K >= 1 && args.size() > 4 && args[4] == "set" && inK > 0 && fShipTypeOf >= 0 && fInPlay >= 0) {
+        int fId = dl::Field("TCampaignShip", "CShipId");
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < game::ShipCount(rec) && OnPatrol(rec) < inK; i++) {
+                void* sh = game::Ship(rec, i);
+                if (!sh || dl::At<uint8_t>(sh, fShipStatus) > 2 || !dl::At<uint8_t>(sh, fInPlay) ||
+                    dl::At<uint8_t>(sh, fShipTypeOf) != (pass ? 9 : kShipTypeKE) ||
+                    !(dl::Call(mIsOper, (uint32_t)(uintptr_t)sh) & 0xFF))
+                    continue;
+                dl::At<uint8_t>(sh, fShipStatus) = 3;
+                put++;
+                if (fId >= 0) ids += (ids.empty() ? "" : ",") + std::to_string(dl::At<int>(sh, fId));
+            }
+        Log("warfx: TEST aibuilds patrol %d %d set: %d ship(s) of nation %d put on trade protection (%d of %d required in "
+            "nation %d's view): %s", J, K, put, J, OnPatrol(rec), inK, K, ids.c_str());
+    }
+    std::string on;  // the ships CountShipsOnPatrol counts (Status 3, operational)
+    int fId = dl::Field("TCampaignShip", "CShipId");
+    for (int i = 0; fId >= 0 && mIsOper && i < game::ShipCount(rec); i++) {
+        void* sh = game::Ship(rec, i);
+        if (sh && dl::At<uint8_t>(sh, fShipStatus) == 3 && (dl::Call(mIsOper, (uint32_t)(uintptr_t)sh) & 0xFF))
+            on += (on.empty() ? "" : ",") + std::to_string(dl::At<int>(sh, fId));
+    }
+    return "ok nation=" + std::to_string(J) + " onPatrol=" + std::to_string(OnPatrol(rec)) + " required=" +
+           std::to_string(host) + " requiredK=" + std::to_string(inK) + " put=" + std::to_string(put) + " ids=" +
+           (ids.empty() ? "-" : ids) + " patrolIds=" + (on.empty() ? "-" : on);
+}
+
+std::string InstallAIBuilds() {
+    const char* F = "TfrmBuildCamp";
+    void* lay = dl::Method(F, "LayDownAIShip");
+    mAIBuildShip = dl::Method(F, "AIBuildShip");
+    mPatrolReq = dl::Method(F, "GetPatrolRequirement");
+    mOnPatrol = dl::Method("TBuilderNation", "CountShipsOnPatrol");
+    mCountType = dl::Method("TBuilderNation", "CountShipsOfType");
+    if (!lay || !mAIBuildShip) return "routines";
+    if (fNatName < 0) fNatName = dl::Field("TBuilderNation", "NationName");
+    if (fShipStatus < 0) fShipStatus = dl::Field("TCampaignShip", "Status");
+    if (!mIsOper) mIsOper = dl::Method("TCampaignShip", "IsOperational");
+    fShipTypeOf = dl::Field("TCampaignShip", "ShipType");
+    fInPlay = dl::Field("TCampaignShip", "InPlay");
+    AddRoutine(F, "AIBuildShip", "build");
+    AddRoutine(F, "AIMonthlyBuild", "monthly");
+    AddRoutine(F, "CheckSubmarineActivity", "escorts");
+    AddRoutine(F, "AIBuildInitialShips", "initial");
+    AddRoutine(F, "AIBuildInitialFleet", "initial");
+    AddRoutine(F, "AIBuildInitialSubs", "initial");
+    if (!HookAt(lay, (void*)&warfx_dLayDown, &warfx_oLayDown, "LayDownAIShip")) return "hook";
+    g_aibOn = true;
+    Log("warfx: the computer's ships laid down are recorded (LayDownAIShip %#x)", (unsigned)((uintptr_t)lay - dl::g_base));
+    return "";
+}
 }  // namespace
 
 bool Install() {
@@ -1489,6 +1759,8 @@ bool Install() {
         Log("warfx: the player's war effects for joined nations: raiders, submarines and the trade war UNAVAILABLE (%s; "
             "the host's wars only)",
             sw.c_str());
+    std::string ab = InstallAIBuilds();
+    if (!ab.empty()) Log("warfx: the computer's ships laid down: not recorded (%s)", ab.c_str());
     if (fBlockaded < 0 || fBM < 0 || fUnrest < 0 || fTension < 0 || fShips < 0 || fDest < 0 || !mIsBlockaded || !check ||
         !effects || !unrest || !stop || !game::WarCell())
         why = "fields or routines";
@@ -1698,6 +1970,31 @@ std::string TestBlockade(const std::vector<std::string>& args) {
     Log("warfx: TEST: the frames' blockade test of nation %d: %s", n, v < 0 ? "the game's" : v ? "blockaded" : "not");
     std::string s = "ok";
     for (int i = 0; i < 9; i++) s += " " + std::to_string(g_testBlk[i]);
+    return s;
+}
+
+std::string AIBuildsCommand(const std::vector<std::string>& args) {
+    if (!g_aibOn) return "error aibuilds unavailable";
+    if (args.size() >= 2 && args[1] == "patrol") return Patrol(args);
+    if (args.size() >= 2 && args[1] == "clear") {
+        size_t n = g_aib.size();
+        g_aib.clear();
+        return "ok cleared=" + std::to_string(n);
+    }
+    if (args.size() >= 3 && args[1] == "keep") {
+        game::TestMaskKeepAI(args[2] != "0");
+        Log("warfx: TEST aibuilds keep %d (%s)", game::MaskKeepAI() ? 1 : 0,
+            game::MaskKeepAI() ? "0.7.2: the relations mask puts back the trade protection and raiders of a computer "
+                                 "nation at war with nations people play, their sea war frames revise its ASW effort"
+                               : "0.7.1: neither");
+    }
+    std::string s = "ok n=" + std::to_string(g_aib.size()) + " keep=" + (game::MaskKeepAI() ? "1" : "0") + " |";
+    for (size_t i = g_aib.size() > 300 ? g_aib.size() - 300 : 0; i < g_aib.size(); i++) {
+        const AIBuild& b = g_aib[i];
+        s += " " + economy::DateString(b.date) + ":" + std::to_string(b.nation) + ":" + TypeName(b.type) + ":" + b.cause +
+             (b.frameK ? ":K" + std::to_string(b.frameK) : std::string()) + ":" + std::to_string(b.patrols) + "/" +
+             std::to_string(b.req);
+    }
     return s;
 }
 
