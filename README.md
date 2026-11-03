@@ -54,7 +54,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 ## Install
 Every player:
 1. Close the game.
-2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.7.2-win32.zip`) from the
+2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.7.3-win32.zip`) from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract all its files into the
    game folder, next to `RTW3.exe`. When you update, replace the older files.
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
@@ -255,6 +255,14 @@ and their messages come in your game's turn report at the start of the new month
   situation!"), for the governments that the game applies it to.
 - **The wartime build rules:** construction delays, submarine building and the war budget ("War budget means
   increased allocations to the navy!") go by your own war; war loans come as in 0.5.0.
+- **Your computer enemies' war effort:** with 0.7.3 on the host, a computer nation at war with your nation (and at
+  peace with the host's nation) fights that war as the computer fights the player in single player: it calls up its
+  reserves, raises its naval budget, builds for the war (escorts against your submarines among them), puts ships on
+  trade protection against your submarines, sends raiders against your merchant ships and concentrates its fleet, and
+  it moves no ships to or from its colonies while the war lasts. Its raiders' sinkings count in your losses, your
+  turn report and its war score against you. Expect tougher computer enemies: with 0.5.0 to 0.7.2 on the host, a
+  computer nation at war only with joined players' nations stayed on a peace footing, with much of its fleet in
+  reserve and no raiders. What still differs: see [Known limitations](#known-limitations).
 
 With 0.6.0 on your PC too, the start of your month at war brings the game's dialogs for:
 - **Help from allies:** your allies' operations add victory points ("The operations of our ally USA adds 13VP"),
@@ -490,12 +498,12 @@ players in the battle need **Fight my battles** on (the host's own box makes no 
 joining a session). If it is off, the host fights its battle against that nation's ships under computer control, and a
 battle between two joined players' nations is resolved by the game.
 - **Same live-battle engine:** a live battle needs the same live-battle engine on both players' PCs. 0.4.1, 0.5.0 and
-  0.6.0 have the same one (17), 0.6.1, 0.7.0, 0.7.1 and 0.7.2 a new one (18), older versions others. A host on 0.4.0 or
-  newer checks it for every live battle: its own battle against a player with another engine is fought against the
-  computer, and a battle between two joined players is resolved by the game unless both have the host's engine. The
-  chat and the players' notices say why, naming both versions (from a host on 0.5.0 or newer, for example "live
-  battles need the same live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0 (engine 17)";
-  older hosts say "the same mod version"), and the month goes on. A
+  0.6.0 have the same one (17), 0.6.1, 0.7.0, 0.7.1, 0.7.2 and 0.7.3 a new one (18), older versions others. A host on
+  0.4.0 or newer checks it for every live battle: its own battle against a player with another engine is fought
+  against the computer, and a battle between two joined players is resolved by the game unless both have the host's
+  engine. The chat and the players' notices say why, naming both versions (from a host on 0.5.0 or newer, for
+  example "live battles need the same live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0
+  (engine 17)"; older hosts say "the same mod version"), and the month goes on. A
   host on 0.3.x checks no versions: when it fights its own battle against a player on 0.4.0 or newer, the player's
   game refuses the battle with a notice, its chat naming both live-battle levels, and the host's computer fights the
   player's side. Two joined players with the same engine (0.4.0 or newer) fight their battle against each other live
@@ -587,8 +595,8 @@ game resolves the battle.
 again first if it stopped; if you are still connected, press *Leave*, then *Join game*). You get your nation back,
 the battle loads on your PC (also from the title screen), and you command your ships again from its next minute. The
 battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0 or
-newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1 and
-0.7.2 a new one); otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
+newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1, 0.7.2
+and 0.7.3 a new one); otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
 
 **When the host's game stops** (it crashes or is closed) during its live battle against a joined player, the joined
 player's game leaves the battle and the session. To go on:
@@ -702,6 +710,17 @@ players' nations for the rest of that month. A battle between two joined players
   count. With an older version than 0.7.2 on the host or on your PC, the month's first encounter without a battle
   (the computer's navy declines, you decline, or a side has no ships there that can fight) ends the search, where
   single player's goes on.
+- **Your computer enemies** (with 0.7.3 on the host) fight your nation as the computer fights the player in single
+  player (see *War effects* in [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)),
+  with a few differences. A computer nation has one player: the host's nation when it is at war with it, else the
+  first of the joined players' nations at war with it in the game's list of nations. It fights every other joined
+  player's nation at war with it as it fights a computer nation, but its raiders attack that nation's merchant ships
+  too. When you blockade a computer enemy, its raiders still leave port without the chance of interception that the
+  player's blockade gives in single player. While your nation is at war, the computer nations that aren't at war with
+  it don't call up part of their reserves or stop moving ships to and from their colonies, as every computer nation
+  does in single player while the player is at war: they follow the host's wars. Under a host on 0.5.0 to 0.7.2, a
+  computer nation at war only with joined players' nations stays on a peace footing: much of its fleet in reserve,
+  its peace budget, its peace building and no raiders.
 - **With an older version on the host or on your PC** (0.4.1 or older), your relations with computer nations change
   by the game's rules for computer nations, not by the player's: tension moves in small steps without explanations on
   your screen, a war between your nation and a computer nation breaks out by the computer's rule and only while the
@@ -714,6 +733,8 @@ players' nations for the rest of that month. A battle between two joined players
   The Air Force's event of 1950 to 1975 isn't run for them. Some of the computer's rules still apply: budget cuts that
   come with high unrest, the world economy's changes of base resources, coups (the government changes without the
   player's dialog), and a few smaller budget rules, which follow the computer's version or the host's months at war.
+  While your nation is at war, but not with the host's nation, two of the game's monthly rules for every nation can
+  still see it at peace: its naval budget, when high, can be cut, and its productivity can grow, as at peace.
   Under a host on 0.4.1 or older, the game treats a joined nation's money partly as a computer nation's: it gets the
   computer nations' monthly sum, which grows with the fleet, and now and then a raised naval budget ("... has
   increased the naval budget to remain a global naval power."), and while its monthly balance is negative and its
@@ -726,8 +747,8 @@ players' nations for the rest of that month. A battle between two joined players
 - **Resigning** is not possible during a session: leave the session first.
 - **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
   play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same live-battle
-  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1 and 0.7.2 a newer one),
-  and a host on 0.4.0 or newer pairs only players with its own (see
+  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1, 0.7.2 and 0.7.3 a newer
+  one), and a host on 0.4.0 or newer pairs only players with its own (see
   [Battles between players](#battles-between-players-live)). Joined players use save slot 77, and slot 87 for their
   battles.
 - **A host on 0.3.x** passes on the live battles between two joined players on 0.4.0, but can't start such a battle
@@ -817,8 +838,8 @@ players' nations for the rest of that month. A battle between two joined players
   0.6.1 and newer leave that file out.
 - **"... live battles need the same live-battle engine" in the chat** (from a host on 0.4.1 or older: "... the same
   mod version"): both players of a live battle need versions with the same live-battle engine (0.4.1, 0.5.0 and 0.6.0
-  have the same one; 0.6.1, 0.7.0, 0.7.1 and 0.7.2 have a new one), and a host on 0.4.0 or newer needs both on its
-  own; until then, such battles are fought against the computer or resolved by the game. See
+  have the same one; 0.6.1, 0.7.0, 0.7.1, 0.7.2 and 0.7.3 have a new one), and a host on 0.4.0 or newer needs both on
+  its own; until then, such battles are fought against the computer or resolved by the game. See
   [Upgrading from an older version](#upgrading-from-an-older-version).
 - **The computer took over your ships in a live battle, or the host's game stopped during one:** see
   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops).
@@ -847,6 +868,12 @@ players' nations for the rest of that month. A battle between two joined players
 - **"Error in AIDetermineTacticalStance2 procedure! ... Read of address 000009D3" during a long battle:** a fault of
   the game's destroyer tactics (single player has it too) when a badly damaged enemy ship counts as dangerous only
   once. Since 0.7.2 the box no longer shows, on each PC with 0.7.2 for its own battles.
+- **"Error in ConvoyEscortCheck procedure! ... Read of address 000009D3" during a battle:** a fault of the game's
+  convoy escort tactics (single player has it too) when a division's ships have just rejoined the division they were
+  detached from, or were all detached or sunk in that minute: the game lists the emptied division until the minute
+  ends. Since 0.7.3 the box no longer shows, on each PC with 0.7.3 for its own battles, nor do "Error in
+  RearDivisionHasNoSightedEnemy function!", "Error in CheckAllDivAfterMove procedure!" and "Error in
+  MoveDivisionShips procedure!", which the same fault can bring.
 - **The host's turn stops with "CV ... aircraft capacity exceeded!":** before 0.3.3, every reload of the campaign
   (every month and every live battle) added another copy of every squadron. Update the host (0.3.3 or newer) and load
   the campaign again: it removes the copies. If the message stays, that carrier really carries more aircraft than it
@@ -874,9 +901,27 @@ players' nations for the rest of that month. A battle between two joined players
   you're at war with instead.
 - **A computer nation lays down a new class of corvettes every month** ("... has laid down a KE of ... class!"
   several times a month in the turn report) while it is at war only with joined players' nations: fixed in 0.7.2 on
-  the host, whatever version the players have. The corvettes laid down before stay in its fleet.
+  the host, whatever version the players have. The corvettes laid down before stay in its fleet. Since 0.7.3 a
+  computer nation at war with your nation builds for the war as the computer does against the player in single
+  player (see *War effects* in [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)):
+  new corvettes and other escorts still come in a war, more when your nation has more submarines.
 
 ### Upgrading from an older version
+- **0.7.3** plays with 0.7.2, 0.7.1, 0.7.0, 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and every
+  player:
+  - 0.7.3 has the live-battle engine of 0.6.1, 0.7.0, 0.7.1 and 0.7.2 (18): players on these versions fight their
+    live battles together, a player on 0.6.0 or older can't (see 0.6.1 below).
+  - A computer nation at war with your nation fights that war as the computer fights the player in single player
+    with 0.7.3 on the host and 0.5.0 or newer on your PC (the versions that give your nation its own wars; see
+    *War effects* in [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)): expect
+    tougher computer enemies. A war that is already going on is fought that way from the first month that a host on
+    0.7.3 runs.
+  - The game's "Error in ConvoyEscortCheck procedure!" box in battles, and three like it (see
+    [Troubleshooting](#troubleshooting)), are gone on each PC with 0.7.3, for its own battles, and 0.7.0's fix of a
+    lead or target division that has just lost its last ship ("Error in AIDetermineTacticalStance2 procedure!") works
+    there in every battle, not only once a live battle has started. In a live battle with a PC on an older version, a
+    minute where one of these four boxes would have come can differ between the two PCs: the battle then synchronises
+    again.
 - **0.7.2** plays with 0.7.1, 0.7.0, 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and every player:
   - 0.7.2 has the live-battle engine of 0.6.1, 0.7.0 and 0.7.1 (18): players on these versions fight their live
     battles together, a player on 0.6.0 or older can't (see 0.6.1 below).

@@ -2552,7 +2552,7 @@ static void AIMaskEnter(const char* routine) {
         if (g_aiMask.k[k]) ks += " " + std::to_string(k);
     }
     if (ks.empty()) return;
-    for (int c = 1; c <= 8; c++) g_aiMask.c[c] = HiddenWarsOnly(c);
+    for (int c = 1; c <= 8; c++) g_aiMask.c[c] = !AIWarOn() && HiddenWarsOnly(c);  // 0.7.3: the war player's view instead
     for (int k = 1; k <= 8; k++)
         if (g_aiMask.k[k] || g_aiMask.c[k]) MaskShipsSave(k);
     g_aiMaskRoutine = routine;
@@ -2583,6 +2583,215 @@ static void AIMaskLeave() {
     if (dropped) Log("relations v2: %d change(s) of the computer's rules to the masked pairs dropped", dropped);
     for (int k = 1; k <= 8; k++)
         if (g_aiMask.k[k] || g_aiMask.c[k]) MaskShipsRestore(k, g_aiMaskRoutine);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0.7.3: the computer's war against a joined nation as in single player.
+//
+// In single player the game runs a computer nation's own monthly routines against its player, nation 0: at war with it
+// (its `Tension` above 40 and the war counter above 0) `PutAIShipsInStatus` takes the war branch (every operational ship
+// in reserve or mothballed back in service, `ReviseASWEffort`, no ship put in reserve, mothballed or scrapped),
+// `AINationAdjustBudget` raises the budget, `AIMonthlyBuild` builds for the war (corvettes against the player's
+// submarines, and more), `EvaluateBuildingStrategy` weighs the player's strength, and `NationIsAtWar` keeps the war rules
+// of `ReduceTimeLimits` (no peace budget cuts, no productivity gain, no maintenance reset of trade protection and raiders).
+// On the host a computer nation J at war with a joined nation K under the player's rules saw none of it: the war is not
+// with nation 0, and B2's mask hides the pair inside `ReduceTimeLimits`, so J ran these routines at peace while at war with
+// K (its fleet demobilized, no war budget, no escorts for the war). Here K is J's player for the month (AIWarPlayer): J's
+// war with K is with a joined nation under the player's rules and J is at peace with the host's nation (at war with the
+// host, the host is its player as the game has it). J's routines with a player-war branch run in K's view
+// (AIWarViewEnter: the mask's real cells back for the call, game::HostViewEnter: K as nation 0 and PlayerNation, K's war
+// counter as War), once a month as before; `NationIsAtWar` answers J's real war inside the masked routines. Tension or
+// alliance changes made in the view are not kept (the view's cells are put back, as the mask drops them). The
+// player-war parts of the month outside `ReduceTimeLimits` run in K's view too: `CheckPatrols`' part for J (its ASW
+// patrols and raiders, warfx.cpp) and J's colonial moves are left out as `CheckShipsOnForeignStations` does at war.
+static bool g_aiWar = true;  // TEST ONLY (bridge `aiwar 0`): off = 0.7.2 (no view, the 0.7.2 keep and the sea frame's ASW)
+void TestAIWar(bool on) { g_aiWar = on; }
+bool AIWarOn() { return g_aiWar && A.playerRules; }
+
+static int RealTension(int a, int b) {  // a's relation with b (0..8) behind the mask
+    if (g_aiMask.on && a >= 1 && a <= 8 && b >= 1 && b <= 8 && a != b && (g_aiMask.k[a] || g_aiMask.k[b]))
+        return g_aiMask.t[a][b];
+    return TensionCell(a, b);
+}
+
+// The joined nation that is computer nation j's player this month (real indices), 0 when none: j at war with a nation
+// under the player's rules (the lowest index of them) and at peace with the host's nation. Not while a view is in place.
+int AIWarPlayer(int j) {
+    if (!AIWarOn() || g_pvOn || j < 1 || j > 8 || NationCount() < 9 || PlayerRules(j) || hookcb::IsHumanRemoteNation(j))
+        return 0;
+    if (TensionCell(j, 0) > 40) return 0;
+    for (int k = 1; k <= 8; k++)
+        if (k != j && PlayerRules(k) && RealTension(j, k) > 40) return k;
+    return 0;
+}
+
+// The mask (B2) lifted for a call in a view and put back afterwards: the masked pairs' real cells, then the mask's again.
+static bool g_aiwSuspended = false;
+static void AIMaskSuspend() {
+    for (int a = 1; a <= 8; a++)
+        for (int b = 1; b <= 8; b++)
+            if (a != b && (g_aiMask.k[a] || g_aiMask.k[b])) {
+                TensionCell(a, b) = g_aiMask.t[a][b];
+                AllianceCell(a, b) = g_aiMask.al[a][b];
+            }
+}
+static void AIMaskResume() {
+    for (int a = 1; a <= 8; a++)
+        for (int b = 1; b <= 8; b++)
+            if (a != b && (g_aiMask.k[a] || g_aiMask.k[b])) {
+                g_aiMask.t[a][b] = TensionCell(a, b);
+                g_aiMask.al[a][b] = AllianceCell(a, b);
+                TensionCell(a, b) = kMaskTension;
+                AllianceCell(a, b) = 0;
+            }
+}
+
+// K's view for a computer nation's routine (host): the real relations, K as nation 0 and PlayerNation, War := K's war
+// counter (at least 1), the other nations people play at peace with K. Not nested; false when not available.
+bool AIWarViewEnter(int K) {
+    if (g_pvOn || K < 1 || K > 8) return false;
+    g_aiwSuspended = g_aiMask.on;
+    if (g_aiwSuspended) AIMaskSuspend();
+    bool human[9] = {};
+    for (int n = 0; n < 9; n++) human[n] = n != K && (n == 0 || hookcb::IsHumanRemoteNation(n));
+    if (!HostViewEnter(K, std::max(1, hookcb::KWarCounter(K)), human)) {
+        if (g_aiwSuspended) AIMaskResume();
+        g_aiwSuspended = false;
+        return false;
+    }
+    return true;
+}
+
+void AIWarViewLeave() {
+    HostViewLeave();
+    if (g_aiwSuspended) AIMaskResume();
+    g_aiwSuspended = false;
+}
+
+// This month's record per computer nation with a player (bridge `aiwar`, log lines once a month).
+struct AIWarRec {
+    int K = 0;
+    std::string routines;
+    int before[7] = {}, after[7] = {};  // its ships in play by status 0-6 around PutAIShipsInStatus
+    bool statuses = false;
+    int natWar = 0, colonies = 0;
+    int moves = -2;  // its ship orders or statuses changed by the strategic moves in K's view (-1 no view, -2 not run)
+};
+static std::map<int, AIWarRec> g_aiwRec;
+static int g_aiwDate = INT_MIN;
+static bool g_aiwTurnHook = false;  // DoStrategicTurn's hook starts the month's record (else a new date does)
+void AIWarMonthStart() {
+    g_aiwRec.clear();
+    g_aiwTurnHook = true;
+}
+static AIWarRec& AIWarRecord(int j, int K) {
+    int d = economy::CurrentDate();
+    if (!g_aiwTurnHook && d != g_aiwDate) {
+        g_aiwRec.clear();
+        g_aiwDate = d;
+    }
+    AIWarRec& r = g_aiwRec[j];
+    r.K = K;
+    return r;
+}
+
+static void ShipStatusCounts(int j, int out[7]) {
+    for (int s = 0; s < 7; s++) out[s] = 0;
+    void* n = Nation(j);
+    for (int i = 0, c = ShipCount(n); i < c; i++) {
+        void* s = Ship(n, i);
+        if (!s || (A.fShipInPlay >= 0 && !dl::At<uint8_t>(s, A.fShipInPlay))) continue;
+        uint8_t st = dl::At<uint8_t>(s, A.fShipStatus);
+        if (st < 7) out[st]++;
+    }
+}
+
+static std::string StatusList(const int c[7]) {
+    char b[96];
+    snprintf(b, sizeof(b), "%d active, %d reserve, %d mothballed, %d trade protection, %d raiding (+%d breaking out), "
+             "%d foreign stations", c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+    return b;
+}
+
+// Before and after one of J's routines in K's view (AIViewCall).
+static void AIWarRoutineBefore(int j, int K, const char* method) {
+    AIWarRec& r = AIWarRecord(j, K);
+    if (r.routines.empty())
+        Log("relations v2: nation %d at war with nation %d (a nation people play), at peace with the host's nation: its "
+            "monthly routines run in nation %d's view, as single player's computer against its player", j, K, K);
+    r.routines += std::string(r.routines.empty() ? "" : ",") + method;
+    if (!strcmp(method, "PutAIShipsInStatus")) ShipStatusCounts(j, r.before);
+}
+
+static void AIWarRoutineAfter(int j, const char* method) {
+    if (strcmp(method, "PutAIShipsInStatus") != 0) return;
+    AIWarRec& r = g_aiwRec[j];
+    ShipStatusCounts(j, r.after);
+    r.statuses = true;
+    Log("relations v2: nation %d's PutAIShipsInStatus in nation %d's view (at war): before %s; after %s", j, r.K,
+        StatusList(r.before).c_str(), StatusList(r.after).c_str());
+}
+
+// 0.7.3: NationIsAtWar of a computer nation inside a masked routine: its real wars (the mask hides its wars with the
+// nations under the player's rules from the computer's relation rules, not from its own economy: ReduceTimeLimits' peace
+// budget cuts and productivity gain, the maintenance's reset of trade protection and raiders).
+extern "C" BOOL __stdcall CB_NationAtWarReal(void* nation) {
+    __try {
+        if (!g_aiMask.on || g_pvOn || !AIWarOn()) return FALSE;
+        int j = NationIndex(nation);
+        if (j < 1 || j > 8 || PlayerRules(j) || hookcb::IsHumanRemoteNation(j)) return FALSE;
+        for (int b = 1; b <= 8; b++) {
+            if (b == j || RealTension(j, b) <= 40) continue;
+            int K = AIWarPlayer(j);
+            AIWarRec& r = AIWarRecord(j, K);
+            if (r.natWar++ == 0)
+                Log("relations v2: nation %d at war with nation %d (behind the mask in %s): NationIsAtWar answers at war",
+                    j, b, g_aiMaskRoutine);
+            return TRUE;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return FALSE;
+}
+
+extern "C" void* o_NationIsAtWar = nullptr;
+// TBuilderNation.NationIsAtWar(Self=EAX): Boolean; a False of a computer nation inside a masked routine is checked.
+extern "C" __declspec(naked) void d_NationIsAtWar() {
+    __asm {
+        push eax
+        call dword ptr [o_NationIsAtWar]
+        pop edx
+        test al, al
+        jnz done
+        push edx
+        call CB_NationAtWarReal
+    done:
+        ret
+    }
+}
+
+// The bridge's `aiwar` (read only): this month's record.
+std::string AIWarInfo() {
+    std::string s = std::string("ok on=") + (AIWarOn() ? "1" : "0") + " players=";
+    std::string p;
+    for (int j = 1; j <= 8 && j < NationCount(); j++) {
+        int K = AIWarPlayer(j);
+        if (K) p += (p.empty() ? "" : ",") + std::to_string(j) + ":" + std::to_string(K);
+    }
+    s += p.empty() ? "-" : p;
+    for (auto& kv : g_aiwRec) {
+        const AIWarRec& r = kv.second;
+        s += " | nation=" + std::to_string(kv.first) + " K=" + std::to_string(r.K) + " routines=" +
+             (r.routines.empty() ? "-" : r.routines) + " natwar=" + std::to_string(r.natWar) +
+             " colonies=" + std::to_string(r.colonies) + " moves=" + std::to_string(r.moves);
+        if (r.statuses) {
+            s += " before=";
+            for (int i = 0; i < 7; i++) s += std::to_string(r.before[i]) + (i < 6 ? "/" : "");
+            s += " after=";
+            for (int i = 0; i < 7; i++) s += std::to_string(r.after[i]) + (i < 6 ? "/" : "");
+        }
+    }
+    return s;
 }
 
 // The host's CheckForWar (kind 1) and RandomTensionChanges (kind 2) with K seen as a player; on a joined player's PC
@@ -5027,6 +5236,87 @@ extern "C" void __stdcall CB_AfterAIMoves(void* self) {
     } catch (...) {
     }
 }
+
+// 0.7.3: the computer's strategic moves (DoTurn2's unnamed routine, all nations in one call) of a computer nation with a
+// war player in that player's view: the routine reads the player's war (War > 0 and Tension > 40: cruisers spread to
+// adjacent areas, 90 % of the ships to the most important area instead of Tension x 3 %, reserves called up) and
+// GetMostImportantArea the player's areas. The routine runs once in the host's frame for every other nation (the war
+// player's enemies' ship orders put back afterwards), then once per war player in its view for its enemies only (every
+// other nation's orders put back): each nation's moves come from one run. It writes only the ships' OrderedArea,
+// LocationArea (a ship without one) and Status (SnapshotShips).
+static int AIMovesCall(void* self) {  // 1, or 0 when a game exception unwound through it
+    __try {
+        dl::Call(o_AIMoves, (uint32_t)(uintptr_t)self);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+static int AIMovesInView(void* self, int K) {  // -1: no view
+    if (!AIWarViewEnter(K)) return -1;
+    int ok = AIMovesCall(self);
+    AIWarViewLeave();
+    return ok;
+}
+
+static void AIMovesRun(void* self) {
+    AIWarMonthStart();  // the month's processing starts here (DoTurn2, before the battles and DoStrategicTurn)
+    int K[9] = {};
+    bool any = false;
+    for (int j = 1; j <= 8 && j < NationCount(); j++) any |= (K[j] = AIWarPlayer(j)) > 0;
+    if (!any) {
+        AIMovesCall(self);
+        return;
+    }
+    std::vector<ShipSnap> own[9];
+    for (int j = 1; j <= 8; j++)
+        if (K[j]) own[j] = SnapshotShips(j);
+    AIMovesCall(self);
+    for (int j = 1; j <= 8; j++)  // J's orders of the host's frame undone (a location the game gave a ship without one kept)
+        for (const ShipSnap& s : own[j]) {
+            dl::At<void*>(s.ship, A.fShipOrderedArea) = s.ordered;
+            dl::At<uint8_t>(s.ship, A.fShipStatus) = s.status;
+            if (s.location) dl::At<void*>(s.ship, A.fShipLocationArea) = s.location;
+        }
+    for (int k = 1; k <= 8; k++) {
+        std::string js;
+        std::vector<ShipSnap> others;
+        for (int n = 0; n <= 8 && n < NationCount(); n++) {
+            if (n >= 1 && K[n] == k) {
+                js += " " + std::to_string(n);
+                continue;
+            }
+            std::vector<ShipSnap> s = SnapshotShips(n);
+            others.insert(others.end(), s.begin(), s.end());
+        }
+        if (js.empty()) continue;
+        int ran = AIMovesInView(self, k);
+        RestoreShips(others);
+        int moved = 0;
+        for (int j = 1; j <= 8; j++) {
+            if (K[j] != k) continue;
+            int m = 0;
+            for (const ShipSnap& s : own[j])
+                if (dl::At<void*>(s.ship, A.fShipOrderedArea) != s.ordered ||
+                    dl::At<uint8_t>(s.ship, A.fShipStatus) != s.status)
+                    m++;
+            AIWarRecord(j, k).moves = ran == 1 ? m : -1;
+            moved += m;
+        }
+        Log("relations v2: the computer's strategic moves of nation(s)%s in nation %d's view (their war player): %d ship "
+            "order(s) or status(es) changed%s",
+            js.c_str(), k, moved, ran == 1 ? "" : ran == 0 ? " (an exception: stopped)" : " (NO VIEW: none)");
+    }
+}
+
+extern "C" void __stdcall CB_AIMovesRun(void* self) {
+    try {
+        AIMovesRun(self);
+    } catch (...) {
+        Log("exception in the computer's strategic moves");
+    }
+}
 // HandleAIPeace ends with VP = 0 for every nation 1..8 after any AI peace (AI nations don't need it afterwards). A
 // joined player's nation keeps its VP while it is still at war; the depth counts nested calls.
 static int g_aiPeaceDepth = 0;
@@ -7023,13 +7313,14 @@ extern "C" __declspec(naked) void d_StrategicTurn() {  // DoStrategicTurn(Self)
     }
 }
 
+extern "C" void __stdcall CB_AIMovesRun(void* self);
 extern "C" __declspec(naked) void d_AIMoves() {
     __asm {
         push eax
         push eax
         call CB_BeforeAIMoves
-        mov eax, [esp]
-        call dword ptr [o_AIMoves]
+        push dword ptr [esp]
+        call CB_AIMovesRun
         call CB_AfterAIMoves
         ret
     }
@@ -7387,7 +7678,9 @@ static void* EmitViewSkipThunk(void** origCell, const volatile bool* flag = null
     return mem;
 }
 
-// Generated thunks: skip an AI routine when its nation argument belongs to a remote human player.
+// Generated thunks: skip an AI routine when its nation argument belongs to a remote human player. 0.7.3: `view` routines of
+// a computer nation with a war player (AIWarPlayer) run in that player's view instead (AIViewCall); `keepHuman` ones are
+// never skipped (only the view).
 struct SkipSpec {
     const char* cls;
     const char* method;
@@ -7395,11 +7688,14 @@ struct SkipSpec {
     bool isIndex; // argument is a nation index instead of a TBuilderNation
     uint16_t retBytes;
     void* orig;
+    bool view = false;
+    bool keepHuman = false;
 };
 static SkipSpec g_skips[] = {
-    {"TfrmBuildCamp", "AIMonthlyBuild", 1, false, 0, nullptr},
-    {"TfrmBuildCamp", "AINationAdjustBudget", 1, false, 0, nullptr},
-    {"TfrmBuildCamp", "PutAIShipsInStatus", 1, false, 0, nullptr},
+    {"TfrmBuildCamp", "AIMonthlyBuild", 1, false, 0, nullptr, true},
+    {"TfrmBuildCamp", "AINationAdjustBudget", 1, false, 0, nullptr, true},
+    {"TfrmBuildCamp", "PutAIShipsInStatus", 1, false, 0, nullptr, true},
+    {"TfrmBuildCamp", "EvaluateBuildingStrategy", 1, true, 0, nullptr, true, true},
     {"TfrmBuildCamp", "DetermineAINationResearch", 1, false, 0, nullptr},
     {"TfrmBuildCamp", "CheckAIRebuilds", 1, false, 0, nullptr},
     {"TfrmBuildCamp", "CheckAINationShipsOnTradePatrol", 1, false, 0, nullptr},
@@ -7438,8 +7734,19 @@ extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
         if (!strcmp(s.method, "AIBuildInitialFleet") || !strcmp(s.method, "AssignOfficersToUncommandedShips"))
             return 0;  // (only for the legacy build)
         int nation = s.isIndex ? (int)arg : NationIndex((void*)(uintptr_t)arg);
-        if (nation > 0 && hookcb::IsHumanRemoteNation(nation)) {
+        if (nation > 0 && !s.keepHuman && hookcb::IsHumanRemoteNation(nation)) {
             Log("AI suppressed: %s for nation %d", s.method, nation);
+            return 1;
+        }
+        if (s.view && !s.retBytes && AIWarPlayer(nation) > 0) return 2;
+        // 0.7.3: the game moves no ship to or from the colonies while its player is at war (CheckShipsOnForeignStations
+        // runs at peace only): nor does a computer nation at war with its war player (AIWarPlayer).
+        if ((!strcmp(s.method, "AISendShipToColonies") || !strcmp(s.method, "MaybeSendHomeShipInColonies")) &&
+            AIWarPlayer(nation) > 0) {
+            AIWarRec& r = AIWarRecord(nation, AIWarPlayer(nation));
+            if (r.colonies++ == 0)
+                Log("relations v2: nation %d at war with nation %d (a nation people play): no colonial moves this month "
+                    "(%s left out, as the game does for all at war)", nation, r.K, s.method);
             return 1;
         }
     } catch (...) {
@@ -7447,6 +7754,29 @@ extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
     return 0;
 }
 
+// A `view` routine of computer nation j in its war player's view (SkipDecider's 2; register arguments only). A game
+// exception unwinding through the routine puts the view and the mask back first.
+static uint32_t AIViewRun(const SkipSpec& s, int j, int K, uint32_t eax, uint32_t edx, uint32_t ecx) {
+    if (!AIWarViewEnter(K)) return dl::Call(s.orig, eax, edx, ecx);
+    AIWarRoutineBefore(j, K, s.method);
+    uint32_t r = 0;
+    __try {
+        r = dl::Call(s.orig, eax, edx, ecx);
+    } __finally {
+        AIWarViewLeave();
+    }
+    AIWarRoutineAfter(j, s.method);
+    return r;
+}
+
+extern "C" uint32_t __stdcall AIViewCall(int idx, uint32_t eax, uint32_t edx, uint32_t ecx) {
+    const SkipSpec& s = g_skips[idx];
+    uint32_t arg = s.argReg == 0 ? eax : s.argReg == 1 ? edx : ecx;
+    int j = s.isIndex ? (int)arg : NationIndex((void*)(uintptr_t)arg);
+    return AIViewRun(s, j, AIWarPlayer(j), eax, edx, ecx);
+}
+
+// push eax/ecx/edx/arg/idx; call SkipDecider; 0: jmp [orig]; 1: ret [n]; 2: AIViewCall(idx, eax, edx, ecx); ret.
 static void* EmitSkipThunk(int idx) {
     uint8_t* mem = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) return nullptr;
@@ -7464,17 +7794,34 @@ static void* EmitSkipThunk(int idx) {
     p += 4;
     *p++ = 0xFF;  // call eax
     *p++ = 0xD0;
-    *p++ = 0x85;  // test eax, eax
-    *p++ = 0xC0;
+    *p++ = 0x83;  // cmp eax, 1
+    *p++ = 0xF8;
+    *p++ = 0x01;
     *p++ = 0x5A;  // pop edx
     *p++ = 0x59;  // pop ecx
     *p++ = 0x58;  // pop eax
-    *p++ = 0x75;  // jnz skip
-    *p++ = 0x06;
-    *p++ = 0xFF;  // jmp [orig]
+    *p++ = 0x72;  // jb run
+    uint8_t* jbRun = p++;
+    *p++ = 0x74;  // je skip
+    uint8_t* jeSkip = p++;
+    *p++ = 0x51;  // push ecx
+    *p++ = 0x52;  // push edx
+    *p++ = 0x50;  // push eax
+    *p++ = 0x68;  // push imm32 (hook index)
+    *(int32_t*)p = idx;
+    p += 4;
+    *p++ = 0xB8;  // mov eax, AIViewCall
+    *(uint32_t*)p = (uint32_t)(uintptr_t)&AIViewCall;
+    p += 4;
+    *p++ = 0xFF;  // call eax
+    *p++ = 0xD0;
+    *p++ = 0xC3;  // ret (view routines have no stack arguments)
+    *jbRun = (uint8_t)(p - (jbRun + 1));
+    *p++ = 0xFF;  // run: jmp [orig]
     *p++ = 0x25;
     *(uint32_t*)p = (uint32_t)(uintptr_t)&g_skips[idx].orig;
     p += 4;
+    *jeSkip = (uint8_t)(p - (jeSkip + 1));
     if (s.retBytes) {  // skip: ret n
         *p++ = 0xC2;
         *(uint16_t*)p = s.retBytes;
@@ -8312,6 +8659,14 @@ bool InstallHooks() {
     } else {
         Log("Player's rules for joined nations: UNAVAILABLE (routines or fields)");
     }
+    // 0.7.3: the computer's war against a joined nation (its routines in the war player's view: the skip thunks' `view`
+    // routines; NationIsAtWar behind the mask; CheckPatrols' part in warfx.cpp).
+    if (A.playerRules) {
+        void* niw = dl::Method("TBuilderNation", "NationIsAtWar");
+        bool ok2 = niw && A.fShipStatus >= 0 && Hook(niw, (void*)&d_NationIsAtWar, &o_NationIsAtWar, "NationIsAtWar");
+        Log("The computer's war against joined nations: %s", ok2 ? "ok (its routines in the war player's view)"
+                                                                 : "NationIsAtWar UNAVAILABLE (its war rules see peace)");
+    }
     // Relations v2, B3: the player's relation routines in a joined nation's view (on its player's PC).
     if (A.playerRules) {
         bool pt = A.events && A.fVP >= 0 && A.fBudget >= 0 && A.mPreviousWars && A.mShowTurnMessages &&
@@ -8458,6 +8813,8 @@ bool InstallHooks() {
         g_sfRandCell ? "found" : "not found");
     // 0.7.2 (fix-stance2): the destroyer stance routine's second ask (a game bug: its box in long battles)
     lockstep::InstallStanceAskFix();
+    // 0.7.3 (fix-convoy): divisions whose ships are gone in the battle AI's loops (ConvoyEscortCheck's box and others)
+    lockstep::InstallEmptyDivisionGuards();
     nplay::InstallHooks();
     if (lockstep::TestPrefsWanted()) {  // TEST ONLY
         Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");

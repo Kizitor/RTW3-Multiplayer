@@ -447,6 +447,19 @@ def samples():
           sk == dict(fix=1, armed=0, side=-1, asks=3, none=3, forced=3, fixed=3, hooked=1) and
           R.parse_stance('error no live battle') == {} and len(R.log_lines(sl, R.STANCE_BOX_RE)) == 1 and
           len(R.log_lines(sl, r'battle AI: the destroyer stance routine of division .* IsBigShip answered')) == 1, sk)
+    ck = R.parse_stance('ok fix=1 armed=0 side=0 forced=3 fixed=4 rear=0 core=0 scout=1 hooked=1')
+    cl = ("11:00:48.101 [74452] lockstep: minute box 'Error in ConvoyEscortCheck procedure!\n"
+          "11:00:48.230 [74452] battle AI: ConvoyEscortCheck: division 'Germany Cruiser Division 3' (side 1) (role "
+          "support) at t=18:26 has no ships left (the end-of-minute walk takes it out of its force); the routine's loop "
+          "over that force's divisions passed it over (the game: \"Error in ConvoyEscortCheck procedure!\")\n"
+          "11:00:49.002 [74452] battle AI: TEST ConvoyEscortCheck of division 'GB Destroyer Division 2' (side 0) at "
+          "t=18:27: the computer's division 'Germany Battle Division 1' (side 1) of force 'Main force' leads its force's "
+          "scouts and support cruisers towards the convoy at once, with the force's first division 'Germany Cruiser "
+          "Division 3' (side 1) (role support, 2 ship(s)) emptied for that loop (its ships and role put back after)\n")
+    check('convoy switch (0.7.3): `ls testconvoy` counts as ints (the other guards\' too); the live minute box of '
+          'ConvoyEscortCheck and the fix\'s line found in a log (not the switch\'s own TEST line)',
+          ck == dict(fix=1, armed=0, side=0, forced=3, fixed=4, rear=0, core=0, scout=1, hooked=1) and
+          len(R.log_lines(cl, R.CONVOY_BOX_RE)) == 1 and len(R.log_lines(cl, R.CONVOY_FIX_RE)) == 1, ck)
     ab = R.parse_aibuilds('ok n=3 keep=1 | 1900-09:3:KE:escorts:K1:0/3 1900-09:5:DD:monthly:2/4 '
                           'unknown:7:CL:other:-1/-1')
     ap = R.parse_aib_patrol('ok nation=3 onPatrol=3 required=4 requiredK=3 put=2 ids=411,412 patrolIds=388,411,412')
@@ -458,6 +471,20 @@ def samples():
           and R.parse_aibuilds('error unknown command') is None and ap['onPatrol'] == 3 and ap['requiredK'] == 3
           and ap['ids'] == ['411', '412'] and ap['patrolIds'] == ['388', '411', '412']
           and R.parse_aib_patrol('error x')['ids'] == [] and 'onPatrol' not in R.parse_aib_patrol('error x'), (ab, ap))
+    aw = R.parse_aiwar('ok on=1 players=3:1,5:2 | nation=3 K=1 routines=EvaluateBuildingStrategy,AINationAdjustBudget,'
+                       'AIMonthlyBuild,PutAIShipsInStatus natwar=12 colonies=1 moves=7 before=10/3/2/0/0/0/1 '
+                       'after=15/0/0/0/0/1/1 | nation=5 K=2 routines=- natwar=4 colonies=0 moves=-2 | patrols 3:K=1 '
+                       'war=1 patrols=0->4/4 raiders=0->1 calls=13 faults=0 5:K=2 war=3 patrols=2->2/2 raiders=1->1 '
+                       'calls=8 faults=0 noview | cp=1')
+    check('parse_aiwar (0.7.3): the war players, each record\'s routines in the view, NationIsAtWar, colonial and move '
+          'counts, statuses before and after, CheckPatrols\' part per nation; an error gives None', aw and aw['on'] and
+          aw['players'] == {3: 1, 5: 2} and aw['recs'][3]['routines'][2] == 'AIMonthlyBuild' and
+          aw['recs'][3]['natwar'] == 12 and aw['recs'][3]['moves'] == 7 and aw['recs'][5]['moves'] == -2 and
+          aw['recs'][3]['after'] == [15, 0, 0, 0, 0, 1, 1] and
+          aw['recs'][5]['routines'] == [] and 'before' not in aw['recs'][5] and aw['patrols'][3] == dict(
+              K=1, war=1, on0=0, on1=4, req=4, r0=0, r1=1, calls=13, faults=0, note='') and
+          aw['patrols'][5]['note'] == 'noview' and aw['cp'] == '1' and R.parse_aiwar('error unknown command') is None
+          and R.parse_aiwar('ok on=0 players=- | patrols - | cp=1')['players'] == {}, aw)
     check('result_box_side: the second player\'s result box (engine level 12): heads and points of both texts across the '
           'box\'s line breaks; ok for the victory from its side with the points swapped, not for a head left as the game '
           'wrote it; None without the line', r1 and r1['ok'] and (r1['head'], r1['own'], r1['enemy'], r1['g_head'],
@@ -798,6 +825,33 @@ def divisions_samples():
                                   dict(id='990002', name='Host Div B', ids=[])])
           and R.off_divisions(None) == dict(no=None, divs=[])
           and R.div_summary(got) == 'Host Div A[122.123]; Host Div B[]', got)
+
+
+def battlegen_samples():
+    """battle_generator's pick of J (0.7.3 regression): `attack_order` takes battle_pairs' candidates where J has a
+    possession worth MAJOR_POSS or more in the area first and keeps battle_pairs' order otherwise."""
+    cands = [(27, 33, 3, 'Northern Europe'), (20, 33, 7, 'Northern Europe'), (16, 19, 5, 'Southeast Asia'),
+             (5, 14, 8, 'The Mediterranean')]
+    pv = {(3, 'Northern Europe'): 12, (7, 'Northern Europe'): 200, (5, 'Southeast Asia'): 5,
+          (8, 'The Mediterranean'): 200, (3, 'The Baltic'): 200}
+    got = R.attack_order(cands, pv)
+    check('attack_order: the pairs where J has a possession worth >= MAJOR_POSS there first (Spain\'s Northwestern '
+          'Spain 200 before Russia\'s Northern Russia 12 in Northern Europe, the 0.7.3 group run\'s case), '
+          'battle_pairs\' order otherwise; without values (no `possessions` reply) battle_pairs\' order',
+          got == [(20, 33, 7, 'Northern Europe'), (5, 14, 8, 'The Mediterranean'), (27, 33, 3, 'Northern Europe'),
+                  (16, 19, 5, 'Southeast Asia')] and R.attack_order(cands, {}) == cands and R.MAJOR_POSS == 100, got)
+    whole = {'General': {}, 'Nation0': {'Name': 'Germany'}, 'Nation0Ships': {}, 'VERSION': {'GAME VERSION': 'x'}}
+    got = [R.battle_slot_unusable(whole, 'Germany'), R.battle_slot_unusable(whole, None),
+           R.battle_slot_unusable(dict(whole, Nation0={'Name': 'Great Britain'}), 'Germany'),
+           R.battle_slot_unusable({k: v for k, v in whole.items() if k != 'VERSION'}, 'Germany'),
+           R.battle_slot_unusable(None, 'Germany')]
+    check('battle_slot_unusable: the battle\'s own slot (nation K as nation 0, [VERSION] at its end) is usable; the '
+          'next battle\'s copy of the host\'s save before the swap (nation 0 Great Britain: default1 of the 0.7.3 RC, '
+          'ship_status d) M1) and a file still being written (no [VERSION]) are not; no file stays the callers\' case',
+          got[0] == '' and got[1] == '' and 'Great Britain' in got[2] and 'VERSION' in got[3] and got[4] == '', got)
+    got = R.lines_diff(['[A]', 'x=1', 'y=2', 'y=2'], ['[A]', 'x=1', 'y=2', 'z=3', 'w=4'])
+    check('lines_diff (disk_growth a)\'s diagnosis): the lines that occur more often before / after',
+          got == (['y=2'], ['z=3', 'w=4']), got)
 
 
 def tracefiles(sandbox):
@@ -1227,6 +1281,7 @@ def main():
     intel_samples()
     relations_samples()
     divisions_samples()
+    battlegen_samples()
     sandbox = os.path.abspath('regression_selftest_sandbox')
     if os.path.exists(sandbox):
         shutil.rmtree(sandbox)

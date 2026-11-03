@@ -287,9 +287,21 @@ int ViewNation();
 int RealIndexOf(void* nation);
 // 0.7.2: the relations mask (B2) puts back the ships on trade protection or raiding of a computer nation whose wars are all
 // with nations under the player's rules (as K's own since 0.7.1), and K's sea war frame runs its ASW effort (warfx.cpp).
-// TEST ONLY (bridge `aibuilds keep 0`): neither (0.7.1).
+// TEST ONLY (bridge `aibuilds keep 0`): neither (0.7.1). 0.7.3: only with `aiwar 0` (the war player's view replaces them).
 void TestMaskKeepAI(bool on);
 bool MaskKeepAI();
+// 0.7.3: the computer's war against a joined nation as in single player (game.cpp, "the computer's war against a joined
+// nation"). AIWarPlayer(j): the joined nation under the player's rules that is computer nation j's player this month (j at
+// war with it and at peace with the host's nation; the lowest index of several), 0 when none (real indices, not in a
+// view). AIWarViewEnter(K): K's view for a computer nation's routine on the host (the relations mask lifted for the call,
+// HostViewEnter with K's war counter, at least 1), false when not available; AIWarViewLeave puts everything back. Game
+// calls inside go under __try. AIWarInfo: the bridge's `aiwar` (this month's record). TEST ONLY TestAIWar(false): 0.7.2.
+int AIWarPlayer(int j);
+bool AIWarViewEnter(int K);
+void AIWarViewLeave();
+std::string AIWarInfo();
+void TestAIWar(bool on);
+bool AIWarOn();
 // 0.7.0 (invasions): the game's ShowMessage boxes recorded instead of shown (on); off returns the last text ("" none).
 std::wstring SetBoxCapture(bool on);
 int PlayerDeclineCalls();          // how often the game's DoPlayerDecline ran (the player declined a battle)

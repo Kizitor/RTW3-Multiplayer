@@ -40,5 +40,12 @@ std::string TestSea(const std::vector<std::string>& args);
 // latter). `keep 0` (TEST ONLY): 0.7.1, the relations mask doesn't put back the trade protection and raiders of a
 // computer nation whose wars are all with nations people play, and the sea war frames run no ASW effort for it.
 std::string AIBuildsCommand(const std::vector<std::string>& args);
+// 0.7.3, bridge `aiwar` (host): the computer's war against joined nations this month: "ok on=<0|1>
+// players=<J:K,...|-> | nation=J K=k routines=<the routines run in K's view> natwar=n colonies=c moves=m
+// [before=a/r/m/t/r/b/f after=...] ... | patrols <J:K=k war=w patrols=a->b/r raiders=x->y calls=c faults=f> ... |
+// cp=<0|1>" (statuses 0-6 of J's ships in play around its PutAIShipsInStatus; CheckPatrols' part in K's view). TEST
+// ONLY `aiwar 0|1` (0: 0.7.2) and `aiwar status <J> <from> <to> [n]` (J's operational capital ships, types 0-2, in play
+// from one status to another, those in a home area first; their CShipIds and how many are outside a home area).
+std::string AIWarCommand(const std::vector<std::string>& args);
 
 }  // namespace warfx

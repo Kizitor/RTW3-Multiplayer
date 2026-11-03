@@ -5181,7 +5181,9 @@ def peace_war(K, J, t=50):
 
 def scenario_battle_generator(ctx):
     """0.6.0 (B6): the player's battle generator for nation 1 under the player's rules, at war with a computer nation J
-    (`settension` on both copies). a) both logs "Player's battle generator for joined nations: ok", the client's hello
+    (`settension` on both copies; J and its area: battle_pairs' first where J has a possession worth MAJOR_POSS or more,
+    `attack_order`: nation 1's attack on a lesser possession can find no battle every time). a) both logs "Player's
+    battle generator for joined nations: ok", the client's hello
     "battle generator 1"; b) `battles gen 1` x20 (CheckForBattles2 in nation 1's view on the host, a dry run): attempts
     with nation 1 on one side and a computer nation on the other only, the host's relations unchanged, all attempts
     (decision 1: < 64, the old cap of 4 gone); `battles gen 1 fault` (decision 3: a game exception in the view): the
@@ -5216,10 +5218,17 @@ def scenario_battle_generator(ctx):
     if not cstate().get('fight'):  # (scenario battles ends with the client joined with `fightbattles 0`)
         log('  the client does not fight its battles: joins again with fightbattles 1', rejoin(ctx, K, True)[0])
     humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
-    cands = [c for c in battle_pairs(K) if c[2] not in humans]
-    if not check(f'setup: a computer nation with a possession in a sea area where nation {K} has >= 4 ships', cands,
-                 cands[:3]):
+    first = [c for c in battle_pairs(K) if c[2] not in humans]
+    pv = poss_values({c[2] for c in first})
+    cands = attack_order(first, pv)
+    if not check(f'setup: a computer nation with a possession in a sea area where nation {K} has >= 4 ships (one with a '
+                 f'possession worth >= {MAJOR_POSS} there first: `attack_order`)', cands,
+                 [c + (pv.get((c[2], c[3])),) for c in cands[:3]]):
         return
+    if cands[0] != first[0]:
+        log(f'  setup: battle_pairs\' first {first[0]} has no possession worth >= {MAJOR_POSS} there (its best: '
+            f'{pv.get((first[0][2], first[0][3]))}): nation {K}\'s attack there can find no battle every time; nation '
+            f'{cands[0][2]} in {cands[0][3]} instead')
     _, _, J, area = cands[0]
     t0 = rel(K, J).get('tension', '5')
     hr, cr = peace_war(K, J)
@@ -5330,12 +5339,20 @@ def scenario_battle_generator(ctx):
         merged = re.search(rf'battle {b} applied: .*(the player declined battle|the game\'s no-force rule, not a decline)',
                            hlog)  # 0.7.1: the game's no-force rule of nation 1's side is merged as a decline's is
         game = re.search(rf'battle {b} resolved by the game', hlog)
+        # 0.7.3: the computer's generator's battle that came to nothing on the client (`nobattle`: no decline) goes to
+        # the game's resolution by design ("No battle came about; the game resolves it.", only kind 0 falls back); a
+        # mobilized enemy (the computer's war against nation 1) can leave nation 1 too weak there after M2's battle
+        fallback = b == b0 and o == 'nobattle'
         check(f'd) battle {b} ({"the player" if b == b1 else "the computer"}\'s generator) declined on the client '
               f'({o}): merged with the decline\'s consequences, never resolved by the game (the enemy\'s decline, no '
-              f'battle or a preview without Decline: as such)',
-              b is not None and not game and ((o == 'declined' and merged) or o in ('avoided', 'nobattle') or
-                                               (o == 'fought' and rec_b.get('no_decline'))),
+              f'battle or a preview without Decline: as such; the computer\'s generator\'s no battle: the game\'s '
+              f'resolution, its design)',
+              b is not None and (not game or fallback) and ((o == 'declined' and merged) or o in ('avoided', 'nobattle')
+                                                            or (o == 'fought' and rec_b.get('no_decline'))),
               dict(outcome=o, lines=log_lines(hlog, rf'battle {b}\b')[-3:]))
+    if not any(drv.rec.get(b, {}).get('outcome') == 'declined' for b in (b1, b0)):
+        log(f'  SKIP-note d) no battle of d) was declined this run (outcomes '
+            f'{[drv.rec.get(b, {}).get("outcome") for b in (b1, b0)]}): the decline\'s merge not exercised')
     # e) the game's resolution: its box captured
     hm = log_mark(H)
     r = cmd(H, f'battles aitest {K} {J} {area}')
@@ -5413,11 +5430,14 @@ def applied_war_scores(hlog, bid):
 
 def search_pick(K, J, area, humans):
     """battle_search's attempts for a month, from the host's save of the latest month: area0, where nation K attacks J
-    (of J's candidates, `battle_pairs`, the one with most of J's ships that can fight; `area` without one), and (J2,
-    area2), where a second computer nation J2 attacks nation K: an area where K has a possession and ships that can fight
-    and J2 has at least two (most first); (None, None) without one."""
+    (of J's candidates, `battle_pairs`, one where J has a possession worth >= MAJOR_POSS first, as `attack_order`, then
+    the one with most of J's ships that can fight; `area` without one), and (J2, area2), where a second computer nation
+    J2 attacks nation K: an area where K has a possession and ships that can fight and J2 has at least two (most first);
+    (None, None) without one."""
     jf = fighting_ships_by_area(J)
-    a0 = max([c[3] for c in battle_pairs(K) if c[2] == J] or [area], key=lambda a: jf.get(a, 0))
+    pv = poss_values([J])
+    a0 = max([c[3] for c in battle_pairs(K) if c[2] == J] or [area],
+             key=lambda a: (pv.get((J, a), 0) >= MAJOR_POSS, jf.get(a, 0)))
     kf = fighting_ships_by_area(K)
     kp = {p['area'] for p in (poss_list(H, f'possessions {K}') or [])}
     best = None
@@ -5910,6 +5930,21 @@ def scenario_battle_surprise(ctx):
 
 # The host's log when a ship a joined nation's peace hands over is not that nation's on the host (game.cpp HandOverShip).
 PEACE_SHIP_SKIPPED = r"relations v2: peace of nation {K}: ship (\d+) \(.*?\) skipped: not among nation {K}'s ships"
+
+
+def battle_slot_unusable(g87, kname):
+    """Why the battle slot the BattleDriver read right after "battle N: fought" is not that battle's own ('' when it
+    is; None, no file, stays the callers' case): a file without its last section [VERSION] (still being written) or
+    one whose nation 0 is not nation K's name `kname` (the next battle's copy of the host's save before the mod made
+    nation K its player). The client copies its next battle into the slot within a second of "fought" (Known traps)."""
+    if g87 is None:
+        return ''
+    if 'VERSION' not in g87:
+        return 'no [VERSION] section (being written)'
+    n0 = (g87.get('Nation0') or {}).get('Name')
+    if kname and n0 != kname:
+        return f'its nation 0 is {n0}, not {kname} (the next battle\'s copy before the swap)'
+    return ''
 
 
 def battle_slot_race(drv, bid, within=3.0):
@@ -6810,10 +6845,14 @@ def scenario_battle_invasion(ctx):
             else:
                 e3what = (f'e3) battle {e3["bid"]} at {t3} ({weak[0][3]} ships of J, {weak[0][4]} of nation 1 in '
                           f'{weak[0][2]}), its setup an intelligence coup\'s ambush (`battles testcoup 1`: forced=+1)')
-                e3ok = amb and not afb and e3['rec'].get('outcome') in ('declined', 'fought')
+                pv = e3['rec'].get('preview_t')
+                # (0.7.3 RC's default run: Liaotung Peninsula, J's 2 ships there none that could fight, the game's
+                # no-force rule for J's side before any preview, "Enemy unable to challenge our forces in the area!":
+                # avoided, the invasion goes ahead; no setup reached the ambush's step either way)
+                e3ok = amb and not afb and (e3['rec'].get('outcome') in ('declined', 'fought')
+                                            or e3['rec'].get('outcome') == 'avoided' and not pv)
                 e3ev = dict(testcoup=(on, off), att=e3['att'][-1:], setup=e3['setup'][-2:], boxes=afb,
                             answers=e3['rec'].get('answers'))
-                pv = e3['rec'].get('preview_t')
                 if rein:
                     check(f'{e3what}: the reinforcements of nation 1\'s side got its nation ("had no nation ... gave '
                           f'them nation 0"), no AdjustForcesForBattle box, {e3["rec"].get("outcome")}',
@@ -6832,7 +6871,8 @@ def scenario_battle_invasion(ctx):
                            f'{weak[0][2]}; the candidates {weak[:3]}), so the reinforcement step met no unset nation'
                            if weak[0][0] <= 0 else
                            f'the battle never came to its preview (answers {e3["rec"].get("answers")}: e.g. the game\'s '
-                           f'"Friendly ships not available to oppose the enemy in the area!"), so no battle was set up'
+                           f'"Friendly ships not available to oppose the enemy in the area!" or "Enemy unable to '
+                           f'challenge our forces in the area!"), so no battle was set up'
                            if not pv else
                            f'the reinforcement step met no unset nation although J outnumbers nation 1 there '
                            f'({weak[0][3]} ships of J, {weak[0][4]} of nation 1 in {weak[0][2]}; the candidates '
@@ -7719,6 +7759,48 @@ def saved_ship_status(n, ids, slot=HOST_SLOT):
     return {i: (sh.get(i) or {}).get('Status', 'missing') for i in ids}
 
 
+AIWAR_PATROL_RE = re.compile(r'(\d+):K=(\d+) war=(-?\d+) patrols=(-?\d+)->(-?\d+)/(-?\d+) raiders=(\d+)->(\d+) '
+                             r'calls=(\d+) faults=(\d+)( exception| noview)?')
+
+
+def parse_aiwar(r):
+    """`aiwar` (0.7.3, host) -> dict(on, players {J: K}, recs {J: dict(K, routines [...], natwar, colonies, moves: its ship
+    orders changed by the strategic moves in K's view (-1 no view, -2 not run), before/after: J's ships in play by status
+    0-6 around its PutAIShipsInStatus)}, patrols {J: dict(K, war, on0, on1, req, r0, r1, calls, faults, note)}, cp:
+    CheckPatrols' part installed, raw), or None (an error: an older build)."""
+    if not (r or '').startswith('ok '):
+        return None
+    parts = [p.strip() for p in r[3:].split('|')]
+    head = dict(x.split('=', 1) for x in parts[0].split() if '=' in x)
+    out = dict(on=head.get('on') == '1', players={}, recs={}, patrols={}, cp=None, raw=r)
+    for x in (head.get('players') or '-').split(','):
+        if ':' in x:
+            j, k = x.split(':', 1)
+            out['players'][int(j)] = int(k)
+    for p in parts[1:]:
+        if p.startswith('nation='):
+            d = dict(x.split('=', 1) for x in p.split() if '=' in x)
+            rec = dict(K=int(d.get('K', 0)), natwar=int(d.get('natwar', 0)), colonies=int(d.get('colonies', 0)),
+                       moves=int(d.get('moves', -2)),
+                       routines=[x for x in d.get('routines', '-').split(',') if x and x != '-'])
+            for k in ('before', 'after'):
+                if k in d:
+                    rec[k] = [int(v) for v in d[k].split('/')]
+            out['recs'][int(d['nation'])] = rec
+        elif p.startswith('patrols'):
+            for m in AIWAR_PATROL_RE.finditer(p):
+                out['patrols'][int(m[1])] = dict(K=int(m[2]), war=int(m[3]), on0=int(m[4]), on1=int(m[5]),
+                                                 req=int(m[6]), r0=int(m[7]), r1=int(m[8]), calls=int(m[9]),
+                                                 faults=int(m[10]), note=(m[11] or '').strip())
+        elif p.startswith('cp='):
+            out['cp'] = p[3:].strip()
+    return out
+
+
+def aiwar(port=None):
+    return parse_aiwar(cmd(port or H, 'aiwar'))
+
+
 def scenario_ai_escorts(ctx):
     """0.7.2: the computer's escorts against a joined player's nation (a report on 0.7.1: "The AI is spamming building
     corvettes in a seemingly random way"). Nation 1's sea war frame (0.6.0, B5 (c): CheckSubmarineActivity in its view on
@@ -7735,11 +7817,14 @@ def scenario_ai_escorts(ctx):
     patrols at the requirement). b) M2 with `aibuilds keep 0` (TEST: 0.7.1's mask, no ASW effort in the frame) after the
     same setup: the ships set are back from trade protection (slot 1, the log's "TEST: not kept"): the check of a)
     catches the 0.7.1 behaviour (the escorts the frame laid down for J are logged). Ends at peace (peace_war), keep 1,
-    nation 1's war counter as before."""
+    nation 1's war counter as before. 0.7.3 (`aiwar`): J's ships stay on trade protection through its PutAIShipsInStatus
+    at war in nation 1's view (the host log's "nation J's PutAIShipsInStatus in nation 1's view (at war)") instead of the
+    mask's keep; b) runs with `aiwar 0` too (0.7.1 needs both off)."""
     K = 1
     if aibuilds() is None:
         log('  ai_escorts: the build under test has no `aibuilds` (0.7.2): skipped')
         return
+    aw = aiwar() is not None  # 0.7.3: the war player's view
     rr = relrules(H)
     if not check('start: nation 1 follows the player\'s rules (`relrules`) and the host answers `warfx`',
                  rr is not None and K in rr and warfx_state() is not None, dict(relrules=rr)):
@@ -7767,6 +7852,8 @@ def scenario_ai_escorts(ctx):
         for step, keep in (('a', 1), ('b', 0)):
             label = f'ai_escorts M{1 if step == "a" else 2}'
             cmd(H, f'aibuilds keep {keep}')
+            if aw:
+                cmd(H, f'aiwar {keep}')
             p0 = aib_patrol(J, K, set_=True)
             cmd(H, 'aibuilds clear')
             hm = log_mark(H)
@@ -7779,31 +7866,189 @@ def scenario_ai_escorts(ctx):
             esc = [b for b in aibuilds() or [] if b['nation'] == J and b['cause'] == 'escorts']
             sea = [x.split('] ', 1)[-1] for x in log_lines(ht, rf'warfx: sea war of nation {K} \(enemies ')]
             kept = [x.split('] ', 1)[-1] for x in log_lines(ht, rf'relations v2: nation {J} at war')]
+            seen = [x.split('] ', 1)[-1] for x in log_lines(ht, rf"relations v2: nation {J}'s PutAIShipsInStatus in nation "
+                                                                rf"{K}'s view \(at war\)")]
             log(f'  {label}: J {J} {nJ} before {p0["raw"]}; after {p1["raw"]}; saved statuses {st} (Status 3 in '
                 f'slot {HOST_SLOT}: {saved3}); escorts of J in the month {esc}; sea frame {[x[:160] for x in sea]}; '
-                f'mask {kept}')
+                f'mask {kept}; at war in nation {K}\'s view {[x[:160] for x in seen]}')
             req = p0.get('requiredK', 0)
             ok_setup = req > 0 and p0.get('onPatrol', -1) >= req and bool(p0['patrolIds'])
             if step == 'a':
+                why = (f'J\'s PutAIShipsInStatus at war in nation {K}\'s view (the host log, 0.7.3)' if aw else
+                       f'the host log\'s "nation {J} at war (a computer nation, ...): N ship(s) ... kept" (0.7.2)')
                 check(f'a) {label}: before it J\'s ships on trade protection up to its requirement in nation {K}\'s view '
                       f'(TEST `aibuilds patrol {J} {K} set`: {p0.get("onPatrol")} of {req}); nation {K}\'s sea war frame '
-                      f'ran; after it J still at its requirement (`aibuilds patrol`, slot {HOST_SLOT}\'s Status 3), the '
-                      f'host log\'s "nation {J} at war (a computer nation, ...): N ship(s) ... kept"; no escort of J laid '
-                      f'down in nation {K}\'s view (`aibuilds`)', ok_setup and bool(sea) and
+                      f'ran; after it J still at its requirement (`aibuilds patrol`, slot {HOST_SLOT}\'s Status 3), '
+                      f'{why}; no escort of J laid down in nation {K}\'s view (`aibuilds`)', ok_setup and bool(sea) and
                       p1.get('onPatrol', -1) >= req and saved3 >= req and
-                      any('a computer nation' in x and 'kept' in x for x in kept) and
+                      (bool(seen) if aw else any('a computer nation' in x and 'kept' in x for x in kept)) and
                       not [b for b in esc if b['view'] == K], dict(before=p0['raw'], after=p1['raw'], saved=st,
                                                                     saved3=saved3, escorts=esc,
-                                                                    sea=[x[:200] for x in sea], mask=kept))
+                                                                    sea=[x[:200] for x in sea], mask=kept,
+                                                                    seen=[x[:200] for x in seen]))
             else:
                 back = sum(v not in ('3', 'missing') for v in st.values())
-                check(f'b) {label} with `aibuilds keep 0` (TEST: 0.7.1\'s mask, no ASW effort in the frame): the ships set '
-                      f'back from trade protection (slot {HOST_SLOT}, the log\'s "TEST: not kept"): a) catches the 0.7.1 '
-                      f'behaviour', ok_setup and bool(st) and back >= max(1, len(st) - 1) and
-                      any('TEST: not kept' in x for x in kept), dict(before=p0['raw'], after=p1['raw'], saved=st,
-                                                                     escorts=esc, mask=kept))
+                check(f'b) {label} with `aibuilds keep 0`{" and `aiwar 0`" if aw else ""} (TEST: 0.7.1\'s mask, no ASW '
+                      f'effort in the frame{", no war player\'s view" if aw else ""}): the ships set back from trade '
+                      f'protection (slot {HOST_SLOT}, the log\'s "TEST: not kept"): a) catches the 0.7.1 behaviour',
+                      ok_setup and bool(st) and back >= max(1, len(st) - 1) and
+                      any('TEST: not kept' in x for x in kept) and not seen,
+                      dict(before=p0['raw'], after=p1['raw'], saved=st, escorts=esc, mask=kept, seen=seen))
     finally:
         cmd(H, 'aibuilds keep 1')
+        if aw:
+            cmd(H, 'aiwar 1')
+        peace_war(K, J, t0)
+        if kw0 is not None and not any(rel(K, x).get('war') == '1' for x in range(9) if x != K):
+            cmd(H, f'kwar {K} {kw0}')
+
+
+AIWAR_VIEW = ('EvaluateBuildingStrategy', 'AINationAdjustBudget', 'AIMonthlyBuild', 'PutAIShipsInStatus')
+
+
+def scenario_ai_war(ctx):
+    """0.7.3: the computer's war against a joined player's nation as in single player. A computer nation J at war only
+    with nation 1 (under the player's rules) saw that war nowhere in the host's month until 0.7.3: the war is not with
+    nation 0, and the relations mask (B2) hides the pair inside ReduceTimeLimits, so J ran its monthly routines at peace:
+    PutAIShipsInStatus put ships in reserve and mothballed them instead of bringing every ship back into service,
+    AINationAdjustBudget had no war budget, AIMonthlyBuild no war building (corvettes against the player's submarines and
+    more), NationIsAtWar answered peace (peace budget cuts, the maintenance's reset of trade protection), CheckPatrols' part
+    for a nation at war with the player (ASW patrols, AINationAssignRaiders: raiders against the player) never ran, and J
+    kept moving ships to its colonies. Since 0.7.3 nation 1 is J's war player: those routines run in its view on the host
+    (`aiwar`). Setup: a computer nation J at peace with everyone, war 1-J on both copies (`peace_war`: nation 1's war counter
+    1). a) M1 (`aiwar 1`): before it three of J's operational capital ships in active service put in reserve (TEST `aiwar
+    status J 0 1 3`: those in a home area first, then those elsewhere: a fleet some months at war is away from home); after
+    it: a1) J's monthly routines ran in nation 1's view (`aiwar`: EvaluateBuildingStrategy, AINationAdjustBudget,
+    AIMonthlyBuild, PutAIShipsInStatus; the host log's "its monthly routines run in nation 1's view"); a2) the ships put in
+    reserve are back in service (slot 1: none in reserve, none mothballed unless J is in debt: the game's debt rule
+    mothballs old ships at war too; the log's "PutAIShipsInStatus in nation 1's view (at war)"); a3) NationIsAtWar
+    answered at war for J behind the mask and J made no colonial move (`aiwar` natwar, colonies);
+    a4) CheckPatrols' part ran for J in nation 1's view without a fault (`aiwar` patrols, the host log's "CheckPatrols for
+    nation J in nation 1's view"); its raiders (J's ships on Status 4 or 5 after it, slot 1) as AINationAssignRaiders drew
+    them (none: a SKIP-note); a5) J's ships laid down in the month (`aibuilds`) all in nation 1's view (none laid down: a
+    note). b) M2 with TEST `aiwar 0` (0.7.2) after the same setup: the ships put in reserve stay there (slot 1), no
+    routine of J in nation 1's view, no CheckPatrols part: a) catches 0.7.2. c) (no month) J also at war with another
+    computer nation: nation 1 stays its war player (`aiwar` players); also at war with the host's nation: none (the host
+    is its player, the game's own rules); the tensions put back. Ends with `aiwar 1`, peace 1-J (the tension
+    before) and nation 1's war counter as before."""
+    K = 1
+    a0 = aiwar()
+    if a0 is None:
+        log('  ai_war: the build under test has no `aiwar` (0.7.3): skipped')
+        return
+    rr = relrules(H)
+    if not check('start: nation 1 follows the player\'s rules (`relrules`); `aiwar` answers on=1 with CheckPatrols\' part '
+                 '(cp=1)', rr is not None and K in rr and a0['on'] and a0['cp'] == '1', dict(relrules=rr, aiwar=a0['raw'])):
+        return
+    cmd(H, 'mpwindow')
+    cmd(C, 'mpwindow')
+    nt = nation_table()
+    humans = set(kwar_counters(H) or {}) | {0, K, STANDIN}
+    cands = [j for j in range(3, 9) if j not in humans and j in nt and rel(K, j).get('war') == '0' and
+             rel(K, j).get('ally') == '0' and not any(rel(j, x).get('war') == '1' for x in range(9) if x != j)]
+    if not check('setup: a computer nation at peace with everyone, not allied with nation 1, the host at peace',
+                 bool(cands) and not (rel(0, 1).get('warCounter', '0').lstrip('-').isdigit() and
+                                      int(rel(0, 1)['warCounter']) > 0), dict(cands=cands)):
+        return
+    J = cands[0]
+    nJ = nt[J]['name']
+    t0 = int(rel(K, J).get('tension', 5))
+    kw0 = (kwar_counters(H) or {}).get(K)
+    hr, cr = peace_war(K, J)
+    a1 = aiwar()
+    check(f'setup: war {K}-{J} ({nJ}) on both copies; `aiwar` lists nation {K} as J\'s war player',
+          hr.get('war') == '1' and 'war=1' in (cr or '') and (a1 or {}).get('players', {}).get(J) == K,
+          dict(host=hr, client=cr, aiwar=(a1 or {}).get('raw')))
+    try:
+        for step, on in (('a', 1), ('b', 0)):
+            label = f'ai_war M{1 if step == "a" else 2}'
+            cmd(H, f'aiwar {on}')
+            put = cmd(H, f'aiwar status {J} 0 1 3')
+            pd = dict(x.split('=', 1) for x in put.split()[1:] if '=' in x) if put.startswith('ok ') else {}
+            ids = [x for x in pd.get('ids', '-').split(',') if x and x != '-']
+            cmd(H, 'aibuilds clear')
+            hm = log_mark(H)
+            war_month(ctx, label, K, J)
+            ht = log_since(H, hm)
+            aw = aiwar() or {}
+            st = saved_ship_status(J, ids)
+            ships = ships_by_id((read_save(save_path(HOST_SLOT)) or {}).get(f'Nation{J}Ships'))
+            raiders = [i for i, f in ships.items() if f.get('InPlay') == '1' and f.get('Status') in ('4', '5')]
+            builds = [b for b in aibuilds() or [] if b['nation'] == J]
+            rec = aw.get('recs', {}).get(J, {})
+            pat = aw.get('patrols', {}).get(J)
+            lv = [x.split('] ', 1)[-1] for x in log_lines(ht, rf"relations v2: nation {J} at war with nation {K} \(a "
+                                                               rf"nation people play\), at peace with the host's nation")]
+            ls = [x.split('] ', 1)[-1] for x in log_lines(ht, rf"relations v2: nation {J}'s PutAIShipsInStatus in nation "
+                                                               rf"{K}'s view \(at war\)")]
+            lp = [x.split('] ', 1)[-1] for x in log_lines(ht, rf"warfx: CheckPatrols for nation {J} in nation {K}'s view")]
+            log(f'  {label}: J {J} {nJ}: put in reserve {put}; after: saved {st}; raiders {raiders}; aiwar {aw.get("raw")}; '
+                f'lay-downs {builds}; logs {[x[:200] for x in lv + ls + lp]}')
+            if step == 'a':
+                check(f'a1) {label}: J\'s monthly routines ran in nation {K}\'s view (`aiwar` routines '
+                      f'{", ".join(AIWAR_VIEW)}; the host log\'s "its monthly routines run in nation {K}\'s view")',
+                      set(AIWAR_VIEW) <= set(rec.get('routines', [])) and rec.get('K') == K and bool(lv),
+                      dict(rec=rec, log=lv[:2]))
+                fv = value(cmd(H, f'nfield {J} Funds'))
+                try:
+                    funds = float(fv)
+                except (TypeError, ValueError):
+                    funds = None
+                debt = funds is not None and funds < 0
+                check(f'a2) {label}: the {len(ids)} capital ship(s) of J put in reserve before it are back in service (slot '
+                      f'{HOST_SLOT}: none in reserve, none mothballed unless J is in debt (the game\'s debt rule, at war '
+                      f'too); the log\'s "PutAIShipsInStatus in nation {K}\'s view (at war)")',
+                      len(ids) >= 1 and all(v != '1' for v in st.values()) and
+                      (debt or all(v != '2' for v in st.values())) and bool(ls),
+                      dict(put=put, saved=st, funds=fv, log=ls[:1], before=rec.get('before'), after=rec.get('after')))
+                check(f'a3) {label}: NationIsAtWar answered at war for J behind the mask (`aiwar` natwar), J made no '
+                      f'colonial move (`aiwar` colonies) and its strategic moves ran in nation {K}\'s view (`aiwar` moves '
+                      f'>= 0)', rec.get('natwar', 0) >= 1 and rec.get('colonies', 0) >= 1 and rec.get('moves', -2) >= 0,
+                      dict(rec=rec))
+                check(f'a4) {label}: CheckPatrols\' part ran for J in nation {K}\'s view (`aiwar` patrols: its war counter '
+                      f'above 0, no fault; the host log\'s "CheckPatrols for nation {J} in nation {K}\'s view"); its '
+                      f'raiders on Status 4/5 in slot {HOST_SLOT} at least those it assigned',
+                      bool(pat) and pat['K'] == K and pat['war'] >= 1 and pat['faults'] == 0 and not pat['note'] and
+                      bool(lp) and len(raiders) >= pat['r1'] - pat['r0'], dict(patrols=pat, raiders=raiders,
+                                                                               log=lp[:1]))
+                if pat and pat['r1'] <= pat['r0']:
+                    log(f'  SKIP-note a4) {label}: AINationAssignRaiders assigned J no raider this month (the game\'s draw: '
+                        f'{pat["r0"]} -> {pat["r1"]})')
+                if builds:
+                    check(f'a5) {label}: J\'s ships laid down in the month all in nation {K}\'s view (`aibuilds`)',
+                          all(b['view'] == K for b in builds), dict(builds=builds))
+                else:
+                    log(f'  note a5) {label}: J laid down no ship in the month')
+            else:
+                check(f'b) {label} with TEST `aiwar 0` (0.7.2): the capital ships put in reserve stay out of service (slot '
+                      f'{HOST_SLOT}: in reserve or mothballed, at least one of them), no routine of J in nation {K}\'s view, '
+                      f'no CheckPatrols part: a) catches 0.7.2',
+                      len(ids) >= 1 and any(v in ('1', '2') for v in st.values()) and not rec.get('routines') and
+                      not pat and not lv and not ls and not lp, dict(put=put, saved=st, rec=rec, patrols=pat))
+        # c) who is J's player with another war (no month: `aiwar` answers from the relations now)
+        cmd(H, 'aiwar 1')
+        C2 = next((j for j in cands[1:] if rel(J, j).get('war') == '0'), None)
+        res = {}
+        if C2 is not None:
+            tc = int(rel(J, C2).get('tension', 5))
+            for port in (H, C):
+                cmd(port, f'settension {J} {C2} 50')
+            res['computer'] = (aiwar() or {}).get('players', {}).get(J)
+            for port in (H, C):
+                cmd(port, f'settension {J} {C2} {tc}')
+        th = int(rel(0, J).get('tension', 5))
+        for port in (H, C):
+            cmd(port, f'settension 0 {J} 50')
+        res['host'] = (aiwar() or {}).get('players', {}).get(J)
+        for port in (H, C):
+            cmd(port, f'settension 0 {J} {th}')
+        res['after'] = (aiwar() or {}).get('players', {}).get(J)
+        check(f'c) J at war with nation {K} and a computer nation{f" ({C2})" if C2 else ""}: nation {K} its war player; also '
+              f'at war with the host\'s nation: no war player (the host is its player, the game\'s own rules); the '
+              f'tensions put back', (C2 is None or res.get('computer') == K) and res.get('host') is None and
+              res.get('after') == K, dict(res, computer_nation=C2))
+    finally:
+        cmd(H, 'aiwar 1')
         peace_war(K, J, t0)
         if kw0 is not None and not any(rel(K, x).get('war') == '1' for x in range(9) if x != K):
             cmd(H, f'kwar {K} {kw0}')
@@ -7837,7 +8082,8 @@ def stance_live_hook(st, what, rec, A, B, r):
     """ls_month's live hook for the stance switch. 'load' (both copies at the loaded boundary): `ls teststance N` on both
     copies alike. 'minutes' (after the live minutes): up to 10 more live minutes until both copies forced the case, then
     the client disarmed and the host armed for its battle after the drop (`side=1`: the dropped player's destroyer
-    divisions, which the computer commands then); no minute runs between this and the drop."""
+    divisions, which the computer commands then); no minute runs between this and the drop. 'minutes-run' and
+    'minutes-arm' are its two halves (a month with several switches runs every switch's minutes before arming any)."""
     nofix = ' nofix' if st['nofix'] else ''
     if what == 'load':
         for p in (A, B):
@@ -7845,22 +8091,24 @@ def stance_live_hook(st, what, rec, A, B, r):
             st['arm'][who_of(p)] = scmd(p, f'ls teststance {STANCE_N}{nofix}')
         log(f'  stance switch armed: {st["arm"]}')
         return
-    if what != 'minutes':
+    if what in ('minutes', 'minutes-run'):
+        extra = 0
+        for _ in range(10):
+            k = {who_of(p): stance_kv(p) for p in (A, B)}
+            if all(k[w].get('forced', 0) > st['c0'].get(w, {}).get('forced', 0) for w in k):
+                break
+            extra += ls_run_total(A, B, 1, A)
+        st['extra'] = extra
+    if what not in ('minutes', 'minutes-arm'):
         return
-    extra = 0
-    for _ in range(10):
-        k = {who_of(p): stance_kv(p) for p in (A, B)}
-        if all(k[w].get('forced', 0) > st['c0'].get(w, {}).get('forced', 0) for w in k):
-            break
-        extra += ls_run_total(A, B, 1, A)
-    st['extra'] = extra
     st['live'] = {who_of(p): stance_kv(p) for p in (A, B)}
     scmd(B, 'ls teststance 0')
     # (nofix: the game shows its box at most once in 20 minutes (TfrmMain +0x73d, cleared when the minute count is a
     # multiple of 20) and the live minutes showed it: more runs, past the next clearing)
     st['after_arm'] = scmd(A, f'ls teststance {STANCE_N * 15 if st["nofix"] else STANCE_N} side=1{nofix}')
     st['after0'] = stance_kv(A)
-    log(f'  stance switch: live {st["live"]} (+{extra} minutes); the host armed for after the drop: {st["after_arm"]}')
+    log(f'  stance switch: live {st["live"]} (+{st.get("extra", 0)} minutes); the host armed for after the drop: '
+        f'{st["after_arm"]}')
 
 
 def stance_checks(st, rec, tag):
@@ -7911,6 +8159,124 @@ def stance_checks(st, rec, tag):
           f'({after["fixed"]}), no game error box "Error in AIDetermineTacticalStance2 procedure!" on either copy, the '
           f'battle fought to its end and the month went on',
           (st['after_arm'] or '').startswith('ok') and after['forced'] >= 1 and after['fixed'] == after['forced'] and
+          not errs and not boxes['host'] and rec.get('date0') != sstatus(C).get('date'),
+          dict(arm=st['after_arm'], after=after, errs=errs[:2], host=hk))
+
+
+# 0.7.3 (fix-convoy): divisions whose ships are gone in the battle AI's loops. ConvoyEscortCheck (the course routine of a
+# computer's convoy escort division) sends the other side's scouts and support cruisers towards the convoy; its loop over
+# that force's divisions reads each one's flagship without checking it has ships ("Error in ConvoyEscortCheck procedure!
+# Access violation ... Read of address 000009D3": a division emptied by its reattach in the end-of-minute walk stays in
+# its force until the next walk). `ls testconvoy <n> [side=<s>] [nofix]` (TEST) runs ConvoyEscortCheck for the next n
+# computer's divisions in the course routine, its inner loop at once with the other side's force's first division
+# emptied for it; the mod's fix passes such a division over. RTW3_CONVOY_NOFIX=1 (diagnosis) arms it with `nofix`: the
+# game's own loop, its box.
+CONVOY_N = 3
+CONVOY_BOX_RE = r"box 'Error in ConvoyEscortCheck"
+CONVOY_FIX_RE = r'battle AI: ConvoyEscortCheck: division .* passed it over'
+
+
+def convoy_kv(port):
+    """`ls testconvoy` -> {'fix', 'armed', 'side', 'forced', 'fixed', 'rear', 'core', 'scout', 'hooked'} as ints."""
+    return parse_stance(scmd(port, 'ls testconvoy'))
+
+
+def convoy_setup():
+    return dict(nofix=os.environ.get('RTW3_CONVOY_NOFIX') == '1', arm={}, c0={}, live={}, after_arm=None, t0=time.time())
+
+
+def convoy_live_hook(st, what, rec, A, B, r):
+    """ls_month's live hook for the convoy switch, as stance_live_hook: 'load' (both copies at the loaded boundary): `ls
+    testconvoy N` on both copies alike. 'minutes': up to 10 more live minutes until both copies forced the case, then the
+    client disarmed and the host armed for its battle after the drop (`side=0`: the host's divisions, which then look at
+    the dropped player's force, the computer's since the drop: the report's case); no minute runs between this and the
+    drop. 'minutes-run' and 'minutes-arm' are its two halves."""
+    nofix = ' nofix' if st['nofix'] else ''
+    if what == 'load':
+        for p in (A, B):
+            st['c0'][who_of(p)] = convoy_kv(p)
+            st['arm'][who_of(p)] = scmd(p, f'ls testconvoy {CONVOY_N}{nofix}')
+        log(f'  convoy switch armed: {st["arm"]}')
+        return
+    if what in ('minutes', 'minutes-run'):
+        extra = 0
+        for _ in range(10):
+            k = {who_of(p): convoy_kv(p) for p in (A, B)}
+            if all(k[w].get('forced', 0) > st['c0'].get(w, {}).get('forced', 0) for w in k):
+                break
+            extra += ls_run_total(A, B, 1, A)
+        st['extra'] = extra
+    if what not in ('minutes', 'minutes-arm'):
+        return
+    st['live'] = {who_of(p): convoy_kv(p) for p in (A, B)}
+    scmd(B, 'ls testconvoy 0')
+    st['after_arm'] = scmd(A, f'ls testconvoy {CONVOY_N} side=0{nofix}')
+    st['after0'] = convoy_kv(A)
+    log(f'  convoy switch: live {st["live"]} (+{st.get("extra", 0)} minutes); the host armed for after the drop: '
+        f'{st["after_arm"]}')
+
+
+def convoy_checks(st, rec, tag):
+    """The checks of the convoy switch after the month (see convoy_live_hook), and the guards' startup lines."""
+    su = {w: log_lines(log_since(p), r"ConvoyEscortCheck's loop over a force's divisions: |Divisions without ships in "
+                       r"the battle AI's other loops: |The division stance routine's guard \(") for w, p in
+          (('host', H), ('client', C))}
+    check(f'{tag}: both copies started with the guards for divisions whose ships are gone (0.7.3): "ConvoyEscortCheck\'s '
+          f'loop over a force\'s divisions: ok ...", "... RearDivisionHasNoSightedEnemy ok ..., the walk\'s '
+          f'core-follower check ok ..., MoveDivisionShips\' scout lead ok ...", "The division stance routine\'s guard '
+          f'(...): on (every battle)"',
+          all(any('divisions: ok' in x for x in v) and any('RearDivisionHasNoSightedEnemy ok' in x and
+                                                          'core-follower check ok' in x and 'scout lead ok' in x
+                                                          for x in v) and
+              any('on (every battle)' in x for x in v) for v in su.values()),
+          {w: [x.split('] ', 1)[-1][:120] for x in v[-3:]] for w, v in su.items()})
+    if not st['arm']:
+        log(f'  SKIP-note {tag}: no live battle in the month: the convoy switch was not armed')
+        return
+    hk = convoy_kv(H)
+    scmd(H, 'ls testconvoy 0')
+    r = next((x for x in rec['live'] if x.get('A') == H), None)
+    hl, cl = log_since(H, rec['hmark']), log_since(C, rec['cmark'])
+    boxes = {'host': log_lines(hl, CONVOY_BOX_RE), 'client': log_lines(cl, CONVOY_BOX_RE)}
+    fixl = {'host': log_lines(hl, CONVOY_FIX_RE), 'client': log_lines(cl, CONVOY_FIX_RE)}
+    errs = [e for e in game_error_boxes(rec['t0']) if 'ConvoyEscortCheck' in e[1]]
+    live = {w: dict(forced=st['live'].get(w, {}).get('forced', 0) - st['c0'].get(w, {}).get('forced', 0),
+                    fixed=st['live'].get(w, {}).get('fixed', 0) - st['c0'].get(w, {}).get('fixed', 0))
+            for w in ('host', 'client')}
+    after = dict(forced=hk.get('forced', 0) - st.get('after0', {}).get('forced', 0),
+                 fixed=hk.get('fixed', 0) - st.get('after0', {}).get('fixed', 0))
+    others = {k: hk.get(k) for k in ('rear', 'core', 'scout')}
+    hc = (r or {}).get('hash') or {}
+    des = (r or {}).get('desync') or []
+    armed = all((st['arm'].get(w) or '').startswith('ok') and 'hooked=1' in st['arm'][w] for w in ('host', 'client'))
+    same = r is not None and hc.get('minutes', 0) >= 12 and not hc.get('differ') and not des
+    if st['nofix']:
+        check(f'{tag}: DIAGNOSIS (RTW3_CONVOY_NOFIX=1: `ls testconvoy {CONVOY_N} nofix`, the game\'s own loop): '
+              f'ConvoyEscortCheck\'s loop at a division without ships shows the game\'s box: in the live minutes on both '
+              f'copies alike ("minute box \'Error in ConvoyEscortCheck procedure! ...\'", every minute equal, no DESYNC), '
+              f'after the drop on the host (its divisions looking at the dropped player\'s force: the game\'s box "Error in '
+              f'ConvoyEscortCheck procedure! Access violation ... Read of address 000009D3")',
+              armed and live['host']['forced'] >= 1 and live['host']['forced'] == live['client']['forced'] and
+              boxes['host'] and boxes['client'] and same and after['forced'] >= 1 and errs,
+              dict(arm=st['arm'], live=live, after=after, boxes={w: len(v) for w, v in boxes.items()}, errs=errs[:2],
+                   hash=(hc.get('minutes'), hc.get('differ')), desync=des[:1]))
+        return
+    check(f'{tag}: ConvoyEscortCheck\'s loop met a division without ships in the live battle (`ls testconvoy {CONVOY_N}` '
+          f'on both copies at its start, TEST: a computer\'s division runs ConvoyEscortCheck, the other side\'s first '
+          f'division emptied for its inner loop): forced on both copies alike ({live["host"]["forced"]}/'
+          f'{live["client"]["forced"]}), the fix passed it over each time ("battle AI: ConvoyEscortCheck: division ... '
+          f'passed it over"), no box, every minute equal on both copies (+{st.get("extra", 0)} minutes), no DESYNC',
+          armed and live['host']['forced'] >= 1 and live['host'] == live['client'] and
+          live['host']['fixed'] >= live['host']['forced'] and fixl['host'] and fixl['client'] and
+          not boxes['host'] and not boxes['client'] and same,
+          dict(arm=st['arm'], live=live, fixlines=(len(fixl['host']), len(fixl['client'])), boxes=boxes,
+               hash=(hc.get('minutes'), hc.get('differ')), desync=des[:1]))
+    check(f'{tag}: after the drop the host\'s battle (the computer commands the dropped player\'s ships) with the switch '
+          f'for side 0 (`ls testconvoy {CONVOY_N} side=0`: the host\'s divisions looking at the dropped player\'s force): '
+          f'forced {after["forced"]}, the fix passed the division over each time ({after["fixed"]}), no game error box '
+          f'"Error in ConvoyEscortCheck procedure!" on either copy, the battle fought to its end and the month went on '
+          f'(the other guards\' passes, natural: {others})',
+          (st['after_arm'] or '').startswith('ok') and after['forced'] >= 1 and after['fixed'] >= after['forced'] and
           not errs and not boxes['host'] and rec.get('date0') != sstatus(C).get('date'),
           dict(arm=st['after_arm'], after=after, errs=errs[:2], host=hk))
 
@@ -8007,8 +8373,10 @@ def scenario_war_effects(ctx):
             cmd(port, f'shipbuilder {J} {sj[0]} {K}')
     vp0, e0, l0 = nint(H, K, 'VP'), value(cmd(H, 'ffield EnemyVP')), kwarvp(K)
     h0 = nint(H, 0, 'VP')
+    wbm0 = nint(H, K, 'BudgetModifier')  # (20 in most runs; the earlier events can leave another: 19 in the 0.7.3 RC's)
     hm, cm = log_mark(H), log_mark(C)
     war_month(ctx, 'war_effects M1', K, J)
+    wbm1 = nint(H, K, 'BudgetModifier')
     rl = [x.split('] ', 1)[-1] for x in wait_log(H, hm, r'relations of .*\(nation 1;', 30)]
     ht, ct = log_since(H, hm), log_since(C, cm)
     cr1 = blockade_credits(ht)
@@ -8042,8 +8410,10 @@ def scenario_war_effects(ctx):
     wl = [x.split('] ', 1)[-1] for x in log_lines(ht, r'warfx: war weariness')]
     kl = [x for x in wl if 'of nation 1 (' in x]
     sm = [x for x in wl if 'this month' in x]
-    check(f'M1: nation {K}\'s war weariness by its own war counter and score (government 2, BM 20, winning): no unrest; '
-          f'the game\'s own rule for the other eight nations', len(kl) == 1 and 'government 2, BM 20' in kl[0] and
+    bms = sorted({b for b in (wbm0, wbm1) if b is not None})
+    check(f'M1: nation {K}\'s war weariness by its own war counter and score (government 2, its own BM '
+          f'{"/".join(map(str, bms))} before/after the month, winning): no unrest; the game\'s own rule for the other '
+          f'eight nations', len(kl) == 1 and any(f'government 2, BM {b},' in kl[0] for b in bms) and
           'no (not losing)' in kl[0] and bool(sm) and
           all(f'{n},' in sm[0].split("game's own for ", 1)[-1] for n in (0, 2, 3, 4, 5, 6, 7, 8)), wl[:3])
     cb = [x.split('] ', 1)[-1] for x in log_lines(ct, r'relations v2: building for war for nation 1 ')]
@@ -8186,9 +8556,20 @@ def scenario_war_effects(ctx):
           dict(r01=r01, kj=rel(K, J), client=(cmd(C, 'rel 0 1'), cmd(C, f'rel {K} {J}'), nint(C, K, 'UnrestLevel')),
                revotest=rt))
     stc = stance_setup()
-    rec = ls_month(ctx, 'war_effects M4', modes=('drop12',),
-                   live_hook=lambda what, rc, A, B, r: stance_live_hook(stc, what, rc, A, B, r))
+    cvc = convoy_setup()
+
+    def m4_live(what, rc, A, B, r):
+        # (every switch's extra live minutes before any switch arms the host alone for after the drop)
+        for step in (('minutes-run', 'minutes-arm') if what == 'minutes' else (what,)):
+            for fn, st in ((stance_live_hook, stc), (convoy_live_hook, cvc)):
+                try:
+                    fn(st, step, rc, A, B, r)
+                except Exception as e:  # noqa: BLE001
+                    log(f'  !! live battle hook {fn.__name__} ({step}): {e!r}')
+
+    rec = ls_month(ctx, 'war_effects M4', modes=('drop12',), live_hook=m4_live)
     stance_checks(stc, rec, 'M4')
+    convoy_checks(cvc, rec, 'M4')
     rl = [x.split('] ', 1)[-1] for x in wait_log(H, rec['hmark'], r'relations of .*\(nation 1;', 30) or []]
     ht, ct = log_since(H, rec['hmark']), log_since(C, rec['cmark'])
     rv = [x.split('] ', 1)[-1] for x in log_lines(ct, r'relations v2: revolution: ')]
@@ -8791,6 +9172,28 @@ def battle_pairs(K, slot=HOST_SLOT, exclude=(STANDIN,)):
     return sorted(cands, reverse=True)
 
 
+MAJOR_POSS = 100  # attack_order: a possession worth this much (the 1900 fixture's home provinces: 200)
+
+
+def poss_values(nations):
+    """{(J, area): the value of J's most valuable possession in that sea area} from the host's `possessions J`."""
+    out = {}
+    for j in nations:
+        for p in poss_list(H, f'possessions {j}') or []:
+            out[(j, p['area'])] = max(out.get((j, p['area']), 0), p['value'])
+    return out
+
+
+def attack_order(cands, values):
+    """battle_pairs' candidates (J's ships, K's ships, J, area) in the order battle_generator takes them for nation K's
+    own attacks (`battles injectgen K J area`): those where J has a possession worth MAJOR_POSS or more in the area
+    first (values: `poss_values`), then battle_pairs' order. The player's attack on a lesser possession can find no
+    battle every time: nation 1 attacking Russia in Northern Europe (its one possession there, Northern Russia, worth
+    12) found none in all 118 attempts of the recorded runs (never the computer's decision either), so with Russia first
+    (0.7.3: its earlier war's moves put 27 of its ships there) battle_generator's d), f2/f3 and g) to i) had none."""
+    return sorted(cands, key=lambda c: values.get((c[2], c[3]), 0) < MAJOR_POSS)
+
+
 def inject(K, J, area):
     """Host `battles inject K J area` -> (battle id or None, reply)."""
     r = cmd(H, f'battles inject {K} {J} {area}')
@@ -8885,6 +9288,13 @@ class BattleDriver:
                         self.g87_stale[int(b[0])] = f'"fought" at {pre[:12]}, slot {BATTLE_SLOT} written at {mt}'
                         log(f'  battle {b[0]}: slot {BATTLE_SLOT} was rewritten for the next battle before it was read '
                             f'({self.g87_stale[int(b[0])]})')
+                    else:
+                        why = battle_slot_unusable(self.g87[int(b[0])],
+                                                   ((self.s0 or {}).get(f'Nation{self.K}') or {}).get('Name'))
+                        if why:
+                            self.g87_stale[int(b[0])] = f'"fought" at {pre[:12]}, slot {BATTLE_SLOT} read then: {why}'
+                            log(f'  battle {b[0]}: slot {BATTLE_SLOT} read after "fought" was not the battle\'s own '
+                                f'({self.g87_stale[int(b[0])]}): the client was copying its next battle there')
                 log(f'  battle {b[0]}: {b[1]} after {r2["done"] - r2["sent"]:.0f} s; answered {r2["answers"]}')
         sent = re.findall(r'battle (\d+) sent to', h)
         if not sent:
@@ -20696,6 +21106,28 @@ def line_count(path):
         return None
 
 
+def ini_lines(slot):
+    """The lines of a save slot's INI files (.bcs, .off, MapData): {file name: [line, ...]} ([] for a missing file)."""
+    out = {}
+    for fn in (f'RTWGame{slot}.bcs', f'RTWGame{slot}.off', f'MapData{slot}.dat'):
+        try:
+            with open(os.path.join(slot_dir(slot), fn), 'rb') as f:
+                out[fn] = f.read().decode('utf-8-sig', errors='replace').splitlines()
+        except OSError:
+            out[fn] = []
+    return out
+
+
+def lines_diff(a, b, n=8):
+    """The distinct lines that occur more often in a / in b (at most n each)."""
+    cnt = {}
+    for x in a:
+        cnt[x] = cnt.get(x, 0) + 1
+    for x in b:
+        cnt[x] = cnt.get(x, 0) - 1
+    return [x for x, v in cnt.items() if v > 0][:n], [x for x, v in cnt.items() if v < 0][:n]
+
+
 def slot_audit(slot):
     """A save slot's files (name -> size), their total, and the counts of the lists a load could append to: intel
     reports, air units, campaign divisions, officers, ships, designs, and the line counts of the INI files."""
@@ -20778,13 +21210,19 @@ def scenario_disk_growth(ctx):
     mods0 = mod_files_audit()
     # a) reload cycles: nothing of the campaign changes, so nothing may grow
     for port, slot, who, player in ((H, HOST_SLOT, 'host', 0), (C, CLIENT_SLOT, 'client', 1)):
-        rows = []
+        rows, prev = [], None
         for i in range(DISK_RELOADS + 1):
             r = cmd(port, 'save', 120)
             a = slot_audit(slot)
             rows.append(a)
             log(f'  {audit_line(f"{who} reload {i}", a)}; private memory {private_mb(ctx.hp if port == H else ctx.cp)} MB'
                 + ('' if r.startswith('ok') else f' (save: {r})'))
+            cur = ini_lines(slot)
+            for fn in cur if prev else ():  # (the 0.7.3 RC's --stress run: the host's .bcs +1 line after the first load)
+                if len(cur[fn]) != len(prev[fn]):
+                    gone, new = lines_diff(prev[fn], cur[fn])
+                    log(f'    {fn}: {len(prev[fn])} -> {len(cur[fn])} lines; only before: {gone}; only after: {new}')
+            prev = cur
             if i < DISK_RELOADS:
                 lr = cmd(port, f'load {slot} {player} mod', 180)
                 if not lr.startswith('ok'):
@@ -21303,6 +21741,13 @@ SCENARIOS = [  # name, months processed, what it guards, function
                       'the log\'s "kept"), no escort of J laid down in nation 1\'s view (aibuilds); M2 with TEST '
                       'aibuilds keep 0 (0.7.1): back in active service (the check catches it); ends at peace',
      scenario_ai_escorts),
+    ('ai_war', 2, '0.7.3: the computer\'s war against nation 1 as in single player: a computer nation J at war only with '
+                  'nation 1; M1: three of J\'s capital ships put in reserve (TEST aiwar status) back in service, J\'s '
+                  'monthly routines (EvaluateBuildingStrategy, AINationAdjustBudget, AIMonthlyBuild, PutAIShipsInStatus) '
+                  'in nation 1\'s view, NationIsAtWar at war behind the mask, no colonial move, CheckPatrols\' part '
+                  '(ASW patrols, AINationAssignRaiders) in nation 1\'s view (aiwar, slot 1, the host log); M2 with TEST '
+                  'aiwar 0 (0.7.2): the ships stay out of service (the check catches it); ends at peace',
+     scenario_ai_war),
     ('player_copy', 1, 'a joined player\'s "Copy game" (0.2.7): the client\'s copy (copygame = the game\'s '
                        'CopyGameToOtherSlot through the hook) is its own campaign (its nation is nation 0, the host\'s '
                        'nation AI nation 1; relations, sections, numbers, war state, cooldowns, map, divisions, designs '
@@ -21475,7 +21920,7 @@ GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), i
     'live-limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_data', 'lockstep_rejoin', 'lockstep_resume',
                     'lockstep_torpedo', 'lockstep_air', 'lockstep_strike', 'lockstep_missiles'),
     'relations': ('relations_peace', 'war_effects', 'arms_treaty', 'battle_generator', 'battle_surprise',
-                  'battle_raider', 'relations_war', 'ai_escorts'),
+                  'battle_raider', 'relations_war', 'ai_escorts', 'ai_war'),
     'battlegen': ('battle_generator', 'battle_surprise', 'battle_raider', 'battle_invasion'),
     'twopc': ('twopc',),
     'legacy': ('legacy_fleet',),
@@ -21491,7 +21936,7 @@ EST = dict(session=14, intel_reports=1, file_lock=4, events=4, merge=17, researc
            lockstep_torpedo=470, lockstep_stress=1310, lockstep_air=265, air_units=65, lockstep_strike=420,
            lockstep_missiles=330, twopc=175, relations_peace=40, war_effects=220, arms_treaty=150,
            battle_generator=340, battle_surprise=60, battle_raider=300, battle_invasion=600, relations_war=40, lockstep_data=15, divisions=90,
-           legacy_fleet=420, disk_growth=330, disk_full=230, ship_status=180, ai_escorts=60)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s), + f)'s month (dist_sf7_2, 2026-10-28: 91-104 s with c) fought in its first month), + g) to i) (dist_bs2, 2026-11-01: 336 s in all, two battles fought, one try again);
+           legacy_fleet=420, disk_growth=330, disk_full=230, ship_status=180, ai_escorts=60, ai_war=60)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s), + f)'s month (dist_sf7_2, 2026-10-28: 91-104 s with c) fought in its first month), + g) to i) (dist_bs2, 2026-11-01: 336 s in all, two battles fought, one try again);
 # ship_status: dist_rc070_2 (0.7.0), 2026-10-28 (167-175 s, four months, one with a fought battle)
 # ai_escorts: dist_fix4 (0.7.2-dev), 2026-11-01 (about 55 s, two months)
 # divisions: dist_fd_2, 2026-10-25 (90 s, two months)

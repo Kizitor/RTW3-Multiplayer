@@ -36,6 +36,9 @@ bool SetPlayerSide(int side);   // the battle's human side (display test; the si
 bool SetDivisionOrder(int idx, int course, int speed, int ai);  // as the course/speed boxes do (tests)
 // 0.7.2: the destroyer stance routine's second ask (a game bug); installed at the mod's start, every battle on this PC
 bool InstallStanceAskFix();
+// 0.7.3: the battle AI's loops over divisions whose ships are gone (ConvoyEscortCheck and others, a game bug) and the
+// division stance routine's guard; installed at the mod's start, every battle on this PC
+bool InstallEmptyDivisionGuards();
 
 // ---- live sessions ----
 typedef std::function<void(const std::string& payload)> SendFn;  // to the other PC (session routes it)

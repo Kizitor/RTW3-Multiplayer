@@ -13,6 +13,7 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
 - [Research speed and the missile era](#research-speed-and-the-missile-era)
 - [Intelligence, trade protection and foreign stations](#intelligence-trade-protection-and-foreign-stations)
 - [The computer's escorts against the player's submarines](#the-computers-escorts-against-the-players-submarines)
+- [The computer's war against its player](#the-computers-war-against-its-player)
 - [Campaign divisions (the Fleet organization tab)](#campaign-divisions-the-fleet-organization-tab)
 - [The legacy fleet: the manual build of the starting fleet](#the-legacy-fleet-the-manual-build-of-the-starting-fleet)
 - [Tactical battles](#tactical-battles)
@@ -1219,6 +1220,65 @@ the mod's sessions; [MODLOG](../MODLOG.md#fix-2026-11-01-the-computers-corvettes
   Germany 5) 2-3 corvettes a month; in 1958 (France against Germany's 14 submarines, a requirement of 17) `AIBuildShip`
   laid down nothing in the frames of war months 2-4 and 2 corvettes in the fifth.
 
+## The computer's war against its player
+Static reading of 1.01.44 and live measurements of 2026-11-02 (the 1935 test campaign, single player and the mod's
+sessions; [MODLOG](../MODLOG.md#fix-2026-11-02-the-computers-war-against-a-joined-nation-as-in-single-player-mobilization-war-budget-war-building-patrols-raiders-and-moves-v073-dev)).
+A computer nation's own routines tell a war with the player (nation 0: its `Tension` above 40 and the war counter
+`War` above 0, often only `Tension` > 40) from a war with another computer nation (`IsAtAIWar`: an `AITension` cell
+1..8 above 40) and do more against the player; several of them run only while the player is at war (`War` > 0) and
+then for every computer nation.
+- **`ReduceTimeLimits`' loop of the computer's nations** (0xc7bfc4, i = 1..8, once a month): `EvaluateBuildingStrategy(i)`
+  0xcd31cc (the `BuildingStrategy` +0x2bb from the economy; at `War` > 0 and `Tension` > 40 also from the player's
+  strength), `DeHaltAllShips`, `AINationAdjustBudget` 0xc78658 (`BudgetModifier` +0x1a0 up while `Tension` or the most
+  tense `AITension` is above 5: from 25 up only while `NationIsAtWar` or `IsAtAIWar`, each time at Random(20) <
+  `Tension` (always at the player's war tension), else 1 in 20, else at war 1 in 2; the intelligence report "<nation> is
+  said to have increased the naval budget"), `AIMonthlyBuild` 0xcaa34c (its war rules, all against the player:
+  corvettes against the player's submarines, [above](#the-computers-escorts-against-the-players-submarines);
+  submarines more likely at `NationIsAtWar`; at `War` > 0 and `Tension` > 40 armed merchant cruisers against the
+  player's submarines and its own armed merchant cruisers, 0xcabcc8-0xcabea2), `CheckAIRebuilds`, four times
+  `GetMonthlyBalance` / `HaltMostExpensiveShip`, `PutAIShipsInStatus` 0xcc16dc, `DetermineAINationResearch`, then the
+  alliance with nation 0 (a separate peace of the player's ally at war: `IsAtAIWar`, 0xc7c366). `CheckAIRebuilds`,
+  `DetermineAINationResearch` and `HaltMostExpensiveShip` read no war state. Before the loop the routine's own peace
+  rules for every nation read `NationIsAtWar` (0xc7b2a0, 0xc7b839: a high `BudgetModifier` cut at peace) and
+  `ProductivityGain` (no productivity gain at war for a government other than 0, or when blockaded).
+- **`PutAIShipsInStatus(nation)`**: at war = (`War` > 0 and `Tension` > 40) or `IsAtAIWar` (0xcc171c-0xcc173f). At war:
+  `ReviseASWEffort`, and every operational ship in reserve or mothballed (Status 1, 2) back in active service wherever it
+  is (0xcc1776-0xcc17bf, no area test: the war flag overrides the tension draws); none is put in reserve, mothballed or
+  scrapped as obsolete. At peace the same ships come back only at Random(5) + 7 < `Tension` and Random(100) < `Tension`
+  + 18, active ships in a home area go to reserve by age and tension (0xcc1803-0xcc18ce), and with a negative balance to
+  reserve and mothballs (0xcc1914-0xcc1b9a); obsolete ships are scrapped. In debt (monthly balance and funds below 0) it
+  mothballs, at war too, ships older than 8 years in a home area at 50 % (obsolete ones, else at 50 % more), whatever
+  their status, trade protection included (0xcc1d26-0xcc1dc3).
+- **`CheckPatrols`** 0xcc7dc4 (`DoStrategicTurn` 0xce1d0a, every month; it ends at once at `War` <= 0): the player's
+  coast complaint, then for each nation 1..8 with `Tension` > 40 six times `PutShipOnASWPatrol` while below its patrol
+  requirement and `CheckAINationShipsOnTradePatrol`, then `AINationAssignRaiders(i)` 0xcd12c0: only while
+  `PlayerNation.Blockaded` (+0x1c5) is 0; while its raiders (Status 4) are fewer than Random(FleetSize) + 1 (else at a
+  tonnage test), six passes over its operational cruisers and armed merchant cruisers (types 3, 4, 7) with `Range`
+  (+0xbe) above 0: at 5 % (15 % more with range 2, 20 % more outside a home area) one is put on Status 5 (a raider that
+  must break out), and the call usually ends after one. The merchant loss fields (`MerchantsLostToSubsThisTurn` +0x188,
+  `...ToRaidersThisTurn` +0x18c, `MoraleSinkingsThisTurn` +0x190) of every nation are zeroed right after the call
+  (0xce1d25): read after the month they hold the month's losses.
+- **Raiders.** `AreaMoveShips` (`DoTurn2`) turns Status 5 into 4 when `CheckBreakout` 0xccf8d4 lets the ship out: always
+  while its nation is not blockaded, else (in its build or blockade area, `War` > 0, at war with the player) the
+  blockading navy may intercept it ("Patrolling <nation> ship intercepts <nation> raider running the blockade.").
+  `CheckRaiderSinkings(raider nation, defender)` 0xcce858 rolls for every operational Status 4 ship of the raider
+  nation against the defender: 20 (cruisers, armed merchant cruisers), 15 or 12 by type, less where the defender's ships
+  are many; x 1.5 in the defender's home area, at least 4 next to its build area, 2 where it has no possession: raiders
+  have no target nation, every enemy of their nation is rolled against.
+- **The computer's strategic moves** (`DoTurn2`'s unnamed routine 0xcf024c, every nation in one call, before
+  `AreaMoveShips`): at `War` > 0 every nation's reserve ships come back at 60 % (0xcf089d); at war with the player
+  (`War` > 0 and `Tension` > 40, or allied with the player) its cruisers in active service, raiding or on foreign
+  stations without orders go to random adjacent areas (0xcf0a11-0xcf0abb, raiders included); its ships go to its most
+  important area (`GetMostImportantArea`, which scores the player's and the most tense nation's areas) at 90 % a month at
+  war with the player, else at `Tension` x 3 % (0xcf053d).
+- **`CheckShipsOnForeignStations`** (`DoStrategicTurn` 0xce1cea) runs only at `War` <= 0: then the player's colonial
+  force check and, for every computer nation, `MaybeSendHomeShipInColonies` and `AISendShipToColonies` per area short of
+  force; at war no nation moves ships to or from its colonies.
+- In multiplayer the game's player is the host's nation: a computer nation J at war with a joined nation K under the
+  player's rules (relations v2) met none of this for that war (the mod's relations mask hid the pair even from
+  `IsAtAIWar` inside `ReduceTimeLimits`). Since 0.7.3 K is J's player for these routines while J is at peace with the
+  host's nation (ARCHITECTURE, [each joined nation's relations](ARCHITECTURE.md#each-joined-nations-relations-relations-v2)).
+
 ## Campaign divisions (the Fleet organization tab)
 Static reading of 1.01.44 and live runs of 2026-10-25 on 0.6.0 and 0.6.1-dev
 ([MODLOG](../MODLOG.md#fix-2026-10-25-campaign-divisions-of-joined-players-and-duplicated-divisions-v061)).
@@ -1602,8 +1662,54 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     independent division its flagship's `InitialDivision` as `LeadDivision` with `Role` drCore (0xdb1258, `Random(100)
     < 20`) without checking that division has ships. Since 0.7.0 the lockstep hooks put a guard
     before the routine (`LS_StanceGuard`, all battles once the hooks are in: a live battle, the host's battle after a
-    drop): an empty `LeadDivision` becomes nil with `Role` drIndependent, an empty `TargetDiv` nil, as the walk does,
-    with the log line `lockstep: stance guard: division '<name>' ...`.
+    drop; since 0.7.3 installed at the mod's start, every battle: see the next item): an empty `LeadDivision` becomes
+    nil with `Role` drIndependent, an empty `TargetDiv` nil, as the walk does, with the log line
+    `lockstep: stance guard: division '<name>' ...`.
+  - *Divisions whose ships are gone in the battle AI's loops* (fix 0.7.3; a game bug of every battle, single player too).
+    A division's ships leave it only by `TDivision.DeleteShip` (the minute's sinkings, `AllShipsCheckSinkings` right
+    before the walk), `DetachShip` (the computer's detaches all need two ships or more: 0xdac2f1, 0xdb8be5, 0xdd018f,
+    0xdd0ae8; the battle screen's Detach can take every ship) and the reattach (0xdc7020, from the walk at 0xdb11bd: a
+    detached division "<ship> *" gives all its ships back to their `InitialDivision`; log "<ship> has reattached to
+    <division>"). The walk checks a division's ships at the top of its iteration (0xdb0c3a), so a division the reattach
+    empties stays in its force's `Divisions` and the division list until the next walk; so does one a player's Detach
+    empties, and the minute's sunk divisions stay until the backward walk reaches them (its `DetachShip`s for the
+    divisions after them run the new division's stance and course routines meanwhile). `RemoveDivFromForces` takes a
+    division only out of its own `myForce`. The StartMinute division loop (0xd955b8) stops at the first division without
+    ships (0xd95609 `je` past the loop: the divisions below it get no AI that minute). Routines that loop over a force's or
+    the walk's divisions and read a division's flagship without checking its ships read nil then:
+    `ConvoyEscortCheck` (0xdf8554, a `TfrmMain` method without an RTTI name: Self EAX, the division EDX; the course
+    routine 0xd968e4 calls it at 0xd96a41 for a computer's division whose force's `ForceMission` is tfmEscort (4) and
+    whose flagship is no TR, CV or LT) finds its convoy (`GetConvoyDivision` 0xe61484 of the force's `MainForce`: a TR
+    division with ships named "Convoy..." or "Invasion...", else a TR division of 2+ ships), then looks twice at a force
+    of the other side (a nested procedure 0xdf8110; the forces from 0xbf6504: the side's "Main force", "Friendly force"
+    or "Enemy force", else its first force by flagship type; and 0xbf66ac: the side's "Support Force", else the last
+    force of the list, of either side). That look needs the force `AIControlled`, `ForceWithdraw` < 2, its flag division
+    with ships, under 30 % damage and `Role` independent, a sighting or `Random(100)` < 50, `Random(30)` = 1 and a branch
+    by stance, ammunition and ranges; then 0xdf7ad4 moves the flag division towards the convoy and loops over the force's
+    `Divisions` (0xdf7e71): a drScout division, or a drSupport division whose flagship is a BC, CA or CL with
+    `Random(100)` < 50, under 30 % damage is sent towards the convoy (" Cruisers sent towards convoy."), after each one
+    `Random(100)` < 50 ends the loop. The drSupport test reads `GetFlagship.ShipType` (0xdf7e9a/0xdf7e9f): for a
+    division without ships "Error in ConvoyEscortCheck procedure! Access violation at address <image base + 0x5c7e9f>
+    ... Read of address 000009D3" (2026-11-02's run b5 of the simultaneous battles: 0x7E7E9F with base 0x220000, the
+    host's battle 54 s after the drop); a drScout one reaches `GetClosestEnemyShip(nil)` (a read of 0xAD9). The handler
+    (0xdf898c) shows its box every time (no flag) and the routine stops (its later draws and its second look skipped).
+    The same unchecked read is in `RearDivisionHasNoSightedEnemy` (0xdf78fc, the course routine of a withdrawing
+    force's division: the divisions following it, their flagship's `SightedShips`; a detached division keeps its
+    original's `LeadDivision`), the walk's check of the core divisions following one lead (0xdb1b5d, the human side's
+    "has more than one core division follwing!" fix; the count 0xd77420 includes divisions without ships) and
+    `MoveDivisionShips`' scout lead (0xdb3d88: the lead tested for nil only). Checked and safe: the StartMinute loop's
+    lead (0xd9561e), `CheckObjectives` 0xdabca7 (only reached with `Role` independent: never), the division target
+    selection 0xd940d8 (`CanSeeShip(nil)` answers False), `BoxFormation`, `IdentifyType`, `GetConvoyDivision`; the
+    battle screen's lists (`FillSelectLead` and its turn-away twin skip "*" divisions, `FillDivTargetList`,
+    `GetNext/PreviousCarrierDivision`, `GlobeClick`) are the player's, between minutes. Since 0.7.3 the mod hooks the
+    four loops at the mod's start (every battle on every PC; `lockstep::InstallEmptyDivisionGuards`): a division
+    without ships is passed over as the loop passes over one of no interest (for the scout's lead: the routine's way for
+    no lead), as it reads after the next walk; no random draw is added or skipped where the game goes on, only shared
+    state is read. Logs `battle AI: ConvoyEscortCheck: division '<name>' (side <s>) (role <r>) at t=<time> has no ships
+    left ...; the routine's loop over that force's divisions passed it over ...` and the like (at most 20 a guard and a
+    game). The 0.7.0 stance guard is in from the mod's start too (every battle; before, with the lockstep hooks).
+    Proven live with `ls testconvoy` (2026-11-02, TESTING.md): see MODLOG, Fix 2026-11-02: ConvoyEscortCheck's box
+    after a drop.
   - *The destroyer routine's second ask* (fix 0.7.2; a game bug of every battle, single player too). In its branch for
     a closest enemy beyond 0.9 of its guns' range (0xdbd853: the enemy no big ship, the flagship under fire
     (`ShipsFiringAtMeTot` +0xbf9 > 0), no scout role, not `WithdrawMe`, no own bigger ship type within 20000 yards:

@@ -247,6 +247,13 @@ belong to 0.4.0.
     ["one battle at a time": battles per month, the host's battle first, several players](#investigation-2026-11-01-one-battle-at-a-time-battles-per-month-the-hosts-battle-first-several-players-v072-dev)
   - Testing:
     [the 0.7.2 release candidates dist_rc072_1 and dist_rc072_2](#testing-2026-11-02-the-072-release-candidates-dist_rc072_1-and-dist_rc072_2-v072)
+- **0.7.3** (the computer's war against joined nations as in single player and the battle AI's divisions without ships;
+  its entries carry "0.7.3-dev" or "0.7.3")
+  - Fix:
+    [the computer's war against a joined nation as in single player: mobilization, war budget, war building, patrols, raiders and moves](#fix-2026-11-02-the-computers-war-against-a-joined-nation-as-in-single-player-mobilization-war-budget-war-building-patrols-raiders-and-moves-v073-dev)
+    [ConvoyEscortCheck's box after a drop: divisions whose ships are gone in the battle AI's loops](#fix-2026-11-02-convoyescortchecks-box-after-a-drop-divisions-whose-ships-are-gone-in-the-battle-ais-loops-v073-dev)
+  - Testing:
+    [the 0.7.3 release candidate dist_rc073_1](#testing-2026-11-02-the-073-release-candidate-dist_rc073_1-v073)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -8655,3 +8662,411 @@ the logs of every run are kept with the developers' session files (`r721\logs_*`
   and no game error box (but `disk_full`'s own) in either candidate; the default set on the first, every `--stress` and
   `--group relations` scenario on the second (with its two fixes), mixed versions both ways with the expected
   differences. The start-up condition above is the test machine's, not 0.7.2's.
+
+## Fix 2026-11-02: the computer's war against a joined nation as in single player: mobilization, war budget, war building, patrols, raiders and moves (v0.7.3-dev)
+The goal: every nation nobody plays is the computer's and behaves as in single player, towards the joined players'
+nations too. The 0.7.2 corvettes fix ([above](#fix-2026-11-01-the-computers-corvettes-against-a-joined-players-submarines-an-escort-class-every-month-v072-dev))
+listed what still differed for a computer nation J whose wars are all with joined nations K: its `PutAIShipsInStatus`
+saw peace (ships put in reserve and mothballed during the war), it sent no raiders against K (`AINationAssignRaiders`),
+and `AIMonthlyBuild`'s corvette rules read nation 0's war and submarines only. This entry measures them against single
+player with K's nation as the player, checks the other routines that branch on a war with the player, and gives J's war
+against K the player's rules.
+
+**Measured** (the 1935 test campaign `fixture1935` copied into throwaway slots; K = Germany (nation 1), J = France
+(nation 2: 38 ships in play, 4 battleships, 6 cruisers, 23 destroyers), one month of peace, then 11 war months from
+March 1935; single player = the same start with Germany as nation 0 (the mod's Copy game transform, `spp1935`), war 0-2;
+multiplayer = the host's Great Britain at peace, Germany joined, war 1-2 on both copies; one game session: single player,
+then multiplayer with TEST `aiwar 0` (0.7.2: the code paths of 0.7.2) and `aiwar 1`; J's ships from the month's save, its
+lay-downs from `aibuilds`, K's merchant losses from the host's sea war frame (multiplayer) or nation 0's loss fields):
+
+| France in war months 1-11 | single player, Germany the player | multiplayer 0.7.2 (`aiwar 0`) | multiplayer 0.7.3 (`aiwar 1`) |
+|---|---|---|---|
+| ships in reserve (28 / 27 / 25 at peace a month before) | 0 every month | 24, 19, 10, 9, 6, 6, 6, 7, 5, 4, 4 | 0 every month |
+| mothballed (`PutAIShipsInStatus` in debt: ships older than 8 years, at war too) | 0-9 | 0-2 | 0-8 |
+| active / on trade protection, a month | 11-24 / 8-18 | 5-8 / 0-16 | 6-30 / 5-16 |
+| raiders (Status 4 or 5) | 1-2 in 9 of 11 months | none | 1 every month |
+| BudgetModifier, start -> month 11 | 11 -> 21 | 11 -> 14 | 11 -> 21 |
+| funds at the end (lowest) | -3,466 (-10,050) | +9,002 | -17,103 (-23,453) |
+| ships under construction, most | 26 | 14 | 20 |
+| laid down | 14 corvettes (`AIMonthlyBuild`), 8 escorts | 7 destroyers (`AIMonthlyBuild`), 2 escort destroyers, a seaplane tender | 6 corvettes (`AIMonthlyBuild`), 18 escorts |
+| Germany's merchants sunk by France's raiders / submarines | 4 (3 months) / 31 | 0 / 30 | 2 (2 months; Germany blockaded in 7 of 10 frames: no enemy raiders then) / 27 |
+| war score Germany : France at the end | 10,506 : 4,332 | 9,267 : 644 | 6,387 : 6,634 |
+
+- In single player France called up its whole reserve in the first war month, kept 8-18 ships on trade protection and 1-2
+  raiders out, raised its budget from 11 to 21 and went into debt building corvettes. Under 0.7.2 it stayed demobilized
+  (24 ships in reserve in the first war month, 4 still in the eleventh; 5-8 active), kept its peace budget (11 -> 14,
+  funds positive), sent no raider and scored 644 points in 11 months. With the fix it mobilized in the first war month
+  as in single player (25 in reserve the month before, 0 from then on), had a raider out every month, the same budget
+  (11 -> 21) and debt, and scored 6,634 points (it blockaded Germany in 7 of 10 sea war frames).
+- The multiplayer runs' patrols: 0.7.2's sea war frame filled them from the second war month (7, 13, 16 of 16), the fix
+  from the first in CheckPatrols' part (`on trade protection 0 -> 6 of 16 required, raiders 0 -> 1`, then 5 -> 11, 11 ->
+  16; later 13-15 -> 16 a month: battles, damage and the debt's mothballing take some off between the months, so the
+  escorts rule of Germany's frame laid down 18 escorts in 7 months (single player: 8 in 4)).
+- The record of the fix's months: `aiwar` `routines=EvaluateBuildingStrategy,AINationAdjustBudget,AIMonthlyBuild,
+  PutAIShipsInStatus`, `natwar=726-778` (NationIsAtWar answers turned to "at war" a month, mostly the maintenance's),
+  `colonies=17`, `moves=25-31` (France's ship orders and statuses from the strategic moves in Germany's view);
+  `PutAIShipsInStatus in nation 1's view (at war): before 23 active, 8 reserve, ...; after 30 active, 1 reserve, ...` in
+  the first war month (the rule takes operational ships only).
+
+**Cause** (static reading of 1.01.44, [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-computers-war-against-its-player)):
+a computer nation's own routines tell a war with the player (nation 0: its `Tension` above 40 and `War` above 0) from a
+war with another computer nation (`IsAtAIWar`) and do more against the player. J's war with K is neither in the host's
+month: K is not nation 0, and the relations mask (B2) hides the pair inside `ReduceTimeLimits`, so there J is at peace
+even for `IsAtAIWar` and `NationIsAtWar`.
+- `PutAIShipsInStatus` (`ReduceTimeLimits`' loop of the computer's nations): at war = (`War` > 0 and `Tension` > 40) or
+  `IsAtAIWar` (0xcc171c). At war every operational ship in reserve or mothballed comes back into service (0xcc17b9), none
+  goes to reserve or is scrapped as obsolete, and `ReviseASWEffort` runs. J took the peace branch every month.
+- `AINationAdjustBudget` (the budget rises with the player's tension, at war also from 25 up), `AIMonthlyBuild` (the
+  corvette rules against the player's submarines, armed merchant cruisers at `War` > 0 and `Tension` > 40, submarines at
+  `NationIsAtWar`), `EvaluateBuildingStrategy` (its war branch): J saw its tension with the host's nation and no war.
+- `ReduceTimeLimits`' own rules: with `NationIsAtWar` false a high budget is cut at peace (0xc7b2a0) and
+  `ProductivityGain` gives the productivity gain of peace; J's maintenance reset its trade protection and raiders (0.7.2
+  put them back afterwards).
+- `CheckPatrols` (`DoStrategicTurn`, before `ReduceTimeLimits`): the six ASW patrol steps and `AINationAssignRaiders` run
+  only for the nations at war with nation 0. 0.7.2's sea war frame ran the patrol steps for J from K's second war month,
+  without raiders.
+- The strategic moves (`DoTurn2`'s unnamed routine 0xcf024c): at war with the player cruisers without orders, raiders
+  included, go to random adjacent areas, and 90 % of the ships to the most important area (else `Tension` x 3 %: J's
+  tension with the host).
+- `CheckShipsOnForeignStations` runs only while the player is at peace: J kept moving ships to and from its colonies.
+- Nothing to change in `CheckAIRebuilds`, `DetermineAINationResearch` and `HaltMostExpensiveShip` (no war state read).
+- J at war with K and with a computer nation C (not the host): `IsAtAIWar` was true through C (the generic war
+  branches ran, `ReviseASWEffort` against the host's submarines), the player-war parts against K missing as above (and
+  0.7.2's sea frame did nothing for such a J). J at war with K and the host: the host is its player and the game's own
+  rules run (no mask issue); its raiders, assigned against the host, roll against K's merchants too in K's sea war frame
+  (raiders have no target nation: `CheckRaiderSinkings`).
+
+**Fix** (game.cpp, warfx.cpp; protocol 3 and the live-battle engine 18 unchanged; host only): K is J's player for the
+month (`game::AIWarPlayer`: J at war with a nation under the player's rules, the lowest index of several, and at peace
+with the host's nation; at war with the host the host stays its player). J's routines with a war-with-the-player branch
+run once a month, at their own place in the month, in K's view (`AIWarViewEnter`: the mask's real cells back for the
+call, `HostViewEnter` with K's war counter, at least 1; tension or alliance changes made in the view are not kept):
+- `EvaluateBuildingStrategy`, `AINationAdjustBudget`, `AIMonthlyBuild` and `PutAIShipsInStatus` through the skip thunks
+  (a third answer of `SkipDecider`: `AIViewCall` runs the original in the view; `EvaluateBuildingStrategy` joins the
+  thunks, never skipped); log `relations v2: nation J at war with nation K (a nation people play), at peace with the
+  host's nation: its monthly routines run in nation K's view, as single player's computer against its player` and
+  `relations v2: nation J's PutAIShipsInStatus in nation K's view (at war): before <statuses>; after <statuses>`.
+- `NationIsAtWar` (hooked) of a computer nation inside a masked routine answers from its real wars (`relations v2:
+  nation J at war with nation K (behind the mask in ReduceTimeLimits): NationIsAtWar answers at war`, once a month).
+- `CheckPatrols` (hooked, warfx.cpp): after the game's call, for each such J with K's war counter above 0, the six patrol
+  steps and `AINationAssignRaiders(J)` in K's view (`warfx: CheckPatrols for nation J in nation K's view (its war player;
+  war counter W): on trade protection a -> b of r required, raiders x -> y (AINationAssignRaiders); calls c, faults f`).
+  The raiders break out in the next month's `AreaMoveShips`, and K's sea war frame (0.6.0) rolls their sinkings of K's
+  merchants with every enemy raider's: K's losses, its report's trade war line and the war score.
+- The strategic moves: the routine once for every nation but J (J's orders put back), then once per war player in its
+  view for its enemies (every other nation's orders put back): `relations v2: the computer's strategic moves of
+  nation(s) J in nation K's view (their war player): n ship order(s) or status(es) changed`.
+- J's colonial moves (`MaybeSendHomeShipInColonies`, `AISendShipToColonies`) are skipped while K is its player.
+- 0.7.2's keep of J's trade protection (the mask's `c[]`) and the sea frame's patrol steps and `ReviseASWEffort` for J
+  run only under TEST `aiwar 0`: with them the keep would undo the destroyers `ReviseASWEffort` takes off patrol, and J
+  would revise its ASW effort twice a month.
+- Bridge `aiwar` (the month's record: the war players, J's routines run in the view, the NationIsAtWar answers, colonial
+  moves left out, ship orders from the moves, statuses around `PutAIShipsInStatus`, CheckPatrols' part), TEST `aiwar
+  0|1` (0: 0.7.2) and `aiwar status J from to [n]` (J's capital ships from one status to another, those in a home area
+  first).
+
+**Left as they are**: `CheckBreakout` (`AreaMoveShips`): J's raiders leave port without the interception roll of K's
+blockade (it reads the war with nation 0); a J at war with two joined nations has one of them as its player (the other
+gets J's generic war behaviour and its raiders, which have no target); the game's rules for every computer nation while
+its player is at war (`War` > 0: no colonial moves, 60 % of the reserves called up by the strategic moves) stay the
+host's for the nations that are not at war with K: in single player with K as the player every computer nation would
+follow K's war. K's own nation inside the masked routines (its productivity and peace budget cut in `ReduceTimeLimits`
+read `NationIsAtWar` behind the mask) is not part of this fix.
+
+**Version mixes**: the views and hooks run on the host, no message changes: a 0.7.3 host gives the computer's war against
+0.7.2, 0.7.1 and 0.7.0 clients; under an older host a 0.7.3 client sees the old behaviour. `aiwar` answers on a 0.7.3
+host (its record is empty elsewhere).
+
+**Tests**: the scenario `ai_war` (group `relations`, after `ai_escorts`; TESTING.md): before a war month three of J's
+capital ships are put in reserve (TEST `aiwar status`: those in a home area first, then those elsewhere); after it they
+are back in service (one mothballed only with J in debt: the game's debt rule), J's monthly routines ran in
+nation 1's view, `NationIsAtWar` answered at war behind the mask, J made no colonial move and its strategic moves ran in
+the view, and CheckPatrols' part (patrols, raiders) ran in the view without a fault; the same month under TEST `aiwar
+0` leaves them out of service (the check catches 0.7.2); with another war against a computer nation nation 1 stays J's
+player, with a war against the host's nation J has none. `ai_escorts` adapted: its a) needs J's PutAIShipsInStatus at
+war in nation 1's view (the keep of 0.7.2 is off), its b) runs with `aiwar 0` too. `battle_generator` d): a request of
+the computer's generator that came to no battle on the client (`nobattle`) goes to the game's resolution by design
+("No battle came about; the game resolves it."): no longer a failure (rel1 below: the client's `StartPlayerBattle`
+found no battle for both requests; `CheckAttackLocation`'s possession path needs the attacker's strength in the area
+above 3, and nation 1 had fought the now mobilized Russia there in M2: likely too weak there afterwards), a `SKIP-note`
+when neither request was declined. Self-test 143/143
+(`parse_aiwar`).
+
+**Runs** (the game open, each inside a backed-up run, v0.7.1 reinstalled afterwards; no game error box in any): m1 22.0 min (the measurement above: single player, then multiplayer with
+`aiwar 0` and `aiwar 1`, 12 months each; two battles the single-player part could not decline stalled its month, once at
+a minute boundary of the battle on auto-run and once at the history prompt after it: moved on through the bridge
+(`pocrun`) and posted messages, the measurement does both itself since). The suite (dist_fix1, one hold of the game lock):
+t1 `--only session,ai_escorts,ai_war` 79/79 (2.9 min; J = Russia: a capital ship put in reserve back in service,
+`CheckPatrols for nation 3 in nation 1's view (its war player; war counter 1): on trade protection 1 -> 4 of 4 required,
+raiders 0 -> 1`), rel1 `--group relations` 557/558 (17.9 min; the failure is `battle_generator` d) above, before the
+check's change; `ai_escorts` and `ai_war` passed), we1 and we2 `--only session,war_effects` 90/90 each (2.7 and 5.7 min),
+rel2 `--group relations` 542/544 (22.8 min): `battle_generator` d) passed (both requests came to no battle, a
+`SKIP-note`; the same month's third battle was declined), `ai_war` a2) and b) failed with nothing to check: TEST `aiwar
+status` found no capital ship of Russia in active service in a home area (`put=0`; at war with nation 1 for most of the
+group, its fleet had gone where its strategic moves in nation 1's view sent it). Since then `aiwar status` takes those in
+a home area first, then those elsewhere (the war branch of `PutAIShipsInStatus` brings a ship back from reserve wherever
+it is), and a2) accepts a mothballed one when J is in debt (the debt rule). rel3 `--group relations` (dist_fix2: that TEST
+command changed, nothing else) 570/570 (22.4 min; `ai_war`: `put=3 ... away=2`, the three back in service; under `aiwar
+0` the same three, put in reserve again (`away=1`), stayed there; `battle_generator` d) again two requests without a
+battle, a `SKIP-note`). The game open 96 min in all: the measurement 22, the suite 74.
+
+## Fix 2026-11-02: ConvoyEscortCheck's box after a drop: divisions whose ships are gone in the battle AI's loops (v0.7.3-dev)
+A suite run of the 0.8.0 feature build (run b5 of the simultaneous battles, 2026-11-02, `battle_simul` M8, not the
+feature): the host's box "Error in ConvoyEscortCheck procedure! Access violation at address 007E7E9F in module
+'RTW3.exe'. Read of address 000009D3" in the host's own battle (1902/6/18, Great Britain against Germany in Northern
+Europe), 54 s after the suite's drop of the live player (`drop3`, minute 5) while the host's battle ran on auto-run with
+the computer commanding the dropped player's ships; the battle went on to its end ("British major victory"). About once
+in 15 such drops. Image base 0x220000 in that run: rva 0x5c7e9f = 0xdf7e9f, `movzx eax, byte ptr [eax+0x9d3]` (`ShipType`)
+right after `TDivision.GetFlagship` of a division without ships. The same family as the 0.7.0 stance guard (an emptied
+lead division) and 0.7.2's second ask.
+
+**Cause**, a game bug of every battle (single player too; [GAME-INTERNALS](docs/GAME-INTERNALS.md#tactical-battles)):
+- `ConvoyEscortCheck` (0xdf8554, unnamed `TfrmMain` method; the course routine 0xd968e4 calls it at 0xd96a41 for a
+  computer's division whose force's `ForceMission` is tfmEscort) looks twice at a force of the other side (nested
+  0xdf8110: the side's main force, then its "Support Force" or else the last force of the list, of either side). With the
+  force `AIControlled`, its flag division fit, `Random(30)` = 1 and a branch by stance and ranges, 0xdf7ad4 loops over
+  that force's `Divisions` (0xdf7e71) to send its scouts and support cruisers towards the convoy. A drSupport division's
+  test reads `GetFlagship.ShipType` (0xdf7e9a/0xdf7e9f) without checking the division has ships: the box (its handler
+  0xdf898c shows it every time; the routine stops, its later draws and its second look skipped). A drScout division
+  without ships stops in `GetClosestEnemyShip(nil)` (a read of 0xAD9).
+- How a division without ships gets into that loop: the game restores its invariant once a minute in the end-of-minute
+  walk (`CheckAllDivAfterMove`, backwards: an empty division -> `RemoveDivision`: out of its own force's list,
+  references cleared, out of the division list). A division's ships leave it only by the minute's sinkings
+  (`DeleteShip` in `AllShipsCheckSinkings`, just before the walk), `DetachShip` (every computer's detach needs 2 ships or
+  more: 0xdac2f1, 0xdb8be5, 0xdd018f, 0xdd0ae8; the battle screen's Detach can take every ship) and the reattach
+  (0xdc7020, called by the walk at 0xdb11bd: a detached division "<ship> *", which inherited its original's `Role` and
+  `LeadDivision`, gives all its ships back). The walk checks a division's ships at the top of its iteration, so the
+  reattach leaves the detached division empty in its force and the division list until the next walk; a player's full
+  Detach does the same; the minute's sunk divisions stay until the backward walk reaches them, while the walk's own
+  detaches run the new division's stance and course routines (and with them `ConvoyEscortCheck`). Not the mod: the drop
+  (`SetSideControl`) writes flags only. The drop made the dropped player's force `AIControlled` (the routine's look needs
+  that) and the host's auto-run made every division the computer's, so more escort divisions ran the routine and more
+  detached divisions reattached.
+- Single player can hit it: in a convoy or invasion battle when the computer's escort (or the player's escort under the
+  computer's command) runs the routine in the minute after a reattach (or a full Detach, or during the walk after the
+  minute's sinkings) and its look reaches the force holding the emptied division (the second look may take the
+  computer's own last force). Rare: the routine runs only for escort forces and looks on with `Random(30)` = 1.
+- The game itself mostly steps around it: the StartMinute division loop (0xd955b8) stops at the first division without
+  ships (0xd95609 `je` past the loop), so in the minute after a reattach only divisions newer than the emptied one get
+  their AI. That is the game's behaviour and stays.
+
+**Audit** (`FILES\cv72\audit.py`: all 1792 calls of `TDivision.GetFlagship`, the division traced back to a force's or
+the walk's list or to a `LeadDivision`/`TargetDiv`/`CappedDivision`/`InitialDivision` reference, a ships check before the
+read looked for; then every candidate of the battle code read by hand):
+- Guarded now (they read the flagship of a list's division unchecked and can meet an emptied one): `ConvoyEscortCheck`'s
+  loop (the report); `RearDivisionHasNoSightedEnemy` (0xdf78fc, from the course routine of a withdrawing force's
+  division: the divisions following it, `GetFlagship.SightedShips`, "Error in RearDivisionHasNoSightedEnemy function!";
+  a detached division keeps its original's `LeadDivision`, so its reattach leaves an empty follower); the walk's check
+  of the core divisions following one lead (0xdb1b5d, the human side; its count 0xd77420 includes divisions without
+  ships, "Error in CheckAllDivAfterMove procedure!"); `MoveDivisionShips`' scout lead (0xdb3d88: the lead tested for
+  nil only, "Error in MoveDivisionShips procedure!").
+- Covered by the 0.7.0 guard (`LS_StanceGuard` before `AIDetermineTacticalStance2`, which both callers of the course
+  routine run right before it): the stance routines' `LeadDivision`/`TargetDiv` reads (0xdb778d, 0xdba690's six) and the
+  course routine's `LeadDivision.GetFlagship` (15 reads tested for nil only, e.g. 0xd96ff5; its exception would leave
+  StartMinute: no handler of its own), `LeadIsIncreasing` (from the stance routines). The guard came with the lockstep
+  hooks (live battles and the host's battle after a drop); it is now installed at the mod's start (every battle).
+- Read and safe: the StartMinute loop's lead (0xd9561e checks the lead's ships), `CheckObjectives` 0xdabca7 (only
+  reached with `Role` independent: never), the division target selection 0xd940d8 (a manual target without ships:
+  `CanSeeShip(nil)` answers False, the target is dropped), `BoxFormation`, `IdentifyType`, `GetConvoyDivision`,
+  `CheckSupportingDDToDetach` and the other loops the audit found checked (the walk, the StartMinute loop, the force
+  routines). Not the battle AI: the battle screen's lists (`FillSelectLead` and its turn-away twin skip "*" divisions,
+  `FillDivTargetList`, `GetNext/PreviousCarrierDivision`, `GlobeClick`), the player's, between minutes; unchanged.
+
+**Fix** (lockstep.cpp `InstallEmptyDivisionGuards`, called by `game::InstallHooks` at the mod's start: every battle on
+every PC; protocol 3 and the live-battle engine 18 unchanged):
+- Four hooks inside the loops, found by their code (each pattern exactly once in the game, its calls checked, the three
+  with their own box checked by the box's text): a division without ships is passed over as the loop passes over one of
+  no interest (its `jne`/`je` to the next index; the scout's lead: the routine's way for no lead). `ConvoyEscortCheck`'s
+  hook sits right after `TList.Get` (rva 0x5c7e82), before any read of the division, and keeps the routine's own store.
+  That is what the loop meets after the next walk (the division out of its force). Logs `battle AI: ConvoyEscortCheck:
+  division '<name>' (side <s>) (role <r>) at t=<time> has no ships left (the end-of-minute walk takes it out of its
+  force); the routine's loop over that force's divisions passed it over (the game: "Error in ConvoyEscortCheck
+  procedure!")` and the like for the other three (at most 20 a guard and a game); at the start `ConvoyEscortCheck's loop
+  over a force's divisions: ok, a division without ships passed over (the loop at rva 0x5c7e71, its next index at rva
+  0x5c808c)`, `Divisions without ships in the battle AI's other loops: RearDivisionHasNoSightedEnemy ok ..., the walk's
+  core-follower check ok ..., MoveDivisionShips' scout lead ok ...` and `The division stance routine's guard (...): on
+  (every battle)`.
+- The 0.7.0 guard is hooked there too, with its own fields (no `Resolve` needed); the lockstep hooks skip it then
+  (`the division stance routine's guard: on (since the mod's start)`).
+- Determinism: the guards read only shared state (a division's ship count, its lead) and draw nothing; the loops skip
+  the division without any of its draws, as for a division of no interest. A 0.7.2 PC stops the routine there (its
+  box; in a live minute answered by the mod): with a 0.7.2 player that minute can differ (a DESYNC, then the resync), as
+  with 0.7.0's and 0.7.2's fixes; the engine stays 18.
+
+**TEST switch** `ls testconvoy [<n> [side=<s>] [nofix]]` (TESTING.md; its hooks made on first use: the course routine's
+escort test, `GetConvoyDivision`, `ConvoyEscortCheck`'s look at a force): the next n runs of the course routine for a
+computer's division (of side s) run `ConvoyEscortCheck` as for an escort (no convoy: the division itself), and its first
+look leads the other side's force towards the convoy at once with the force's first division emptied for that loop (ship
+count 0, role support; put back after, also when the game's code stops there): the game's moment of the box. `nofix`
+turns the fix's hook off. `RTW3MP_TEST_CONVOYFIX=0` starts a copy without the fix; `RTW3MP_DIAG` logs every guard pass
+and a note at each reattach that empties a division. Suite: `war_effects` M4 arms it on both copies at the live battle's
+start and, after the live minutes, on the host for side 0 (the host's divisions looking at the dropped player's force,
+the computer's after the drop: the report's case); three checks (TESTING.md: the guards' startup lines, the live
+battle, after the drop); `RTW3_CONVOY_NOFIX=1` turns the last two into one DIAGNOSIS check that passes on the game's
+boxes. The stance switch and the convoy switch run their extra live minutes before either arms the host alone
+(`minutes-run`, `minutes-arm`).
+
+**Evidence**
+- Natural precondition (nofix1 below, `RTW3MP_DIAG`'s note at each reattach that empties a division): in the host's
+  battle after the drop the dropped player's 'V5 *' (side 1, role support: a detached torpedo boat of a support
+  division) was emptied by its reattach five times, every 15 minutes (t=20:23, 20:38, 20:53, 21:08, 21:23: its detach
+  countdown), each time "still in its force's divisions (index 6 of 7) until the next end-of-minute walk"; the client's
+  own battle of that month had 'G7 *' (support), 'Arcona *' (screen) and 'V2 *' (support) the same way. An escort's
+  `ConvoyEscortCheck` looking at such a force in such a minute meets the box. The natural box itself needs a convoy
+  battle and the routine's `Random(30)`: too rare to wait for (about once in 15 of `battle_simul`'s drops).
+- Before the fix (the switch with `nofix`; nofix1): in the live battle (begun t=10:32) the forced runs alike on both
+  copies (`TEST ConvoyEscortCheck of division 'GB Destroyer Division 20' (side 0) at t=10:32: the computer's division
+  'Germany Destroyer Division 7' (side 1) of force 'Germany Main force' leads ... with the force's first division
+  'Germany Cruiser Division 1' (side 1) (role independent, 2 ship(s)) emptied for that loop ...`, then two for side 1
+  looking at 'Great Britain Main force'), each with the box answered as a live minute's box on both copies (`lockstep:
+  minute box 'Error in ConvoyEscortCheck procedure! ...`), the 12 minutes equal; the DIAG trace of each: `diag:
+  exception c0000005 at rva 5c7e9f (read 000009d3, ...): eax=00000000 ...` and `diag:   stack (return rvas from esp+0):
+  ... +ec:5c8956 +994:565c77 +9e8:57b6fd +a04:5822bc ...` (`ConvoyEscortCheck`'s call of its look, the StartMinute
+  loop's call of the course routine, StartMinute's call of that loop). After the drop (minute 12, t=10:44) the host's
+  three forced runs for side 0 showed the report's box three times: "Error in ConvoyEscortCheck procedure! Access
+  violation at address 007E7E9F in module 'RTW3.exe'. Read of address 000009D3" (the report's address: image base
+  0x220000 again). 93/95: the DIAGNOSIS check passed; the two failures are the suite's "no game error box" checks.
+- After the fix: fix1 (below) 95/95: the forced runs 3/3 on both copies alike in the live minutes, each passed over by
+  the fix (`battle AI: ConvoyEscortCheck: division 'GB Battery 0' (side 0) (role support) at t=09:43 has no ships left
+  (the end-of-minute walk takes it out of its force); the routine's loop over that force's divisions passed it over (the
+  game: "Error in ConvoyEscortCheck procedure!")` on both copies; that battle's side-0 main force was 'Great Britain
+  Coastal forces', batteries), no box, every minute equal, no DESYNC; after the drop 3 forced, 3 passed over, no game
+  error box, the host's battle fought to its end and the month on; both copies' startup lines `ConvoyEscortCheck's loop
+  over a force's divisions: ok, a division without ships passed over (the loop at rva 0x5c7e71, its next index at rva
+  0x5c808c)`, `Divisions without ships in the battle AI's other loops: RearDivisionHasNoSightedEnemy ok (rva 0x5c7942),
+  the walk's core-follower check ok (rva 0x581b5d), MoveDivisionShips' scout lead ok (rva 0x583d88)`, `The division
+  stance routine's guard (...): on (every battle) (rva 0x59108c)` and, at the live battle, `lockstep: the division
+  stance routine's guard: on (since the mod's start)`.
+- After the fix in the full runs (p1, p2, rel1 below): M4's convoy switch forced 3/3 on both copies alike in the live
+  minutes and 3 after the drop each time, every one passed over, no box, no DESYNC; no natural pass of any of the four
+  guards and no `lockstep: stance guard` line in these runs.
+
+**Tests**: `war_effects` M4 (three checks: the guards' startup lines on both copies, the live battle, after the drop;
+TESTING.md); self-test 144/144 (`convoy switch (0.7.3)`).
+
+**Runs** (each inside a backed-up run, the released build reinstalled afterwards: v0.7.1 after nofix1, fix1 and p1,
+v0.7.2 (dist_rc072_2, released meanwhile) after p2 and rel1, its hashes checked; the game open about 68 minutes in all;
+dist_cv72_1 = this commit's build, RTW3MP.dll SHA-256 4AE53EF85E838D0D...):
+- nofix1 `RTW3MP_DIAG=1 --only session,war_effects` with `RTW3_CONVOY_NOFIX=1`: 93/95 (the DIAGNOSIS check passed; the
+  two failures are the boxes it shows), 223 s.
+- fix1 `--only session,war_effects`: 95/95, 156 s.
+- `--only session,lockstep_rejoin,lockstep_resume,war_effects` twice: 182/182 (1373 s) and 182/182 (1078 s).
+- `--group relations`: 493/493 (1219 s), `war_effects` 78/78 with the stance and convoy checks; no game error box.
+
+## Testing 2026-11-02: the 0.7.3 release candidate dist_rc073_1 (v0.7.3)
+The final regression of 0.7.3 on its release candidate dist_rc073_1 (int-073 0cd4c32: 0.7.3, live-battle engine 18,
+protocol 3; RTW3MP.dll SHA-256 128F9336AED852B3..., version.dll 548287AD0A0F671B...): the released 0.7.2 with [the
+computer's war against a joined nation as in single
+player](#fix-2026-11-02-the-computers-war-against-a-joined-nation-as-in-single-player-mobilization-war-budget-war-building-patrols-raiders-and-moves-v073-dev)
+and [the battle AI's divisions without
+ships](#fix-2026-11-02-convoyescortchecks-box-after-a-drop-divisions-whose-ships-are-gone-in-the-battle-ais-loops-v073-dev).
+It ran on two days: on 2026-11-02 from 16:08 until the user paused it at 18:40 (its third run was waiting for the game
+lock; the coordinator stopped the chain before anything started), and on 2026-11-03 from 00:47 to 05:29 (the last run's
+end; the notes and commits after), resumed by a second agent from the first one's progress notes and wrappers (the
+hashes, the installed build, the slots and the Preferences checked again first). Run on the reg-073 runner (int-073
+0cd4c32; on 2026-11-03 merged with int-073 673e52b, the 0.7.3 docs, and the suite fixes below), installed from the
+frozen snapshot (`--dist`), the released 0.7.2 (dist_rc072_2, RTW3MP.dll 7FFE8EE4D4B6A82E...) put back after every run
+(hash checked); slots 1 and 9 and the Preferences identical to the first run's backup after every run, the save folders
+as before (Game1, Game2, Game9), no folder copy, `python` or `RTW3.exe` left, the game lock released. The 0.8.0
+integration agent shared the game through the lock (waits of 37 and 42 minutes on the first day; on the second the
+coordinator gave this regression priority). The logs of every run are kept with the developers' session files
+(`r731\logs_*`).
+- **Runs** (checks, seconds with the game open):
+  - 2026-11-02: self-test 145/145; `--group relations --only battle_invasion` 745/745 (1919 s); mixed a) 78/78 (389 s).
+  - 2026-11-03: self-test 145/145 (148/148 with the suite fixes); mixed b) 74/74 (380 s); the default run
+    (`--legacy-fixture`, 36 scenarios) 1734/1738 (4097 s); the whole `--stress` run (43 scenarios, `--missile-fixture`,
+    `--legacy-fixture`) 2188/2199 (8232 s); run again: `--stress --only session,war_effects,lockstep_pvp,
+    lockstep_torpedo,lockstep_stress,lockstep_strike,lockstep_missiles,disk_growth` once aborted after 85 s by a fault
+    of the suite fixes (below), then 425/425 (3275 s: `war_effects` 78/78 with a live battle in M4, `lockstep_pvp`
+    32/32, `lockstep_torpedo` 21/21, `lockstep_stress` 125/125, `lockstep_strike` 21/21, `lockstep_missiles` 23/23,
+    `disk_growth` 108/108).
+  - With the game open: 18377 s (5 h 06 min): 2308 s on the first day, 16069 s on the second (the aborted re-run's 85 s
+    included).
+- **No game error box** in any run but `disk_full`'s own (its "not enough space on the disk" and file-in-use boxes
+  inside its windows); `session`'s whole-run check passed in every suite run, the mixed drivers' in both cases.
+- **0.7.3's fixes as tested**:
+  - The computer's war against a joined nation: `ai_war` 33/33 in each of the three suite runs (J = Russia; the capital
+    ships put in reserve before the war month back in service: 1, 2 and 3 ships; NationIsAtWar answered at war behind
+    the mask 758, 896 and 878 times; 31, 31 and 27 ship orders from the strategic moves in nation 1's view; patrols 1 ->
+    4 of 4, raiders 0 -> 1, 1 -> 2, 1 -> 2; no fault; Russia's funds -2189 (in debt after 27 war months in the group
+    run), 13519 and 18732; under TEST `aiwar 0` the ships stayed in reserve: b) catches 0.7.2), `ai_escorts` 29/29 in
+    each, the mixed cases (below). Every war month of every run (39, 39 and 45 months with the war view: Russia, Spain,
+    Japan, France in the legacy campaign) ended `PutAIShipsInStatus` with no ship in reserve or mothballed;
+    CheckPatrols' part had no fault.
+  - The battle AI's divisions without ships: both copies logged the guards' start-up lines in every run (`war_effects`
+    M4, and the mixed cases for the 0.7.3 copy); `war_effects` M4's live battle in the group run and in the re-run: `ls
+    teststance 3` and `ls testconvoy 3` forced 3 on both copies in the live minutes and 3 more on the host after the
+    drop, every one passed over by the guard, no box, every minute equal (the default and `--stress` runs' M4 month had
+    no live battle: `SKIP-note`s).
+- **Mixed versions** ([TESTING](docs/TESTING.md#mixed-versions), the driver `mixed_073.py`): a) a 0.7.3 host with a
+  0.7.2 player 78/78: the join line with `battle generator 5`, hostgen 5, the guards on the 0.7.3 host only, J's
+  routines in nation 1's view with the 0.7.2 player (the three ships back in service, NationIsAtWar 780, 31 moves,
+  patrols 0 -> 4 of 4, raiders 0 -> 1), the player's month with the host's statuses, the live battle 424 minutes equal;
+  b) a 0.7.2 host (the Steam folder) with a 0.7.3 player (`r721\game_a`) 74/74: `aiwar` unknown on the host, no AI war
+  line, two of J's three ships still in reserve after the war month (expected: the computer's war needs a 0.7.3 host),
+  the live battle 454 minutes equal; both: no box, no DESYNC, the stance guard's line at the live battle on both copies.
+- **`battle_generator` g) to i) (0.7.2's search after an encounter) and the computer's war**: all three were
+  `SKIP-note`s in the group run (and in all three group runs of fix-aiwar), as d)'s declines and f2/f3. The cause is not
+  the mobilization's strength but the pick: Russia's war in `war_effects` and `arms_treaty` moved its fleet to Northern
+  Europe (27 ships), so `battle_pairs` put Russia there first (0.7.2's runs: Spain), and nation 1's attack on Russia's
+  one possession in Northern Europe, Northern Russia (worth 12), never comes to a battle: in the 524 recorded mod logs
+  of the 0.7.x runs `StartPlayerBattle 0 attacks 3 in Northern Europe` was `none` all 118 times, the computer's decision
+  never asked (`0 attacks 7` there: 110 battles). In the default run (ship_status' war with Spain first) and the
+  `--stress` run J was Spain: g), h) and i) passed at their first try in both (119/119 each; in the `--stress` run g)
+  and h) also split the points between two opponents), d) and f1-f3 too. The suite now picks J by the value of its
+  possession in the area (`attack_order`, 91bf289; the `--stress` run's live line: Spain 200, Russia 12).
+- **Natural occurrences** (the logs of every run, `r731\nat_scan73.py`, `aiw_scan73.py`, `inuse_scan.py`): the war
+  view's months as above. The battle AI's guards without a TEST switch: the division stance guard three times, twice in
+  a host's battle that went on against the computer after a drop (the default run's `lockstep_limits`, `lockstep: stance
+  guard: division 'Bat *' (side 0) at t=17:14 ... its lead division 'Renown *' (LeadDivision := none, role independent)
+  has no ships left`; the `--stress` run's second strike battle, 'Mosquito *' and 'Anson *') and once in the player's
+  own battle against Russia on its PC (the re-run's `war_effects` month, 'S22 *' and 'Stettin *': a battle that is not
+  live, which only 0.7.3 guards); ConvoyEscortCheck's guard once, in the re-run's `lockstep_stress` after the client's
+  disconnect, the host's battle going on against the computer (`battle AI: ConvoyEscortCheck: division 'S22 *' (side 1)
+  (role support) at t=16:19 has no ships left ...; the routine's loop over that force's divisions passed it over (the
+  game: "Error in ConvoyEscortCheck procedure!")`: the reported case); no box with any of them, the battles to their
+  end. No natural pass of the other three loop guards or of 0.7.2's destroyer stance fix (their lines came from the TEST
+  switches). Merged results with two or more encounters 24, 20 and 19 (group, default, `--stress`), "the search goes on"
+  66, 56 and 64 times; 0.7.2's keep of a computer nation's trade protection only under TEST `aiwar 0`; the SelectForce
+  guard only after TEST builds; one real file in use (the default run's host save of slot 1 in `battle_generator` h)'s
+  month: `RTWGame1.bcs` in use, saved again 2 s later, no box).
+- **The computer's behaviour over the long runs**: a computer nation at war with nation 1 called up its whole reserve in
+  its first war month every time (e.g. Russia 20 active and 19 in reserve -> 34 and 0), kept its trade protection at or
+  above its requirement (4 of 4 to 8 of 4 ships) and had 1 to 6 raiders out; its lay-downs in nation 1's view were
+  mostly corvettes (the corvette rules against the player's submarines: Russia 7, 7 and 5 KE of 11, 12 and 9 lay-downs),
+  the others in the host's frame as before; the trade war: Russia's raiders sank 75, 19 and 27 German merchant ships in
+  24, 17 and 19 war months (0 to 9 a month, +5 VP each), Spain's 8, 17 and 31; Russia's funds at `ai_war`'s month -2189
+  in the group run (in debt after 27 war months, as France in single player in the fix's measurement), 13519 and 18732
+  in the others; no debt line. Nothing beyond what the fix describes. Cosmetic: the host's line `relations v2: nation
+  J's PutAIShipsInStatus in nation K's view (at war): before ...; after ...` cuts each list at 95 characters (game.cpp
+  `StatusList`, `char b[96]`: "..., 0 foreign" without "stations"); the numbers are complete.
+- **Failures and their classes:** no product fault.
+  - The suite's: the default run's `ship_status` d) M1 (twice) and f): the BattleDriver read slot 87 0.3 s after "battle
+    16: fought", while the client wrote the next battle's bundle there in the host's numbering (nation 0 Great Britain),
+    so the tracked German ships were missing and taken as sunk; the host and the client kept every status (the known
+    battle-slot race, as `battles` b)); `battle_slot_unusable` now marks such a read stale (91bf289), and `ship_status`
+    passed 62/62 in the `--stress` run. The default run's `battle_invasion` e3): the game's no-force rule for J's side
+    at Liaotung Peninsula before any preview ("Enemy unable to challenge our forces in the area!": avoided, the invasion
+    went ahead, no box); the check took only declined or fought (b1c3602). The `--stress` run's `war_effects` M1: the
+    check wanted "government 2, BM 20", nation 1's own BudgetModifier was 19 after that run's events (cb971d8: before or
+    after the month); that fix clobbered the scenario's own `bm0`, so the first re-run's `war_effects` aborted ("'int'
+    object is not subscriptable") and the runner skipped the rest (46d0268); `war_effects` then passed 78/78.
+  - The game's conditions, passed when run again: `lockstep_pvp` b) (500 minutes, only the last one different: the state
+    equal on both copies, `all=995fa1e7bd467d60`, the draws two apart, `sim=78608`/`78610`, in the minute of the game's
+    own end), `lockstep_torpedo` b) to e) ("No contact between fleets!"), `lockstep_stress` f) ("Enemy unable to
+    challenge our forces in the area! Gain 102405 VP!"), `lockstep_strike` d) and e) (the game refused B's carrier
+    twice, "CV Bearn cannot perform flight operations!", then "Could not find attack squadron!": no strike of B),
+    `lockstep_missiles` e) (the held ship Espero 4 -> 2 SSM in the approach, every minute equal: the third time since
+    dist_rc060_1, see Known traps). `disk_growth` a) in the `--stress` run: the host's `RTWGame1.bcs` had one line more
+    after the first load and save (38994 -> 38995 lines, +52 bytes) and the same through five more cycles, every list
+    count unchanged and the client's slot unchanged; the slot was put back afterwards, so the line is unknown; the
+    re-run passed (38197 lines in all seven saves). The cycles now log the lines that changed (8853b92): watch it.
+- **Suite fixes** (reg-073): 91bf289 (`battle_generator`'s J and area: `attack_order`; the battle slot read after
+  "fought": `battle_slot_unusable`), b1c3602 (`battle_invasion` e3)), cb971d8 and 46d0268 (`war_effects` M1), 8853b92
+  (`disk_growth` a) logs the lines a cycle changed); self-test 148/148; TESTING.md (the catalog, the game times, Mixed
+  versions, Known traps).
+- **Verdict: GO** for dist_rc073_1 (RTW3MP.dll 128F9336AED852B3..., version.dll 548287AD0A0F671B...): no product fault
+  and no game error box (but `disk_full`'s own) in any run; every default and `--stress` scenario and the `--group
+  relations` set passed on this candidate, its failures the suite's (fixed, passed again) or the game's known conditions
+  (passed again); 0.7.3's two fixes work as described, across versions both ways too, and their guards passed naturally
+  without a box; 0.7.2's battle search (g) to i)) passed in two runs.

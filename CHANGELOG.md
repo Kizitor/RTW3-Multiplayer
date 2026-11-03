@@ -9,6 +9,74 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.7.3 (2026-11-03)
+A computer nation at war with a joined player's nation (and at peace with the host's nation) now fights that war as
+the computer fights the player in single player. Until now, one at war only with joined players' nations stayed on a
+peace footing: it kept much of its fleet in reserve, raised its budget far less, built as in peace and sent no
+raiders. Expect tougher computer enemies. Also fixed: the game's own box "Error in ConvoyEscortCheck procedure!" in
+battles, and three boxes like it.
+**Update the host and every player:** the computer's war is fixed by 0.7.3 on the host, the boxes by 0.7.3 on each PC
+for its own battles. The protocol is still 3 and the live-battle engine still 18: players on 0.6.1, 0.7.0, 0.7.1,
+0.7.2 and 0.7.3 play a campaign and fight their live battles together.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.7.3)
+
+### Fixed
+- **The computer's war against joined players' nations** (found while fixing 0.7.2's corvettes): in single player, a
+  computer nation at war with the player calls up its reserves, raises its naval budget, builds for the war (escorts
+  against the player's submarines among them), puts ships on trade protection against the player's submarines, sends
+  raiders against the player's merchant ships and concentrates its fleet. In the host's month, a computer nation at
+  war only with joined players' nations looked at peace to most of these routines: it kept much of its fleet in
+  reserve, raised its budget far less, built as in peace and sent no raiders. In a test of 11 war months in a 1935
+  campaign it still had 24 ships in reserve in the first war month and 4 in the eleventh, where single player's
+  computer called up its whole reserve at once. One also at war with another computer nation was at war for the game,
+  but fought the joined player's nation as it fights a computer nation. Now, while it is at peace with the host's
+  nation, the host runs its war routines once a month as if the joined player's nation at war with it were its
+  player: it calls up its reserves, raises its naval budget, builds for the war, puts ships on trade protection,
+  sends raiders (their sinkings count in your merchant losses, your turn report and its war score against you) and
+  concentrates its fleet, and it moves no ships to or from its colonies while the war lasts. In the same test it
+  called up its whole reserve in the first war month, raised its budget as much as single player's computer did and
+  had a raider out every month. Computer enemies are tougher now.
+- **"Error in ConvoyEscortCheck procedure! Access violation at address ... in module 'RTW3.exe'. Read of address
+  000009D3"** in battles (found by the tests, in the host's battle after the other player dropped out of the live
+  battle; single player has it too): when the ships of a division have just rejoined the division they were detached
+  from, or were all detached or sunk in that minute, the game keeps the empty division in its lists until the end of
+  the minute. The computer's convoy escort tactics read the flagship of each division in a force, and the empty one
+  has none. The box no longer shows: the mod passes such a division over, as if the game had already taken it out of
+  its lists, in every battle on a PC with 0.7.3. Three other routines of the game's battle tactics read such a
+  division the same way and are fixed with it ("Error in RearDivisionHasNoSightedEnemy function!", "Error in
+  CheckAllDivAfterMove procedure!", "Error in MoveDivisionShips procedure!"). 0.7.0's fix of the same kind for the
+  computer's division tactics (a lead or target division that had just lost its last ship: "Error in
+  AIDetermineTacticalStance2 procedure!") worked only once a live battle had started in that game; it now works in
+  every battle too. In a live battle between a PC on 0.7.3 and one on an older version, a minute where this happens
+  can differ between the two PCs: the battle then synchronises again, as it does for other differences.
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1, 0.7.2 and 0.7.3 can join each other's
+  hosts and play the campaign together.
+- 0.7.3 keeps the live-battle engine of 0.6.1, 0.7.0, 0.7.1 and 0.7.2 (18): players on these versions fight their
+  live battles live, with each other and under a host on any of them. A player on 0.6.0 (engine 17) or older can't
+  fight a live battle with a host or player on 0.7.3.
+- Each fix works on the PCs that run 0.7.3, so update the host and every player:
+  - the computer's war against joined players' nations: the host's fix, for players on 0.5.0 or newer (the versions
+    that give a joined nation its own wars);
+  - the *ConvoyEscortCheck* box, the three like it and 0.7.0's fix in every battle: each PC for its own battles.
+- Existing campaigns go on from where they are: a computer nation already at war with a joined player's nation fights
+  that war as above from the first month that a host on 0.7.3 runs.
+
+### Known issues
+- A computer nation has one player: the host's nation when it is at war with it, else the first of the joined
+  players' nations at war with it in the game's list of nations. It fights every other joined player's nation at war
+  with it as it fights a computer nation, but its raiders attack that nation's merchant ships too.
+- When a joined player's nation blockades a computer enemy, that enemy's raiders still leave port without the chance
+  of interception that the player's blockade gives in single player.
+- While a joined player's nation is at war, the computer nations that aren't at war with it don't call up part of
+  their reserves or stop moving ships to and from their colonies, as every computer nation does in single player
+  while the player is at war: they follow the host's wars.
+- In the host's month, two of the game's rules for every nation can still see a joined player's nation at peace while
+  it is at war (unless it is at war with the host's nation): the cut of a high naval budget at peace and the
+  productivity growth of peace.
+- The known issues of 0.7.2 remain.
+
 ## 0.7.2 (2026-11-02)
 Fixes of the bugs that players reported on 0.7.1: a joined player couldn't set their own invasion targets (the game's
 button followed the host's wars), a joined player's search for the month's battle stopped at the first encounter, so

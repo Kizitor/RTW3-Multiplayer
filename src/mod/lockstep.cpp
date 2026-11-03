@@ -2455,6 +2455,7 @@ static bool HookOne(void* target, void* detour, void** orig, const char* name) {
 
 static void* DialogForm(const char* cls);
 static void* FindStanceRoutine();
+static bool g_stanceAtStart = false;  // the stance guard hooked at the mod's start (InstallEmptyDivisionGuards)
 
 bool BeginTextCapture() {
     if (!g_showPicHooked) {
@@ -2572,10 +2573,12 @@ bool EnsureHooks() {
     if (!(g_ssmHookable && HookOne(E.fireSSM, (void*)&LS_dFireSSM, &g_lsOrigFireSSM, "FireSSM"))) g_featMissile = false;
     // The division stance routine: its stance routines read the flagship of the division's LeadDivision and TargetDiv
     // without checking that division has ships left (LS_StanceGuard). Without the hook the game's routine runs as is.
+    // Since 0.7.3 the guard is in from the mod's start (InstallEmptyDivisionGuards); this is the fallback.
     void* stance = FindStanceRoutine();
-    bool stanceOn = stance && HookOne(stance, (void*)&LS_dStance, &g_lsOrigStance, "AIDetermineTacticalStance2");
-    Log("lockstep: the division stance routine's guard: %s (%p)", stanceOn ? "on" : "OFF (the routine was not found)",
-        stance);
+    bool stanceOn = g_stanceAtStart ||
+                    (stance && HookOne(stance, (void*)&LS_dStance, &g_lsOrigStance, "AIDetermineTacticalStance2"));
+    Log("lockstep: the division stance routine's guard: %s (%p)",
+        stanceOn ? (g_stanceAtStart ? "on (since the mod's start)" : "on") : "OFF (the routine was not found)", stance);
     if (g_featMissile && !(E.mslDlgVar && dl::IsInstanceOf(*E.mslDlgVar, "TdlgMissileFire"))) {
         g_featMissile = false;
         Log("lockstep: manual missile salvoes OFF (the missile dialog was not found)");
@@ -7242,16 +7245,19 @@ static void OnSimFrameUnwound(int idx) {
 // := nil). The guard applies those rules to the division the routine is about to judge, so a reference to a division
 // whose ships are gone reads as none, as it will after CheckAllDivAfterMove; it changes nothing else. (The box "Error in
 // AIDetermineTacticalStance2 procedure! ... Read of address 000009D3" of destroyer divisions is the routine's second
-// ask, below.)
-static int g_fTargetDiv = -1, g_fDivRole = -1;
+// ask, below.) Since 0.7.3 the guard is installed at the mod's start (InstallEmptyDivisionGuards: every battle; before,
+// with the lockstep hooks), and its fields are its own (no Resolve needed).
+static int g_fTargetDiv = -1, g_fDivRole = -1, g_fDivShips = -1, g_fDivLead = -1;
 
 static void* FindStanceRoutine() {
     void* ds = dl::Method("TfrmMain", "DetachShip");
     void* gf = dl::Method("TDivision", "GetFlagship");
     void* big = dl::Method("TFightingShip", "IsBigShip");
-    int fAI = E.fDAI, fSinking = dl::Field("TFightingShip", "Sinking");
+    int fAI = E.fDAI > 0 ? E.fDAI : dl::Field("TDivision", "AIControlled"), fSinking = dl::Field("TFightingShip", "Sinking");
     g_fTargetDiv = dl::Field("TDivision", "TargetDiv");
     g_fDivRole = dl::Field("TDivision", "Role");
+    g_fDivShips = dl::Field("TDivision", "Ships");
+    g_fDivLead = dl::Field("TDivision", "LeadDivision");
     if (!ds || !gf || !big || fAI <= 0 || fAI > 0x7f || fSinking <= 0) return nullptr;
     // DetachShip, the new division: cmp byte ptr [ebx+AIControlled], 0; je; cmp dword ptr [edi+Sinking], 0; jne;
     // mov edx, ebx; mov eax, [ebp-8]; call AIDetermineTacticalStance2
@@ -7268,6 +7274,7 @@ static void* FindStanceRoutine() {
 static int g_stanceFixes = 0;
 
 static void StanceFixNote(void* div, void* ret, void* lead, void* target) {
+    if (!E.tried) Resolve();  // (the battle clock and the names: a single-player battle may come before any session)
     auto name = [](void* d) { return W2U(dl::ReadUStr(dl::At<void*>(d, E.fDivName))); };
     std::string what;
     if (lead) what += "its lead division '" + name(lead) + "' (LeadDivision := none, role independent)";
@@ -7278,17 +7285,17 @@ static void StanceFixNote(void* div, void* ret, void* lead, void* target) {
 }
 
 extern "C" void __stdcall LS_StanceGuard(void* self, void* div, void* ret) {
-    int fTarget = g_fTargetDiv, fRole = g_fDivRole;
+    int fTarget = g_fTargetDiv, fRole = g_fDivRole, fShips = g_fDivShips, fLead = g_fDivLead;
     (void)self;
     __try {
-        if (!div || E.fShips <= 0 || E.fLeadDiv <= 0 || fTarget <= 0 || fRole <= 0) return;
-        void* lead = dl::At<void*>(div, E.fLeadDiv);
+        if (!div || fShips <= 0 || fLead <= 0 || fTarget <= 0 || fRole <= 0) return;
+        void* lead = dl::At<void*>(div, fLead);
         void* target = dl::At<void*>(div, fTarget);
-        if (lead && dl::ListCount(dl::At<void*>(lead, E.fShips)) > 0) lead = nullptr;
-        if (target && dl::ListCount(dl::At<void*>(target, E.fShips)) > 0) target = nullptr;
+        if (lead && dl::ListCount(dl::At<void*>(lead, fShips)) > 0) lead = nullptr;
+        if (target && dl::ListCount(dl::At<void*>(target, fShips)) > 0) target = nullptr;
         if (!lead && !target) return;
         if (lead) {
-            dl::At<void*>(div, E.fLeadDiv) = nullptr;
+            dl::At<void*>(div, fLead) = nullptr;
             dl::At<uint8_t>(div, fRole) = 0;  // drIndependent
         }
         if (target) dl::At<void*>(div, fTarget) = nullptr;
@@ -7690,6 +7697,643 @@ static std::string TestStanceCommand(const std::vector<std::string>& a) {
            " side=" + std::to_string(g_ddTestSide) + " asks=" + std::to_string(g_ddAsks) +
            " none=" + std::to_string(g_ddNone) + " forced=" + std::to_string(g_ddForced) +
            " fixed=" + std::to_string(g_ddFixes) + " hooked=" + std::to_string(g_ddTestHooked ? 1 : 0);
+}
+
+// ---- Divisions whose ships are gone, in the battle AI's loops (0.7.3, fix-convoy) ----
+// A game bug of every battle (single player too). The game's invariant is restored once a minute: the end-of-minute walk
+// (CheckAllDivAfterMove, backwards over the division list) removes a division without ships from its force and the list
+// and clears the references to it (RemoveDivision -> RemoveDivFromForces, RemoveAsDivTarget). A division empties
+// - by its reattach in the walk (0xdc7020: a detached division "<ship> *" gives its ships back to its InitialDivision),
+//   after the walk's own check of that division: it stays in its force's Divisions and the division list until the next
+//   walk;
+// - by a player's Detach of every ship (between minutes; the computer's detaches all leave one ship);
+// - by the minute's sinkings (AllShipsCheckSinkings, just before the walk): until the walk reaches it, which runs the
+//   computer's detaches (DetachShip -> the stance and course routines of the new division) for the divisions after it.
+// Routines that loop over a force's or the walk's divisions and read a division's flagship without checking its ships
+// read nil then (GetFlagship of no ships) and stop with the game's box:
+// - ConvoyEscortCheck (0xdf8554, from the course routine 0xd968e4 for a computer's escort division), its inner loop
+//   (0xdf7ad4: the other side's force's scouts and support cruisers sent towards the convoy): a support division's
+//   GetFlagship.ShipType (0xdf7e9f, "Error in ConvoyEscortCheck procedure! Access violation ... Read of address
+//   000009D3"), a scout division's GetClosestEnemyShip(nil) (read of 0xAD9);
+// - RearDivisionHasNoSightedEnemy (0xdf78fc, the course routine of a withdrawing force's division): the divisions
+//   following it, their flagship's SightedShips (a detached division keeps its original's LeadDivision);
+// - the walk's check of the core divisions following one lead (0xdb1b5d, the human side): a core division's flagship;
+// - MoveDivisionShips (0xdb39cc): a scout division's LeadDivision's flagship (the routine tests the lead for nil only).
+// The guards pass such a division over in the loop as the loop passes over one of no interest (or, for the scout's lead,
+// take the routine's own way for no lead): as it reads after the next walk. No random draw is added or skipped where the
+// game goes on (the passed-over division's own draws are those the game makes for a division it skips), only shared
+// state is read: both PCs of a live battle do the same. (The stance routines' and the course routine's LeadDivision and
+// TargetDiv reads: LS_StanceGuard, also in from the mod's start since 0.7.3.)
+extern "C" {
+void* g_lsOrigCVLoop = nullptr;     // ConvoyEscortCheck's inner loop, after TList.Get (the fix)
+void* g_lsOrigRearLoop = nullptr;   // RearDivisionHasNoSightedEnemy's loop
+void* g_lsOrigCoreLoop = nullptr;   // the walk's core-follower check
+void* g_lsOrigScoutLead = nullptr;  // MoveDivisionShips' scout lead
+uintptr_t g_cvLoopNext = 0, g_rearNext = 0, g_coreNext = 0, g_scoutSkip = 0;
+int g_edShips = -1, g_edLead = -1;  // TDivision.Ships, TDivision.LeadDivision
+void __stdcall LS_EmptyDivSkip(int which, void* div, void* ref);
+// TEST ONLY (hooked on demand): the course routine's escort test, GetConvoyDivision, ConvoyEscortCheck's first look
+void* g_lsOrigCVMission = nullptr;
+void* g_lsOrigConvoyDiv = nullptr;
+void* g_lsOrigCVN1 = nullptr;
+uintptr_t g_cvAfterCall = 0;
+volatile long g_cvArm = 0;           // TEST: armed for the next n runs
+void* g_cvForceDiv = nullptr;        // TEST: the division of the switch's ConvoyEscortCheck run
+long g_cvForceDone = 0;              // TEST: its first look at the other side's force taken
+int __stdcall LS_CVTestCall(void* div, void* self);
+int __stdcall LS_CVForceN1(void* frame);
+// RTW3MP_DIAG: the reattach routine (a detached division's ships back to their InitialDivision)
+void* g_lsOrigReattach = nullptr;
+void __stdcall LS_ReattachNote(void* div);
+}
+static volatile long g_edSkips[4] = {0, 0, 0, 0};  // the guards' passes: convoy loop, rear loop, core loop, scout lead
+static volatile long g_cvForced = 0;
+static bool g_cvSiteOk = false, g_cvHooked = false, g_cvFixOn = false, g_cvTestHooked = false, g_edTrace = false;
+static int g_cvTestSide = -1;
+static int g_cvFDivs = -1, g_cvFRole = -1, g_cvFSide = -1;  // TForce.Divisions, TDivision.Role, TDivision.Side
+static void *g_cvMain = nullptr, *g_cvN1 = nullptr, *g_cvN2 = nullptr, *g_cvConvoyDiv = nullptr;
+static uint8_t *g_cvSite = nullptr, *g_cvMissionSite = nullptr;
+
+// ConvoyEscortCheck's inner loop right after TList.Get (EAX: the division; EBX: the routine's variable for it; ECX and
+// EDX free: TList.Get's call clobbered them and the loop sets both before reading them). A division without ships: the
+// routine's own store, then the loop's next index (the target of its `jne` for a division of no interest).
+extern "C" __declspec(naked) void LS_dCVLoop() {
+    __asm {
+        test eax, eax
+        jz orig
+        mov ecx, dword ptr [g_edShips]
+        mov ecx, [eax + ecx]
+        test ecx, ecx
+        jz orig
+        cmp dword ptr [ecx + 8], 0
+        jg orig
+        mov [ebx], eax
+        pushad
+        push 0
+        push eax
+        push 0
+        call LS_EmptyDivSkip
+        popad
+        jmp dword ptr [g_cvLoopNext]
+    orig:
+        jmp dword ptr [g_lsOrigCVLoop]
+    }
+}
+
+// RearDivisionHasNoSightedEnemy's loop at `mov eax, ebx; call GetFlagship` (EBX: a division following the routine's
+// division [ebp-8]; ECX and EDX free): a follower without ships sights nothing: the loop's next index.
+extern "C" __declspec(naked) void LS_dRearLoop() {
+    __asm {
+        mov ecx, dword ptr [g_edShips]
+        mov ecx, [ebx + ecx]
+        test ecx, ecx
+        jz orig
+        cmp dword ptr [ecx + 8], 0
+        jg orig
+        pushad
+        push dword ptr [ebp - 8]
+        push ebx
+        push 1
+        call LS_EmptyDivSkip
+        popad
+        jmp dword ptr [g_rearNext]
+    orig:
+        jmp dword ptr [g_lsOrigRearLoop]
+    }
+}
+
+// The walk's core-follower check at `mov eax, esi; call GetFlagship` (ESI: a core division of the same lead; EBX: the
+// walk's division; ECX and EDX free): a candidate without ships: the loop's next index.
+extern "C" __declspec(naked) void LS_dCoreLoop() {
+    __asm {
+        mov ecx, dword ptr [g_edShips]
+        mov ecx, [esi + ecx]
+        test ecx, ecx
+        jz orig
+        cmp dword ptr [ecx + 8], 0
+        jg orig
+        pushad
+        push ebx
+        push esi
+        push 2
+        call LS_EmptyDivSkip
+        popad
+        jmp dword ptr [g_coreNext]
+    orig:
+        jmp dword ptr [g_lsOrigCoreLoop]
+    }
+}
+
+// MoveDivisionShips at `mov eax, [ebp-8]; mov eax, [eax+LeadDivision]; call GetFlagship` (the routine tested the lead
+// for nil just before; ECX and EDX free): a lead without ships takes the routine's way for no lead (its `je` target).
+extern "C" __declspec(naked) void LS_dScoutLead() {
+    __asm {
+        mov eax, [ebp - 8]
+        mov ecx, dword ptr [g_edLead]
+        mov ecx, [eax + ecx]
+        test ecx, ecx
+        jz orig
+        mov edx, dword ptr [g_edShips]
+        mov edx, [ecx + edx]
+        test edx, edx
+        jz orig
+        cmp dword ptr [edx + 8], 0
+        jg orig
+        pushad
+        push ecx
+        push eax
+        push 3
+        call LS_EmptyDivSkip
+        popad
+        jmp dword ptr [g_scoutSkip]
+    orig:
+        jmp dword ptr [g_lsOrigScoutLead]
+    }
+}
+
+// TEST ONLY: the course routine at its escort test (`mov eax, [ebx]; mov eax, [eax+myForce]; cmp byte ptr
+// [eax+ForceMission], 4; jne <after>; mov edx, [ebx]; mov eax, [ebp-8]; call ConvoyEscortCheck`): while armed,
+// LS_CVTestCall may run ConvoyEscortCheck itself for the division (then the routine goes on after its call).
+extern "C" __declspec(naked) void LS_dCVMission() {
+    __asm {
+        cmp dword ptr [g_cvArm], 0
+        jle orig
+        push eax
+        push ecx
+        push edx
+        push dword ptr [ebp - 8]
+        push dword ptr [ebx]
+        call LS_CVTestCall
+        test eax, eax
+        pop edx
+        pop ecx
+        pop eax
+        jz orig
+        jmp dword ptr [g_cvAfterCall]
+    orig:
+        jmp dword ptr [g_lsOrigCVMission]
+    }
+}
+
+// TEST ONLY: GetConvoyDivision (EAX: a force; the answer in EAX): in the switch's run its none is the division itself.
+extern "C" __declspec(naked) void LS_dConvoyDiv() {
+    __asm {
+        call dword ptr [g_lsOrigConvoyDiv]
+        test eax, eax
+        jnz done
+        mov eax, dword ptr [g_cvForceDiv]
+    done:
+        ret
+    }
+}
+
+// TEST ONLY: ConvoyEscortCheck's first look at a force (a nested procedure: the routine's frame at [esp+4], popped by
+// the caller): in the switch's run LS_CVForceN1 may take it (the inner loop at once).
+extern "C" __declspec(naked) void LS_dCVN1() {
+    __asm {
+        cmp dword ptr [g_cvForceDiv], 0
+        je orig
+        cmp dword ptr [g_cvForceDone], 0
+        jne orig
+        push dword ptr [esp + 4]
+        call LS_CVForceN1
+        test eax, eax
+        jz orig
+        ret
+    orig:
+        jmp dword ptr [g_lsOrigCVN1]
+    }
+}
+
+// A nested procedure of the game's (its parent's frame pushed, popped by the caller).
+static __declspec(naked) void __stdcall CallNested(void* fn, void* frame) {
+    __asm {
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        push dword ptr [ebp + 12]
+        call dword ptr [ebp + 8]
+        add esp, 4
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret 8
+    }
+}
+
+// RTW3MP_DIAG: the reattach routine (Self EAX, the detached division EDX): the game's, then a note when it emptied it.
+extern "C" __declspec(naked) void LS_dReattach() {
+    __asm {
+        push edx
+        call dword ptr [g_lsOrigReattach]
+        pop edx
+        push edx
+        call LS_ReattachNote
+        ret
+    }
+}
+
+static int DivShips(void* div) {
+    void* l = div && g_edShips > 0 ? dl::At<void*>(div, g_edShips) : nullptr;
+    return l ? dl::ListCount(l) : -1;
+}
+
+static const char* kRoleNames[] = {"independent", "core", "support", "scout", "screen", "patrol", "fleet flag", "scout flag"};
+static std::string RoleText(void* div) {
+    int r = div && g_cvFRole > 0 ? dl::At<uint8_t>(div, g_cvFRole) : -1;
+    return r >= 0 && r < 8 ? kRoleNames[r] : "?";
+}
+
+extern "C" void __stdcall LS_EmptyDivSkip(int which, void* div, void* ref) {
+    if (which < 0 || which > 3) return;
+    long n = InterlockedIncrement(&g_edSkips[which]);
+    if (n > 20 && !g_edTrace) return;
+    try {
+        if (!E.tried) Resolve();  // (the battle clock: a single-player battle may come before any session)
+        const char* last = n == 20 && !g_edTrace ? " (the last such line of this guard in this game)" : "";
+        std::string t = ClockText();
+        if (which == 0)
+            Log("battle AI: ConvoyEscortCheck: division %s (role %s) at t=%s has no ships left (the end-of-minute walk "
+                "takes it out of its force); the routine's loop over that force's divisions passed it over (the game: "
+                "\"Error in ConvoyEscortCheck procedure!\")%s",
+                DDDivText(div).c_str(), RoleText(div).c_str(), t.c_str(), last);
+        else if (which == 1)
+            Log("battle AI: RearDivisionHasNoSightedEnemy of division %s at t=%s: division %s following it has no ships "
+                "left; passed over (the game: \"Error in RearDivisionHasNoSightedEnemy function!\")%s",
+                DDDivText(ref).c_str(), t.c_str(), DDDivText(div).c_str(), last);
+        else if (which == 2)
+            Log("battle AI: the end-of-minute walk's check of the core divisions following the lead of division %s at t=%s: "
+                "division %s has no ships left; passed over (the game: \"Error in CheckAllDivAfterMove procedure!\")%s",
+                DDDivText(ref).c_str(), t.c_str(), DDDivText(div).c_str(), last);
+        else
+            Log("battle AI: MoveDivisionShips: the lead division %s of the scout division %s at t=%s has no ships left; "
+                "as no lead (the game: \"Error in MoveDivisionShips procedure!\")%s",
+                DDDivText(ref).c_str(), DDDivText(div).c_str(), t.c_str(), last);
+    } catch (...) {
+    }
+}
+
+extern "C" void __stdcall LS_ReattachNote(void* div) {
+    static int notes = 0;
+    try {
+        if (!div || DivShips(div) != 0 || ++notes > 50) return;
+        if (!E.tried) Resolve();
+        static int fForce = dl::Field("TDivision", "myForce");
+        void* force = fForce > 0 ? dl::At<void*>(div, fForce) : nullptr;
+        void* divs = force && g_cvFDivs > 0 ? dl::At<void*>(force, g_cvFDivs) : nullptr;
+        int at = -1;
+        for (int i = 0; i < dl::ListCount(divs); i++)
+            if (dl::ListItem(divs, i) == div) at = i;
+        Log("diag: division %s (role %s) emptied by its reattach at t=%s; still in its force's divisions (index %d of %d) "
+            "until the next end-of-minute walk",
+            DDDivText(div).c_str(), RoleText(div).c_str(), ClockText().c_str(), at, dl::ListCount(divs));
+    } catch (...) {
+    }
+}
+
+// The site in ConvoyEscortCheck's inner loop (1.01.44: 0xdf7e71): mov eax, [ebp+8]; mov eax, [eax-0x10]; mov eax,
+// [eax+Divisions]; mov edx, [ebp-8]; call TList.Get; mov [ebx], eax; mov eax, [ebx]; cmp byte ptr [eax+Role], 3; je;
+// mov eax, [ebx]; cmp byte ptr [eax+Role], 2; jne <next>; mov eax, [ebx]; call GetFlagship; movzx eax, byte ptr
+// [eax+ShipType]. Exactly one in the game.
+static uint8_t* FindUnique(const std::vector<int>& pat) {
+    uint8_t* start = (uint8_t*)dl::g_base + 0x1000;
+    size_t len = dl::g_size - 0x1000;
+    uint8_t* hit = nullptr;
+    int hits = 0;
+    for (uint8_t* p = start;;) {
+        uint8_t* q = dl::FindPattern(p, len - (size_t)(p - start), pat);
+        if (!q) break;
+        if (!hits++) hit = q;
+        p = q + 1;
+    }
+    return hits == 1 ? hit : nullptr;
+}
+
+static void PushLe32(std::vector<int>& p, int v) {
+    for (int i = 0; i < 4; i++) p.push_back((v >> (8 * i)) & 0xFF);
+}
+
+static bool CVFix(bool on) {
+    if (!g_cvSiteOk) return false;
+    if (!g_cvHooked) {
+        if (!on) return true;
+        if (MH_CreateHook(g_cvSite + 0x11, (void*)&LS_dCVLoop, &g_lsOrigCVLoop) != MH_OK) return false;
+        g_cvHooked = true;
+    }
+    MH_STATUS st = on ? MH_EnableHook(g_cvSite + 0x11) : MH_DisableHook(g_cvSite + 0x11);
+    if (st != MH_OK && st != (on ? MH_ERROR_ENABLED : MH_ERROR_DISABLED)) return false;
+    g_cvFixOn = on;
+    return true;
+}
+
+static bool EdHook(uint8_t* site, void* detour, void** orig) {
+    MH_STATUS st = site ? MH_CreateHook(site, detour, orig) : MH_ERROR_NOT_EXECUTABLE;
+    if (st == MH_OK && MH_EnableHook(site) != MH_OK) {
+        MH_RemoveHook(site);  // (not left for game::InstallHooks' MH_ALL_HOOKS to turn on)
+        return false;
+    }
+    return st == MH_OK;
+}
+
+static std::string Rva(const void* p) {
+    char b[24];
+    snprintf(b, sizeof(b), "%#x", p ? (unsigned)((uintptr_t)p - dl::g_base) : 0u);
+    return b;
+}
+
+// Installed at the mod's start (game::InstallHooks): every battle on this PC.
+bool InstallEmptyDivisionGuards() {
+    void* get = dl::Method("TList", "Get");
+    void* gf = dl::Method("TDivision", "GetFlagship");
+    void* range = dl::Method("TFightingShip", "GetRangeToShip");
+    g_edShips = dl::Field("TDivision", "Ships");
+    g_edLead = dl::Field("TDivision", "LeadDivision");
+    g_cvFRole = dl::Field("TDivision", "Role");
+    g_cvFSide = dl::Field("TDivision", "Side");
+    g_cvFDivs = dl::Field("TForce", "Divisions");
+    int fForce = dl::Field("TDivision", "myForce"), fName = dl::Field("TDivision", "Name");
+    int fType = dl::Field("TFightingShip", "ShipType"), fSighted = dl::Field("TFightingShip", "SightedShips");
+    bool small = g_edShips > 0 && g_edShips < 0x80 && g_edLead > 0 && g_edLead < 0x80 && g_cvFRole > 0 &&
+                 g_cvFRole < 0x80 && g_cvFSide > 0 && g_cvFDivs > 0 && g_cvFDivs < 0x80 && fForce > 0 && fForce < 0x80 &&
+                 fName > 0 && fName < 0x80 && fType > 0 && fSighted > 0 && get && gf && range;
+    // 1. ConvoyEscortCheck's inner loop (the fix)
+    uint8_t* s = nullptr;
+    if (small) {
+        std::vector<int> p = {0x8B, 0x45, 0x08, 0x8B, 0x40, 0xF0, 0x8B, 0x40, g_cvFDivs, 0x8B, 0x55, 0xF8, 0xE8, -1, -1, -1,
+                              -1,   0x89, 0x03, 0x8B, 0x03, 0x80, 0x78, g_cvFRole, 0x03, 0x74, -1,   0x8B, 0x03, 0x80,
+                              0x78, g_cvFRole, 0x02, 0x0F, 0x85, -1, -1, -1, -1, 0x8B, 0x03, 0xE8, -1, -1, -1, -1, 0x0F,
+                              0xB6, 0x80};
+        PushLe32(p, fType);
+        s = FindUnique(p);
+        if (s && CallTarget(s + 12) == get && CallTarget(s + 41) == gf) {
+            g_cvSite = s;
+            g_cvSiteOk = true;
+            g_cvLoopNext = (uintptr_t)(s + 0x21 + 6 + *(int32_t*)(s + 0x23));
+        }
+    }
+    char v[8];
+    bool off = g_cvSiteOk && GetEnvironmentVariableA("RTW3MP_TEST_CONVOYFIX", v, sizeof(v)) > 0 && v[0] == '0';
+    bool cvOk = g_cvSiteOk && (off || CVFix(true));
+    Log("ConvoyEscortCheck's loop over a force's divisions: %s (the loop at rva %s, its next index at rva %s)",
+        off    ? "TEST: off (RTW3MP_TEST_CONVOYFIX=0: the game's own loop, its box at a division without ships)"
+        : cvOk ? "ok, a division without ships passed over"
+               : "UNAVAILABLE (the game's own: its box at a division without ships)",
+        Rva(g_cvSite).c_str(), Rva((void*)g_cvLoopNext).c_str());
+    // 2. RearDivisionHasNoSightedEnemy's loop: mov eax, [<division list cell>]; mov eax, [eax]; mov edx, edi; call
+    // TList.Get; mov ebx, eax; mov eax, [ebx+LeadDivision]; cmp eax, [ebp-8]; jne <next>; mov eax, ebx; call GetFlagship;
+    // mov eax, [eax+SightedShips]
+    bool rearOk = false;
+    uint8_t* r = nullptr;
+    if (small) {
+        std::vector<int> p = {0xA1, -1,   -1,   -1,   -1,       0x8B, 0x00, 0x8B, 0xD7, 0xE8, -1,   -1, -1,
+                              -1,   0x8B, 0xD8, 0x8B, 0x43, g_edLead, 0x3B, 0x45, 0xF8, 0x75, -1, 0x8B, 0xC3, 0xE8,
+                              -1,   -1,   -1,   -1,   0x8B, 0x80};
+        PushLe32(p, fSighted);
+        r = FindUnique(p);
+        if (r && CallTarget(r + 9) == get && CallTarget(r + 0x1a) == gf &&
+            RefersTo(r, 0x100, FindLiteral(L"Error in RearDivisionHasNoSightedEnemy function!"))) {
+            g_rearNext = (uintptr_t)(r + 0x18 + (int8_t)r[0x17]);
+            rearOk = EdHook(r + 0x18, (void*)&LS_dRearLoop, &g_lsOrigRearLoop);
+        }
+    }
+    // 3. The walk's core-follower check: mov eax, [ebx+myForce]; mov eax, [eax+Divisions]; mov edx, edi; call TList.Get;
+    // mov esi, eax; mov eax, [esi+LeadDivision]; cmp eax, [ebx+LeadDivision]; jne; cmp byte ptr [esi+Role], 1; jne;
+    // mov eax, [esi+Name]; mov ecx, 1; mov edx, eax; mov eax, <'*'>; call Pos; test eax, eax; sete [ebp-0xd]; jmp +4;
+    // mov byte ptr [ebp-0xd], 0; cmp byte ptr [ebp-0xd], 0; je <next>; mov eax, esi; call GetFlagship; movzx eax, byte
+    // ptr [eax+ShipType]
+    bool coreOk = false;
+    uint8_t* c = nullptr;
+    if (small) {
+        std::vector<int> p = {0x8B, 0x43, fForce, 0x8B, 0x40, g_cvFDivs, 0x8B, 0xD7, 0xE8, -1, -1, -1, -1, 0x8B, 0xF0, 0x8B,
+                              0x46, g_edLead, 0x3B, 0x43, g_edLead, 0x75, -1, 0x80, 0x7E, g_cvFRole, 0x01, 0x75, -1, 0x8B,
+                              0x46, fName, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x8B, 0xD0, 0xB8, -1, -1, -1, -1, 0xE8, -1, -1, -1,
+                              -1, 0x85, 0xC0, 0x0F, 0x94, 0x45, 0xF3, 0xEB, 0x04, 0xC6, 0x45, 0xF3, 0x00, 0x80, 0x7D, 0xF3,
+                              0x00, 0x74, -1, 0x8B, 0xC6, 0xE8, -1, -1, -1, -1, 0x0F, 0xB6, 0x80};
+        PushLe32(p, fType);
+        c = FindUnique(p);
+        if (c && CallTarget(c + 8) == get && CallTarget(c + 0x45) == gf &&
+            RefersTo(c, 0x400, FindLiteral(L"Error in CheckAllDivAfterMove procedure!"))) {
+            g_coreNext = (uintptr_t)(c + 0x43 + (int8_t)c[0x42]);
+            coreOk = EdHook(c + 0x43, (void*)&LS_dCoreLoop, &g_lsOrigCoreLoop);
+        }
+    }
+    // 4. MoveDivisionShips' scout lead: mov eax, [ebp-8]; cmp dword ptr [eax+LeadDivision], 0; je <no lead>; mov eax,
+    // [ebp-8]; mov eax, [eax+LeadDivision]; call GetFlagship; mov edx, eax; mov eax, [ebx]; call GetRangeToShip
+    bool scoutOk = false;
+    uint8_t* m = nullptr;
+    if (small) {
+        m = FindUnique({0x8B, 0x45, 0xF8, 0x83, 0x78, g_edLead, 0x00, 0x0F, 0x84, -1, -1, -1, -1, 0x8B, 0x45, 0xF8, 0x8B,
+                        0x40, g_edLead, 0xE8, -1, -1, -1, -1, 0x8B, 0xD0, 0x8B, 0x03, 0xE8});
+        if (m && CallTarget(m + 0x13) == gf && CallTarget(m + 0x1c) == range &&
+            RefersTo(m, 0x1600, FindLiteral(L"Error in MoveDivisionShips procedure!"))) {
+            g_scoutSkip = (uintptr_t)(m + 0xd + *(int32_t*)(m + 9));
+            scoutOk = EdHook(m + 0xd, (void*)&LS_dScoutLead, &g_lsOrigScoutLead);
+        }
+    }
+    Log("Divisions without ships in the battle AI's other loops: RearDivisionHasNoSightedEnemy %s (rva %s), the walk's "
+        "core-follower check %s (rva %s), MoveDivisionShips' scout lead %s (rva %s)",
+        rearOk ? "ok" : "UNAVAILABLE", Rva(r).c_str(), coreOk ? "ok" : "UNAVAILABLE", Rva(c).c_str(),
+        scoutOk ? "ok" : "UNAVAILABLE", Rva(m).c_str());
+    // 5. The stance routines' and the course routine's LeadDivision and TargetDiv (0.7.0's guard, every battle since 0.7.3)
+    void* stance = FindStanceRoutine();
+    g_stanceAtStart = stance && EdHook((uint8_t*)stance, (void*)&LS_dStance, &g_lsOrigStance);
+    Log("The division stance routine's guard (AIDetermineTacticalStance2: a LeadDivision or TargetDiv without ships): %s "
+        "(rva %s)",
+        g_stanceAtStart ? "on (every battle)" : "UNAVAILABLE here (the lockstep hooks try again)", Rva(stance).c_str());
+    // RTW3MP_DIAG: the reattach routine (the walk: mov edx, ebx; mov eax, [ebp-8]; call <reattach> after
+    // ComputeFuelExpenditure's call; it names the ship that "has reattached to" its division)
+    if (game::PocDiag()) {
+        g_edTrace = true;
+        void* fuel = dl::Method("TDivision", "ComputeFuelExpenditure");
+        void* re = nullptr;
+        uint8_t* start = (uint8_t*)dl::g_base + 0x1000;
+        size_t len = dl::g_size - 0x1000;
+        for (uint8_t* p = start; fuel && !re;) {
+            uint8_t* w = dl::FindPattern(p, len - (size_t)(p - start), {0xE8, -1, -1, -1, -1, 0x8B, 0xD3, 0x8B, 0x45, 0xF8, 0xE8});
+            if (!w) break;
+            if (CallTarget(w) == fuel) re = CallTarget(w + 10);
+            p = w + 1;
+        }
+        bool ok = re && RefersTo(re, 0x300, FindLiteral(L" has reattached to ")) &&
+                  EdHook((uint8_t*)re, (void*)&LS_dReattach, &g_lsOrigReattach);
+        Log("diag: the reattach routine's note: %s (rva %s); every pass of the guards logged", ok ? "on" : "not found",
+            Rva(re).c_str());
+    }
+    return cvOk;
+}
+
+// TEST ONLY, once, on the switch: the course routine's escort test (its call of ConvoyEscortCheck), GetConvoyDivision
+// (ConvoyEscortCheck: mov eax, [ebp-4]; mov eax, [eax+myForce]; mov eax, [eax+MainForce]; call GetConvoyDivision) and
+// ConvoyEscortCheck's first look (push ebp; call <it>; pop ecx: twice, the same routine) whose inner loop holds the fix's
+// site (push eax; call <inner loop>; pop ecx).
+static bool CVTestHooks() {
+    if (g_cvTestHooked) return true;
+    int fForce = dl::Field("TDivision", "myForce"), fMission = dl::Field("TForce", "ForceMission"),
+        fMain = dl::Field("TForce", "MainForce");
+    if (!g_cvSiteOk || fForce <= 0 || fForce > 0x7f || fMission <= 0 || fMission > 0x7f || fMain <= 0) return false;
+    uint8_t* h = FindUnique({0x8B, 0x03, 0x8B, 0x40, fForce, 0x80, 0x78, fMission, 0x04, 0x75, 0x0A, 0x8B, 0x13, 0x8B,
+                             0x45, 0xF8, 0xE8});
+    void* cec = h ? CallTarget(h + 16) : nullptr;
+    if (!cec || !RefersTo(cec, 0x500, FindLiteral(L"Error in ConvoyEscortCheck procedure!"))) {
+        Log("battle AI: TEST ConvoyEscortCheck's call in the course routine was not found");
+        return false;
+    }
+    uint8_t* a1 = Find(cec, 0x500, {0x55, 0xE8, -1, -1, -1, -1, 0x59});
+    uint8_t* a2 = a1 ? Find(a1 + 1, 0x80, {0x55, 0xE8, -1, -1, -1, -1, 0x59}) : nullptr;
+    void* n1 = a1 ? CallTarget(a1 + 1) : nullptr;
+    uint8_t* b1 = n1 && a2 && CallTarget(a2 + 1) == n1 ? Find(n1, 0x400, {0x50, 0xE8, -1, -1, -1, -1, 0x59}) : nullptr;
+    void* n2 = b1 ? CallTarget(b1 + 1) : nullptr;
+    std::vector<int> pc = {0x8B, 0x45, 0xFC, 0x8B, 0x40, fForce, 0x8B, 0x80};
+    PushLe32(pc, fMain);
+    pc.push_back(0xE8);
+    uint8_t* gc = Find(cec, 0x100, pc);
+    void* conv = gc ? CallTarget(gc + 12) : nullptr;
+    if (!n2 || !conv || g_cvSite < (uint8_t*)n2 || g_cvSite > (uint8_t*)n2 + 0x600) {
+        Log("battle AI: TEST ConvoyEscortCheck's inner loop or GetConvoyDivision was not found (%p %p %p)", n1, n2, conv);
+        return false;
+    }
+    g_cvMain = cec;
+    g_cvN1 = n1;
+    g_cvN2 = n2;
+    g_cvConvoyDiv = conv;
+    g_cvMissionSite = h;
+    g_cvAfterCall = (uintptr_t)(h + 21);
+    bool ok = EdHook(h, (void*)&LS_dCVMission, &g_lsOrigCVMission) &&
+              EdHook((uint8_t*)conv, (void*)&LS_dConvoyDiv, &g_lsOrigConvoyDiv) &&
+              EdHook((uint8_t*)n1, (void*)&LS_dCVN1, &g_lsOrigCVN1);
+    Log("battle AI: TEST ConvoyEscortCheck's hooks (the course routine's escort test rva %s, ConvoyEscortCheck rva %s, its "
+        "first look rva %s, its inner loop rva %s, GetConvoyDivision rva %s): %s",
+        Rva(h).c_str(), Rva(cec).c_str(), Rva(n1).c_str(), Rva(n2).c_str(), Rva(conv).c_str(), ok ? "ok" : "FAILED");
+    g_cvTestHooked = ok;
+    return ok;
+}
+
+// TEST ONLY: the switch's run of ConvoyEscortCheck for a computer's division in the course routine (the game's own
+// routine, its own box).
+extern "C" int __stdcall LS_CVTestCall(void* div, void* self) {
+    if (g_cvArm <= 0 || !div || !self || !g_cvMain || g_cvForceDiv) return 0;
+    if (g_cvTestSide >= 0 && dl::At<int>(div, g_cvFSide) != g_cvTestSide) return 0;
+    if (dl::At<uint8_t>(div, g_cvFRole) == 5 || DivShips(div) <= 0) return 0;  // (drPatrol: the routine leaves at once)
+    g_cvForceDiv = div;
+    g_cvForceDone = 0;
+    dl::Call(g_cvMain, U(self), U(div));
+    g_cvForceDiv = nullptr;
+    return 1;
+}
+
+// The inner loop with the force's first division emptied for it (its ship count 0, its role support), both put back
+// after, also when the game's code stops at it (the routine's own handler then shows its box).
+static void RunInnerLoopEmptied(void* frame, int* count, int count0, uint8_t* role, uint8_t role0) {
+    __try {
+        *count = 0;
+        *role = 2;  // drSupport: the loop reads the flagship's type of a support division first
+        CallNested(g_cvN2, frame);
+    } __finally {
+        *count = count0;
+        *role = role0;
+    }
+}
+
+static void CVForceNote(void* esc, void* force, void* first, int ships, void* lead) {
+    try {
+        if (!E.tried) Resolve();
+        static int fFName = dl::Field("TForce", "Name");
+        Log("battle AI: TEST ConvoyEscortCheck of division %s at t=%s: the computer's division %s of force '%s' leads its "
+            "force's scouts and support cruisers towards the convoy at once, with the force's first division %s (role "
+            "%s, %d ship(s)) emptied for that loop (its ships and role put back after)%s",
+            DDDivText(esc).c_str(), ClockText().c_str(), DDDivText(lead).c_str(),
+            fFName > 0 ? W2U(dl::ReadUStr(dl::At<void*>(force, fFName))).c_str() : "?", DDDivText(first).c_str(),
+            RoleText(first).c_str(), ships,
+            g_cvFixOn ? "" : "; the fix is off: the game's box comes");
+    } catch (...) {
+    }
+}
+
+// TEST ONLY: ConvoyEscortCheck's first look at the other side's force in the switch's run. Its frame: [-4] the
+// division variable (the force's division the routine moves first), [-8] the convoy division, [-0xc] Self, [-0x10] the
+// force. 1: taken (the inner loop ran), 0: the game's own first look.
+extern "C" int __stdcall LS_CVForceN1(void* frame) {
+    if (!g_cvForceDiv || g_cvForceDone) return 0;
+    g_cvForceDone = 1;
+    uint8_t* fr = (uint8_t*)frame;
+    void* force = *(void**)(fr - 0x10);
+    if (!force) return 1;  // (no force of the other side: the routine's own first look would stop at it)
+    if (!dl::IsInstanceOf(force, "TForce") || g_cvFDivs <= 0) return 0;
+    // (TEST: a force of that side whose first division can be emptied while another one with ships leads)
+    auto usable = [](void* f, void** first, void** lead) {
+        void* divs = f ? dl::At<void*>(f, g_cvFDivs) : nullptr;
+        int n = dl::ListCount(divs);
+        *first = n >= 2 ? dl::ListItem(divs, 0) : nullptr;
+        *lead = nullptr;
+        for (int i = n - 1; i >= 1 && *first; i--) {
+            void* d = dl::ListItem(divs, i);
+            if (d && d != *first && DivShips(d) > 0) {
+                *lead = d;
+                break;
+            }
+        }
+        return *first && *lead && dl::At<void*>(*first, g_edShips);
+    };
+    void *first = nullptr, *lead = nullptr;
+    if (!usable(force, &first, &lead)) {
+        static int fFSide = dl::Field("TForce", "Side");
+        if (!E.tried) Resolve();
+        void* forces = List(E.forcesVar);
+        void* other = nullptr;
+        for (int i = 0; fFSide > 0 && i < dl::ListCount(forces) && !other; i++) {
+            void* f = dl::ListItem(forces, i);
+            if (f && f != force && dl::At<int>(f, fFSide) == dl::At<int>(force, fFSide) && usable(f, &first, &lead))
+                other = f;
+        }
+        if (!other) return 0;
+        force = other;
+        *(void**)(fr - 0x10) = force;
+    }
+    void* ships = dl::At<void*>(first, g_edShips);
+    InterlockedDecrement(&g_cvArm);
+    InterlockedIncrement(&g_cvForced);
+    CVForceNote(g_cvForceDiv, force, first, dl::ListCount(ships), lead);
+    *(void**)(fr - 4) = lead;
+    RunInnerLoopEmptied(frame, &dl::At<int>(ships, 8), dl::At<int>(ships, 8), &dl::At<uint8_t>(first, g_cvFRole),
+                        dl::At<uint8_t>(first, g_cvFRole));
+    return 1;
+}
+
+// `ls testconvoy [<n> [side=<s>] [nofix]]` (TEST ONLY; any battle, between minutes, on both PCs of a live battle alike):
+// the next n runs of the course routine for a computer's division (of side s; any side without it) run
+// ConvoyEscortCheck for it as for a convoy's escort (GetConvoyDivision's none: the division itself), and the routine's
+// first look at the other side's force leads that force's scouts and support cruisers towards the convoy at once (its
+// inner loop), with the force's first division emptied for that loop (ship count 0, role support; both put back after):
+// the game's moment of the box. `nofix` turns the fix's hook off (the game's own loop: its box) until the next `ls
+// testconvoy`, which turns it on again; `ls testconvoy 0` disarms. The reply's counts: forced= the switch's runs,
+// fixed= the fix's passes over a division without ships (natural ones too), rear=/core=/scout= the other guards'.
+static std::string TestConvoyCommand(const std::vector<std::string>& a) {
+    if (a.size() > 2) {
+        if (!CVTestHooks()) return "error ConvoyEscortCheck's routines were not found";
+        long n = atol(a[2].c_str());
+        int side = -1;
+        bool nofix = false;
+        for (size_t i = 3; i < a.size(); i++)
+            if (a[i] == "nofix")
+                nofix = true;
+            else if (a[i].rfind("side=", 0) == 0)
+                side = atoi(a[i].c_str() + 5);
+        if (!CVFix(!nofix)) return "error the fix's hook could not be turned " + std::string(nofix ? "off" : "on");
+        g_cvTestSide = side;
+        InterlockedExchange(&g_cvArm, n > 0 ? n : 0);
+        Log("battle AI: TEST the next %ld runs of the course routine for a computer's division%s run ConvoyEscortCheck "
+            "with the other side's first division emptied for its inner loop; the fix %s",
+            n, side >= 0 ? (" of side " + std::to_string(side)).c_str() : "",
+            nofix ? "OFF (the game's own loop: its box)" : "on");
+    }
+    return "ok fix=" + std::to_string(g_cvFixOn ? 1 : 0) + " armed=" + std::to_string(g_cvArm) +
+           " side=" + std::to_string(g_cvTestSide) + " forced=" + std::to_string(g_cvForced) +
+           " fixed=" + std::to_string(g_edSkips[0]) + " rear=" + std::to_string(g_edSkips[1]) +
+           " core=" + std::to_string(g_edSkips[2]) + " scout=" + std::to_string(g_edSkips[3]) +
+           " hooked=" + std::to_string(g_cvTestHooked ? 1 : 0);
 }
 
 static void AfterMinute() {
@@ -11605,6 +12249,7 @@ std::string Debug(const std::vector<std::string>& a) {
                " hash=" + std::to_string(g_typeFlagsHash ? 1 : 0);
     }
     if (c == "teststance") return TestStanceCommand(a);  // (TEST ONLY, any battle: the destroyer stance routine's asks)
+    if (c == "testconvoy") return TestConvoyCommand(a);  // (TEST ONLY, any battle: ConvoyEscortCheck's inner loop)
     if (!S.on) return "error no live battle";
     NoteDispatchInSim(("bridge `ls " + c + "`").c_str());
     if (c == "run") {  // ls run [1|5|until|<n>]

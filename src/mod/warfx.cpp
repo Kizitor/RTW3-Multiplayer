@@ -1213,9 +1213,10 @@ void SeaFrame(void* f, int K, int kwar, const std::vector<int>& enemies) {
     g_boxes.clear();
     warfx_boxCap = 1;
     SeaRes r;
-    bool asw[9] = {};  // 0.7.2: the enemies whose wars are all with nations people play (real relations)
+    bool asw[9] = {};  // 0.7.2: the enemies whose wars are all with nations people play (real relations); 0.7.3: only
+                       // with the war player's view off (TEST `aiwar 0`): CheckPatrols' part and PutAIShipsInStatus at war
     for (int j : enemies) {
-        bool hidden = game::MaskKeepAI() && j >= 1 && j <= 8 && !game::AtWar(j, 0);
+        bool hidden = game::MaskKeepAI() && !game::AIWarOn() && j >= 1 && j <= 8 && !game::AtWar(j, 0);
         for (int x = 1; x <= 8 && hidden; x++)
             if (x != j && game::AtWar(j, x) && !hookcb::PlayerRulesNation(x)) hidden = false;
         asw[j] = hidden;
@@ -1729,6 +1730,129 @@ std::string InstallAIBuilds() {
 }
 }  // namespace
 
+// ---------------------------------------------------------------------------------------------
+// 0.7.3: CheckPatrols' part for a computer nation J whose war player is a joined nation K (game::AIWarPlayer: J at war
+// with K under the player's rules and at peace with the host's nation). The game's CheckPatrols (DoStrategicTurn, before
+// ReduceTimeLimits) serves the nations at war with nation 0 only: six times, below its patrol requirement
+// PutShipOnASWPatrol, then CheckAINationShipsOnTradePatrol; then AINationAssignRaiders (raiders against the player:
+// cruisers and armed merchant cruisers of some range on Status 5, which AreaMoveShips' CheckBreakout turns into raiders,
+// Status 4; K's sea war frame then counts their sinkings of K's merchants). Hooked at its end: the same for each such J in
+// K's view (game::AIWarViewEnter; K's war counter above 0, as the game's War > 0), once a month. 0.7.2's sea war frame
+// ran the patrol loop and ReviseASWEffort for J instead (from K's second war month, without raiders): with the war
+// player's view on, J's ReviseASWEffort comes from its PutAIShipsInStatus at war (game.cpp) and the frame runs neither.
+extern "C" void* warfx_oCheckPatrols = nullptr;
+extern "C" void warfx_dCheckPatrols();
+
+namespace {
+void* mAssignRaiders = nullptr;
+bool g_patrolsOn = false;
+std::map<int, std::string> g_patrolRec;  // J -> this month's record (bridge `aiwar`)
+
+int RaidersOf(void* rec) {  // ships in play raiding or breaking out (Status 4, 5)
+    int n = 0;
+    for (int i = 0; rec && i < game::ShipCount(rec); i++) {
+        void* sh = game::Ship(rec, i);
+        if (!sh || !dl::At<uint8_t>(sh, fInPlay)) continue;
+        uint8_t s = dl::At<uint8_t>(sh, fShipStatus);
+        if (s == 4 || s == 5) n++;
+    }
+    return n;
+}
+
+struct PatrolRes {
+    int on0 = -1, on1 = -1, req = -1, r0 = 0, r1 = 0, calls = 0, faults = 0;
+};
+
+void RunPatrols(void* f, int j, PatrolRes& r) {  // in K's view (plain data only; each game call guarded)
+    void* rec = Rec(j);
+    r.on0 = OnPatrol(rec);
+    r.r0 = RaidersOf(rec);
+    for (int i = 0; i < 6; i++) {
+        if (OnPatrol(rec) < Required(f, rec)) {
+            r.calls++;
+            if (!G1(mPutPatrol, rec)) r.faults++;
+        }
+        r.calls++;
+        if (!G1(mTradePatrol, f, rec)) r.faults++;
+    }
+    r.on1 = OnPatrol(rec);
+    r.req = Required(f, rec);
+    r.calls++;
+    if (!G1(mAssignRaiders, f, (void*)(uintptr_t)j)) r.faults++;
+    r.r1 = RaidersOf(rec);
+}
+
+int RunPatrolsGuarded(void* f, int j, PatrolRes& r) {
+    __try {
+        RunPatrols(f, j, r);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+void Patrols(void* f) {
+    g_patrolRec.clear();
+    if (!game::AIWarOn()) return;
+    for (int j = 1; j <= 8 && j < game::NationCount(); j++) {
+        int K = game::AIWarPlayer(j);
+        int kwar = K ? hookcb::KWarCounter(K) : 0;
+        if (!K || kwar <= 0) continue;
+        PatrolRes r;
+        int ran = -1;
+        if (game::AIWarViewEnter(K)) {
+            ran = RunPatrolsGuarded(f, j, r);
+            game::AIWarViewLeave();
+        }
+        char b[300];
+        snprintf(b, sizeof(b), "K=%d war=%d patrols=%d->%d/%d raiders=%d->%d calls=%d faults=%d%s", K, kwar, r.on0,
+                 r.on1, r.req, r.r0, r.r1, r.calls, r.faults,
+                 ran == 1 ? "" : ran == 0 ? " exception" : " noview");
+        g_patrolRec[j] = b;
+        Log("warfx: CheckPatrols for nation %d in nation %d's view (its war player; war counter %d): on trade protection %d "
+            "-> %d of %d required, raiders %d -> %d (AINationAssignRaiders); calls %d, faults %d%s",
+            j, K, kwar, r.on0, r.on1, r.req, r.r0, r.r1, r.calls, r.faults,
+            ran == 1 ? "" : ran == 0 ? " (an exception: stopped)" : " (NO VIEW: nothing run)");
+    }
+}
+
+std::string InstallPatrols() {
+    mAssignRaiders = dl::Method("TfrmBuildCamp", "AINationAssignRaiders");
+    void* cp = dl::Method("TfrmBuildCamp", "CheckPatrols");
+    if (!cp || !mAssignRaiders || !mPutPatrol || !mTradePatrol || !mOnPatrol || !mPatrolReq || fShipStatus < 0 ||
+        fInPlay < 0 || fTension < 0)
+        return "routines";
+    // AINationAssignRaiders' first test: GetBNation(NationIdx).Tension > 40 (`cmp dword ptr [eax+Tension],0x28`)
+    std::vector<int> t = {0x83, 0xB8};
+    Le(fTension, t);
+    t.push_back(0x28);
+    if (!dl::FindPattern((uint8_t*)mAssignRaiders, 0x60, t)) return "AINationAssignRaiders' code";
+    if (!HookAt(cp, (void*)&warfx_dCheckPatrols, &warfx_oCheckPatrols, "CheckPatrols")) return "hook";
+    g_patrolsOn = true;
+    Log("warfx: the computer's war against joined nations: CheckPatrols' part in the war player's view ok (CheckPatrols "
+        "%#x, AINationAssignRaiders %#x)",
+        (unsigned)((uintptr_t)cp - dl::g_base), (unsigned)((uintptr_t)mAssignRaiders - dl::g_base));
+    return "";
+}
+}  // namespace
+
+extern "C" void __stdcall warfx_PatrolsCB(void* form) {
+    __try {
+        if (g_patrolsOn && form) Patrols(form);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("warfx: CheckPatrols' part for the computer's nations at war with nations people play failed (exception)");
+    }
+}
+// CheckPatrols(Self=EAX): the game's, then the part for the war players' enemies.
+extern "C" __declspec(naked) void warfx_dCheckPatrols() {
+    __asm {
+        push eax
+        call dword ptr [warfx_oCheckPatrols]
+        call warfx_PatrolsCB
+        ret
+    }
+}
+
 bool Install() {
     fBlockaded = dl::Field("TBuilderNation", "Blockaded");
     fBM = dl::Field("TBuilderNation", "BudgetModifier");
@@ -1761,6 +1885,11 @@ bool Install() {
             sw.c_str());
     std::string ab = InstallAIBuilds();
     if (!ab.empty()) Log("warfx: the computer's ships laid down: not recorded (%s)", ab.c_str());
+    std::string pa = InstallPatrols();
+    if (!pa.empty())
+        Log("warfx: the computer's war against joined nations: CheckPatrols' part UNAVAILABLE (%s; no ASW patrols or "
+            "raiders of a computer nation against its war player)",
+            pa.c_str());
     if (fBlockaded < 0 || fBM < 0 || fUnrest < 0 || fTension < 0 || fShips < 0 || fDest < 0 || !mIsBlockaded || !check ||
         !effects || !unrest || !stop || !game::WarCell())
         why = "fields or routines";
@@ -1996,6 +2125,54 @@ std::string AIBuildsCommand(const std::vector<std::string>& args) {
              std::to_string(b.req);
     }
     return s;
+}
+
+// 0.7.3, bridge `aiwar` (host): the computer's war against joined nations this month (game::AIWarInfo, CheckPatrols' part).
+// TEST ONLY: `aiwar 0|1` (0: 0.7.2's behaviour); `aiwar status <J> <from> <to> [n]`: up to n (default all) of J's capital
+// ships (battleships, battlecruisers, pre-dreadnoughts: no patrol or raider takes them) in play and operational with
+// Status `from` put on Status `to`, those in a home area first, then those elsewhere (a fleet at war concentrates away
+// from home; PutAIShipsInStatus brings a ship back from reserve wherever it is); their CShipIds and the number of those
+// outside a home area in the reply.
+std::string AIWarCommand(const std::vector<std::string>& args) {
+    if (args.size() >= 2 && (args[1] == "0" || args[1] == "1")) {
+        game::TestAIWar(args[1] == "1");
+        Log("warfx: TEST aiwar %s (%s)", args[1].c_str(),
+            args[1] == "1" ? "0.7.3: the computer's war against a joined nation in its war player's view"
+                           : "0.7.2: no war player's view (the mask's keep and the sea war frame's ASW effort)");
+    } else if (args.size() >= 5 && args[1] == "status") {
+        int J = atoi(args[2].c_str()), from = atoi(args[3].c_str()), to = atoi(args[4].c_str());
+        int n = args.size() > 5 ? atoi(args[5].c_str()) : 1000;
+        void* rec = Rec(J);
+        int fId = dl::Field("TCampaignShip", "CShipId");
+        void* home = dl::Method("TMapArea", "IsHomeArea");
+        if (!rec || J < 1 || J > 8 || from < 0 || from > 6 || to < 0 || to > 6 || fId < 0 || !home || !mIsOper ||
+            fInPlay < 0 || fShipLoc < 0 || fShipTypeOf < 0)
+            return "error usage: aiwar status <J 1-8> <from 0-6> <to 0-6> [n]";
+        std::string ids;
+        int put = 0, away = 0;
+        for (int pass = 0; pass < 2; pass++)  // 0: in a home area, 1: elsewhere
+            for (int i = 0; i < game::ShipCount(rec) && put < n; i++) {
+                void* sh = game::Ship(rec, i);
+                if (!sh || !dl::At<uint8_t>(sh, fInPlay) || dl::At<uint8_t>(sh, fShipStatus) != from ||
+                    dl::At<uint8_t>(sh, fShipTypeOf) > 2 || !(dl::Call(mIsOper, (uint32_t)(uintptr_t)sh) & 0xFF))
+                    continue;
+                void* loc = dl::At<void*>(sh, fShipLoc);
+                if (!loc) continue;
+                bool atHome = (dl::Call(home, (uint32_t)(uintptr_t)loc, (uint32_t)(uintptr_t)rec, 0) & 0xFF) != 0;
+                if (atHome != (pass == 0)) continue;
+                dl::At<uint8_t>(sh, fShipStatus) = (uint8_t)to;
+                put++;
+                away += pass;
+                ids += (ids.empty() ? "" : ",") + std::to_string(dl::At<int>(sh, fId));
+            }
+        Log("warfx: TEST aiwar status %d %d %d: %d ship(s) of nation %d (%d outside a home area): %s", J, from, to, put, J,
+            away, ids.c_str());
+        return "ok put=" + std::to_string(put) + " ids=" + (ids.empty() ? "-" : ids) + " away=" + std::to_string(away);
+    }
+    std::string s = game::AIWarInfo() + " | patrols";
+    if (g_patrolRec.empty()) s += " -";
+    for (auto& kv : g_patrolRec) s += " " + std::to_string(kv.first) + ":" + kv.second;
+    return s + " | cp=" + (g_patrolsOn ? "1" : "0");
 }
 
 }  // namespace warfx

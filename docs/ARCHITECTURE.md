@@ -1,6 +1,6 @@
 # Architecture
 
-How RTW3 Multiplayer works in the current version (0.7.2, protocol 3, live-battle engine level 18, battle generator
+How RTW3 Multiplayer works in the current version (0.7.3, protocol 3, live-battle engine level 18, battle generator
 level [`gen`](#network-protocol) 5) on Rule the Waves 3 1.01.44. This is the developer view; players read the
 [README](../README.md). The history of each part, with the measurements and the dead ends, is in
 [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game facts (calling convention, objects,
@@ -70,12 +70,12 @@ RTW3.exe (Delphi/VCL, Steam DRM stub)
 | `src/mod/saveio.cpp`, `saveio.h` | `IniDoc`, `Bundle`, month packages, submissions, the merge, `MakeNationPlayer`, `ExtractBattleResult`/`ApplyBattleResult`, the `.off`'s campaign divisions (0.6.1). |
 | `src/mod/net.cpp`, `net.h` | TCP transport, message types, LAN discovery. |
 | `src/mod/ui.cpp`, `ui.h` | The Multiplayer window, the title-screen button, the Claim land window, `config.ini`. |
-| `src/mod/lockstep.cpp`, `lockstep.h` | Live battles: the battle engine bindings, the deterministic RNG, the minute protocol. |
+| `src/mod/lockstep.cpp`, `lockstep.h` | Live battles: the battle engine bindings, the deterministic RNG, the minute protocol. The fixes of the game's battle AI in every battle (installed at the mod's start): the destroyer stance routine's second ask (0.7.2), the divisions without ships in the battle AI's loops and 0.7.0's stance guard (0.7.3). |
 | `src/mod/x87.cpp`, `x87.h`, `softmath.h` | Live battles (engine level 16): the hooks of the game's 11 x87 transcendental routines and their software versions (fdlibm's algorithms in SSE2 doubles, with the x87's own 66-bit pi reduction, out-of-range and special-value rules and the game's Exp rounding, within 1 ulp of a double of the CPU's results), the same bits on every CPU; the CPU vendor. |
 | `src/mod/datafiles.cpp`, `datafiles.h` | Live battles (engine level 16): the hash of the game's `Data` folder (but `Data\Graphics` and, since level 18, the game's temporary files `tmp*`), computed in a background thread when a session starts, and the list of files a start compares. |
 | `src/mod/nationplay.cpp`, `nationplay.h` | What the game does for its player only, for joined players' nations: intelligence, the Turn's trade protection and foreign stations questions, the month's consequences ([below](#per-player-intelligence-trade-protection-and-foreign-stations)); the host's store of their campaign divisions (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
 | `src/mod/economy.cpp`, `economy.h` | The player's economy rules for joined nations on the host (relations v2, B5 money): the computer's money and budget bonuses left out, MinHook at single instructions found by pattern. |
-| `src/mod/warfx.cpp`, `warfx.h` | The player's war effects for joined nations on the host (0.6.0, B5): blockades (their points, flags, effects and messages), war weariness, the build rules' war tests, and raiders, submarines and the trade war (a frame in K's view in DoStrategicTurn) for each joined nation at war; 0.7.2: in that frame the patrols of K's computer enemies at war only with nations people play (`CheckPatrols`' loop, `ReviseASWEffort`), and on every PC the record of the computer's ships laid down (`LayDownAIShip`, `aibuilds`). |
+| `src/mod/warfx.cpp`, `warfx.h` | The player's war effects for joined nations on the host (0.6.0, B5): blockades (their points, flags, effects and messages), war weariness, the build rules' war tests, and raiders, submarines and the trade war (a frame in K's view in DoStrategicTurn) for each joined nation at war; the computer's ships laid down (0.7.2); `CheckPatrols`' part for a computer nation in its war player's view (0.7.3). |
 | `src/mod/invasion.cpp`, `invasion.h` | Invasions of joined nations (0.7.0): the host's routines that must not see their invasions (`CheckRebellionAndInvasions`, its rebellion part, `DoPossessionBattle` from the host's invasion check, `DoPeace` through game.cpp), a nation's month resolution in its view, its plan (`kinv`), its invasions in its battle slot and back, the computer's fleets (`GetMostImportantArea`); 0.7.2: the possession details' "Set invasion target" on a joined player's PC by the nation's own wars (`TdlgPossessionDetailsNew.FormShow`). |
 | `src/mod/bridge.cpp` | The test bridge. |
 | `src/mod/poc_battle.cpp`, `poc_battle.h` | The `poc*` research commands of the battle investigation (inactive unless used). |
@@ -120,8 +120,10 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `TfrmBuildCamp.btbnTurnClick` | Host: start the month or wait for the players ("Still waiting for ..."). Client: the Turn button submits, after the Turn's trade protection and foreign stations questions for the player's nation (0.4.1, [below](#per-player-intelligence-trade-protection-and-foreign-stations)). |
 | `btbnResignClick` | Resigning is disabled during a session. |
 | `DoEndOfTurn` | Marks the end of the host's month: the battle phase, diplomacy and the new month follow. |
-| the AI strategic-move routine (unnamed) | Snapshots the human nations' ship orders before it and restores them after it. |
-| `AIMonthlyBuild`, `AINationAdjustBudget`, `PutAIShipsInStatus`, `DetermineAINationResearch`, `CheckAIRebuilds`, `CheckAINationShipsOnTradePatrol`, `AINationAssignRaiders`, `AISendShipsToForeignStations`, `AISendShipToColonies`, `TBuilderNation.SetAITraining`, `CheckAISpying` (0.4.1) | Generated skip thunks: the call is skipped when its nation is a human player's (connected or reserved). |
+| the AI strategic-move routine (unnamed) | Snapshots the human nations' ship orders before it and restores them after it. 0.7.3: a computer nation at war with a joined nation under the player's rules and at peace with the host's nation gets its moves from a second run in that player's view (each nation's orders from one run; [relations v2, B2](#each-joined-nations-relations-relations-v2)). |
+| `AIMonthlyBuild`, `AINationAdjustBudget`, `PutAIShipsInStatus`, `DetermineAINationResearch`, `CheckAIRebuilds`, `CheckAINationShipsOnTradePatrol`, `AINationAssignRaiders`, `AISendShipsToForeignStations`, `AISendShipToColonies`, `TBuilderNation.SetAITraining`, `CheckAISpying` (0.4.1) | Generated skip thunks: the call is skipped when its nation is a human player's (connected or reserved). 0.7.3: `EvaluateBuildingStrategy` (never skipped), `AINationAdjustBudget`, `AIMonthlyBuild` and `PutAIShipsInStatus` of a computer nation with a war player run in that player's view; its colonial moves are skipped while at war with it ([B2](#each-joined-nations-relations-relations-v2)). |
+| `TBuilderNation.NationIsAtWar` | 0.7.3, host: a computer nation inside a routine under B2's mask answers from its real wars (its war with a joined nation is hidden from the computer's relation rules, not from its own economy). |
+| `TfrmBuildCamp.CheckPatrols` | 0.7.3, host (`warfx.cpp`): after it, the part for a nation at war with the player (ASW patrols, `AINationAssignRaiders`) for each computer nation with a war player, in that player's view. |
 | `HandleAIPeace` | Hides the wars the players declared on each other from the AI's peace; keeps the players' VP. Relations v2: runs with the pairs of nations under the player's rules masked (B2). |
 | `DoPeace` | Keeps the players' prestige (the game sets nations 1-8 to 0); shares the host's enemies' VP before it. Relations v2 (B4), in a joined nation's peace part on its PC: only every other nation's Prestige is kept (nothing of the host's). |
 | `HandleBattleAftermath`, `DoBattleBetweenAINations`, `QuickResolveRaiderBattle` | Victory points per battle (players' VP, war scores). `DoBattleBetweenAINations` also defers battles of joined players (see the battle phase). |
@@ -129,6 +131,7 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `DoBattle` | Counts battle setups (declined vs no battle) and tells the session that the host's battle screen opened (live battles). |
 | the battle setup's `SelectForce` (unnamed; its except box "Error in SelectForce procedure!"), its nested ally fallback and no-force rule, and the fallback's read of the side's division | 0.7.1: a side without ships that can fight in the area gets its ally's division, and the game read the division of the side it was to join, which doesn't exist ("... Read of address 0000000D", single player too). The guard ends the force build there with no force (SelectForce False, DoBattle 0) as after the game's handled exception, without the box and without the no-force rule's points, and the ally's ships the fallback marked Used are unused again. The game's own no-force rule ("Friendly ships not available ...", "Enemy unable to challenge ...") and the guard's ends are counted (`game::NoForce`) for the replay ([the battle phase](#joined-players-battles-against-ai-nations-the-battle-phase)). Any PC (the host's own battles, battle slots, live battles); TEST `battles testnoforce`. |
 | `TFightingShip.IsBigShip` (only its call after the destroyer stance routine's second ask, told apart by its return address; `lockstep::InstallStanceAskFix`) | 0.7.2: a bug of the game's battle AI (single player too): the stance routine for destroyer divisions (from `AIDetermineTacticalStance2`) asks an unnamed routine for the closest dangerous big enemy ship twice and uses the second answer unchecked; a random draw (`IsDangerous` of a ship with 70 % damage or more) can make it none, and `IsBigShip(nil)` showed "Error in AIDetermineTacticalStance2 procedure! Division: ... Read of address 000009D3". There a nil answers True, as for the first answer (always a big ship for a destroyer); no draw is added or skipped, so a live battle stays equal on both PCs. Any PC, every battle. TEST `ls teststance` hooks the unnamed routine, the destroyer routine's sighting check and out-of-range branch and `TfrmMain.GetClosestEnemyShip` on first use ([GAME-INTERNALS](GAME-INTERNALS.md#tactical-battles)). |
+| four loops of the battle AI over divisions (unnamed, found by their code: `ConvoyEscortCheck`'s loop over the other side's force right after `TList.Get`, `RearDivisionHasNoSightedEnemy`'s loop, the end-of-minute walk's core-follower check, `MoveDivisionShips`' scout lead) and `AIDetermineTacticalStance2` (`lockstep::InstallEmptyDivisionGuards`) | 0.7.3: a bug of the game's battle AI (single player too): a division whose ships are gone (a detached division after its reattach in the end-of-minute walk, a player's Detach of every ship, the minute's sunk divisions until the walk reaches them) stays in its force's list until the next walk, and these loops read its flagship unchecked: "Error in ConvoyEscortCheck procedure! Access violation ... Read of address 000009D3" in the host's battle after a drop. Such a division is passed over as the loop passes over one of no interest (the scout's lead: as no lead), as it reads after the walk; no draw is added or skipped where the game goes on, so a live battle stays equal on both PCs. The 0.7.0 guard before `AIDetermineTacticalStance2` (`LS_StanceGuard`: a `LeadDivision` or `TargetDiv` without ships) is hooked here too, so every battle has it (before 0.7.3: with the lockstep hooks only). Any PC, every battle. TEST `ls testconvoy` hooks the course routine's escort test, `GetConvoyDivision` and `ConvoyEscortCheck`'s look at a force on first use; `RTW3MP_DIAG` adds a note at each reattach that empties a division ([GAME-INTERNALS](GAME-INTERNALS.md#tactical-battles)). |
 | `AdvanceDesignStudies` | Counts down the joined players' design studies, once per month. |
 | `ReduceTimeLimits` | Counts down the joined players' pending doctrine changes, once per month. Relations v2: runs with the pairs of nations under the player's rules masked (its "separate peace" of a computer nation, B2). |
 | `DoResearch` | Puts a joined nation's research priorities back after the game's AI branch. |
@@ -890,6 +893,37 @@ decided later). Done so far:
     another war is at war for the game anyway (nothing to keep); ships under construction are left to the game (it sets
     them to 0 in any month). TEST ONLY `aibuilds keep 0` (warfx.cpp): neither this nor B5 (c)'s ASW effort (0.7.1's
     behaviour).
+    0.7.3: only under TEST `aiwar 0`; the war player's view below replaces it (with it, `ReviseASWEffort` taking a
+    destroyer off trade protection would be undone).
+  - *The computer's war against a joined nation (0.7.3).* In single player a computer nation runs its own routines
+    against its player (nation 0): at war with it (`Tension` above 40, `War` above 0) it calls up its reserves, raises its
+    budget, builds for the war, patrols against the player's submarines, sends raiders and concentrates its fleet
+    ([GAME-INTERNALS](GAME-INTERNALS.md#the-computers-war-against-its-player)). A computer nation J at war with K saw none
+    of it: the war is not with nation 0, and the mask hid it inside `ReduceTimeLimits` even from `IsAtAIWar`, so J
+    demobilized during the war. Now `AIWarPlayer(J)` = K (game.cpp): J at war with a nation under the player's rules (the
+    lowest index of several) and at peace with the host's nation (at war with the host, the host is its player, as the
+    game has it). J's routines with a war-with-the-player branch run once a month, as before, but in K's view
+    (`AIWarViewEnter`: the mask lifted for the call, `HostViewEnter` with K's war counter, at least 1; `AIWarViewLeave`):
+    `EvaluateBuildingStrategy`, `AINationAdjustBudget`, `AIMonthlyBuild`, `PutAIShipsInStatus` (the skip thunks'
+    `view` routines: `SkipDecider` answers 2, `AIViewCall` runs the original in the view; log `relations v2: nation J at
+    war with nation K (a nation people play), at peace with the host's nation: its monthly routines run in nation K's
+    view ...` and `relations v2: nation J's PutAIShipsInStatus in nation K's view (at war): before <statuses>; after
+    ...`), `CheckPatrols`' part for J (B5 (c)'s 0.7.3 paragraph) and the strategic moves (the unnamed routine of
+    `DoTurn2` once more in K's view for its enemies, every other nation's orders put back: `relations v2: the computer's
+    strategic moves of nation(s) J in nation K's view (their war player): n ship order(s) or status(es) changed`).
+    `NationIsAtWar` of a computer nation answers from its real wars while a masked routine runs (`ReduceTimeLimits`'
+    peace budget cut and productivity gain, the maintenance's reset of trade protection and raiders: `relations v2:
+    nation J at war with nation K (behind the mask in <routine>): NationIsAtWar answers at war`), and J moves no ship to
+    or from its colonies (`MaybeSendHomeShipInColonies`, `AISendShipToColonies` skipped: the game's
+    `CheckShipsOnForeignStations` runs at peace only). Tension or alliance changes made in a view are not kept (its cells
+    are put back, as the mask drops them); the intelligence reports and news of these routines go to the host's lists as
+    before. Not handled: `CheckBreakout` (J's raiders leave port without K's blockade's interception roll), the game's
+    rules for every computer nation while the player is at war (`War` > 0: no colonial moves, 60 % of the reserves
+    called up by the strategic moves), which stay the host's for nations that are not K's enemies, a second joined
+    nation at war with J (J's generic war behaviour; J's raiders have no target, so they roll against it too), and K's
+    own `NationIsAtWar` inside the masked routines (its peace budget cut and productivity gain in `ReduceTimeLimits`).
+    Bridge `aiwar` (this month's record), TEST `aiwar 0` (0.7.2), `aiwar status`. Host only, no message: a 0.7.3 host
+    gives it to every client whose nation follows the player's rules (0.5.0 or newer).
   - From B2 on, K's relations with the computer's nations change only by K's player routines (B3), the players'
     diplomacy and the events; a client that doesn't announce `rel` keeps the computer's rules (0.4.x behaviour).
 - **B3, the player's relation routines on K's PC.** The host tells a client whose nation follows the player's rules
@@ -1073,6 +1107,15 @@ decided later). Done so far:
   [GAME-INTERNALS](GAME-INTERNALS.md#the-computers-escorts-against-the-players-submarines)) stops once they reach it, as
   in single player; up to 0.7.1 J's patrols never did and it laid down escorts every month of the war. The frame's record
   ends with `ASW effort of the enemies at war only with nations people play ...: J: before -> after of <requirement>`.
+  0.7.3: only under TEST `aiwar 0`. With the war player's view (B2's 0.7.3 bullet) J's patrols and raiders come from
+  `CheckPatrols` at its place in the month (before `ReduceTimeLimits`, from K's first war month: K's war counter above 0
+  as the game's `War` > 0): hooked at its end, the game's call first, then for each computer nation J whose war player
+  is K, in K's view, the six patrol steps (reproduced as above) and `AINationAssignRaiders(J)` (its cruisers and armed
+  merchant cruisers on Status 5; `AreaMoveShips` lets them out next month and this frame's second `CheckRaiderSinkings`
+  loop rolls their sinkings of K's merchants, which reach K's report and war score as every enemy raider's); log
+  `warfx: CheckPatrols for nation J in nation K's view (its war player; war counter W): on trade protection a -> b of r
+  required, raiders x -> y (AINationAssignRaiders); calls c, faults f`. J's `ReviseASWEffort` is its
+  `PutAIShipsInStatus`' at war; the frame runs neither.
 - **The computer's ships laid down (0.7.2, `warfx.cpp`, every PC; diagnosis and tests).** `LayDownAIShip` is hooked at
   its entry (it lays down every computer nation's ship): each lay-down is recorded with the nation (its real index, also
   inside a view: `game::RealIndexOf`), the type, what asked for it (the first routine of the call chain other than
@@ -1589,19 +1632,19 @@ decided later). Done so far:
 - The command reference, the runner and the scenario catalog are in [TESTING.md](TESTING.md).
 
 ## Versions and protocol
-- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.7.2
+- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.7.3
   starting (protocol 3)`).
 - The host refuses a client with another protocol or another game build. Protocol history: 1 = 0.1.0, 2 =
-  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1 and 0.7.2 (relations v2, 0.6.0, 0.6.1
-  and 0.7.0 keep 3: their new keys are ignored by older peers; 0.7.0's features go by the hello's and the welcome's
-  `gen` and the month's `legacy`, see [Network protocol](#network-protocol); 0.7.1 adds only the battle result's
-  optional `noforce`; 0.7.2 raises the hello's and the welcome's `gen` to 5 and adds the battle result's optional
-  `enc`, sent only to a `gen` 5 host).
+  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1, 0.7.2 and 0.7.3 (relations v2, 0.6.0,
+  0.6.1 and 0.7.0 keep 3: their new keys are ignored by older peers; 0.7.0's features go by the hello's and the
+  welcome's `gen` and the month's `legacy`, see [Network protocol](#network-protocol); 0.7.1 adds only the battle
+  result's optional `noforce`; 0.7.2 raises the hello's and the welcome's `gen` to 5 and adds the battle result's
+  optional `enc`, sent only to a `gen` 5 host; 0.7.3 changes no message).
   Within a protocol, versions can play together, but features may need both
   sides (see [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is not checked; the notices about
   another live-battle level quote it.
 - Live battles have their own version, the live-battle engine level `MP_LS_LEVEL` (`src/mod/common.h`): 1 = 0.3.0 to
-  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1 and 0.7.0 to 0.7.2. Levels 2 to 13 were development levels
+  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1 and 0.7.0 to 0.7.3. Levels 2 to 13 were development levels
   of 0.4.0 (the live-battle limits branch, whose MODLOG entries say "v0.4.0", "v0.5.0" and "v0.6.0" after the release
   plan of 2026-10-16, but it shipped as one version, 0.4.0), and levels 15 and 16 were rounds of 0.4.1's two-PC fixes;
   none of them was released. A client announces its level in its hello (`ls=<level>`), and the host pairs a live battle
@@ -1664,6 +1707,11 @@ decided later). Done so far:
   (the button under a 0.7.0 or newer host), and the refusal of a target outside the nation's wars, the end of a plan
   whose target another nation invades, each invasion's support drifting in its own nation's call only and the patrols
   of the computer enemies at war only with nations people play (the escorts) are the host's month; no live-battle path
-  changes.
+  changes. 0.7.3 keeps level 18 and protocol 3 as well: the computer's war against a joined nation (B2's war player's
+  view, B5 (c)'s `CheckPatrols` part) is the host's month only, with no message, and the guards of the battle AI's
+  loops over divisions without ships are each PC's own, in every battle (with them 0.7.0's stance guard, which live
+  battles had already). They draw nothing, so two 0.7.3 PCs stay equal; an older PC stops the routine at such a
+  division with its box (in a live minute answered by the mod), so that minute can differ (a DESYNC, then the
+  resync), as with 0.7.0's and 0.7.2's fixes of the battle AI.
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

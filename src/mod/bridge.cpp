@@ -517,6 +517,9 @@ static std::string ExecuteOnMain(const std::string& line) {
         // aibuilds [clear | patrol <J> [<K> [set]] | keep <0|1>]: the computer's ships laid down (0.7.2); `patrol ... set`
         // and `keep 0` are TEST ONLY (keep 0: 0.7.1's mask and sea war frame)
         if (cmd == "aibuilds") return warfx::AIBuildsCommand(args);
+        // aiwar [0|1 | status <J> <from> <to> [n]]: the computer's war against joined nations this month (0.7.3, host);
+        // `0|1` and `status` are TEST ONLY (0: 0.7.2, no war player's view)
+        if (cmd == "aiwar") return warfx::AIWarCommand(args);
         // TEST ONLY: warfxblk <n> <-1|0|1>: the war effects' blockade test of nation n answers 1 / 0; -1 the game's
         if (cmd == "warfxblk") return warfx::TestBlockade(args);
         // TEST ONLY: warfxrand <v>: the war effects' own Random(n) draws min(v, n - 1); -1 the game's
