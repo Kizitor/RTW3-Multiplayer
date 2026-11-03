@@ -104,6 +104,14 @@ void DebugApplyDiplomacy();  // tests (host): run the month-end diplomacy step n
 void DebugEvent(int forcedIdx);  // tests (client): roll this month's event now (-1 = random, else that event)
 void DebugEventChance(int pct);  // tests (client): chance of an event per month (default 33)
 void DebugIntelCheck();          // tests (client): the monthly intelligence check now (the game's dialogs may show)
+// 0.8.0 tests (client): the month's officer routine now (forced >= 0: the game's officer event with that random number;
+// its dialogs may show), as the event roll runs it (sent to the host if an event was shown); `ofstate` for the bridge.
+void DebugOfficerMonth(int forced);
+void DebugOfficersQuiet(int on);  // TEST ONLY: RTW3MP_TEST_OFFICERS=quiet switched (-1: as it is)
+// TEST ONLY (host): KillCommander in the next month: once its turns are merged, or (month, 0.8.0) when its
+// DoStrategicTurn starts, after the battles sent during the month
+void DebugArmOfficerKill(int nation, int ship, bool pow, bool month = false);
+std::string DebugOfficerState();
 std::string DebugLastEvent();    // tests: last event sent (client) or applied (host)
 std::string DebugWarVP(int a, int b, int va, int vb, bool set);  // tests (host): read or set a war's victory points
 std::string DebugTerms(int a, int b);                            // tests (host): the peace terms right now

@@ -254,6 +254,17 @@ belong to 0.4.0.
     [ConvoyEscortCheck's box after a drop: divisions whose ships are gone in the battle AI's loops](#fix-2026-11-02-convoyescortchecks-box-after-a-drop-divisions-whose-ships-are-gone-in-the-battle-ais-loops-v073-dev)
   - Testing:
     [the 0.7.3 release candidate dist_rc073_1](#testing-2026-11-02-the-073-release-candidate-dist_rc073_1-v073)
+- **0.8.0** (officers for joined players and simultaneous battles, features asked for by players on 0.7.1; its entries
+  carry "0.8.0-dev" or "0.8.0")
+  - Feature:
+    [officers for joined players](#feature-2026-11-01-officers-for-joined-players-v080-dev);
+    [simultaneous battles](#feature-2026-11-02-simultaneous-battles-v080-dev);
+    [the 0.8.0 integration: officers and simultaneous battles together](#feature-2026-11-02-the-080-integration-officers-and-simultaneous-battles-together-v080-dev)
+  - Investigation:
+    [officers for joined players](#investigation-2026-11-01-officers-for-joined-players-v080-dev);
+    [simultaneous battles: the design](#investigation-2026-11-01-simultaneous-battles-the-design-v080-dev)
+  - Testing:
+    [the 0.8.0 release candidate dist_rc080_1](#testing-2026-11-03-the-080-release-candidate-dist_rc080_1-v080)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -8464,6 +8475,194 @@ measurement answers "New model" with Cancel now and starts no further part while
 (the 1958 and 1900 campaigns, multiplayer, 0.7.1 and the fix). In all about 53 minutes with the game open for the
 measurements, plus the suite runs above.
 
+## Investigation 2026-11-01: officers for joined players (v0.8.0-dev)
+- **Report (0.7.1):** "The non-host player has no officers of their own." Each joined player should have the officers
+  the game gives its player in single player. Phase 1: the game's officer model, what the mod does with officers
+  today, and a design; nothing implemented. Static reading of 1.01.44 (rdis, RTTI, form layouts) and two short live
+  probes on the 0.7.1 code (the feat-officers branch at a0d08e4 plus a probe bridge command, not committed); the facts
+  are in GAME-INTERNALS, [Officers](docs/GAME-INTERNALS.md#officers).
+- **The model.** `TOfficer` (Name, Id, Ability, Rank, YearsInRank, two `TSpecialAbility`, BattleStars, Status, Fate,
+  AbilityKnown). Every `TBuilderNation` has an `OfficerList` (+0x115), but only PlayerNation's is filled: the `.off`'s
+  `[Officers]` (load 0xe100f4, save 0xe0fc78, both on PlayerNation), `ConnectOfficersToShips` 0xc69134 (Self's ships;
+  the map areas only when Self is PlayerNation) on PlayerNation only. Commanders: ships (`Commander` +0xcc,
+  `CommanderId` +0xd0; `SaveMe` writes the pointer's id or -1), campaign divisions (+0x14), map areas (`AreaCommander`
+  +0x178, one per area for every nation). New officers take ids from the campaign's IDNo counter (0xd79de4).
+- **PlayerNation only:** the *Officers* tab and every action on it, the ship, area and division popups' commander
+  items, the free promotion a turn (a global byte, cleared only by `DoTurn2`), the month's officer routine
+  `HandleOfficerStuff` 0xc6952c (inside `CheckTurnEvents`' one monthly event slot: an officer event uses the slot), the
+  Turn's question about uncommanded ships and its auto-assignment, the new campaign's pool, `DoPeace`'s release of
+  POWs. `AssignOfficerToCommandShip` takes the officer from PlayerNation's list whatever the ship's nation;
+  `AdvanceShipConstruction` auto-assigns only nation index 0's new ships.
+- **Any nation's ship with a commander:** `KillCommander` (submarines, mines, torpedoes, foreign stations, raider
+  battles; 30 % POW, no message), maintenance (GoodAdmin x0.75, PoorAdmin x1.1, constants read from the image),
+  `AdjustCrewQuality` (every nation's ships; its picture messages have no nation test), the raider checks, `ScrapShip`.
+- **Battles.** The generator copies the campaign ships' and (player's side) divisions' commanders into the battle
+  (0xbf282f, 0xbf6f98, 0xbf8ce0); the battle area's commander changes the chance of each of the player's ships to join
+  the force (0xbf82ad). The `.sac` keeps
+  `Ship<i>Commander` (0xdd472b) and its load looks it up with `PlayerNation.GetOfficerWithId` (0xdda984) for both
+  sides; it keeps no division commander. So every live battle (both PCs resume A's files) has the commanders of A's
+  nation 0 only, the same on both PCs: no determinism problem at engine level 18.
+- **Live, probe 1** (game open 69 s): the joined player's (Germany, nation 1) *Officers* tab is empty in both months
+  (0 rows; the host's 38). The month package's `.off` holds the host's 38 officers (same ids); slot 77's `.bcs` has 22
+  commanded ships, all the host's, and the MapData the host's 11 area commands. `copygame 78`: `player copy in slot 78:
+  ... 22 commanders ...`; the copy keeps the host's 38 officers and 11 area commands: loaded, it lists British names with
+  German ranks and admirals as "CO Northeast Asia station" and so on (the README's "unassigned" holds for ships only).
+  The host's month: "Admiral Blanfield has shown himself to be of Average ability!" (the host's own routine).
+- **Live, probe 2** (game open 79 s; bridge `ofprobe`: per nation officers / active / ships / commanded / ids /
+  in-own-list): client `pn=1 nations=0:38/38/51/22/22/22;1:0/0/34/0/0/0;... areas=11/11/0x11`: the host's officers sit
+  in nation 0's list and command the host's ships and every area; nation 1 has none. TEST `ofprobe adopt 2` (the two
+  lists traded, the host ships' 22 commanders cleared, officers 99 and 100 put on two of nation 1's ships): `1:38/38/34/
+  2/2/2`, the game's *Officers* tab lists 38 with "B Brandenburg" and "B Wittelsbach" as commands; the client's `save`
+  wrote `[Officers]` (38, PlayerNation's list) and 2 `Ship<n>CommanderId` in `[Nation1Ships]`; `copygame 78` of that
+  save: "0 commanders", the copy's `[Nation0Ships]` 2 ids, loaded `0:38/38/34/2/2/2` (the game's own connect). After the
+  month the host held the 2 ids in memory (`1:0/0/34/0/2/0`) but its save wrote -1 for all of nation 1's ships.
+- **Recommended design** (the developers' brief, protocol 3 and engine level 18 kept): each joined nation K's corps in
+  K's own `OfficerList`. The host keeps K's officers and area commands in `rtw3mp_nations.ini`, loads them into K's
+  list after every load of its slot (the game's loader, then `K.ConnectOfficersToShips`), so its month kills, captures,
+  trains and prices K's commanders natively and its saves keep K's ship ids; it writes them back after its saves
+  outside the battle phase. K's month package carries K's officers in the `.off` (never the host's) and K's area
+  commands in the MapData. On K's PC a hook of `ConnectOfficersToShips` (only in the load of K's own month) trades
+  nation 0's and K's lists, so the game's own screens, popups, divisions and saves work on K's corps; K's PC runs
+  `HandleOfficerStuff` in its event slot (the dialogs are the player's), the Turn's question and auto-assignment at
+  Submit, and generates the corps in the first month (the new campaign's recipe). The turn and the battle results
+  carry `officers.ini`; battle slots and Copy game need nothing (K is nation 0 there). Guards on the host:
+  `AdjustCrewQuality`'s messages for K's ships go to K's news, the ship sheet's commander line. Live battles keep A's
+  commanders only (both sides: a later engine level). Older players get an empty `[Officers]`.
+- **Alternatives:** the host keeps text only (K's commanders would survive sinkings, no admin pricing or training,
+  the mod must keep K's ship ids itself), or the officer routines on the host (their dialogs are K's player's): not
+  recommended. **No-gos:** none found.
+- **Gotchas.**
+  - The bridge routes every command beginning with `poc` to `poc_battle.cpp` ("error unknown poc command"): the first
+    probe's `pocofficers` never ran; probes need another prefix.
+  - A ship's commander id survives a save only through the pointer: a turn's ids for a nation the host never connects
+    are gone after the host's month (probe 2).
+  - Map areas have one commander for all nations: K's area commands must come from K's own files, and the host's
+    area commander shapes K's battles today (the battle slot keeps the host's MapData commands).
+  - The free promotion is a global byte only `DoTurn2` clears: a joined player's PC (no `DoTurn2`) needs it cleared
+    with each month.
+  - A host load before the session attached its records must not write empty lists over them.
+
+## Investigation 2026-11-01: simultaneous battles: the design (v0.8.0-dev)
+- **The feature** (asked for by players on 0.7.1, approved): a joined player fights its battle of the month while the
+  host fights its own, instead of after the host's whole month (the design limit B of the
+  [battle investigation](#investigation-2026-11-01-one-battle-at-a-time-battles-per-month-the-hosts-battle-first-several-players-v072-dev)).
+  Research only: static reading, one POC run; the implementation-ready design is in the developers' session files
+  (`sb80\simul-design.md`), the POC as a patch there (`sb80\poc.patch`, not committed).
+- **A save into another slot is safe at the generator's hook** (static; [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)).
+  `SaveBuildCampaign` reads the slot global (`[0xf2788c]`) again for every file it writes (design files, `.sta`,
+  `MapData`, `.bcs`, `.off`) and creates the folder, so the global switched for one call and put back (`__finally`)
+  saves the campaign in memory into a scratch slot. At the hook (`CB_BeforeBattles`, the entry of the host's
+  `CheckForBattles2`, after `AreaMoveShips`) no dialog is open, `DoTurn2`'s own autosave (0xce16c7) is over, K's view
+  is left (`HostViewLeave`: a save inside it would write permuted relations) and `BattleArea`/`BattlePossession` are
+  nil or valid (cleared before every load since 0.6.0, no `DoBattle` yet this month). Its side effects are those of
+  the turn's autosave (the cursor), plus `SaveQuestion` := False (a normal save clears it, an autosave doesn't).
+  Every save also writes `MapData<slot>.dat` and the `.sta`, the autosaves too (`DoTurn2`'s, `DoAutosaveBeforeBattle`
+  0xd02d4c from `DoBattle`, the battle's minute timer 0xdafc9d): during a month the host slot's `.bcs` is the month's
+  start but its `MapData` is not, so a package of the slot's files must be built before the Turn handler runs.
+- **The POC** (`battles simulprobe 1`, host only, off by default): after the joined nations' generators the hook
+  saves the month into slot 150 + host slot (`PocSaveSnapshot`: no box of the game, the save counters and the last
+  save's state put back), sends each kind 1 request at once from it (`SendBattle(r, slot)`, `sentBcs` = the snapshot,
+  header `early=1`; not to a nation at war with nation 0), holds a result that arrives before the battle phase (the
+  payload kept in the request) and runs it through `HostOnBattleResult` once the phase has saved the month-end
+  (`PocThreeWay` logs what the battle, the month and both changed in the result's ship sections).
+- **Live run** (host + Captain (nation 1, at war with Spain) + Bot (nation 2, at war with Italy) on one PC, the host at
+  war with Italy, the 1900 fixture, 3 months on auto-run; 54 checks passed, no error box; game open 8.5 min, the
+  released 0.7.1 reinstalled and its hash checked, slots 1 and 9 and the Preferences identical, slots 76/77/86/87/151
+  deleted):
+  - Snapshot: 62, 47, 47 ms (13 files, 1.8 MB; the slot global back to 1, the save counters unchanged); each package
+    (1.76 MB, as the month-end ones) sent 15-47 ms later.
+  - Timeline, month 1: 19:24:03.257 both requests, .313 snapshot, .339/.367 sent; Bot's battle screen 19:24:07.4,
+    Captain's 19:24:08.6, the host's 19:24:08.8 (all three at once, every month: K's screens 4-6 s after the request,
+    within 2 s of the host's); results held at 19:24:45.1 and 19:24:46.8; `DoEndOfTurn` 19:25:53.0; battle phase .072,
+    both merged by .139 (30-42 ms each); the new month .554. Months 2 and 3 alike (the host's battles 208 and 84 s:
+    the held results waited for them). The battle phase took 0.3-0.5 s instead of the players' whole battles; the
+    clients ran unchanged client code (`MSG_BATTLE` during the host's processing waits for a free game, as today).
+  - Three-way, per battle (the result's ship sections, 69-92 ships): the battle changed 6-22 ships, only
+    `CrewQuality`, `BattleStars`, `RepairTime`, `LogEntry<i>`, `NumberOfLogEntries`; the month changed 55-77 of them
+    (`CrewQuality` +1 on almost every ship, `BuildProgress`, `Status`/`OldStatus`, `RepairTime` countdowns, and the log
+    entries and stars of the host's own battle); **both, with different values: 6-16 ships every time, always
+    `CrewQuality`**, plus log entries on 1-4 Italian ships a month that fought both Bot and the host in the
+    Mediterranean. Today's merge takes the battle's value, so an early battle would cost its ships the month's training
+    (`CrewQuality`) and the host's battle its log entries on a shared enemy's ships. The month-end diffs (snapshot
+    against the phase's save, `sb80\diff_snap.py`): `CrewQuality` of 242-258 ships of all nations a month.
+- **The design** (`sb80\simul-design.md`): kind 1 at the hook from the snapshot (a nation at war with nation 0 when
+  `CheckForBattles2` returns, unless the host's battle is live against it), kind 2 at the Turn from the month's start
+  (that nation's kind 1 then late), kind 0 and live K1-vs-K2 battles in the battle phase as today; results held until
+  the phase and merged first, three-way against the snapshot with field rules for a field both changed
+  (`CrewQuality` and `BattleStars`: month + the battle's change; log entries appended; `RepairTime` the larger; `Used`
+  the month's; else the battle's, logged); hello and welcome `simb=1` (older peers keep today's order); protocol 3 and
+  engine 18 unchanged; a host restart loses held results like today's requests (persistence for
+  `AdoptMonthInProgress` optional). Effort about 4 days, risk medium; no hard no-go.
+
+## Feature 2026-11-01: officers for joined players (v0.8.0-dev)
+- **Report (0.7.1):** "The non-host player has no officers of their own." Since 0.8.0 each joined player's nation has
+  its own officer corps, as the game's player has in single player: the Officers tab and its actions, ship, area and
+  division commanders, the monthly officer routine and its events, the Turn's commander question, battle stars and
+  fates. The design of the investigation ([above](#investigation-2026-11-01-officers-for-joined-players-v080-dev)),
+  implemented as proposed; ARCHITECTURE: [Each joined player's officers](docs/ARCHITECTURE.md#each-joined-players-officers-080);
+  the game facts found on the way in GAME-INTERNALS, [Officers](docs/GAME-INTERNALS.md#officers).
+- **Host:** the record `rtw3mp_nations.ini` `[Nation<K>Officers]` / `[Nation<K>AreaCmd]`; after every load of its slot
+  (and when the records attach to an open campaign) each record goes into its nation's own list with the game's
+  unnamed loader (0xe100f4, found as the call before `ConnectOfficersToShips` in `LoadBuildCampaign`) and
+  `K.ConnectOfficersToShips` connects its ships; the lists go back with the game's writer (0xe0fc78, the call before
+  `SaveCampaignDivisions` in `SaveBuildCampaign`) after every good save of its slot and after `DoEndOfTurn`, only for the
+  nations the last load put in memory and never in the battle phase. The month package's `.off` holds K's record (empty
+  for an older mod), the MapData K's area commands; header `offs` (and `offgen` while K has none). The merge
+  (`HostTakeOfficers`) checks `officers.ini` strictly; K's ships' commanders that are not active officers of the record
+  become -1; a turn without
+  it (or rejected) keeps the host's ids first.
+- **The player's PC:** the hook of `ConnectOfficersToShips` trades the lists of nation 0 and K at the month's load
+  (`ofc::LoadScope` in `game::LoadCampaign(77, K)`), so every game screen and save works on K's corps; `offgen` forms the
+  corps with the new campaign's recipe; the month's `HandleOfficerStuff` runs before the event roll in the events' view
+  (its events need K at index 0: `GetRandomShipUnderConstruction(0)`, `TensionChangeWithMessage` of the most tense
+  nation), an officer event using the month's event slot (`MSG_EVENT` `event=-2`); the free promotion's byte is cleared
+  each month; Submit asks the game's commander question (0xd33ed0) and runs the three assignments of `DoTurn2`; turns and
+  battle results carry `officers.ini`.
+- **Battles:** K's battle slot gets K's record and area commands (native load: K is nation 0), the result its
+  post-battle `[Officers]`; `ApplyBattleResult` never takes a ship's `CommanderId` (in K1's battle slot K2's ships come
+  back without commanders: they would have lost them on the host); after the record is stored, K's ships whose
+  commander the battle killed or captured lose him on the host too (`HostFixShipCommanders`: only active officers
+  command; the game's `GetOfficerWithId` ignores the status, so the next load connected the dead officer again - found
+  by the relations group's battle_raider cross-check, fixed in 0e658f1). The Copy-game transform clears every other
+  nation's ship commanders. Live battles unchanged (engine 18).
+- **Host guards:** `AdjustCrewQuality`'s picture messages for a nation other than the host's are captured
+  (`lockstep::BeginTextCapture`) and go to its player; the ship sheet shows no commander for a ship not PlayerNation's.
+- **Tests:** suite scenario `officers` (default run, after `divisions`); the legacy scenario checks the first month's
+  corps and the Continue's assignment; `disk_growth` follows the record's size (`RecOfficers`); the runner starts every
+  copy with `RTW3MP_TEST_OFFICERS=quiet` (no officer routine or question in other scenarios; `ofquiet 0` in
+  `officers`, `ofquiet 1` at its end). Mixed versions with 0.7.1 by `of80\mixed_of.py` (the developers' session folder).
+- **Runs** (the developers' session folder `of80\run_<tag>.txt`; game open in parentheses). Up to 0e658f1's C++:
+  `--only session,of_smoke` 47/47 (89 s); `--only session,officers` 74/80 (166 s), 79/80 (117 s), 80/80 (126 s)
+  (suite fixes in between: the promotion boxes' OK/Cancel, the list view's selection, the cycles' compare); the
+  default run with the legacy fixture 1679/1682 (3672 s: the officers c)/d) ship choice and `disk_full` d), suite);
+  `--group relations` 428/432 (731 s: the game's repeated intel report, known, and the battle_raider cross-check that
+  found the battle's dead commander, fixed in 0e658f1); mixed a) and b) all checks of the officers and the months
+  passed (72 s, 81 s; the driver's version check expected "0.8.0"). With 0e658f1's build (`dist_p4`, the release
+  candidate): `--only session,officers` 80/80 three times (127 s, 127 s, 123 s); `--group relations` 407/407 (800 s);
+  mixed a) 32/32 (71 s), b) 32/32 (70 s); the default run 1192/1206 (2188 s: the game dismissed the host's player in
+  1904/10, its summary stopped the run; battle_invasion e2)'s other drop form; suite fixes eecedc1), then 1632/1634
+  (3200 s; `officers` 64/64, `legacy_fleet` 27/27, every live battle and `twopc` PASS): the two fails are one game
+  box on the host, "Error in AIDetermineTacticalStance2 procedure! Division: Germany Destroyer Division 11 Access
+  violation ... Read of address 000009D3" (`war_effects`' live battle against the player after the scripted drop at
+  minute 12, the player's divisions the computer's: `TFightingShip.IsBigShip` on a nil flagship, the 0.7.0 stance
+  guard's family in a path it does not cover; live battles have no commander of a joined nation, unchanged by 0.8.0),
+  and 1699/1701 (3277 s; no game error box; `officers` 64/64; the two fails are flaky checks seen before: `battle_invasion`
+  j)'s setup found one possession of J, `lockstep_ui` k)'s hash group `ord` differed for a moment with no order listed).
+- **Gotchas.**
+  - A TEST kill on the host during the planning phase is undone by the player's turn (planned on the month before):
+    the scenario arms it for the month (`ofkill ... arm`, after the merge and the reload).
+  - The event roll's log line of a month with an officer event keeps the suite's pattern ("event: no event this month
+    (an officer event used the month's event slot)").
+  - The promotion boxes have OK and Cancel (not Yes/No); `TListView.Selected` is the first selected row, so the suite
+    clears every row's selection before it selects the officer for the popup.
+  - The Turn's question asks only about operational ships (in play, not under repair) and a ship under repair costs
+    twice its base without her commander's factor: after `battles` the first commanded ships are under repair, so the
+    scenario picks an operational ship (`of_fit_ships`) for the move to the pool and the GoodAdmin check.
+  - The scenario's extra months move the default run's later scenarios to 1905, when nation 1 is short of foreign
+    stations: `disk_full` d) answers the retried Submit's question while it waits. And the test campaign's host, its
+    prestige worn down, can be dismissed by the game (a game over): `run_month` keeps the host's Prestige at 20 or more
+    (`keep_host_prestige`, TEST); `battle_invasion` e2) retries the game's second drop form ("enemy plan -/-1").
+
 ## Fix 2026-11-02: the destroyer stance routine's second ask (v0.7.2)
 A full default run of the suite on 0.7.1 + the officers (1 of 3 runs): the host's four boxes in `war_effects`' live battle
 100000 (1902/8/25) after the scripted drop of the joined player at minute 12, while the host's battle ran on auto-run with
@@ -9070,3 +9269,337 @@ coordinator gave this regression priority). The logs of every run are kept with 
   relations` set passed on this candidate, its failures the suite's (fixed, passed again) or the game's known conditions
   (passed again); 0.7.3's two fixes work as described, across versions both ways too, and their guards passed naturally
   without a box; 0.7.2's battle search (g) to i)) passed in two runs.
+
+## Feature 2026-11-02: simultaneous battles (v0.8.0-dev)
+- **What.** A joined player fights its battle of the month while the host's month goes on, the host's own battle
+  included, instead of after the host's whole month: the
+  [design](#investigation-2026-11-01-simultaneous-battles-the-design-v080-dev) implemented, its deviations below.
+  Mechanism and texts in [ARCHITECTURE](docs/ARCHITECTURE.md#simultaneous-battles-080); the game facts it needed in
+  [GAME-INTERNALS](docs/GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on).
+- **Code.** `game.cpp`: `SaveSnapshot` (the slot global switched for one `SaveBuildCampaign`, no box: `CB_SaveBox`
+  shows none while `g_snapshot`, `SaveQuestion` and the save counters put back, a file in use saved again twice 0.6 s
+  apart), `SnapshotInProgress`, TEST `SetTestSnapshot`; `d_CheckForBattles` calls `CheckForBattles2` through and then
+  `CB_AfterBattles` -> `hookcb::OnAfterBattleSearch`. `session.cpp`: hello/welcome `simb`, `RTW3MP_SIMUL`; `BattleReq`
+  `early`/`kept`/`prePacked`/`pre`/`held`/`announce`/`gen`; `PackBattleFiles`, `SendBattle(r, pre, fromSlot)` (header
+  `early=1`), `HostPackSurprises` (the Turn), `HostSendEarly` (the hook), `HostSendKept` (the end of the host's battle
+  search), `SimulEligible`, `SimulLate`, `SimulTick`, `SimulStatus`, `SimulCancel`, `SimulMarker`/`SimulRestartCheck`
+  (`rtw3mp_simul.ini`), `SimulDeleteSlot`; `HostOnBattleResult` split into the hold and `HostApplyBattleResult`; the
+  battle phase merges the held results first; the log line "the host's month: DoStrategicTurn runs; ..."; TEST
+  `battles simul`, `battles snapfail`, `battles simulkeep`. `saveio.cpp`: `ApplyBattleResult`'s rules for the fields
+  both the battle and the host's save changed (`MergeNotes`, `MergeShipLog`). The client: `simb` in its hello, the
+  notice of an `early` battle.
+- **Deviations from the design, each for a reason found on the way.**
+  - `CrewQuality` is not floored at 0: it is negative on many ships (the POC's third month-end save: 25 of 382 ships,
+    -12 to -1); the merged value stays within the game's own bounds, -25..25 (`AdjustCrewQuality`, static). Stars are
+    floored at 0.
+  - The snapshot is saved again when a file of it is in use (twice, 0.6 s apart; the design: no retry, not to hold
+    `DoTurn2`): the task asked for 0.7.1's in-use retries, and at most 1.2 s more of a month in the rare case is not
+    seen.
+  - A surprise attack is packed at the Turn (the month's start) but sent at the generator's hook, about a second later:
+    sent at the Turn it would go out before the game's own pre-turn questions, and a Turn the host cancels there
+    would leave the player fighting a battle of a month that does not run.
+  - At most one battle a nation during the month: the player's PC keeps one incoming battle (a second `MSG_BATTLE`
+    would replace the first), so a second request of the nation waits for the battle phase.
+  - The requests queued before the hook (the suite's `battles injectgen`, `injectraid`, `injectinv`, `gen K queue`) go
+    out at the hook like the generator's own: in play every kind 1 comes from the hook.
+  - A restart of the host's game: the held results stay lost (the design's v1), but the scratch slot keeps a marker of
+    the month's battles, so the next session tells their players (the design's option of persisting the results was
+    not built).
+- **What each player sees.** Everyone's chat: the generator's line of the month ends "... Captain plays it now,
+  during the host's month." (sent at once), "... plays it during the host's month, once the host's own battle search
+  is over." (a nation at war with the host's; then "* Captain plays the battle of Germany now, during the host's
+  month." when it goes out) or "... plays it after the month (<why>)." (the host could not save the month's state for
+  it; the player's mod fights its battles after the host's month (an older version); the nation's surprise attack
+  comes first; Germany fights the host's battle live first); a surprise attack: "* Surprise attack? Japan may strike
+  Germany at the war's start. Captain plays it during the host's month." at the Turn, "* Captain plays the surprise
+  attack of Japan on Germany now, during the host's month." when it goes out. The player's notice with the battle: "Battle! Germany meets Spain in
+  Northern Europe. The battle starts as soon as your game is free. The host's month goes on meanwhile; your result is
+  merged when it is over."; after it: "Your battle's result is with the host; the new month follows when the host's
+  month is over." The host's status while it fights its own battle: "The host is fighting a battle... (Captain:
+  Germany vs Spain in Northern Europe)", in the battle phase "Battles in progress: Captain: Germany vs Spain in ...". A
+  battle called off during the month (the player gone, the month cancelled): "Your battle of Germany against Spain was
+  called off: <why>."; after a restart of the host's game the host's chat "* The host's game was restarted during a
+  month: the battles fought during it are lost (Captain: Germany against Spain)." and, when the player joins again,
+  "* The host's game was restarted during the month: your battle (Germany against Spain) fought during the host's
+  month is lost."
+- **Found on the way: the suite's expectations of the old order.** battles b) (the phase's first battle can wait
+  behind a battle of the same nation sent during the month and still fought); battle_invasion e1/e2 (the invasion check
+  now runs in the state of the month's battle search, single player's moment: the enemy's pending battle is dropped
+  whenever the player is the stronger in the area, its target going too with `Random(100) < 40`, which the test knew
+  only in its other form, and GAME-INTERNALS said "may be dropped" (static, corrected); an enemy without a ship there
+  that can fight: the game's no-force rule); battle_raider c) (an auto-resolved battle may change no ship); battle_simul
+  (a battle that did not come about has no "applied" line). Three flakes of the suite the full run met, fixed there:
+  ship_status (the BattleDriver read slot 87 while the client copied its next battle into it, 330 ms after "fought":
+  every tracked ship counted sunk), the relations month check (an alliance the player's own relation turn ended,
+  "alliance=1:4:60:0;"), disk_full d) (the resumed Submit asked "insufficient ships on foreign stations? Continue
+  anyway?" and nobody answered).
+- **Results** (the 1900 fixture; the released 0.7.1 back after every run, slots and Preferences restored). The
+  snapshot 31-62 ms (14 files; the in-use case saved after 2 retries, 1.3 s); the battles sent 16-41 ms after it; each
+  player's battle screen opened within 3 s of the host's and was open while the host's was (every M1 b); held results
+  merged first in the battle phase, 20-50 ms each; the CrewQuality rule (the month's training + the battle's change)
+  on 7 to 33 ships a month, every merged result cross-checked field by field on the kept files with 0 differences;
+  the scratch slot deleted after each month.
+
+  | Run | Args | Dist | Checks | Game open |
+  |---|---|---|---|---|
+  | s2 | smoke: 2 months, a driver of the POC's kind | dist_s2 | pass | 4.6 min |
+  | b1 | `--only session,battle_simul` | dist_s2 | 143/155 (test bugs: question boxes counted as errors, the chat read without `mpwindow`, a rejoin case a short month never reached) | 14.7 min |
+  | b2 | `--only session,battle_simul` | dist_s2 | 134/140 (results not always held: TEST `simulhold`; an avoided result changes no ship; the test's own peace by `settension` let DoPeace run in the month) | 13.6 min |
+  | b3 | `--only session,battle_simul` | dist_s3 | 155/155 | 15.5 min |
+  | b4 | `--only session,battle_simul` | dist_s3 | 140/140 | 12.5 min |
+  | r1 | `--only session,battles,battle_generator,battle_invasion` | dist_s3 | 414/417 (battles b), invasion e2 x2: above) | 20.2 min |
+  | rel1 | `--group relations` | dist_s3 | 503/505 (battle_raider c) x2: above) | 21.5 min |
+  | def1 | the full default run | dist_s3 | 1802/1811 (ship_status 5, battle_invasion 2, battle_simul 1, disk_full 1: above; legacy_fleet SKIP, no fixture) | 72.5 min |
+  | b5 | `--only session,ship_status,battle_raider,battle_invasion,battle_simul` (the suite's fixes above; battle_simul with R) | dist_s3 | 451/457: ship_status 61/61, battle_raider 96/96, battle_invasion 140/140; battle_simul 138/143 and the run's box check: two game error boxes on the host, below; R's empty folder (below) | 30.7 min |
+  | b6 | `--only session,battle_simul` (the fixes of b5) | dist_s3 | 144/144 (R: the empty folder stayed again, the marker gone: accepted) | 14.6 min |
+  | mxa | mixed versions, the two-folder pattern of the 0.7.1 release's mixed runs (a driver outside the repo): the 0.8.0-dev host, the 0.7.2 RC2 player from a folder copy | dist_s3, dist_rc072_2 | 21/21: the host logs the player's hello "battles during the host's month 0 (this host: 1)" (`battles simul`: Captain:0); nation 1's battle "after the month (the player's mod fights its battles after the host's month (an older version))", no snapshot, sent in the battle phase, fought on the RC2 PC, merged; no game error box | 76 s |
+  | mxb | the same, the 0.7.2 RC2 host with the 0.8.0-dev player | dist_rc072_2, dist_s3 | 21/21: the RC2 host's line for the player without `simb`, the player's `battles simul` hostsimb=0; the battle in the RC2 host's battle phase as before, fought on the 0.8.0 PC, merged; no game error box | 109 s |
+
+  (The folder copy ran from a folder path Windows already knew: SetWindowsHookEx registers the hook DLL's full path in
+  a per-session table of 32 entries, full on this PC after the day's many copies, so a copy from a new path started
+  without the mod's message hook, "msg hook 00000000"; found by the 0.7.2 release regression.)
+- **Two game error boxes in b5, neither from the feature.** M3: "Error in CheckForWar procedure! Access violation
+  ... Read of address 00000004": battle_simul ended the host's M1 war by a raw `settension`, which left the game's war
+  counter above 0 with no enemy, and the game's "... has entered the war against <nil> on our side!" path read it
+  (GAME-INTERNALS; the scenario now sets the counter to 0 as a peace does). M8: "Error in ConvoyEscortCheck procedure!
+  Access violation ... Read of address 000009D3", in the host's own battle going on against the computer 54 s after
+  the suite dropped the live player (`drop3`): the game's `ConvoyEscortCheck` reads the flagship of a division whose
+  ships are gone, the 0.7.0 stance-guard case in a routine that guard does not cover (GAME-INTERNALS). Seen once in all
+  the runs (about 15 such drops); left to the live battles' owner. R: the marker the runner had written 2 s before was
+  still open elsewhere (OneDrive's sync or a virus scan), so its deletion completed later and the empty Game151 folder
+  stayed ("the folder stays (0 file(s) in use)"); harmless (the next month's snapshot reuses it, and the month's end
+  or the session's end deletes it); the test accepts it with the marker gone.
+
+## Feature 2026-11-02: the 0.8.0 integration: officers and simultaneous battles together (v0.8.0-dev)
+The two 0.8.0 features, [officers for joined players](#feature-2026-11-01-officers-for-joined-players-v080-dev) (written
+on 0.7.1) and [simultaneous battles](#feature-2026-11-02-simultaneous-battles-v080-dev) (written on the 0.7.2 release
+candidate 1), merged onto 0.7.3-dev (the released 0.7.2 and the computer's war against a joined nation as in single
+player), so that each joined player's officers go into the battles fought during the host's month and come back with
+their held results. ARCHITECTURE: [the monthly flow](docs/ARCHITECTURE.md#the-monthly-flow) with both,
+[officers](docs/ARCHITECTURE.md#each-joined-players-officers-080), [simultaneous battles](docs/ARCHITECTURE.md#simultaneous-battles-080).
+
+**Merges** (simultaneous battles first, then the officers; protocol 3 and the live-battle engine 18 unchanged):
+- Simultaneous battles: the version, 0.8.0-dev; the suite's `battle_invasion` e2) (both branches had taught it the
+  game's second drop form, "enemy plan -/-1"; the corrected rule's comment kept) and `disk_full` d) (both answered the
+  retried Submit's questions; 0.7.2's 30 s kept), the `relations` group with `ai_war` and `battlegen` with
+  `battle_simul`; the docs' version paragraphs, the stance guard's `ConvoyEscortCheck` sentence before 0.7.2's
+  destroyer bullet, both mixed-version reports. The C++ merged by itself: `RunHostTurn` checks the joined nations'
+  invasion targets (0.7.2) before the surprise attacks are packed from the month's start.
+- Officers: in `session.cpp` the player's `simb` and `off` side by side (hello, welcome, the client's battle state with
+  0.7.2's search-on and the battle's `offs`), the host's join line "Captain: mod ..., campaign divisions 1, battles
+  during the host's month 1 (this host: 1), officers 1" (the officers last: the suite reads its end); `RunHostTurn`
+  checks the invasion plans, then a TEST kill armed for the month; `ApplyBattleResult` keeps the simultaneous battles'
+  field rules and never takes a ship's `CommanderId`; the docs' hook table, protocol history and version paragraphs
+  name both features' keys; one 0.8.0 group in this index.
+- The finished 0.7.3 base (`int-073` with the [ConvoyEscortCheck fix](#fix-2026-11-02-convoyescortchecks-box-after-a-drop-divisions-whose-ships-are-gone-in-the-battle-ais-loops-v073-dev)),
+  merged after the first run below: the version stays 0.8.0-dev; GAME-INTERNALS takes 0.7.3's bullet on the battle
+  AI's loops over divisions without ships, which replaces the simultaneous battles' note that the stance guard did not
+  cover `ConvoyEscortCheck` (its run b5 found the box); the later runs use a build with it.
+  Then 0.7.3's release candidate docs (673e52b: the protocol history and the live-battle level paragraph name 0.7.3,
+  then 0.8.0-dev) and, after the default run below, the released 0.7.3 (743d089: the 0.7.3 regression's suite fixes,
+  battle_generator's J pick by its possession's value, the BattleDriver's read of the battle slot after "fought",
+  battle_invasion e3) without a preview, war_effects M1's own BM, disk_growth a)'s line diagnosis; the self-test keeps
+  both sides' samples), with no source change.
+
+**Interactions checked in the code** (and in the live runs below):
+1. *Officers in the battles sent during the host's month.* Every package (the month's snapshot, a surprise attack packed
+   at the Turn, a battle of the phase) goes through `SendBattle`, which puts the nation's record and area commands in
+   it (`HostPutOfficers`, header `offs`); the player's PC loads the battle slot as before (K is nation 0 there: the game's
+   own load). The snapshot's own `.off` is the host's list, the record the nation's, written from the host's memory
+   after each save of the host's slot. New: right after a good snapshot the host writes the corps from memory into the
+   records too (`HostOfficersFromMemory("the month's snapshot")`), so a package from the snapshot carries the corps of
+   that moment, as a package of the battle phase carries the month's end.
+2. *Officers in held results.* **Bug:** the result's `officers.ini` replaced the nation's record when the held result
+   was merged (`HostTakeBattleOfficers`). The record then held the corps of the snapshot plus the battle: what the host's
+   month did to the corps after the send was lost, e.g. a commander killed or captured by a submarine, a mine or a
+   raider in `DoStrategicTurn` came back to life (his ship kept no commander: an active officer in the pool). **Fix:**
+   the request keeps the `[Officers]` lines its package carried (`sentOff`), and the result is merged per officer id
+   into the record (`saveio::MergeOfficers`): a field only the battle changed is the battle's; `BattleStars` both
+   changed are the record's plus the battle's change; `Status` and `Fate` stay the record's when the record's officer is
+   no longer active; any other field the battle's; an officer the battle's list dropped goes unless the record changed
+   him; the record's others stay. A battle of the battle phase is sent from the record as it is, so the record becomes
+   the battle's list as before. The order holds the rest: the record's write after `DoEndOfTurn` and the battle phase's
+   first save come before the held merges, no record is written from memory during the phase, and its reload loads the
+   merged record (not lost, not applied twice, not overwritten). `HostFixShipCommanders` then takes the dead and
+   captured commanders off the nation's ships (the ships' rules never take `CommanderId`). Host log: "officers of
+   nation 1: 24 after its battle merged into the record (24): 2 changed by the battle, 1 of them changed by the host's
+   month too; dead, captured or retired in the month (the battle's status not taken): 1".
+3. *The record's write after the host's saves and the snapshot.* The snapshot saves into slot 151 with the game's slot
+   global switched, so the save hook's slot is 151 and `OnCampaignSaved` writes no record (only the host's slot does);
+   it now also checks `game::SnapshotInProgress` (the design's guard). The mid-month writes (`DoTurn2`'s autosave, the
+   autosave before the host's battle, the snapshot's) are each the host's memory at that moment and are superseded by
+   the write after `DoEndOfTurn`; a held result is merged after that one with its own list as the base.
+4. *0.7.2's encounters and 0.7.3's view.* The result's `enc` is applied with the rest of a held result (its points per
+   opponent, its chat lines after the phase). The computer's war view is entered and left around single calls of the
+   computer nation's routines (the strategic moves in `DoTurn2` before the battle search, `ReduceTimeLimits`' routines
+   and `CheckPatrols` in `DoStrategicTurn`), so it is never open at the generators' hook, where the snapshot is taken
+   after the joined nations' generator views are left; no officer record is read or written inside it.
+5. *Mixed versions.* Each feature keeps its own flag: hello/welcome `simb` (battles during the host's month) and hello
+   `off` / header `offs` (the officers); an older player gets its battles after the month with an empty officer list, a
+   0.8.0 player under an older host keeps the old order and the host's officers.
+
+**Tests.** `merge_test` 31/31 (11 cases of the officers' merge: the battle's star, the month's dead with the battle's
+star, stars both, captured in the battle, dropped, the record's promotion, new on either side, dead in the month and
+captured in the battle, the battle phase's case = the battle's list); with the POC's real snapshot 33/33. Self-test
+159/159 (`officer_samples`, `simul_merge_changes`). `battle_simul` g): each battle sent from the snapshot carried its
+nation's officers and the player's PC loaded them; the held results' officers merged by the rules on the files the host
+keeps (`battles simulkeep`: `<id>_off{sent,host,result,merged}.ini`); a commander killed when the host's
+`DoStrategicTurn` starts (TEST `ofkill ... armmonth`, after Captain's battle went out) stays dead through the merge, in
+the host's game and in Captain's new month; a star given in Captain's battle slot (TEST `ofset`) reaches the record and
+Captain's new month; M3: the surprise attack carries the officers. The player's PC logs the battle slot's officers at
+its load ("battle B: the battle slot holds the nation's N officers (a active), commanding S of its ships"; the first
+run's surprise attack gave no battle in ten tries of CheckSurpriseAttack, so its officers were seen only in the host's
+line), and the checks read it. `simul_expected` never takes `CommanderId` (a commander killed in a battle fought during
+the month showed as a wrong merge); `officers`' battle line accepts the merge's wording. `battles` b) (found by the
+first full default run of the integration, which a pause stopped): the battle it fought can be one of the player's
+generator sent during the host's month (from the snapshot; the simultaneous battles' own runs had fought only injected
+ones there), merged into the month-end save by the rules (its CrewQuality the month's training plus the battle's change:
+"mismatches [(1, '170', 'CrewQuality', '-2', '0'), ...]" against the battle slot's values), so the host keeps the
+merges' files during b)'s months (`battles simulkeep 1`) and such a battle is cross-checked by the rules on them
+(`simul_merge_check`; the merged save read at once against `simul_merge_changes`' values; a result held during the
+month, merged as the phase begins and so before the runner reads the phase's save, takes its VP base from the save the
+host kept before the merge).
+
+**Runs** (the game open; each inside a backed-up run, v0.7.2 reinstalled afterwards):
+- o1 `--only session,officers,battle_simul` (dist_i1, before the 0.7.3 merge): 212/212, the game open 849 s. M1 g):
+  Captain's package 30 officers (4 area commands), its battle slot 30 commanding 16 ships; Bot's 23; the merge of
+  Captain's held result: 30 sent, 1 changed in the record since (the TEST kill), 6 by the battle, 0 unlike the rules;
+  the killed commander dead in the record, the host's game and Captain's new month (the result had him active); the
+  star 3 everywhere. Its M3 surprise attack gave no battle in ten tries (`saretry 10`): the officers only in the host's
+  line, so the battle slot's officers are logged at its load since.
+- With dist_i2 (int-080 50744ba, 0.7.3 merged): o2 and o3 `--only session,officers,battle_simul` 228/228 (1013 s) and
+  213/213 (1098 s): g) each time (kills of officers 100583 and 80578 kept, stars back), M3 h) the surprise attack's
+  slot held its 29 officers, o3's kept request (the host's battle search over without a battle) went out with 31;
+  `SKIP-note`s: o2 M6-M8 (the host's battle was against nation 1 every month), o3 R (the empty Game151 folder).
+  r1 `--only session,battles,battle_generator,battle_invasion` 434/434 (1207 s; the `SKIP-note`s of the game's own
+  draws in `battle_generator` h)/i) and `battle_invasion` i1)). rel1 `--group relations` 553/553 (1305 s; `ai_war` and
+  `war_effects`' convoy case with both features). Mixed versions against the released 0.7.2 (`mixed_080i.py`, TESTING):
+  a) 22/22 (138 s), b) 22/22 (85 s).
+- def1b, the full default run with `--legacy-fixture` (dist_i3: int-080 fa4a781, RTW3MP.dll SHA-256 AD3D6521FC0691C4...;
+  the suite of d182c8a; 2026-11-03): 1937/1939, the game open 4860 s, no game error box (but the TEST boxes of
+  `battle_generator` b) and `disk_full`). Every scenario passed (`battles` 102/102, its b) a battle of the player's
+  generator fought during the host's month cross-checked by the rules on the kept files: the CrewQuality rule on 3
+  ships, 9 ships changed, none wrong; `officers` 64/64; `battle_simul` 133/133 with g), the commander killed as
+  `DoStrategicTurn` started dead through the held result's merge and a battle star back, and M3 h), the surprise
+  attack's slot holding its 35 officers; `legacy_fleet` 27/27) but `lockstep_limits` and `lockstep_data` b): the game's
+  "Enemy unable to challenge our forces in the area! Gain 102405 VP!" at their test battle after the earlier test
+  battles (the known game condition, TESTING Known traps), and `--only lockstep_limits,lockstep_data` passed when run
+  again (83/83, 210 s, the released 0.7.3 merged). `SKIP-note`s: `war_effects` M1 (no ship of nation 1 under
+  construction), `battle_invasion` e3) and i1), `battle_simul` R) (the empty Game151 folder). The first default run
+  (dist_i2, 2026-11-02) was stopped by a pause after 22 minutes, with the `battles` b) finding above (Tests).
+
+## Testing 2026-11-03: the 0.8.0 release candidate dist_rc080_1 (v0.8.0)
+The final regression of 0.8.0 on its release candidate dist_rc080_1 (int-080 36c1c20: 0.8.0, live-battle engine 18,
+protocol 3; RTW3MP.dll SHA-256 8972DE54535FF675..., version.dll 6E8F707F9E01B852...): [officers for joined
+players](#feature-2026-11-01-officers-for-joined-players-v080-dev) and [simultaneous
+battles](#feature-2026-11-02-simultaneous-battles-v080-dev) on the released 0.7.3, [merged
+together](#feature-2026-11-02-the-080-integration-officers-and-simultaneous-battles-together-v080-dev). It ran on
+2026-11-03 from 07:10 to 12:10 as two chains of detached runs, each run taking and releasing the game lock. The agent
+that started them was cancelled at 10:51, during the `--stress` run (the chains ran on); a second agent took over from
+its progress notes and wrappers, watched both chains to their end and analysed the runs. Run on the reg-080 runner
+(int-080 36c1c20 and the suite fixes below; merged with int-080 9759ce3, the 0.8.0 docs, before this entry), installed
+from the frozen snapshot (`--dist`), the released 0.7.3 (dist_rc073_1, RTW3MP.dll 128F9336AED852B3...) put back after
+every run (hash checked); slots 1 and 9 and the Preferences identical to the first run's backup after every run, the
+save folders as before (Game1, Game2, Game9), no folder copy, `python` or `RTW3.exe` left, the game lock released. The
+logs of every run are kept with the developers' session files (`r801\logs_*`).
+- **Runs** (checks, seconds with the game open):
+  - Offline: self-test 162/162 (with the suite fixes below too), `merge_test` 31/31.
+  - `--only session,officers,battle_simul` twice: 227/227 (957 s) and 213/213 (791 s); `--group relations` 530/530
+    (1062 s); the mixed cases (below) 131/131 (504 s), 130/130 (440 s) and 79/79 (194 s); the default run
+    (`--legacy-fixture`, 38 scenarios) 1908/1911 (4591 s); the whole `--stress` run (45 scenarios, `--missile-fixture`,
+    `--legacy-fixture`) 2409/2411 (8330 s); run again: `--only battles,war_effects,battle_raider,lockstep_limits,
+    lockstep_data` 343/343 (690 s).
+  - With the game open: 17559 s (4 h 53 min).
+- **No game error box** in any run but `disk_full`'s own (its "not enough space on the disk" box on each copy and the
+  file-in-use box of its g) after the five tries, inside its windows, in the default and the `--stress` run);
+  `session`'s whole-run check passed in every suite run, the mixed driver's in all three cases. The exceptions and
+  kept-off boxes in the mod logs were the tests' own (`lockstep_stress` S7's thrown minute, `battle_generator` b)'s
+  generator fault, `battle_simul`'s snapshot failures, `disk_full`'s full disk and file locks) but the one real file in
+  use below.
+- **0.8.0 as tested**:
+  - Officers for joined players: `officers` 63/63 twice and 64/64 in the default and the `--stress` run. `battle_simul`
+    g) in all four runs that had it: every battle sent from the month's snapshot carried its nation's officers and the
+    player's PC loaded them; the held results merged per officer id by the rules; the commander killed as the host's
+    DoStrategicTurn started (TEST `ofkill ... armmonth`: officers 60558, 100581, 220684 and 60554) dead in the record,
+    the host's game and Captain's new month (the `--stress` run's merge counted an officer changed by both: "4 changed
+    by the battle, 1 of them changed by the host's month too"); the star of Captain's battle back three times (once a
+    `SKIP-note`: the battle avoided, no screen); M3 h): the surprise attack's slot held the nation's 30, 29, 36 and 35
+    officers. Every `officers` reply had distinct ids over all nations' lists; every "corps in memory" line equalled the
+    record's count of that moment (the scan's count check: nothing odd in any run); `disk_growth`'s seven save and
+    reload cycles kept the host's 419 `[Officers]` lines, its record of nation 1 (28) and the client's 309. Natural
+    losses: in the `--stress` run's raider battles nation 1 lost an officer in each of three (the battle slot's active
+    officers 34 -> 33 -> 32, commanded ships 18 -> 17 -> 16; the first the raider Hela's commander 60557, dead in the
+    record: the battle interned his ship), Bot's nation one in `battle_simul`; each time the host took him off his ship
+    ("... 1 not active in its list reset"). 242 officer merges of held or battle-phase results, each "N changed by the
+    battle" (the one above also "changed by the host's month").
+  - Simultaneous battles: `battle_simul` 147/147, 133/133, 133/133 and 147/147 (the two `--only` runs, the default and
+    the `--stress` run): each time a) to f) (the snapshot in slot 151, both players' requests sent within 2 s of it,
+    their battle screens open with the host's, the results held under TEST `simulhold`, merged first in the battle
+    phase, every ship by the merge rules on the kept files, slot 151 deleted), M2 to M5 (the snapshot's TEST failure,
+    the surprise attack packed at the Turn with the snapshot's file in use, a player and then the host without `simb`),
+    M6 to M8 (nation 1's request after the host's battle search, and after the host's live battle against nation 1)
+    and R) (a restart of the host's game during a month: the host's and the player's notices; once the empty Game151
+    folder stayed, a `SKIP-note`, removed by the runner). The month's snapshot 122 times in the suite runs (median 31 to
+    47 ms per run, at most 1.33 s), FAILED only under its TEST switch.
+  - Mixed versions ([TESTING](docs/TESTING.md#mixed-versions), the driver `mixed_080.py`): a) a 0.8.0 host with a 0.7.3
+    player (`r721\game_a`) 131/131: the join line "..., battles during the host's month 0 (this host: 1), officers 0",
+    empty officer lists, each battle of nation 1 after the month ("... (an older version)") and taken (the third war
+    month's fought), 0.7.3's computer war across the versions, the live battle 624 minutes equal; b) a 0.7.3 host (the
+    Steam folder) with a 0.8.0 player (`r721\game_a`) 130/130: the join line without `simb` and officers, hostsimb=0,
+    `ofstate` active=0, the host's officers in nation 0 of slot 77, nation 1's battles in the host's battle phase as
+    before (none fought in three war months, a `SKIP-note`; run again with `--war-months 6 --part main` 79/79, fought
+    in the first), the live battles 468 and 514 minutes equal; no box, no DESYNC and no snapshot in any of them.
+- **Natural occurrences** (the logs of every suite run, each from its run's start: `r801\nat_scan80.py`, `off_scan.py`,
+  `inuse_scan.py`, `r731\aiw_scan73.py`):
+  - Battles sent during the host's month: 136 (the two `--only` runs 9 and 8, the group run 21, the default run 45,
+    `--stress` 47, the re-run 6), in `battles`, `ship_status`, `war_effects`, `arms_treaty`, `battle_generator`,
+    `battle_surprise`, `battle_raider`, `battle_invasion`, `battle_simul`, `ai_escorts` and `ai_war`; results held
+    because they came while the host's month still ran, without a TEST hold: 44 (4, 4, 8, 13, 12, 3), each merged first
+    in the battle phase (16 more held under `simulhold`). Sent after the month because another battle of the nation was
+    in progress: 44; the other reasons only where a scenario made them. The merge rules on a host save the month had
+    changed after the send: CrewQuality (the host's value + the battle's change) in 48 merges, Status (the battle's
+    value over the host's) in 3 (1, 10 and 13 ships), the ships' log entries in 1. Results with two or more encounters
+    (0.7.2) 101 and "the search goes on" 264 times without a TEST switch.
+  - Guards without a TEST switch: the division stance guard in a convoy battle on the player's PC (the group run's
+    `battle_generator`: 'Merchant 1/2/3 *', whose lead 'Convoy Division 1' had no ships left, 20 asks passed over, the
+    battle fought to its end; not live, which only 0.7.3 guards), in the host's own battle against the computer during
+    `battle_simul`'s month (twice) and in host battles going on against the computer after a drop (`lockstep_torpedo`,
+    the missile battle that `disk_full` finished); no box. ConvoyEscortCheck's and the other loop guards only under
+    `war_effects` M4's TEST switch (the re-run's M4 had no live battle: two `SKIP-note`s).
+  - The computer's war (0.7.3): all 179 war months with the war view (16, 14, 23, 55, 59 and 12 by run) ended
+    `PutAIShipsInStatus` with no ship in reserve or mothballed; no debt line; 0.7.2's keep of a computer nation's trade
+    protection only under TEST `aiwar 0`.
+  - One real file in use: the `--stress` run's host month save in `battle_generator` (`RTWGame1.bcs` at 10:04:44, saved
+    again 2 s later, no box), as under dist_rc071_2 and dist_rc073_1.
+  - Save growth (`disk_growth`, `--stress`): over its 8 months the host's slot 2,630,485 -> 2,824,145 bytes (+7.4 %),
+    the client's 1,812,012 -> 1,937,404 (+6.9 %), the logs 8.1 and 2.6 kB a month; the seven save and reload cycles kept
+    every list and line count, the host's slot 9 bytes larger after the first (2630476 -> 2630485) and the same after.
+- **Failures and their classes:** no product fault.
+  - The suite's, fixed and passed again in the re-run: the `--stress` run's `war_effects` M2 ("warfx: war weariness of
+    nation 1 (the player's rule): war counter 2, war score 0:5150, government 2, BM 18, blockaded 1 -> no
+    (BudgetModifier)": the rule wants BudgetModifier above 18, and the months had moved nation 1's from the 20 set
+    before M1 to 19 at M1's rule and 18 at M2's; M2 now sets 20 again, a rule line with 18 or less is a `SKIP-note`:
+    a7eff47; the re-run: BM 20, unrest 4 -> 5) and `battle_raider` c) side 0 fought ("the test's own setup did not reach
+    the host": the battle interned the raider, "CL Hela is forced to seek internment in neutral port due to damage
+    incurred in battle.", Status 0 -> 7 in the merged save, its area unchanged; a leak is now the test's own values
+    there (the raiding status 4, a side-1 patrol's 3, the interception's area) and the battle's changes are logged:
+    24def21; in the re-run the battle interned the raider Blücher the same way and the check passed).
+  - The game's conditions, passed when run again (the `--stress` run and the re-run): the default run's `battles` c2)
+    (all six injected battles of its two attempts avoided, "The Spanish navy declines battle! You gain 360 VP!" or
+    "Enemy unable to challenge our forces in the area! Gain 215 VP!"; the one declined in its preview was a battle of
+    the player's generator), `lockstep_limits` and `lockstep_data` b) ("Enemy unable to challenge our forces in the
+    area! Gain 102405 VP!" after `lockstep`'s and `lockstep_ui`'s test battles, the known condition).
+  - `SKIP-note`s, the battles' and the game's own draws as before: `battle_simul` M1 g)'s star and R) once each (above),
+    `battle_generator` g) or h) (every encounter against one nation) in the group, default and `--stress` runs,
+    `war_effects` M1 (no ship of nation 1 under construction) and `battle_invasion` e3) and i1) in the default and
+    `--stress` runs (i2) in `--stress`), `lockstep_ui` e) and `lockstep_pvp` f) in `--stress`, the re-run's
+    `war_effects` M4 (no live battle), mixed b)'s three war months.
+- **Suite fixes** (reg-080): a7eff47 (`war_effects` M2's BudgetModifier), 24def21 (`battle_raider` c): the test's setup
+  told from the battle's own change); self-test 162/162; TESTING.md (the catalog, the game times, Mixed versions, Known
+  traps).
+- **Verdict: GO** for dist_rc080_1 (RTW3MP.dll 8972DE54535FF675..., version.dll 6E8F707F9E01B852...): no product fault
+  and no game error box (but `disk_full`'s own) in any run; every default and `--stress` scenario and the `--group
+  relations` set passed on this candidate, its failures the suite's (fixed, passed again) or the game's known
+  conditions (passed again); officers and simultaneous battles work as described, together and across versions both
+  ways (each feature's flag keeps the older side on its own behaviour), with the held results (by the TEST hold and
+  naturally), the restart notice, and the officers' deaths and losses through the merges.

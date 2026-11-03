@@ -3,6 +3,7 @@
 #include "invasion.h"
 #include "nationplay.h"
 #include "lockstep.h"
+#include "officers.h"
 #include "../../third_party/minhook/include/MinHook.h"
 #include <algorithm>
 #include <climits>
@@ -581,6 +582,7 @@ bool Resolve() {
     A.fTurnMessages = dl::Field("TfrmBuildCamp", "TurnMessages");
     ResolvePeace();
     nplay::Resolve();
+    ofc::Resolve();
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -1374,6 +1376,82 @@ static const char* kEvDeltaFields[] = {"Prestige", "BudgetModifier", "BaseResour
                                        "UnrestLevel", "TechLeakRisk", "Corruption"};
 static const char* kEvSetFields[] = {"BuildConstraint", "BuildConstraintTime"};
 
+// The player's view for K (relations with K, K's war state, `used` as the event cooldowns (nullptr: the host's stay),
+// K at index 0), and the state it changes, to report the changes afterwards (EvEnd).
+struct EvView {
+    int tmpT[9], tmpA[9];
+    std::map<std::string, int> before;
+    int fType = -1, typeBefore = 0;
+};
+
+static void EvBegin(void* f, void* list, int K, const int* used, EvView& v) {
+    g_ev.arr = dl::At<void**>(list, 4);
+    g_ev.K = K;
+    bool kAtWar = false;
+    for (int i = 0; i < 9; i++) {
+        g_ev.obj[i] = g_ev.arr[i];
+        g_ev.origT[i] = dl::At<int>(g_ev.obj[i], A.fTension);
+        g_ev.origA[i] = dl::At<int>(g_ev.obj[i], A.fAllied);
+        g_ev.origTS[i] = dl::At<int>(g_ev.obj[i], A.fTechSharing);
+        v.tmpT[i] = i == K ? 0 : Tension(K, i);
+        v.tmpA[i] = i == K ? 0 : AllianceMonths(K, i);
+        if (i != K && v.tmpT[i] > 40) kAtWar = true;
+    }
+    g_ev.war = *A.warVar;
+    for (int j = 0; j < kEventSlots; j++) g_ev.hostUsed[j] = *(int*)(EventRec(f, j) + kEvUsed);
+    for (const char* n : kEvDeltaFields) v.before[n] = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
+    for (const char* n : kEvSetFields) v.before[n] = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
+    v.fType = dl::Field("TBuilderNation", "BuildConstraintType");
+    v.typeBefore = v.fType >= 0 ? dl::At<uint8_t>(g_ev.obj[K], v.fType) : 0;
+
+    // The player's view: relations with K, K's war state, K's own event cooldowns, K at index 0.
+    for (int i = 0; i < 9; i++) {
+        dl::At<int>(g_ev.obj[i], A.fTension) = v.tmpT[i];
+        dl::At<int>(g_ev.obj[i], A.fAllied) = v.tmpA[i];
+        dl::At<int>(g_ev.obj[i], A.fTechSharing) = 0;
+    }
+    // K's own war counter when the host sent it (it is in place already, see LoadCampaign), else a guess from the host's.
+    bool ownKnown = g_ownWar != INT_MIN && (g_ownWar > 0) == kAtWar;
+    *A.warVar = ownKnown ? g_ownWar : kAtWar ? (g_ev.war > 0 ? g_ev.war : 1) : (g_ev.war > 0 ? -12 : g_ev.war);
+    if (used)
+        for (int j = 0; j < kEventSlots; j++) *(int*)(EventRec(f, j) + kEvUsed) = used[j];
+    g_ev.swapped = true;
+    g_ev.arr[0] = g_ev.obj[K];
+    g_ev.arr[K] = g_ev.obj[0];
+    g_evActive = true;
+}
+
+static void EvEnd(void* f, int K, int* usedOut, const EvView& v, ClientEventResult& res) {
+    int afterT[9], afterA[9];
+    for (int i = 0; i < 9; i++) {
+        afterT[i] = dl::At<int>(g_ev.obj[i], A.fTension);
+        afterA[i] = dl::At<int>(g_ev.obj[i], A.fAllied);
+    }
+    if (usedOut)
+        for (int j = 0; j < kEventSlots; j++) usedOut[j] = *(int*)(EventRec(f, j) + kEvUsed);
+    EvRestore();
+
+    for (int i = 0; i < 9; i++) {
+        res.alliance[i] = -1;
+        if (i == K) {
+            if (afterT[i] != v.tmpT[i]) Log("event: own relation entry changed by %d (ignored)", afterT[i] - v.tmpT[i]);
+            continue;
+        }
+        res.tension[i] = afterT[i] - v.tmpT[i];
+        if (afterA[i] != v.tmpA[i]) res.alliance[i] = afterA[i];
+    }
+    for (const char* n : kEvDeltaFields) {
+        int d = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n)) - v.before.at(n);
+        if (d) res.fieldDelta[n] = d;
+    }
+    for (const char* n : kEvSetFields) {
+        int val = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
+        if (val != v.before.at(n)) res.fieldSet[n] = val;
+    }
+    if (v.fType >= 0 && dl::At<uint8_t>(g_ev.obj[K], v.fType) != v.typeBefore)
+        res.fieldSet["BuildConstraintType"] = dl::At<uint8_t>(g_ev.obj[K], v.fType);
+}
+
 ClientEventResult RunClientEvent(int K, int forcedIdx, int used[100]) {
     ClientEventResult res;
     void* f = BuildCamp();
@@ -1395,77 +1473,61 @@ ClientEventResult RunClientEvent(int K, int forcedIdx, int used[100]) {
             return res;
         }
     }
-    g_ev.arr = dl::At<void**>(list, 4);
-    g_ev.K = K;
-    int tmpT[9], tmpA[9];
-    bool kAtWar = false;
-    for (int i = 0; i < 9; i++) {
-        g_ev.obj[i] = g_ev.arr[i];
-        g_ev.origT[i] = dl::At<int>(g_ev.obj[i], A.fTension);
-        g_ev.origA[i] = dl::At<int>(g_ev.obj[i], A.fAllied);
-        g_ev.origTS[i] = dl::At<int>(g_ev.obj[i], A.fTechSharing);
-        tmpT[i] = i == K ? 0 : Tension(K, i);
-        tmpA[i] = i == K ? 0 : AllianceMonths(K, i);
-        if (i != K && tmpT[i] > 40) kAtWar = true;
-    }
-    g_ev.war = *A.warVar;
-    for (int j = 0; j < kEventSlots; j++) g_ev.hostUsed[j] = *(int*)(EventRec(f, j) + kEvUsed);
-    std::map<std::string, int> before;
-    for (const char* n : kEvDeltaFields) before[n] = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
-    for (const char* n : kEvSetFields) before[n] = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
-    int fType = dl::Field("TBuilderNation", "BuildConstraintType");
-    int typeBefore = fType >= 0 ? dl::At<uint8_t>(g_ev.obj[K], fType) : 0;
-
-    // The player's view: relations with K, K's war state, K's own event cooldowns, K at index 0.
-    for (int i = 0; i < 9; i++) {
-        dl::At<int>(g_ev.obj[i], A.fTension) = tmpT[i];
-        dl::At<int>(g_ev.obj[i], A.fAllied) = tmpA[i];
-        dl::At<int>(g_ev.obj[i], A.fTechSharing) = 0;
-    }
-    // K's own war counter when the host sent it (it is in place already, see LoadCampaign), else a guess from the host's.
-    bool ownKnown = g_ownWar != INT_MIN && (g_ownWar > 0) == kAtWar;
-    *A.warVar = ownKnown ? g_ownWar : kAtWar ? (g_ev.war > 0 ? g_ev.war : 1) : (g_ev.war > 0 ? -12 : g_ev.war);
-    for (int j = 0; j < kEventSlots; j++) *(int*)(EventRec(f, j) + kEvUsed) = used[j];
-    g_ev.swapped = true;
-    g_ev.arr[0] = g_ev.obj[K];
-    g_ev.arr[K] = g_ev.obj[0];
-    g_evActive = true;
+    EvView v;
+    EvBegin(f, list, K, used, v);
 
     static std::mt19937 rng((unsigned)(GetTickCount() * 2654435761u));
     int order[101];
     for (int& o : order) o = std::uniform_int_distribution<int>(0, kEventSlots - 1)(rng);
     int shown = EvRollGuarded(f, forcedIdx, order, 101);
 
-    int afterT[9], afterA[9];
-    for (int i = 0; i < 9; i++) {
-        afterT[i] = dl::At<int>(g_ev.obj[i], A.fTension);
-        afterA[i] = dl::At<int>(g_ev.obj[i], A.fAllied);
-    }
-    for (int j = 0; j < kEventSlots; j++) used[j] = *(int*)(EventRec(f, j) + kEvUsed);
-    EvRestore();
-
+    EvEnd(f, K, used, v, res);
     res.shown = shown >= 0;
     res.eventIdx = shown;
     if (shown >= 0) res.caption = dl::ReadUStr(*(void**)EventRec(f, shown));
-    for (int i = 0; i < 9; i++) {
-        res.alliance[i] = -1;
-        if (i == K) {
-            if (afterT[i] != tmpT[i]) Log("event: own relation entry changed by %d (ignored)", afterT[i] - tmpT[i]);
-            continue;
-        }
-        res.tension[i] = afterT[i] - tmpT[i];
-        if (afterA[i] != tmpA[i]) res.alliance[i] = afterA[i];
+    return res;
+}
+
+// 0.8.0: PlayerNation.HandleOfficerStuff (Boolean in AL: an officer event was shown); the view is put back when the
+// game raises (-1).
+static std::vector<std::wstring> ReadStringList(void* sl);
+static int OfficersGuarded(void* fn, void* nation, int arg) {
+    int r = -1;
+    __try {
+        r = (dl::Call(fn, (uint32_t)(uintptr_t)nation, (uint32_t)arg) & 0xFF) != 0 ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        EvRestore();
+        r = -1;
     }
-    for (const char* n : kEvDeltaFields) {
-        int d = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n)) - before[n];
-        if (d) res.fieldDelta[n] = d;
+    return r;
+}
+
+ClientEventResult RunClientOfficers(int K, std::vector<std::wstring>& messages, int forcedEvent) {
+    ClientEventResult res;
+    messages.clear();
+    static void* handle = dl::Method("TBuilderNation", "HandleOfficerStuff");
+    static void* event = dl::Method("TBuilderNation", "HandleOfficerEvent");
+    void* f = BuildCamp();
+    void* list = NationList();
+    if (!handle || !EventsAvailable() || !f || !list || K < 1 || K > 8 || PlayerNation() != Nation(K) ||
+        EventActive() || A.fTurnMessages < 0 || (forcedEvent >= 0 && !event)) {
+        res.error = "the officers' month is unavailable";
+        return res;
     }
-    for (const char* n : kEvSetFields) {
-        int v = dl::At<int>(g_ev.obj[K], dl::Field("TBuilderNation", n));
-        if (v != before[n]) res.fieldSet[n] = v;
+    void* msgs = dl::At<void*>(f, A.fTurnMessages);
+    size_t m0 = ReadStringList(msgs).size();
+    EvView v;
+    EvBegin(f, list, K, nullptr, v);
+    int r = forcedEvent >= 0 ? OfficersGuarded(event, g_ev.obj[K], forcedEvent) : OfficersGuarded(handle, g_ev.obj[K], 0);
+    if (r < 0) {
+        res.error = "the game raised an exception";
+        return res;
     }
-    if (fType >= 0 && dl::At<uint8_t>(g_ev.obj[K], fType) != typeBefore)
-        res.fieldSet["BuildConstraintType"] = dl::At<uint8_t>(g_ev.obj[K], fType);
+    EvEnd(f, K, nullptr, v, res);
+    res.shown = r == 1;
+    std::vector<std::wstring> ml = ReadStringList(msgs);
+    for (size_t i = m0; i < ml.size(); i++)
+        if (!ml[i].empty()) messages.push_back(ml[i]);
     return res;
 }
 
@@ -4588,9 +4650,12 @@ static SaveCause TextCause(const std::wstring& text) {
 
 // A box of the game during the save: recorded; true = show it. Only the first box of a save is shown: a full disk makes
 // every design file fail on its own (nine "Error in SaveDesignFiles procedure!" boxes, then SaveBuildCampaign's). A box
-// about a file in use stays off the screen in a save the mod tries again (SaveGame(true)): the next try may work.
+// about a file in use stays off the screen in a save the mod tries again (SaveGame(true)): the next try may work. 0.8.0:
+// no box of the month's snapshot (SaveSnapshot) is shown: the host's player never sees that save.
+static volatile bool g_snapshot = false;
+
 extern "C" bool __stdcall CB_SaveBox(const void* text) {
-    bool show = !g_saveBoxShown;
+    bool show = !g_saveBoxShown && !g_snapshot;
     try {
         std::wstring t = text ? dl::ReadUStr(text) : L"";
         if (g_saveBoxes.size() < 16) g_saveBoxes.push_back(t.empty() ? L"(no text)" : t);
@@ -4598,7 +4663,8 @@ extern "C" bool __stdcall CB_SaveBox(const void* text) {
         show = show && !retried;
         if (!show)
             Log("save: the game's box %d of this save not shown%s: %s", (int)g_saveBoxes.size(),
-                retried ? " (a file in use: the mod saves again)" : "", W2U(t.substr(0, 200)).c_str());
+                g_snapshot ? " (the month's snapshot)" : retried ? " (a file in use: the mod saves again)" : "",
+                W2U(t.substr(0, 200)).c_str());
     } catch (...) {
     }
     if (show) g_saveBoxShown = true;
@@ -4761,6 +4827,11 @@ static void SaveEnd(int slot, int sip, bool autosave, bool unwound) {
         g_saveCause = SaveCause::None;
         g_saveText.clear();
         g_saveFile.clear();
+        try {
+            hookcb::OnCampaignSaved(slot, autosave);  // 0.8.0: the joined nations' officers back into their records
+        } catch (...) {
+            Log("exception after a save");
+        }
         return;
     }
     InterlockedIncrement(&g_saveFail);
@@ -4802,6 +4873,7 @@ static void CallSaveCampaign(void* self, uint32_t sip, uint32_t autosave, uint32
 }
 
 extern "C" void __stdcall CB_SaveCampaign(void* self, uint32_t sip, uint32_t autosave, uint32_t beforeBattle) {
+    ofc::BeforeSave();  // 0.8.0: a commander the open ship sheet hides is put back first
     LONG depth = InterlockedIncrement(&g_saveDepth);
     int slot = CurrentSlot();
     if (depth == 1) SaveBegin(slot);
@@ -4864,6 +4936,109 @@ bool SaveGame(bool quietInUse) {
     dl::Call(A.mSave, (uint32_t)(uintptr_t)f, 0xFFFFFFFFu, 0, 1, &beforeBattle);
     g_saveQuietInUse = false;
     return SaveFailCount() == fails;  // (without the hook: true, as before 0.7.1)
+}
+
+// 0.8.0 (simultaneous battles): the month's snapshot. SaveBuildCampaign(-1, False, False) through the mod's hook with
+// the slot global switched to `slot` for the call (every path of the save reads it again: the folder, which it creates,
+// the design files, the .sta, MapData, the .bcs, the .off; GAME-INTERNALS) and put back whatever happens.
+static bool SnapshotCall(void* f, int slot) {
+    int old = *A.slotVar;
+    *A.slotVar = slot;
+    bool ok = true;
+    __try {
+        uint32_t beforeBattle = 0;
+        dl::Call(A.mSave, (uint32_t)(uintptr_t)f, 0xFFFFFFFFu, 0, 1, &beforeBattle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    *A.slotVar = old;
+    return ok;
+}
+
+static volatile LONG g_testSnapFail = 0, g_testSnapLockSec = 0;
+static const int kSnapRetries = 2;
+
+bool SnapshotInProgress() { return g_snapshot; }
+
+std::string SetTestSnapshot(const std::string& mode, int seconds) {
+    if (mode == "fail") {
+        InterlockedExchange(&g_testSnapFail, 1);
+        Log("TEST: snapshot: the next one fails");
+    } else if (mode == "inuse") {
+        InterlockedExchange(&g_testSnapLockSec, seconds > 0 ? seconds : 1);
+        Log("TEST: snapshot: the next one finds its .bcs held without sharing for %d s", seconds > 0 ? seconds : 1);
+    } else if (mode == "off") {
+        InterlockedExchange(&g_testSnapFail, 0);
+        InterlockedExchange(&g_testSnapLockSec, 0);
+        Log("TEST: snapshot: as it is");
+    } else {
+        return "error usage: snapfail fail|inuse <s>|off";
+    }
+    return "ok snapfail=" + mode;
+}
+
+bool SaveSnapshot(int slot, unsigned long& ms, std::string& why) {
+    ms = 0;
+    why.clear();
+    void* f = BuildCamp();
+    if (!f || !A.slotVar || !A.mSave || slot < 50) {
+        why = "unavailable";
+        return false;
+    }
+    if (EventActive()) {
+        why = "an event dialog is open";
+        return false;
+    }
+    if (g_saveDepth > 0) {
+        why = "a save is in progress";
+        return false;
+    }
+    if (InterlockedExchange(&g_testSnapFail, 0)) {
+        why = "TEST: snapfail";
+        return false;
+    }
+    LONG lockSec = InterlockedExchange(&g_testSnapLockSec, 0);
+    if (lockSec > 0) {  // TEST: a file of the snapshot held by another program (the file must exist to be held)
+        std::wstring dir = SaveDir(slot), bcs = dir + L"RTWGame" + std::to_wstring(slot) + L".bcs";
+        EnsureDir(dir);
+        if (!FileExists(bcs)) WriteFileBytes(bcs, "[General]\r\n");
+        SetTestSaveLock((int)lockSec, L"");
+    }
+    static int fq = dl::Field("TfrmBuildCamp", "SaveQuestion");  // a normal save clears it (an autosave doesn't)
+    uint8_t question = fq > 0 ? dl::At<uint8_t>(f, fq) : 0;
+    LONG ok0 = g_saveOk, fail0 = g_saveFail;
+    int failSlot0 = g_saveFailSlot, last0 = g_lastSaveSlot;
+    SaveCause cause0 = g_saveCause;
+    std::string why0 = g_saveWhy, text0 = g_saveText, file0 = g_saveFile;
+    DWORD t0 = GetTickCount();
+    bool ok = false;
+    g_snapshot = true;
+    for (int i = 0; i <= kSnapRetries; i++) {
+        if (i) {
+            Log("snapshot: a file of slot %d is in use (%s); saving again in 0.6 s (%d of %d)", slot,
+                g_saveFile.c_str(), i, kSnapRetries);
+            Sleep(600);
+        }
+        LONG f1 = g_saveFail;
+        bool called = SnapshotCall(f, slot);
+        ok = called && g_saveFail == f1;
+        if (ok) break;
+        why = called ? g_saveWhy : "an exception in the game's save";
+        if (!called || g_saveCause != SaveCause::InUse) break;
+    }
+    g_snapshot = false;
+    ms = GetTickCount() - t0;
+    if (fq > 0) dl::At<uint8_t>(f, fq) = question;
+    // (not the player's save: a step waiting for a save that works keeps waiting, the last save's state stays)
+    g_saveOk = ok0;
+    g_saveFail = fail0;
+    g_saveFailSlot = failSlot0;
+    g_lastSaveSlot = last0;
+    g_saveCause = cause0;
+    g_saveWhy = why0;
+    g_saveText = text0;
+    g_saveFile = file0;
+    return ok;
 }
 
 // pocHeapCheck (diagnosis only, RTW3MP_DIAG or the bridge's `pocheapcheck`): the campaign's objects from frmBuildCamp
@@ -5065,6 +5240,7 @@ bool LoadCampaign(int slot, int playerIdx, bool modReload) {
         explicit DivNation(int k) { g_divNation = std::max(0, k); }
         ~DivNation() { g_divNation = 0; }
     } dn(playerIdx);
+    ofc::LoadScope os(slot, playerIdx);  // 0.8.0: a joined player's own month: its own officers (officers.cpp)
     bool ok = (dl::Call(A.mLoad, self, s.ptr()) & 0xFF) != 0;
     std::string whole;
     if (ok && !CampaignComplete(&whole)) {
@@ -5558,6 +5734,7 @@ extern "C" void __stdcall CB_BeforeLoad(void* self) {
     } catch (...) {
         Log("exception taking out the campaign divisions before a load");
     }
+    ofc::OnLoadStart();  // 0.8.0: the nations of the load are new: no joined nation's corps is in memory
 }
 extern "C" void __stdcall CB_AfterLoad(void* self, uint32_t result) {
     try {
@@ -6484,13 +6661,29 @@ extern "C" void __stdcall CB_BeforeBattles() {
     }
 }
 
-// CheckForBattles2(Self=EAX): Boolean. The joined nations' generators run first (they only record).
+// 0.8.0: CheckForBattles2 returned: the host's battle search of the month is over (its battle screen open, or none).
+extern "C" void __stdcall CB_AfterBattles(int result) {
+    if (g_b6View || g_battleSlotMode) return;
+    try {
+        hookcb::OnAfterBattleSearch((result & 0xFF) != 0);
+    } catch (...) {
+        Log("exception in OnAfterBattleSearch");
+    }
+}
+
+// CheckForBattles2(Self=EAX): Boolean. The joined nations' generators run first (they only record); 0.8.0: called
+// through, so the mod hears when the host's battle search is over (the result in AL kept).
 extern "C" __declspec(naked) void d_CheckForBattles() {
     __asm {
         push eax
         call CB_BeforeBattles
         pop eax
-        jmp dword ptr [o_CheckForBattles]
+        call dword ptr [o_CheckForBattles]
+        push eax
+        push eax
+        call CB_AfterBattles
+        pop eax
+        ret
     }
 }
 
@@ -7728,6 +7921,11 @@ extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
         if (g_legacySkip && StartBuildPhase() != 2 &&
             (!strcmp(s.method, "AIBuildInitialFleet") || !strcmp(s.method, "AIMonthlyBuild") ||
              !strcmp(s.method, "AssignOfficersToUncommandedShips"))) {
+            if (!strcmp(s.method, "AssignOfficersToUncommandedShips") && ofc::ClientActive()) {
+                // 0.8.0: the copy's officers are the nation's own (a host that keeps them): the game's assignment
+                Log("legacy fleet: %s for nation %d's own officers", s.method, NationIndex((void*)(uintptr_t)arg));
+                return 0;
+            }
             Log("legacy fleet: %s skipped (nation %d)", s.method, NationIndex((void*)(uintptr_t)arg));
             return 1;
         }
@@ -8816,6 +9014,7 @@ bool InstallHooks() {
     // 0.7.3 (fix-convoy): divisions whose ships are gone in the battle AI's loops (ConvoyEscortCheck's box and others)
     lockstep::InstallEmptyDivisionGuards();
     nplay::InstallHooks();
+    ofc::InstallHooks();  // 0.8.0: the joined players' officers (officers.cpp)
     if (lockstep::TestPrefsWanted()) {  // TEST ONLY
         Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");
         Hook(dl::Method("TdlgPrefs", "SavePrefs"), (void*)&d_SavePrefs, &o_SavePrefs, "TdlgPrefs.SavePrefs (TEST)");

@@ -16,6 +16,7 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
 - [The computer's war against its player](#the-computers-war-against-its-player)
 - [Campaign divisions (the Fleet organization tab)](#campaign-divisions-the-fleet-organization-tab)
 - [The legacy fleet: the manual build of the starting fleet](#the-legacy-fleet-the-manual-build-of-the-starting-fleet)
+- [Officers](#officers)
 - [Tactical battles](#tactical-battles)
   - [Battle commands](#battle-commands)
 
@@ -145,6 +146,34 @@ Offsets are those of 1.01.44; always resolve by name at runtime.
   the `.sta` are new then and the `.bcs` and `.off` old. The system's part is in the user's language (Delphi's
   `SysErrorMessage`: `FormatMessage`, the trailing dot cut); "Cannot create file", "Stream write error" and the
   "Error in ..." prefixes are the game's own English texts. The same save a moment later, the file free again, works.
+- **A save into another slot; what every save writes** (static reading of 1.01.44 and the live POC run sb80,
+  2026-11-01; [MODLOG](../MODLOG.md#investigation-2026-11-01-simultaneous-battles-the-design-v080-dev)).
+  `SaveBuildCampaign` reads the slot global (`[0xf2788c]`, the integer behind the mod's `CurrentSlot`) again for every
+  path: `GetSaveDirectory(slot)` (0xc8e61d; 0xc8e63d creates the folder when it is missing: `DirectoryExists`
+  0x859938, `ForceDirectories` 0x8599e0), the design files (0xc8e68c), `SaveMonthRecords(slot)` (0xc8f172, the `.sta`),
+  the map data (0xcf5080, called unconditionally at 0xc8f183: `MapData<slot>.dat`), the `.bcs` (0xc8f1b5/0xc8f1cf) and
+  the `.off` (0xc8f268/0xc8f282); at its end, when `GetOldSaveDirectory` (0xd4cdf0: `<game folder>\Save\Game<n>\`)
+  differs from the save folder, `TfrmSelectNation2.ClearSaveGameData(slot, True)` (0xbc8c08) clears that old folder's
+  slot. Its other effects: `SaveQuestion` (+0xa04) := False unless it is an autosave (0xc8e65a), `Screen.Cursor` :=
+  crHourGlass (0xc8e668) and crDefault at its end (0xc8f47d). So the global switched for one call and put back saves
+  the campaign in memory into another slot; live (the POC, inside `DoTurn2` at the player's generator's hook, the 1900
+  fixture): 47 to 62 ms, 13 files (1.8 MB), the host's month went on as usual. Every save writes `MapData<slot>.dat`
+  and the `.sta`, autosaves too: `DoTurn2`'s turn autosave (`SaveBuildCampaign(-1, True, False)` 0xce16c7, with the
+  design files), `DoAutosaveBeforeBattle` (0xd02d4c, from `DoBattle` 0xcb3bf6: a normal save first when the slot has
+  no `DesignFiles0.des`, then, with the preference at `[[0xf278b4]+0x46]` set (by its two uses, the autosave option),
+  `SaveBuildCampaign(EnemyIdx, True, True)`: `Autosave.bcs`/`.off` and `BattleInfo.bbi`) and the battle screen's minute
+  timer (0xdafc9d, the same preference, an autosave with ScenarioInProgress). During a month the slot's
+  `RTWGame<slot>.bcs` stays the month's start while its `MapData` and `.sta` follow these autosaves: a package of the
+  slot's files is consistent only before the Turn handler runs or after a full save. 0.8.0 saves the month's snapshot
+  this way (`game::SaveSnapshot`; live 2026-11-02, the 1900 fixture: 31 to 62 ms, 14 files with the mod's marker;
+  with its `.bcs` held by another handle for 1 s: two failed tries, each with the game's "Error in SaveBuildCampaign
+  procedure! Cannot create file ..." handled off the screen, then saved after 1.3 s).
+- **`CheckForBattles2` returns with the host's battle on screen** (live, 2026-11-02, the hook called through since
+  0.8.0). When the search gives a battle, `DoBattle` has opened the battle screen (non-modal) and `CheckForBattles2`
+  returns True right after it: the mod's "the host's battle search is over (its battle screen is open; ...)" follows
+  "DoBattle(opponent N) -> 1, battle screen open" 0 to 5 s later in the runs (the longest when a live battle against a
+  joined nation starts: its start is held by then, `HostOnBattleStarted`). `DoTurn2` then returns; `TfrmMain.FormClose`
+  runs `DoStrategicTurn` and `DoEndOfTurn` when the battle screen closes.
 - **A campaign file cut short loads as fewer than nine nations** (static reading and live runs, 2026-10-28;
   [MODLOG](../MODLOG.md#fix-2026-10-28-the-bare-access-violation--read-of-address-00000109-box-a-campaign-save-cut-short-v071-dev)).
   `LoadBuildCampaign` adds one nation per `[Nation<i>]` section and leaves its loop at the first missing one (`IndexOf
@@ -291,7 +320,12 @@ The game is written for one player, nation 0; it runs every other nation, a join
   `TensionEffectOfPreviousWars`. Wars:
   `CheckForWar` 0xc84f04 (from DoEndOfTurn: common-enemy relief, the `WillGoToWar` countdown +0x1bd with spy warnings
   and rumours, declarations, allies joining on either side, surprise attacks and landings) -> `WarStartsWithNation`
-  (Tension 50, War := 1, Allied and TechSharing 0, both nations' BudgetModifier raised). Peace: `GetPeaceEvent`,
+  (Tension 50, War := 1, Allied and TechSharing 0, both nations' BudgetModifier raised). Its path of a nation joining
+  the player's war (0xc8584c..0xc859c1: the nation's Tension 0 with the player, not allied, `Random(100) < 10`, War >
+  0, the force ratios) takes `GetRandomEnemy` and reads the enemy's name with no nil check: with War > 0 and no nation
+  at war with the player (a war ended by a raw tension write; `DoPeace`, and the mod's own peace after it, set War 0)
+  it fails with "Error in CheckForWar procedure! Access violation ... Read of address 00000004" (static, and live
+  2026-11-02: the suite's battle_simul had ended the host's war by `settension`). Peace: `GetPeaceEvent`,
   `NegotiatePeace`, `DoPeace`. War effects: `CheckBlockadeStatus`' VP, `CheckRaiderActivity`, `WarHelpFromAllies`,
   `CheckBuildingShipsForWar`, war loans in `CheckTurnEvents`. Battles: `CheckForBattles2` 0xcecb10 (only while War > 0;
   PlayerNation against nations with Tension > 40: invasions, raiders vs patrols, home areas, possessions,
@@ -571,8 +605,11 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
   - `CheckForInvasionBattles` 0xd10228 (from `CheckForBattles2`, War > 0, before the raider checks and the attack
     locations): at its start the player's target goes when it is worth more than 15 or invaded by anyone (Invaded <>
     -1: Target := nil, Count := 0, 0xd10258..0xd102a2; the enemy's target over 15 clears the player's too, 0xd10282);
-    a pending battle of the enemy may be dropped (the player much stronger in the area: `Random(100) <
-    40`; the enemy's mission range); Pending 0 -> `DoPossessionBattle(P, Target.Owner, area, Target)`, Pending > 0 ->
+    a pending battle of the enemy is dropped (Pending := -1, no battle) when the player is the stronger in the area
+    (its `GetStrengthInArea` above the pending enemy's, or above the active strength of all the nations at war with it,
+    0xd3b894), the enemy's target going too with `Random(100) < 40` (0xd10354..0xd1036b), and when the target is out of
+    the enemy's range (`GetDistanceToClosestBase`, both gone, 0xd10375..0xd10498; static 2026-11-02); Pending 0 ->
+    `DoPossessionBattle(P, Target.Owner, area, Target)`, Pending > 0 ->
     `DoPossessionBattle(GetBNation(Pending), P, area, EnemyInvasionTarget)`; then every invaded possession with
     `Random(100) < 60` (the target and the enemy's target 30 %): owner P -> the invader attacks P, else P attacks the
     owner, without asking whose invasion it is. It returns `DoPossessionBattle`'s result; a False goes on to the next
@@ -1368,6 +1405,143 @@ Static reading of 1.01.44 (0.7.0 investigation), proven live for a joined player
   with the AI loops and the officers skipped, after clearing K's generated fleet and designs in the files
   (ARCHITECTURE: [the legacy fleet](ARCHITECTURE.md#the-legacy-fleet-of-joined-players-070)).
 
+## Officers
+Static reading of 1.01.44 and live runs of 2026-11-01 on 0.7.1 (MODLOG
+[officers for joined players](../MODLOG.md#investigation-2026-11-01-officers-for-joined-players-v080-dev)).
+
+- **The officer.** `TOfficer` (40 bytes): `Name` +4, `Id` +8, `Ability` +0xc, `Rank` +0x10 (0 Commander, 1 Captain, 2
+  Rear Admiral, 3 Admiral; the names per nation are `[Nation<i>] OfficerRankName<r>`), `YearsInRank` +0x14,
+  `Special1`/`Special2` +0x18/+0x19 (`TSpecialAbility`: 0 None, 1 Aggressive, 2 Timid, 3 Gunnery, 4 Torpedo, 5 Wily, 6
+  Lucky, 7 Disciplinarian, 8 WellConnected, 9 Speed, 10 PoorShiphandler, 11 PoorAdmin, 12 Sportsman, 13 MusicLover, 14
+  ROF, 15 LooseCannon, 16 NoConnections, 17 GoodAdmin, 18 DamageControl, 19 Aviator), `BattleStars` +0x1a, `Status`
+  +0x1e (`TOfficerStatus`: 0 Active, 1 Dead, 2 Retired, 3 POW), `Fate` +0x1f, `AbilityKnown` +0x23.
+- **One corps, the player's.** Every `TBuilderNation` has an `OfficerList` (+0x115, made by `Create`; `Destroy` frees
+  the list, not the officers), but only PlayerNation's is ever filled: the computer's ships have no commanders
+  (`Ship<n>CommanderId=-1`, the 1900 fixture: 22 of nation 0's 51 ships commanded, none of the others'). Dead, retired
+  and captured officers stay in the list (`RemoveDeadOrRetiredOfficers` 0xd37ca8 only takes them off their posts).
+- **New officers.** `TfrmBuildCamp.GenerateNewOfficer(aNation, aRank, ToFillPost)` 0xd335e0 adds a `TOfficer` to
+  aNation's list, its `Id` from the campaign's `[General] IDNo` counter 0xd79de4 (as `CDivId` and `AirUnitId`), its name
+  from `Data\<nation>Names.txt` (0xe10678), random abilities. `AddOfficerToPool(aRank)` 0xd369f8 calls it for
+  PlayerNation (rank 0 gives 0 or 1). A new campaign (0xbc8f68) makes PlayerNation's pool: `AddOfficerToPool(0)`
+  FleetSize+3 times, `(2)` FleetSize+1 times, `(3)` FleetSize+GlobalNavalPower+1 times, then
+  `AssignofficerstoUncommandedAreas` and, with the fleet, `PlayerNation.AssignOfficersToUncommandedShips`.
+- **The save.** The `.off`'s `[Officers]`: `OfficerNo`, then `Officer<i>Name`, `Ability`, `AbilityKnown`, `Rank`,
+  `YearsInRank`, `Special`, `Special2`, `BattleStars`, `Status`, `Fate`, `Id`. `SaveBuildCampaign` writes it with
+  0xe0fc78(PlayerNation.OfficerList, file, 'Officers'); `LoadBuildCampaign` reads it with 0xe100f4(list, file,
+  'Officers') into PlayerNation's list (it appends, but the nations are new objects at every load: the counts stay,
+  0.7.0's growth audit), then calls `PlayerNation.ConnectOfficersToShips`.
+- **Commanders.** `TCampaignShip.Commander` +0xcc and `CommanderId` +0xd0 (`Ship<n>CommanderId`): `LoadMe` reads the
+  id (default 0), `SaveMe` writes `Commander.Id` or -1, so a ship whose pointer nobody connected loses its id at the next
+  save. `TCampaignDivision.Commander` +0x14 (`CampDiv<i>Commander`, looked up by `LoadMe` in PlayerNation). Map areas:
+  `TMapArea.AreaCommander` +0x178 and `CommanderId` +0x17c (MapData `MapArea<i>Commander`), one per area for all
+  nations. `TBuilderNation.ConnectOfficersToShips` 0xc69134 (only caller `LoadBuildCampaign`) sets Self's ships'
+  `Commander` from `GetOfficerWithId(CommanderId)` and the map areas' only when Self is PlayerNation.
+- **The player's screens.** The *Officers* tab (`pnOfficers`, `lvOfficers`; `FillOfficerList` 0xd33ba8 lists
+  PlayerNation's officers: Rank, Name, Years, Battles, Ability, Special ability, Status, Command/Fate; filters Active,
+  Retired, Dead, Show only unassigned). Its popup: *Move to pool* (`BeachOfficer`), *Reassign* (`ReassignOfficer`:
+  an area, a division or a ship), *Promote* (`Promote1Click`: four years in rank, or three and two battles; one free
+  promotion per turn, a global byte behind the cell [0xf27a2c] that only `DoTurn2` clears; the others cost prestige),
+  *Rename officer*, *Assign another officer to ship*. The ship list's popup (*Assign commander*, *Send commander
+  ashore*, *Reassign commander*), the area popup's *Assign commander* and the division popup's *Assign new commander*.
+  Replacing or moving a commander mostly costs prestige (`ProportionalPrestigeLoss`). All of it works on PlayerNation.
+- **The month.** `CheckTurnEvents` calls `PlayerNation.HandleOfficerStuff` 0xc6952c inside the month's one event slot
+  (at war after the peace decision; at peace after `SmallFleetCheck`, `BuyTechnology`, `CheckForPossessionEvent`); it
+  returns True when an officer event was shown, and then the slot is used (no technology offer, random event or
+  intelligence). It unassigns the dead and retired, promotes, retires, changes abilities ("... has shown himself to be
+  of Average ability!"), adds `YearsInRank` when the month is December, offers vacant area commands (the leader's
+  suggestion, `TdlgEventAnswer.ExecuteGeneral`), 1 in 8 runs `HandleOfficerEvent` (about 25 events with dialogs:
+  Prestige, `FleetMorale` +0x19c, `BudgetModifier`, the `Cautious` trait, ships' crew quality and repair time) and refills
+  the pool; its helpers use PlayerNation, its texts go to the turn report, its event cooldowns (`UsedOfficerEvents`
+  +0xa7c, 21) are not saved. The Turn (`DoTurn2`): `PlayerChecksBeforeTurn` asks "Some ships or divisions have no
+  commander assigned. Do you want to have ship and division commanders assigned automatically!" (0xd33ed0; the
+  preference at [0xf278b4]+0x364 answers it; No goes back to the screen), then `AssignofficerstoUncommandedAreas`,
+  `AssignofficerstoUncommandedDivisions` and `PlayerNation.AssignOfficersToUncommandedShips`. `AdvanceShipConstruction`
+  gives a commissioned ship of list index 0 a commander (with the preference). `AssignOfficerToCommandShip` always takes
+  or makes the officer from PlayerNation's list, whatever the ship's nation. `DoPeace` releases PlayerNation's POWs
+  ("... is released from captivity.", a box).
+- **In battle.** The generator copies `TCampaignShip.Commander` into `TFightingShip.Commander` (+0xac1; 0xbf282f,
+  0xbf6f98, both sides) and `TCampaignDivision.Commander` into `TDivision.Commander` (+0x11f; 0xbf8ce0, the player's
+  side). Abilities change hit chance, rate of fire, damage control, fires, torpedoes, CAP and landings
+  (`HasCommanderWithSpecialAbility`; a division without a commander uses its flagship's). The battle area's
+  `AreaCommander` changes the score that decides whether each of the player's (side 0) ships joins the force (`Ability`
+  +-5, GoodAdmin +10, PoorAdmin -10; 0xbf82ad, against `Random(100)`) and gets a battle star. The `.sac` saves
+  `Ship<i>Commander` (0xdd472b) and its load looks it up with
+  `PlayerNation.GetOfficerWithId` (0xdda984), for both sides; it has no division commander, so a resumed battle
+  (every live battle) has none. After a battle `TransferCampaignShipDamage` 0xd55dd8 gives battle stars; a sunk
+  ship's commander is captured (20 %), saved by luck or his specials, or goes down with her (`Fate`; a MusicLover's
+  band first gives PlayerNation prestige and fleet morale).
+- **The campaign, for any nation's ship with a commander:** `KillCommander` 0xd36ed4 (submarines, mines, torpedoes,
+  foreign stations, raider battles: 30 % POW, else dead; no message); `GetShipMaintenanceCost` (GoodAdmin x0.75,
+  PoorAdmin x1.1); `AdjustCrewQuality` 0xcb27c8 (from `AdvanceShipConstruction`, every nation's operational ships: the
+  commander's ability and specials change crew quality, with picture messages and no nation test; a PlayerNation ship
+  without a commander loses crew quality 1 in 5); the raider checks; `ScrapShip` (unassigns). The strategic ship sheet
+  (`TdlgShipStatus.ExecuteShipStatusStrategic`) shows "<officer> commanding" for a ship with a commander unless it is
+  called with `Enemy`.
+- **Joined players (0.7.1, live).** A joined player's month carries the host's `.off`, so on the player's PC the host's
+  officers load into nation 0's list and command the host's ships and areas there; the player's own list is empty (the
+  *Officers* tab shows nothing) and its ships have no commanders. Ids a joined player's turn sends for its ships are
+  lost at the host's next save (nobody connects them there). The battle slot and Copy game (`MakeNationPlayer`) clear
+  the host's ships' commanders but keep the host's officers and their area commands. Probe (TEST only): with the two
+  lists traded on the player's PC, the game's *Officers* tab, ship commands and save follow the player's nation, and a
+  Copy game of that save connects them natively.
+- **Found while building 0.8.0** (static reading of 1.01.44, proven live 2026-11-01 unless marked):
+  - The loader 0xe100f4 (EAX = the `TList`, EDX = a `TStringList` holding the `.off`'s text, ECX = 'Officers') reads
+    the INI keys from the `TStringList` with the game's reader 0xab6fc8 (string list, section, key, default) and
+    appends a `TOfficer` per `OfficerNo` (a missing `Name` reads "Officer<i> Name Error"); `LoadBuildCampaign` calls it
+    only when the `.off` exists. It is the E8 call right before `PlayerNation.ConnectOfficersToShips` in
+    `LoadBuildCampaign`. The writer 0xe0fc78 (the same registers) writes the section header (0xab6f34) and every
+    officer's eleven keys into a `TStringList`; it is the E8 call right before `SaveCampaignDivisions` in
+    `SaveBuildCampaign`. Both work on any nation's list: a `TStringList` made by the mod (`[Officers]` and the lines)
+    loads a joined nation's corps into its own list, and the writer reads it back (live: 24 officers in, the same 24
+    lines out).
+  - `ConnectOfficersToShips` sets each of Self's ships' `Commander` from `Self.GetOfficerWithId(CommanderId)` (nil
+    when not found; `GetOfficerWithId` searches Self's list) and, only when Self is PlayerNation, each map area's
+    `AreaCommander` whose `CommanderId` is not -1. `SaveGameMapArea` writes `MapArea<i>Commander` from the pointer
+    (`AreaCommander.Id` or -1), as ships do.
+  - The Turn's question 0xd33ed0 (Self = frmBuildCamp, Boolean in AL) answers True without asking when the
+    preference ([0xf278b4]+0x364) is set or when PlayerNation has no ship with `IsCommandedShip` (type byte +0x14 < 7),
+    in play (byte +0x41) and `IsOperational` (status +0xac not 7 or 9, `RepairTime` +0x25 = 0, in play) without a
+    commander, and no division with ships without a commander; else `MessageDlg` Yes / No / Yes To All: Yes True, Yes
+    To All sets the preference, No False (`PlayerChecksBeforeTurn` then returns False). A ship under repair is not
+    asked about (live: the default run's battles left the first commanded ships under repair). `DoTurn2`
+    then clears the free-promotion byte (`mov eax,[cell]; mov byte ptr [eax],0` right before `call
+    AssignofficerstoUncommandedAreas`) and runs the three assignments (`AssignOfficersToUncommandedShips` twice).
+  - `GetShipMaintenanceCost(aShip, AllActive)` takes the ship's base (+0xa2) x0.75 for a GoodAdmin commander (special
+    17) and x1.1 for a PoorAdmin (11), then replaces the cost of a ship under repair (`RepairTime` > 0, not mothballed)
+    with twice its base (three times for type 0xc): the commander's factor is lost while she is repaired (live: `econ`
+    unchanged by a GoodAdmin on a ship under repair, +48 a month on an active one).
+  - `Promote1Click`: "Select an officer", "This officer is not active!", "Admirals cannot be further promoted.";
+    `TOfficer.CanBePromoted` ("An officer needs to have four years in rank, or three years and two or more battle
+    stars"); free when the officer is the senior of his rank (0xe111ac on PlayerNation's list) and the byte is 0 ("... is
+    senior to other officers of his rank and can be promoted without prestige cost. On promotion, ... will be removed
+    from any current command. ... You can only do one free promotion per turn."), else "Promoting ... over the heads of
+    others will cost some prestige." and `ProportionalPrestigeLoss`. *Move to pool* (`Dismiss1Click` ->
+    `BeachOfficer`; admirals refused): "Do you want to reassign <officer> to a post ashore?" with "This will cost some
+    prestige!" or, for an officer with special ability 8, "He has connections in high circles and this will cost
+    prestige!" (then also [PlayerNation+0x198] - 1); Yes: `RemoveOfficerFromShip(officer, False, AutoReplace True)`,
+    `RemoveOfficerFromDivision`, `ProportionalPrestigeLoss(30)`, `UpdateUIValues` (live: the ship had no commander
+    until the Turn's assignments). *Rename officer*: InputQuery "Change officer name" / "Enter new name".
+  - `HandleOfficerEvent(aRndNum)`: -1 = `Random(24)`, else event aRndNum (0-23, a jump table), re-rolled while its
+    cooldown (`UsedOfficerEvents[i]`, set to 24 months) is above a counter; each event has its own conditions and
+    returns False when they fail. Two events use `GetRandomShipUnderConstruction(0)` (index 0, not PlayerNation) and one
+    `TensionChangeWithMessage(GetBNation(GetMostTenseNationIndex), 1, ...)`: for another nation they need the events'
+    view (K at index 0, the relations of K).
+  - `AdjustCrewQuality(aShip, aNation)` reaches its commander part on every path; a LooseCannon's (1 in 20), a
+    Sportsman's and a MusicLover's picture messages (`CopyMessageToLog` 1) have no nation test, the carriers' working-up
+    messages only PlayerNation's. `KillCommander(aShip, CouldBePOW)` sets `Status` 3 (POW, 30 %) or 1 (dead), the `Fate`
+    (" POW after sinking of <ship>." / " Went down with <ship>.") and nils the ship's `Commander`; no message, no new
+    commander. `TransferCampaignShipDamage` nils a ship's commander only when he is dead or the ship sank: a battle never
+    changes a surviving ship's commander.
+  - The ship sheet (`ExecuteShipStatusStrategic`, nine stack arguments, `ret 0x24`) shows "<officer> commanding" inside
+    its `not Enemy` block; `ShowShipData` passes `Enemy = not Correct`, and the map details' *Details*
+    (`TdlgMapDetails.D1Click`) passes Correct = 1.
+  - `CheckPlayerPrestigeLevel` (the month's end): PlayerNation's `Prestige` (+0x198) at 15 after more (the month
+    before's, +0x32f4) gives "Many people in naval circles express their doubts about your leadership ...", at 14 the
+    criticism message; at 14 or less the player is dismissed when `Random(20)` > Prestige or Prestige <= 10 ("... You
+    have been dismissed from the Navy!", then 0xcdebd8 shows the game's summary `TfrmSummary` modally: the campaign is
+    over); fleet morale (+0x19c) at -3/-4 has its own dismissal. Live: the default run's host was dismissed in 1904/10
+    (the run stopped at the summary); the runner now keeps the host's Prestige at 20 or more (`keep_host_prestige`).
+
 ## Tactical battles
 The battle facts, gathered since the battle investigation of 2026-10-14; the later findings carry their dates.
 
@@ -1998,6 +2172,25 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     play; nation order does not matter), so the mod runs it on the joined player's PC. Harmless: `[0xfb591c]` (a
     once-a-month aircraft message flag). The host player's invasion fields (+0x4a8c, +0x4a94, +0x4a98) are loaded from
     the save too (`InvasionCount` +0x4a90 is not).
+  - *What the rest of a month and a battle change in the campaign's ships (live, 2026-11-01, the sb80 POC of
+    simultaneous battles: the save at the player's generator's hook against the month-end save and against the battle
+    slot's results; 3 months of the 1900 fixture, 6 battles; [MODLOG](../MODLOG.md#investigation-2026-11-01-simultaneous-battles-the-design-v080-dev)).*
+    From the hook (after `AreaMoveShips`) to the month's end (`CheckForBattles2` with the host's battle,
+    `DoStrategicTurn`, `DoEndOfTurn`) the game changes `CrewQuality` of almost every ship of every nation (242 to 258
+    a month, mostly +1: the month's training), `BuildProgress` of the ships building, `Status`/`OldStatus` (work-up or
+    refit over), `RepairTime` countdowns, `TimeToRefit`, `InPlay`, `ObsoleteDate`, and the log entries
+    (`LogEntry<i>`, `NumberOfLogEntries`) and `BattleStars` of the ships in the host's battle. A battle fought in a
+    joined player's battle slot changes only `CrewQuality`, `BattleStars`, `RepairTime`, `LogEntry<i>` and
+    `NumberOfLogEntries` of the ships that fought (6 to 22 a battle; sunk ships leave the list); every other field of
+    the result equals the save it was built from (no change from the slot's load and save).
+  - *The bounds of `CrewQuality` and a ship's log (static, 2026-11-02, for 0.8.0's merge rules;
+    [MODLOG](../MODLOG.md#feature-2026-11-02-simultaneous-battles-v080-dev)).* `CrewQuality` (`TCampaignShip` +0x1d,
+    an Integer) is negative on many ships (the 1900 fixture: -12 to 20). The month's `TfrmBuildCamp.AdjustCrewQuality`
+    (0xcb27c8) adds 1 (0xcb2e4c), raises a value below -25 to -25 (0xcb2e4f), takes 1 off above 20 by a random draw
+    against a nation value (0xcb2e5c-0xcb2e80) and above 25 always (0xcb2e83): -25 to 25 is the game's own range. A
+    ship's log is `NumberOfLogEntries` and `LogEntry0..n-1` in the save, appended to only: each record (the laying
+    down, a battle: "August 1900 Took part in Battle of ...", "In action.", the damage, the hits) ends with an empty
+    entry, so a battle's new entries are the indices from the count the battle started from on.
   - *Raider vs patrol battles (static 2026-10-23; 0.7.0 static and live 2026-10-26).* `CheckForBattles2` calls
     `CheckRaiderVsPatrols` 0xcce6bc at two places, each after `Random(100) < 30` (0xcecb7e after the invasion check;
     0xcecfbc in the `GetRandomEnemy` passes after a `CheckAttackLocation` that found nothing); a True ends the search

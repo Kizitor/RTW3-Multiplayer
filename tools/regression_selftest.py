@@ -827,6 +827,160 @@ def divisions_samples():
           and R.div_summary(got) == 'Host Div A[122.123]; Host Div B[]', got)
 
 
+def simul_samples():
+    """0.8.0 (simultaneous battles): battle_simul's merge rules (simul_expected, simul_merge_check: the rules of
+    saveio::ApplyBattleResult, the same cases as tools/merge_test.cpp) on made-up files, and its log patterns
+    (SIMUL_RE) on lines of src/mod's formats."""
+    lg = ['January 1899 Laid down.', '']
+    lm = lg + ['March 1900 The host\'s battle.', '']
+    lb = lg + ['March 1900 Took part in a battle.', 'In action.', '']
+
+    def ship(cq, stars, rt, used, status, log):
+        f = dict(Name='x', CrewQuality=str(cq), RepairTime=str(rt), Used=str(used), Status=status,
+                 BattleStars=str(stars), NumberOfLogEntries=str(len(log)))
+        f.update({f'LogEntry{i}': e for i, e in enumerate(log)})
+        return f
+
+    got, rules = R.simul_expected(ship(6, 0, 0, 0, '0', lg), ship(7, 1, 0, 0, '1', lm), ship(7, 2, 3, 1, '2', lb), True)
+    check('simul_expected: CrewQuality both +1 -> 8, stars 1+2 -> 3, RepairTime the battle\'s 3, Used the host\'s, Status '
+          'the battle\'s, the battle\'s 3 log entries after the host\'s 4',
+          got == {'CrewQuality': '8', 'BattleStars': '3', 'RepairTime': '3', 'Status': '2', 'LogEntry4':
+                  'March 1900 Took part in a battle.', 'LogEntry5': 'In action.', 'LogEntry6': '',
+                  'NumberOfLogEntries': '7'} and sorted(rules) == ['BattleStars', 'CrewQuality', 'log', 'other Status'],
+          (got, rules))
+    got, rules = R.simul_expected(ship(24, 0, 2, 0, '0', lg), ship(25, 0, 1, 0, '0', lg), ship(26, 0, 5, 0, '0', lg), True)
+    check('simul_expected: CrewQuality at the game\'s bound (24 -> 25, 26: 25); RepairTime both (2 -> 1, 5): the larger',
+          got == {'CrewQuality': '25', 'RepairTime': '5'} and sorted(rules) == ['CrewQuality', 'RepairTime'], (got, rules))
+    got, _ = R.simul_expected(ship(6, 0, 4, 0, '0', lg), ship(7, 0, 6, 0, '0', lg), ship(5, 0, 3, 1, '0', lg), False)
+    check('simul_expected: CrewQuality 6 -> 7, battle 5: 6; RepairTime 4 -> 6, 3: 6; Used without keep_used: the '
+          'battle\'s', got == {'CrewQuality': '6', 'RepairTime': '6', 'Used': '1'}, got)
+    got, rules = R.simul_expected(ship(6, 0, 0, 0, '0', lg), ship(6, 0, 0, 0, '0', lg), ship(7, 1, 2, 0, '0', lb), False)
+    check('simul_expected: the host unchanged since the send (a battle sent after the month): the battle\'s values',
+          got == {'CrewQuality': '7', 'BattleStars': '1', 'RepairTime': '2', 'LogEntry2': 'March 1900 Took part in a '
+                  'battle.', 'LogEntry3': 'In action.', 'LogEntry4': '', 'NumberOfLogEntries': '5'} and not rules,
+          (got, rules))
+
+    def sec(ships):
+        return {f'Ship{i}{k}': v for i, (sid, f) in enumerate(ships) for k, v in dict(f, Id=sid).items()}
+    s1, h1, r1 = ship(6, 0, 0, 0, '0', lg), ship(7, 0, 0, 0, '0', lg), ship(7, 1, 0, 0, '0', lg)
+    files = dict(sent={'Nation1Ships': sec([('101', s1), ('102', s1), ('103', s1)])},
+                 host={'Nation1Ships': sec([('101', h1), ('102', h1), ('104', h1)])},
+                 result={'Nation1Ships': sec([('101', r1), ('103', r1)]), 'Nation1Losses': {'BB': '1'}})
+    files['merged'] = {'Nation1Ships': sec([('101', dict(h1, CrewQuality='8', BattleStars='1')), ('104', h1)])}
+    got = R.simul_merge_check(files, True)
+    check('simul_merge_check: the merge by the rules (101: 7 + 1 = 8, a star), 102 sunk in the battle, 103 gone from the '
+          'host\'s save stays gone, 104 new there kept: no difference',
+          got['bad'] == [] and (got['ships'], got['changed'], got['sunk'], got['gone'], got['new']) == (2, 1, 1, 1, 1)
+          and got['rules'] == {'CrewQuality': 1}, got)
+    files['merged'] = {'Nation1Ships': sec([('101', dict(h1, CrewQuality='7', BattleStars='1')), ('102', h1),
+                                            ('103', s1), ('104', dict(h1, Status='5'))])}
+    got = R.simul_merge_check(files, True)
+    check('simul_merge_check: the battle\'s value over the month\'s training, a sunk ship still there, a gone one back '
+          'and a new one changed: all four found', len(got['bad']) == 4, got['bad'])
+    ch, sk = R.simul_merge_changes(files)
+    check('simul_merge_changes (`battles` b) on a battle fought during the host\'s month): the merge rules\' values per '
+          'ship (101: CrewQuality 7 + 1 = 8, a star), 102 sunk in the battle, 103 gone from the host\'s save left out',
+          ch == {(1, '101'): {'CrewQuality': (None, '8'), 'BattleStars': (None, '1')}} and sk == {(1, '102')}, (ch, sk))
+    lines = {
+        'snap': "01:02:03.456 [1] simultaneous battles: the month's snapshot in slot 151: saved in 62 ms",
+        'sent': "01:02:03.500 [1] battle 7 sent to Captain (1757506 bytes), during the host's month (the month's "
+                "snapshot, slot 151)",
+        'held': "01:02:40.000 [1] battle 7: the result (fought) held until the host's month is over (100903 bytes)",
+        'merged': "01:03:00.000 [1] battle 7: its result held since the host's month merged now (100903 bytes)",
+        'late': "01:02:03.600 [1] battle 8 (kind 1): after the month (the nation's surprise attack comes first)",
+        'kept': "01:02:03.600 [1] battle 9: waits for the end of the host's battle search (nation 1 is at war with the "
+                "host's)",
+        'search': "01:02:09.000 [1] the host's battle search is over (its battle screen is open; live against nation 1): "
+                  "1 battle(s) kept for it",
+        'packed': "01:02:01.000 [1] battle 5 (surprise attack): packed from the month's start (1757000 bytes); it goes "
+                  "out with the month",
+        'strategic': "01:02:50.000 [1] the host's month: DoStrategicTurn runs; battles of the players during the month "
+                     "still fought: none",
+        'deleted': "01:03:01.000 [1] simultaneous battles: the scratch slot 151 deleted (the month is over): 14 file(s)",
+        'rules': "01:03:00.040 [1] battle 7: the host's save changed since the send (a battle fought during the host's "
+                 "month): the host's value + the battle's change: CrewQuality 6 ship(s)",
+    }
+    ev = R.simul_events('\n'.join(lines.values()))
+    names = [n for _, n, _ in ev if n != 'request']
+    check('SIMUL_RE: each step of the host\'s log found once, in order, with its fields (slot, ms, id, player, outcome, '
+          'reason, live nation, why deleted)',
+          names == list(lines) and R.simul_first(ev, 'snap')[1].group(2, 3) == ('saved', '62')
+          and R.simul_first(ev, 'sent')[1].group(1, 2) == ('7', 'Captain')
+          and R.simul_first(ev, 'held')[1].group(2) == 'fought'
+          and 'surprise attack comes first' in R.simul_first(ev, 'late')[1].group(3)
+          and R.simul_first(ev, 'search')[1].group(2) == '1'
+          and R.simul_first(ev, 'deleted')[1].group(2) == 'the month is over'
+          and abs(R.simul_first(ev, 'snap')[0] - 3723.456) < 1e-6, names)
+    hl = ('10:00:36.351 [1] battle 66: resolved by the game (no battle came about)\n'
+          '10:00:37.002 [1] battle 67 applied: 3 ships changed (12 fields), 0 removed\n'
+          '10:00:38.000 [1] battle 6: its result held since the host\'s month merged now (90 bytes)')
+    check('simul_done: "applied" or "resolved by the game (...)" takes a battle\'s result; another battle\'s line or a '
+          'merge line alone does not', R.simul_done(hl, 66) and R.simul_done(hl, 67) and not R.simul_done(hl, 6)
+          and not R.simul_done(hl, 7), hl)
+    got, _ = R.simul_expected(dict(ship(6, 0, 0, 0, '0', lg), CommanderId='60553'),
+                              dict(ship(7, 0, 0, 0, '0', lg), CommanderId='60553'),
+                              dict(ship(7, 1, 0, 0, '0', lg), CommanderId='-1'), True)
+    check('simul_expected: never the ship\'s CommanderId (0.8.0 officers: the merge takes none; the dead and captured '
+          'are cleared by the officers\' merge)', 'CommanderId' not in got and got.get('BattleStars') == '1', got)
+    officer_samples()
+
+
+def officer_samples():
+    """0.8.0 integration (officers with simultaneous battles): battle_simul's officers' merge rules (of_section,
+    of_merge_expected: saveio::MergeOfficers, the cases of tools/merge_test.cpp) and its log patterns."""
+    def ofs(rows):  # rows: (id, status, stars, fate, rank)
+        lines = ['[Officers]', f'OfficerNo={len(rows)}']
+        for i, (oid, st, stars, fate, rank) in enumerate(rows):
+            for k, v in (('Name', f'Officer {oid}'), ('Rank', rank), ('BattleStars', stars), ('Status', st),
+                         ('Fate', fate), ('Id', oid)):
+                lines.append(f'Officer{i}{k}={v}')
+        return '\r\n'.join(lines + ['[AreaCmd]', 'MapArea3Commander=11', ''])
+    sent = ofs([('11', '0', '1', '', '1'), ('12', '0', '0', '', '2'), ('13', '0', '2', '', '0'), ('14', '0', '0', '', '1'),
+                ('15', '0', '3', '', '3'), ('16', '0', '0', '', '0'), ('19', '0', '0', '', '1')])
+    host = ofs([('11', '0', '1', '', '1'), ('12', '1', '0', 'Killed when his ship struck a mine', '2'),
+                ('13', '0', '3', '', '0'), ('14', '0', '0', '', '1'), ('15', '0', '3', '', '3'), ('16', '0', '0', '', '1'),
+                ('17', '0', '0', '', '0'), ('19', '1', '0', 'Lost at sea', '1')])
+    battle = ofs([('11', '0', '2', '', '1'), ('12', '0', '1', '', '2'), ('13', '0', '4', '', '0'),
+                  ('14', '3', '0', 'Captured', '1'), ('16', '0', '0', '', '0'), ('18', '0', '0', '', '0'),
+                  ('19', '3', '0', 'Captured', '1')])
+    (s, so), (h, _), (b, _) = R.of_section(sent), R.of_section(host), R.of_section(battle)
+    check('of_section: the [Officers] keys by officer id in list order (not [AreaCmd])',
+          so == ['11', '12', '13', '14', '15', '16', '19'] and s['12'] == dict(Name='Officer 12', Rank='2',
+                                                                           BattleStars='0', Status='0', Fate='', Id='12'),
+          (so, s.get('12')))
+    m = R.of_merge_expected(s, h, b)
+    g = lambda oid, k: m.get(oid, {}).get(k)  # noqa: E731
+    check('of_merge_expected: the battle\'s star (11: 2), the month\'s dead with the battle\'s star (12: dead, his fate, '
+          '1), stars both (13: 3 + 2 = 5), captured in the battle (14), 15 dropped, the record\'s promotion (16: rank 1), '
+          '17 kept, 18 added, dead in the month and captured in the battle (19: dead, the month\'s fate)',
+          (g('11', 'BattleStars'), g('12', 'Status'), g('12', 'Fate'), g('12', 'BattleStars'), g('13', 'BattleStars'),
+           g('14', 'Status'), g('14', 'Fate'), '15' in m, g('16', 'Rank'), '17' in m, '18' in m, g('19', 'Status'),
+           g('19', 'Fate')) == ('2', '1', 'Killed when his ship struck a mine', '1', '5', '3', 'Captured', False, '1',
+                                True, True, '1', 'Lost at sea'), m)
+    check('of_merge_expected: the record as the package carried it (a battle of the battle phase): the battle\'s list',
+          R.of_merge_expected(s, s, b) == b, R.of_merge_expected(s, s, b))
+    hl = ("10:00:01.000 [1] divisions of nation 1: 3 in its battle (pruned)\n"
+          "10:00:01.001 [1] officers of nation 1: 24 in its battle (3 area commands; 2 area lines changed)\n"
+          "10:00:01.050 [1] battle 7 sent to Captain (1757506 bytes), during the host's month (the month's snapshot, "
+          "slot 151)\n"
+          "10:00:01.060 [1] officers of nation 2: none stored yet: its PC forms the corps, in its battle (0 area "
+          "commands; 0 area lines changed)\n"
+          "10:00:01.090 [1] battle 8 sent to Bot (1757000 bytes), during the host's month (the month's snapshot, slot "
+          "151)\n"
+          "10:00:40.000 [1] officers of nation 1: 24 after its battle merged into the record (25): 2 changed by the "
+          "battle, 1 of them changed by the host's month too\n")
+    cl = ("10:00:04.000 [1] battle 7: the battle slot holds the nation's 24 officers (23 active), commanding 16 of its "
+          "ships (a battle during the host's month)\n"
+          "10:00:05.000 [1] battle 7: the nation's 24 officers (23 active) command 16 of its ships; in the battle: x\n")
+    check('OF_PUT_RE, OF_SLOT_RE, OF_CLIENT_RE, OF_MERGED_RE: the host\'s officers line before each send (none for a '
+          'nation without a record), the player\'s battle slot and its battle, the merge',
+          R.simul_officer_puts(hl) == {7: (1, 24, 3)} and re.findall(R.OF_CLIENT_RE, cl) == [('7', '24', '23', '16')]
+          and re.findall(R.OF_SLOT_RE, cl) == [('7', '24', '23', '16')]
+          and [x[:3] for x in re.findall(R.OF_MERGED_RE, hl, re.M)] == [('1', '24', '25')],
+          (R.simul_officer_puts(hl), re.findall(R.OF_CLIENT_RE, cl), re.findall(R.OF_SLOT_RE, cl),
+           re.findall(R.OF_MERGED_RE, hl, re.M)))
+
+
 def battlegen_samples():
     """battle_generator's pick of J (0.7.3 regression): `attack_order` takes battle_pairs' candidates where J has a
     possession worth MAJOR_POSS or more in the area first and keeps battle_pairs' order otherwise."""
@@ -1281,6 +1435,7 @@ def main():
     intel_samples()
     relations_samples()
     divisions_samples()
+    simul_samples()
     battlegen_samples()
     sandbox = os.path.abspath('regression_selftest_sandbox')
     if os.path.exists(sandbox):

@@ -725,17 +725,18 @@ bool TransformNationPlayer(PlayerCopyFiles& f, int K, const std::vector<int>& ev
     for (auto& p : playerOwn) SetExisting(d, n0, p.first, p.second);
 
     // Nation numbers inside the sections: where ships were built, the air units' and aircraft types' nations. The
-    // host's ships (now nation K) lose their commanders: officers belong to the player.
+    // other nations' ships lose their commanders: officers belong to the player (the host's ships, now nation K, and
+    // since 0.8.0 the other joined nations' ships, whose officers the copy doesn't have).
     int commanders = 0;
     for (auto& s : d.sections) {
-        bool hostShips = s.name.compare(0, nk.size(), nk) == 0 && s.name.size() > nk.size() &&
-                         !isdigit((unsigned char)s.name[nk.size()]);
+        bool otherShips = s.name.compare(0, 6, "Nation") == 0 && s.name.size() > 6 &&
+                          isdigit((unsigned char)s.name[6]) && atoi(s.name.c_str() + 6) != 0;
         for (auto& l : s.lines) {
             std::string k, v;
             if (!SplitKV(l, k, v) || !IsInt(v)) continue;
             if (KeyShape(k, "Ship", "BuildingNationIdx") || AirNationKey(k)) {
                 l = k + "=" + std::to_string(SwapIdx(atoi(v.c_str()), K));
-            } else if (hostShips && KeyShape(k, "Ship", "CommanderId") && v != "-1") {
+            } else if (otherShips && KeyShape(k, "Ship", "CommanderId") && v != "-1") {
                 l = k + "=-1";
                 commanders++;
             }
@@ -1082,10 +1083,97 @@ static bool IntelField(const std::string& f) {
 }
 
 static std::string FieldKey(const std::string& f) { return f.substr(0, f.find('=')); }
+static std::string FieldValue(const std::string& f) {
+    size_t e = f.find('=');
+    return e == std::string::npos ? std::string() : f.substr(e + 1);
+}
+
+// "LogEntry<i>" (i: digits) -> i, else -1.
+static int LogEntryIndex(const std::string& key) {
+    if (key.size() <= 8 || key.compare(0, 8, "LogEntry") != 0 || !AllDigits(key, 8, key.size())) return -1;
+    return atoi(key.c_str() + 8);
+}
+
+static void SetShipField(ShipBlock& b, const std::string& key, const std::string& line) {
+    for (auto& f : b.fields)
+        if (FieldKey(f) == key) {
+            f = line;
+            return;
+        }
+    b.fields.push_back(line);
+}
+
+// A ship's log: NumberOfLogEntries and the entries by index.
+static int ShipLog(const ShipBlock& b, std::map<int, std::string>& entries) {
+    int n = -1;
+    for (auto& f : b.fields) {
+        std::string key = FieldKey(f);
+        if (key == "NumberOfLogEntries") n = atoi(FieldValue(f).c_str());
+        int i = LogEntryIndex(key);
+        if (i >= 0) entries[i] = FieldValue(f);
+    }
+    return n;
+}
+
+// 0.8.0: the ship's log after a battle that added entries to it (result r against the sent o) while the host's save
+// (nb) changed it too: the battle's new entries (index >= the sent count) follow the host's. Returns the fields set.
+// When the host's log is still the sent one, or the battle did more than append, the battle's fields (as before).
+static int MergeShipLog(ShipBlock& nb, const ShipBlock& o, const ShipBlock& r, MergeNotes* notes) {
+    std::map<int, std::string> eo, er, eh;
+    int no = ShipLog(o, eo), nr = ShipLog(r, er), nh = ShipLog(nb, eh);
+    bool hostSame = nh == no && eh == eo;
+    bool appended = no >= 0 && nr >= no;
+    for (int i = 0; appended && i < no; i++) appended = er.count(i) && eo.count(i) && er[i] == eo[i];
+    int set = 0;
+    if (hostSame || !appended || nh < 0) {
+        std::map<std::string, std::string> was;
+        for (auto& f : o.fields) was[FieldKey(f)] = f;
+        for (auto& f : r.fields) {
+            std::string key = FieldKey(f);
+            if (key != "NumberOfLogEntries" && LogEntryIndex(key) < 0) continue;
+            auto w = was.find(key);
+            if (w != was.end() && w->second == f) continue;
+            SetShipField(nb, key, f);
+            set++;
+        }
+        if (!hostSame && set && notes) notes->other["LogEntry"]++;
+        return set;
+    }
+    size_t at = nb.fields.size();  // after the host's last log line (the game writes them last)
+    for (size_t i = 0; i < nb.fields.size(); i++) {
+        std::string key = FieldKey(nb.fields[i]);
+        if (key == "NumberOfLogEntries" || LogEntryIndex(key) >= 0) at = i + 1;
+    }
+    std::vector<std::string> add;
+    for (int i = no; i < nr; i++) add.push_back("LogEntry" + std::to_string(nh + i - no) + "=" + (er.count(i) ? er[i] : ""));
+    nb.fields.insert(nb.fields.begin() + at, add.begin(), add.end());
+    SetShipField(nb, "NumberOfLogEntries", "NumberOfLogEntries=" + std::to_string(nh + nr - no));
+    if (notes) notes->logs++;
+    return (int)add.size() + 1;
+}
+
+std::string MergeNotes::Text() const {
+    auto list = [](const std::map<std::string, int>& m) {
+        std::string s;
+        for (auto& kv : m) s += (s.empty() ? "" : ", ") + kv.first + " " + std::to_string(kv.second);
+        return s;
+    };
+    std::string s;
+    if (!added.empty())
+        s += "the host's value + the battle's change: " + list(added) + " ship(s)" +
+             (clamped ? " (" + std::to_string(clamped) + " at the game's bounds)" : "");
+    if (logs) s += std::string(s.empty() ? "" : "; ") + "the battle's log entries after the host's: " + std::to_string(logs) + " ship(s)";
+    if (repair) s += std::string(s.empty() ? "" : "; ") + "RepairTime the larger: " + std::to_string(repair) + " ship(s)";
+    if (!other.empty()) s += std::string(s.empty() ? "" : "; ") + "the battle's value over the host's change: " + list(other) + " ship(s)";
+    if (monthGone)
+        s += std::string(s.empty() ? "" : "; ") + std::to_string(monthGone) + " ship(s) gone from the host's save since the send" +
+             (bothGone ? " (" + std::to_string(bothGone) + " also sunk in the battle: in the losses of both)" : "");
+    return s;
+}
 
 bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J, const Bundle& result,
                        const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed,
-                       const std::map<int, int>* otherVP) {
+                       const std::map<int, int>* otherVP, MergeNotes* notes) {
     IniDoc sent = ParseIni(sentBcs);
     IniDoc host = hostOut;  // committed only if everything applies
     std::vector<std::pair<std::string, const std::string*>> secs;
@@ -1141,6 +1229,15 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
             err = "ships without an id in " + name;
             return false;
         }
+        if (notes) {  // 0.8.0: ships gone from the host's save since the send (sunk in the month, ...)
+            std::set<std::string> inHost;
+            for (auto& b : hShips) inHost.insert(b.id);
+            for (auto& ob : oShips)
+                if (!inHost.count(ob.id)) {
+                    notes->monthGone++;
+                    if (!res.count(ob.id)) notes->bothGone++;
+                }
+        }
         std::vector<ShipBlock> merged;
         for (auto& b : hShips) {
             auto o = orig.find(b.id);
@@ -1153,24 +1250,50 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
                 removedShips++;
                 continue;
             }
-            // Only the fields the battle changed (relative to what was sent), never the player's intel.
-            std::map<std::string, std::string> was;
+            // Only the fields the battle changed (relative to what was sent), never the player's intel. 0.8.0: a field
+            // the host's save changed since the send as well follows the rules of MergeNotes (saveio.h). Never the
+            // commanders (0.8.0): a battle doesn't assign any (a sunk ship is gone with hers); in the battle's slot only
+            // the player's own officers are known, so the other nations' ships come back without theirs.
+            std::map<std::string, std::string> was, cur;
             for (auto& f : o->second->fields) was[FieldKey(f)] = f;
+            for (auto& f : b.fields) cur[FieldKey(f)] = f;
             ShipBlock nb = b;
             int n = 0;
+            bool log = false;
             for (auto& f : r->second->fields) {
                 std::string key = FieldKey(f);
                 auto w = was.find(key);
-                if ((w != was.end() && w->second == f) || IntelField(f) || (keepUsed && key == "Used")) continue;
-                bool set = false;
-                for (auto& hf : nb.fields)
-                    if (FieldKey(hf) == key) {
-                        hf = f;
-                        set = true;
+                if ((w != was.end() && w->second == f) || IntelField(f) || (keepUsed && key == "Used") ||
+                    key == "CommanderId")
+                    continue;
+                if (key == "NumberOfLogEntries" || LogEntryIndex(key) >= 0) {
+                    log = true;
+                    continue;
+                }
+                auto c = cur.find(key);
+                bool both = c != cur.end() && w != was.end() && c->second != w->second;
+                std::string line = f;
+                if (both && (key == "CrewQuality" || key == "BattleStars")) {
+                    long long v = atoll(FieldValue(c->second).c_str()) + atoll(FieldValue(f).c_str()) -
+                                  atoll(FieldValue(w->second).c_str());
+                    long long lo = key == "CrewQuality" ? -25 : 0, hi = key == "CrewQuality" ? 25 : LLONG_MAX;
+                    if (v < lo || v > hi) {
+                        v = v < lo ? lo : hi;
+                        if (notes) notes->clamped++;
                     }
-                if (!set) nb.fields.push_back(f);
+                    line = key + "=" + std::to_string(v);
+                    if (notes) notes->added[key]++;
+                } else if (both && c->second != f && key == "RepairTime") {
+                    if (atoll(FieldValue(c->second).c_str()) > atoll(FieldValue(f).c_str())) line = c->second;
+                    if (notes) notes->repair++;
+                } else if (both && c->second != f) {
+                    if (notes) notes->other[key]++;
+                }
+                if (c != cur.end() && c->second == line) continue;
+                SetShipField(nb, key, line);
                 n++;
             }
+            if (log) n += MergeShipLog(nb, *o->second, *r->second, notes);
             if (n) {
                 changedShips++;
                 changedFields += n;
@@ -1393,12 +1516,14 @@ bool OffDivisionLines(const std::string& off, std::vector<std::string>& lines) {
     return true;
 }
 
-std::string WithDivisionLines(const std::string& off, const std::vector<std::string>& lines) {
+// `off` with the lines of its [name] section replaced (the section appended if missing); every other byte stays.
+static std::string WithSectionLines(const std::string& off, const std::string& name, const std::vector<std::string>& lines) {
     std::string body;
     for (auto& l : lines) body += l + "\r\n";
     // The section's first line and the next section's header line, as ParseIni sees them.
     size_t p = off.size() >= 3 && off.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
     size_t start = std::string::npos, end = off.size();
+    std::string header = "[" + name + "]";
     while (p < off.size()) {
         size_t e = off.find('\n', p);
         size_t next = e == std::string::npos ? off.size() : e + 1;
@@ -1409,14 +1534,18 @@ std::string WithDivisionLines(const std::string& off, const std::vector<std::str
                 end = p;
                 break;
             }
-            if (line == "[CampaignDivisions]") start = next;
+            if (line == header) start = next;
         }
         p = next;
     }
     std::string out = start == std::string::npos ? off : off.substr(0, start);
     if (!out.empty() && out.back() != '\n') out += "\r\n";
-    if (start == std::string::npos) return out + "[CampaignDivisions]\r\n" + body;
+    if (start == std::string::npos) return out + header + "\r\n" + body;
     return out + body + off.substr(end);
+}
+
+std::string WithDivisionLines(const std::string& off, const std::vector<std::string>& lines) {
+    return WithSectionLines(off, "CampaignDivisions", lines);
 }
 
 int PutDivisions(std::string& off, const std::string& bcs, int K, std::vector<CampDiv> divs, std::string& summary) {
@@ -1470,6 +1599,387 @@ bool OwnDivisionLines(const std::wstring& slotDir, int slot, int K, std::vector<
     }
     lines = DivisionLines(mine);
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Officers (saveio.h, 0.8.0). The game's loader (0xe100f4 in 1.01.44) creates OfficerNo officers and reads each one's
+// keys with defaults; the writer (0xe0fc78) writes all eleven keys for every officer of the list.
+
+static const char* kOfficerFields[] = {"Name",    "Ability",     "AbilityKnown", "Rank",   "YearsInRank", "Special",
+                                       "Special2", "BattleStars", "Status",       "Fate",   "Id"};
+
+std::string OfficerRec::Get(const std::string& field, const std::string& def) const {
+    for (auto& f : fields)
+        if (f.first == field) return f.second;
+    return def;
+}
+
+// The game's ranges (TOfficer: Rank 0-3, TSpecialAbility 0-19, TOfficerStatus 0-3); generous where the game has none.
+static bool OfficerValueOk(const std::string& field, const std::string& v) {
+    if (field == "Name" || field == "Fate")
+        return v.size() <= 200 && v.find_first_of(std::string("\r\n\0", 3)) == std::string::npos;
+    if (!IsInt(v) || v.size() > 11) return false;
+    long long n = atoll(v.c_str());
+    if (field == "Id") return n >= 1 && n <= 0x7FFFFFFF;
+    if (field == "Rank" || field == "Status") return n >= 0 && n <= 3;
+    if (field == "Special" || field == "Special2") return n >= 0 && n <= 19;
+    if (field == "AbilityKnown") return n >= -1 && n <= 1;
+    if (field == "Ability") return n >= -100 && n <= 100;
+    if (field == "YearsInRank") return n >= 0 && n <= 1000;
+    if (field == "BattleStars") return n >= 0 && n <= 1000000;
+    return false;
+}
+
+bool ParseOfficers(const std::vector<std::string>& lines, std::vector<OfficerRec>& out, bool strict, std::string& err) {
+    out.clear();
+    auto fail = [&](const std::string& why) {
+        err = why;
+        out.clear();
+        return false;
+    };
+    int count = -1;
+    std::map<int, std::vector<std::pair<std::string, std::string>>> byNo;
+    std::set<std::string> keys;
+    for (auto& l : lines) {
+        if (l.empty()) continue;
+        std::string k, v;
+        if (!SplitKV(l, k, v)) {
+            if (strict) return fail("a line without a key");
+            continue;
+        }
+        if (strict && !keys.insert(k).second) return fail("key " + k.substr(0, 40) + " twice");
+        if (k == "OfficerNo") {
+            int n = atoi(v.c_str());
+            bool ok = IsInt(v) && v.size() <= 6 && n >= 0 && n <= (strict ? kMaxOfficers : 99999);
+            if (!ok && strict) return fail("OfficerNo=" + v.substr(0, 20));
+            if (count < 0) count = ok ? n : 0;
+            continue;
+        }
+        size_t p = 7;
+        if (k.compare(0, 7, "Officer") == 0)
+            while (p < k.size() && isdigit((unsigned char)k[p])) p++;
+        // Officer<i><Field>, i as the game writes it (no leading zero)
+        if (p == 7 || p > 12 || p >= k.size() || (p > 8 && k[7] == '0')) {
+            if (strict) return fail("unknown key " + k.substr(0, 40));
+            continue;
+        }
+        std::string field = k.substr(p);
+        bool known = false;
+        for (const char* f : kOfficerFields) known = known || field == f;
+        if (!known) {
+            if (strict) return fail("unknown key " + k.substr(0, 40));
+            continue;
+        }
+        if (strict && !OfficerValueOk(field, v)) return fail("bad value of " + k.substr(0, 40));
+        byNo[atoi(k.c_str() + 7)].push_back({field, v});
+    }
+    if (count < 0) {
+        if (strict) return fail("no OfficerNo");
+        count = 0;
+    }
+    std::set<std::string> ids;
+    for (auto& e : byNo) {
+        if (e.first >= count) {
+            if (strict) return fail("officer " + std::to_string(e.first) + " beyond OfficerNo");
+            continue;
+        }
+        OfficerRec o;
+        for (auto& fv : e.second) {
+            bool seen = false;
+            for (auto& f : o.fields) seen = seen || f.first == fv.first;
+            if (!seen) o.fields.push_back(fv);
+        }
+        std::string id = o.Get("Id");
+        if (strict && id.empty()) return fail("officer " + std::to_string(e.first) + " without Id");
+        if (strict && !ids.insert(id).second) return fail("officer id " + id + " twice");
+        out.push_back(std::move(o));
+    }
+    if (strict && (int)out.size() != count)
+        return fail("OfficerNo=" + std::to_string(count) + " but " + std::to_string(out.size()) + " officers");
+    return true;
+}
+
+std::vector<std::string> OfficerLines(const std::vector<OfficerRec>& officers) {
+    std::vector<std::string> out = {"OfficerNo=" + std::to_string(officers.size())};
+    for (size_t i = 0; i < officers.size(); i++) {
+        std::string p = "Officer" + std::to_string(i);
+        for (auto& f : officers[i].fields) out.push_back(p + f.first + "=" + f.second);
+    }
+    return out;
+}
+
+std::set<int> OfficerIds(const std::vector<OfficerRec>& officers) {
+    std::set<int> ids;
+    for (auto& o : officers) {
+        std::string id = o.Get("Id");
+        if (IsInt(id)) ids.insert(atoi(id.c_str()));
+    }
+    return ids;
+}
+
+// "MapArea<i>Commander" -> i (no leading zero), or -1.
+static int AreaCommanderKey(const std::string& k) {
+    if (!KeyShape(k, "MapArea", "Commander") || k.size() > 7 + 9 + 4 || (k[7] == '0' && k.size() > 7 + 9 + 1)) return -1;
+    return atoi(k.c_str() + 7);
+}
+
+bool ParseAreaCommands(const std::vector<std::string>& lines, const std::set<int>& ids, std::map<int, int>& out,
+                       bool strict, std::string& err) {
+    out.clear();
+    for (auto& l : lines) {
+        if (l.empty()) continue;
+        std::string k, v;
+        int a = SplitKV(l, k, v) ? AreaCommanderKey(k) : -1;
+        bool ok = a >= 0 && a < kMaxMapAreas && IsInt(v) && v.size() <= 11;
+        if (!ok) {
+            if (strict) {
+                err = "bad line " + l.substr(0, 40);
+                out.clear();
+                return false;
+            }
+            continue;
+        }
+        int id = atoi(v.c_str());
+        if (id == -1) continue;
+        if (!ids.count(id) || out.count(a)) {
+            if (strict) {
+                err = out.count(a) ? "area " + std::to_string(a) + " twice"
+                                   : "area " + std::to_string(a) + ": officer " + v + " is not in the list";
+                out.clear();
+                return false;
+            }
+            continue;
+        }
+        out[a] = id;
+    }
+    return true;
+}
+
+std::vector<std::string> AreaCommandLines(const std::map<int, int>& cmd) {
+    std::vector<std::string> out;
+    for (auto& c : cmd) out.push_back("MapArea" + std::to_string(c.first) + "Commander=" + std::to_string(c.second));
+    return out;
+}
+
+std::map<int, int> MapAreaCommanders(const std::string& map, const std::set<int>* ids) {
+    std::map<int, int> out;
+    IniDoc d = ParseIni(map);
+    if (const IniSection* s = d.Find("MapAreas"))
+        for (auto& l : s->lines) {
+            std::string k, v;
+            int a = SplitKV(l, k, v) ? AreaCommanderKey(k) : -1;
+            if (a < 0 || !IsInt(v)) continue;
+            int id = atoi(v.c_str());
+            if (id != -1 && (!ids || ids->count(id))) out[a] = id;
+        }
+    return out;
+}
+
+std::string WithAreaCommanders(const std::string& map, const std::map<int, int>& cmd, int* changed) {
+    IniDoc d = ParseIni(map);
+    IniSection* s = d.Find("MapAreas");
+    int n = 0;
+    if (s)
+        for (auto& l : s->lines) {
+            std::string k, v;
+            int a = SplitKV(l, k, v) ? AreaCommanderKey(k) : -1;
+            if (a < 0) continue;
+            auto it = cmd.find(a);
+            std::string nv = std::to_string(it == cmd.end() ? -1 : it->second);
+            if (nv == v) continue;
+            l = k + "=" + nv;
+            n++;
+        }
+    if (changed) *changed = n;
+    return n ? WriteIni(d) : map;
+}
+
+static bool OffSectionLines(const std::string& off, const char* name, std::vector<std::string>& lines) {
+    IniDoc d = ParseIni(off);
+    const IniSection* s = d.Find(name);
+    if (!s) return false;
+    lines.clear();
+    for (auto& l : s->lines)
+        if (!l.empty()) lines.push_back(l);
+    return true;
+}
+
+bool OffOfficerLines(const std::string& off, std::vector<std::string>& lines) {
+    return OffSectionLines(off, "Officers", lines);
+}
+
+std::string WithOfficerLines(const std::string& off, const std::vector<std::string>& lines) {
+    return WithSectionLines(off, "Officers", lines);
+}
+
+std::map<std::string, int> ShipCommanderIds(const IniDoc& bcs, int K) {
+    std::map<int, std::string> idOf;
+    std::map<int, int> cmdOf;
+    if (const IniSection* s = bcs.Find("Nation" + std::to_string(K) + "Ships"))
+        for (auto& l : s->lines) {
+            int n;
+            std::string f, k, v;
+            if (!ShipKey(l, n, f) || !SplitKV(f, k, v)) continue;
+            if (k == "Id") idOf[n] = v;
+            if (k == "CommanderId" && IsInt(v)) cmdOf[n] = atoi(v.c_str());
+        }
+    std::map<std::string, int> out;
+    for (auto& c : cmdOf) {
+        auto it = idOf.find(c.first);
+        if (it != idOf.end()) out[it->second] = c.second;
+    }
+    return out;
+}
+
+int SetShipCommanderIds(IniDoc& bcs, int K, const std::map<std::string, int>& byShipId) {
+    IniSection* s = bcs.Find("Nation" + std::to_string(K) + "Ships");
+    if (!s) return 0;
+    std::map<int, std::string> idOf;
+    for (auto& l : s->lines) {
+        int n;
+        std::string f, k, v;
+        if (ShipKey(l, n, f) && SplitKV(f, k, v) && k == "Id") idOf[n] = v;
+    }
+    int changed = 0;
+    for (auto& l : s->lines) {
+        int n;
+        std::string f, k, v;
+        if (!ShipKey(l, n, f) || !SplitKV(f, k, v) || k != "CommanderId") continue;
+        auto id = idOf.find(n);
+        auto c = id == idOf.end() ? byShipId.end() : byShipId.find(id->second);
+        if (c == byShipId.end() || v == std::to_string(c->second)) continue;
+        l = "Ship" + std::to_string(n) + "CommanderId=" + std::to_string(c->second);
+        changed++;
+    }
+    return changed;
+}
+
+int ClearShipCommanders(IniDoc& bcs, int K, const std::set<int>& keep) {
+    IniSection* s = bcs.Find("Nation" + std::to_string(K) + "Ships");
+    if (!s) return 0;
+    int cleared = 0;
+    for (auto& l : s->lines) {
+        int n;
+        std::string f, k, v;
+        if (!ShipKey(l, n, f) || !SplitKV(f, k, v) || k != "CommanderId" || !IsInt(v)) continue;
+        int id = atoi(v.c_str());
+        if (id == -1 || keep.count(id)) continue;
+        l = "Ship" + std::to_string(n) + "CommanderId=-1";
+        cleared++;
+    }
+    return cleared;
+}
+
+bool BuildOfficersFile(const std::wstring& slotDir, int slot, std::string& out, int& officers, int& areas,
+                       std::string& err) {
+    std::wstring s = SlotStr(slot);
+    std::string off, map, perr;
+    officers = areas = 0;
+    std::vector<std::string> lines;
+    if (!ReadFileBytes(slotDir + L"RTWGame" + s + L".off", off) || !OffOfficerLines(off, lines)) {
+        err = "the slot's .off has no [Officers]";
+        return false;
+    }
+    std::vector<OfficerRec> list;
+    ParseOfficers(lines, list, false, perr);
+    std::set<int> ids = OfficerIds(list);
+    std::map<int, int> cmd;
+    if (ReadFileBytes(slotDir + L"MapData" + s + L".dat", map)) cmd = MapAreaCommanders(map, &ids);
+    IniDoc d;
+    d.bom = off.size() >= 3 && off.compare(0, 3, "\xEF\xBB\xBF") == 0;
+    d.sections.push_back({"Officers", OfficerLines(list)});
+    d.sections.push_back({"AreaCmd", AreaCommandLines(cmd)});
+    out = WriteIni(d);
+    officers = (int)list.size();
+    areas = (int)cmd.size();
+    return true;
+}
+
+std::string OfficerMergeNotes::Text() const {
+    std::string s = std::to_string(battle) + " changed by the battle";
+    if (month) s += ", " + std::to_string(month) + " of them changed by the host's month too";
+    if (stars) s += "; stars the record's + the battle's: " + std::to_string(stars);
+    if (fate) s += "; dead, captured or retired in the month (the battle's status not taken): " + std::to_string(fate);
+    if (added) s += "; new in the battle: " + std::to_string(added);
+    if (dropped) s += "; dropped by the battle: " + std::to_string(dropped);
+    if (kept) s += "; the record's alone, kept: " + std::to_string(kept);
+    return s;
+}
+
+static void SetOfficerField(OfficerRec& o, const std::string& field, const std::string& v) {
+    for (auto& f : o.fields)
+        if (f.first == field) {
+            f.second = v;
+            return;
+        }
+    o.fields.push_back({field, v});
+}
+
+std::vector<OfficerRec> MergeOfficers(const std::vector<OfficerRec>& sent, const std::vector<OfficerRec>& host,
+                                      const std::vector<OfficerRec>& battle, OfficerMergeNotes* notes) {
+    OfficerMergeNotes n;
+    std::map<std::string, const OfficerRec*> s, h;
+    for (auto& o : sent) s[o.Get("Id")] = &o;
+    for (auto& o : host) h[o.Get("Id")] = &o;
+    std::set<std::string> inBattle;
+    std::vector<OfficerRec> out;
+    for (auto& b : battle) {
+        std::string id = b.Get("Id");
+        inBattle.insert(id);
+        auto si = s.find(id);
+        auto hi = h.find(id);
+        if (si == s.end() || hi == h.end()) {  // new in the battle (or gone from the record since the send)
+            n.added += si == s.end();
+            out.push_back(b);
+            continue;
+        }
+        const OfficerRec &so = *si->second, &ho = *hi->second;
+        OfficerRec m = ho;
+        bool hostActive = ho.Get("Status", "0") == "0", byBattle = false, byMonth = so.fields != ho.fields;
+        bool starsBoth = false, fateKept = false;
+        for (auto& f : b.fields) {
+            std::string sv = so.Get(f.first), hv = ho.Get(f.first, sv);
+            if (f.second == sv) continue;  // the battle left it: the record's
+            byBattle = true;
+            std::string v = f.second;
+            if (hv != sv && f.first == "BattleStars") {
+                long long x = atoll(hv.c_str()) + atoll(f.second.c_str()) - atoll(sv.c_str());
+                v = std::to_string(x < 0 ? 0 : x);
+                starsBoth = true;
+            } else if (!hostActive && hv != sv && (f.first == "Status" || f.first == "Fate")) {
+                v = hv;
+                fateKept = true;
+            } else if (!hostActive && f.first == "Status") {  // (the record's officer is no longer active: he stays so)
+                v = hv;
+                fateKept = true;
+            }
+            SetOfficerField(m, f.first, v);
+        }
+        n.battle += byBattle;
+        n.month += byBattle && byMonth;
+        n.stars += starsBoth;
+        n.fate += fateKept;
+        out.push_back(m);
+    }
+    for (auto& o : sent) {  // officers the battle's list has no more: gone, unless the record changed them since
+        std::string id = o.Get("Id");
+        auto hi = h.find(id);
+        if (inBattle.count(id) || hi == h.end()) continue;
+        if (hi->second->fields == o.fields) {
+            n.dropped++;
+            continue;
+        }
+        out.push_back(*hi->second);
+        n.kept++;
+    }
+    for (auto& o : host) {  // the record's officers the battle never had
+        std::string id = o.Get("Id");
+        if (s.count(id) || inBattle.count(id)) continue;
+        out.push_back(o);
+        n.kept++;
+    }
+    if (notes) *notes = n;
+    return out;
 }
 
 }  // namespace saveio

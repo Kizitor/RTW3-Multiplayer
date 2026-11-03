@@ -36,6 +36,32 @@ void HostTakeDivisions(const Bundle& sub, int K, bool fresh = false);
 // divisions written, -1 if the package has no .off.
 int HostPutDivisions(Bundle& b, int K, bool own, const char* what);
 std::string HostDivisionsInfo(int K);  // bridge `divstore`: "ok n=<n> list=<CDivId>:<name>:<ships>:<id.id...>|..."
+// Officers (0.8.0; officers.h). The host keeps each joined nation's corps (its [Officers] lines, the game's keys) and
+// its area commands ("MapArea<i>Commander=<id>") in its records ([Nation<K>Officers], [Nation<K>AreaCmd]).
+bool HostHasOfficers(int K);
+// The officers.ini of K's turn (validated strictly) into K's record. False: none sent (an older mod) or rejected (the
+// stored record stays; `why`).
+bool HostTakeOfficers(const Bundle& sub, int K, std::string& why);
+// The [Officers] of K's battle result (officers.ini; the area commands stay). False: none or rejected. sent (0.8.0, with
+// simultaneous battles): the [Officers] lines its package carried (HostPutOfficers' `put`): the result is merged per
+// officer id into the record (saveio::MergeOfficers: the host's month since the send stays), else it replaces it.
+bool HostTakeBattleOfficers(const Bundle& res, int K, const std::vector<std::string>* sent = nullptr);
+// The package's .off [Officers] := K's record (own = false or no record: OfficerNo=0), its MapData's area commanders :=
+// K's (-1 elsewhere). Returns true if K has a record (false: the player's PC makes the corps, `offgen`). put: the
+// [Officers] lines the package got (own only; else left empty).
+bool HostPutOfficers(Bundle& b, int K, bool own, const char* what, std::vector<std::string>* put = nullptr);
+// K's record's [Officers] lines (empty: none); tests (`battles simulkeep`).
+std::vector<std::string> HostRecordOfficers(int K);
+// After a load of the host's slot: every joined nation's record into its own list (officers.h LoadIntoNation).
+void HostOfficersToMemory(const char* why);
+// After a save of the host's slot (not during the battle phase) and after the month: the lists the last load filled
+// back into the records.
+void HostOfficersFromMemory(const char* why);
+// The host's save after K's turn was merged: K's ships whose commander is not in K's record lose it (-1); `keep`
+// (a turn without officers.ini: an older mod) puts the host's previous ids back first. Returns the ids reset.
+int HostFixShipCommanders(const std::wstring& bcsPath, int K, const std::map<std::string, int>* keep);
+std::string HostOfficersInfo(int K);  // bridge `ofstore`: "ok n=<n> active=<a> areas=<m> ids=<min>-<max> first=..."
+int FleetSizeValue();  // [General] FleetSize of the open campaign (-1 unknown)
 void SetNewsSink(std::function<void(int nation, const std::string& line)> fn);  // the month's news for a player
 std::string HostDebug();
 

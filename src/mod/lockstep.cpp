@@ -12024,6 +12024,26 @@ std::string Debug(const std::vector<std::string>& a) {
         return "ok " + h;
     }
     if (c == "forces") return ForcesText(arg(2) == "div");
+    if (c == "commanders") {  // 0.8.0: ls commanders: per side the battle's ships with a commander (TFightingShip.Commander)
+        if (!Resolve() || !BattleForm() || !E.allShipsVar) return "error no battle";
+        static int fCmd = dl::Field("TFightingShip", "Commander"), fOId = dl::Field("TOfficer", "Id");
+        if (fCmd < 0 || fOId < 0 || E.fShipSide < 0) return "error the commander field was not found";
+        void* ships = List(E.allShipsVar);
+        int n[2] = {}, cmd[2] = {};
+        std::string ids[2];
+        for (int i = 0; i < dl::ListCount(ships); i++) {
+            void* s = dl::ListItem(ships, i);
+            if (!s) continue;
+            int side = dl::At<int>(s, E.fShipSide) == 0 ? 0 : 1;
+            void* o = dl::At<void*>(s, fCmd);
+            n[side]++;
+            if (!o) continue;
+            cmd[side]++;
+            ids[side] += std::to_string(dl::At<int>(o, fOId)) + ",";
+        }
+        return "ok side0=" + std::to_string(cmd[0]) + "/" + std::to_string(n[0]) + " side1=" + std::to_string(cmd[1]) +
+               "/" + std::to_string(n[1]) + " ids0=" + ids[0] + " ids1=" + ids[1];
+    }
     if (c == "airforce") {  // ls airforce <force index>: its routine air ops settings and the land-CAP requests
         if (!Resolve() || !BattleForm()) return "error no battle";
         return AirForceText(dl::ListItem(List(E.forcesVar), atoi(arg(2, "-1").c_str())));

@@ -8,6 +8,7 @@
 #include "lockstep.h"
 #include "nationplay.h"
 #include "net.h"
+#include "officers.h"
 #include "poc_battle.h"
 #include "session.h"
 #include "ui.h"
@@ -149,6 +150,29 @@ static std::string Execute(const std::string& line) {
     if (cmd == "intelcheck") {  // client: the monthly intelligence check now (the game's spy dialogs may show)
         if (game::EventActive()) return "error an event dialog is open";
         return RunOnMainThread([] { mp::DebugIntelCheck(); }), "ok";
+    }
+    // 0.8.0, officers (async: the game's dialogs may show): ofmonth [n]: client, the month's officer routine now (n: the
+    // game's officer event with that random number); ofask: client, the Turn's commander question (logged); ofcrew
+    // <nation> <ship> [count] (TEST ONLY): the game's AdjustCrewQuality on that ship, count times (through the host's
+    // guard)
+    if (cmd == "ofmonth") {
+        if (game::EventActive()) return "error an event dialog is open";
+        int forced = atoi(arg(1, "-1").c_str());
+        return RunOnMainThread([forced] { mp::DebugOfficerMonth(forced); }), "ok";
+    }
+    if (cmd == "ofask") {
+        if (game::EventActive()) return "error an event dialog is open";
+        return RunOnMainThread([] { Log("TEST: officers: the Turn's question -> %s", ofc::AskCommanders() ? "go on" : "go back"); }),
+               "ok";
+    }
+    if (cmd == "ofcrew") {
+        int n = atoi(arg(1, "-1").c_str()), s = atoi(arg(2, "-1").c_str()), c = std::max(1, std::min(500, atoi(arg(3, "1").c_str())));
+        RunOnMainThread([n, s, c] {
+            std::string r;
+            for (int i = 0; i < c; i++) r = ofc::TestAdjustCrew(n, s);
+            Log("TEST: officers: AdjustCrewQuality on nation %d's ship %d, %d time(s) -> %s", n, s, c, r.c_str());
+        });
+        return "ok";
     }
     if (cmd == "windows") {
         std::string out;
@@ -402,6 +426,45 @@ static std::string ExecuteOnMain(const std::string& line) {
         // divstore <K> (host): nation K's list the host keeps from its turns
         if (cmd == "divs") return game::CampaignDivisionsInfo();
         if (cmd == "divstore") return nplay::HostDivisionsInfo(atoi(arg(1, "0").c_str()));
+        // Officers (0.8.0): officers: every nation's list and commanders in memory (read only); ofstore <K> (host): nation
+        // K's record; ofstate (client): the month's officer state; ofpromo [clear]: the free promotion's byte; ofgen
+        // (client): the new campaign's corps now; ofassign (client): the Turn's assignments now; ofkill <nation> <ship>
+        // [pow] (TEST ONLY): the game's KillCommander on that ship (a sinking's fate for its commander)
+        if (cmd == "officers") return ofc::Info();
+        if (cmd == "ofstore") return nplay::HostOfficersInfo(atoi(arg(1, "0").c_str()));
+        if (cmd == "ofstate") return mp::DebugOfficerState();
+        if (cmd == "ofquiet") {  // TEST ONLY: ofquiet [0|1]: RTW3MP_TEST_OFFICERS=quiet switched off or on
+            mp::DebugOfficersQuiet(args.size() > 1 ? atoi(arg(1).c_str()) : -1);
+            return mp::DebugOfficerState();
+        }
+        if (cmd == "ofpromo") {
+            if (arg(1) == "clear") ofc::ClearFreePromotion();
+            return ofc::FreePromotionState();
+        }
+        if (cmd == "ofgen") {
+            std::string sum;
+            bool ok = ofc::GenerateCorps(game::PlayerIndex(), sum);
+            return (ok ? "ok " : "error ") + sum;
+        }
+        if (cmd == "ofassign") {
+            std::string sum;
+            ofc::AutoAssign(sum);
+            return "ok " + sum;
+        }
+        if (cmd == "ofkill") {  // ofkill <nation> <ship|-1> [pow] [arm|armmonth]: -1 = its first commanded ship; arm: in
+            // the month once its turns are merged; armmonth (0.8.0): when its DoStrategicTurn starts
+            int n = atoi(arg(1, "-1").c_str()), s = atoi(arg(2, "-1").c_str());
+            bool pow = arg(3, "0") == "1";
+            if (arg(4) == "arm" || arg(4) == "armmonth") {
+                mp::DebugArmOfficerKill(n, s, pow, arg(4) == "armmonth");
+                return "ok armed";
+            }
+            return ofc::TestKill(n, s, pow);
+        }
+        if (cmd == "ofset")  // TEST ONLY: ofset <nation> <officer id|-1> <field> <value>
+            return ofc::TestSet(atoi(arg(1, "-1").c_str()), atoi(arg(2, "-1").c_str()), arg(3), atoi(arg(4, "0").c_str()));
+        if (cmd == "ofship") return ofc::ShipCommander(atoi(arg(1, "-1").c_str()), atoi(arg(2, "-1").c_str()));
+        if (cmd == "ofget") return ofc::OfficerText(atoi(arg(1, "-1").c_str()), atoi(arg(2, "-1").c_str()), arg(3, "any"));
         if (cmd == "doctrine") {  // doctrine <nation>: training priorities, pending ones, months left; missile storage
             game::DoctrineState d = game::GetDoctrine(atoi(arg(1).c_str()));
             if (!d.valid) return "error unavailable";

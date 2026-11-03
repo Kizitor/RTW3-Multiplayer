@@ -86,11 +86,28 @@ bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::v
 // 0.7.2 (fix-battlesearch): a request whose search went on after encounters without a battle: `more` (Extract) are its
 // other opponents (real indices), whose sections go in too; `otherVP` (Apply) their points (nation -> VP added), the
 // deltas' dVP_J being J's own share then.
+// 0.8.0 (simultaneous battles): a field of a ship that both the battle (result != sent) and the host's save since the
+// send (host != sent: the rest of the month for a battle fought during it, another player's merged battle) changed:
+// CrewQuality and BattleStars take the host's value plus the battle's change (CrewQuality within the game's own bounds
+// -25..25, AdjustCrewQuality; stars >= 0), the log entries the battle added (from the sent NumberOfLogEntries on) follow
+// the host's, RepairTime takes the larger, any other field the battle's value (as before). Ships gone from the host's
+// save stay gone (the battle's changes dropped), new ones stay. `notes` (optional) counts what these rules did.
+struct MergeNotes {
+    std::map<std::string, int> added;  // CrewQuality, BattleStars: host + the battle's change (field -> ships)
+    std::map<std::string, int> other;  // other fields both changed to different values: the battle's (field -> ships)
+    int logs = 0;       // ships whose log got the battle's entries after the host's
+    int repair = 0;     // ships whose RepairTime both changed (the larger kept)
+    int clamped = 0;    // CrewQuality sums the game's bounds cut
+    int monthGone = 0;  // ships of the sent save no longer in the host's (their battle changes dropped)
+    int bothGone = 0;   // ... of them also sunk in the battle (counted in the losses by both)
+    bool Any() const { return !added.empty() || !other.empty() || logs || repair || monthGone; }
+    std::string Text() const;
+};
 bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterBcs, int K, int J, Bundle& out,
                          std::string& summary, std::string& err, const std::vector<int>& more = {});
 bool ApplyBattleResult(IniDoc& host, const std::string& sentBcs, int K, int J, const Bundle& result,
                        const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed = false,
-                       const std::map<int, int>* otherVP = nullptr);
+                       const std::map<int, int>* otherVP = nullptr, MergeNotes* notes = nullptr);
 
 // Campaign divisions (the strategic screen's Fleet organization): the [CampaignDivisions] section of a slot's .off as
 // TCampaignDivision.SaveMe writes it: CampDivNo=<n>, then for each division i < n the keys CampDiv<i><Field> with the
@@ -135,5 +152,65 @@ bool PutSlotDivisions(const std::wstring& slotDir, int slot, int K, const std::v
 // holding a ship that is not K's in the slot's .bcs is not K's (e.g. the host's, from an older host's month) and is
 // left out (`foreign` counts them). False if the slot has no .off/.bcs.
 bool OwnDivisionLines(const std::wstring& slotDir, int slot, int K, std::vector<std::string>& lines, int& foreign);
+
+// Officers (0.8.0): the [Officers] section of a slot's .off as the game's writer makes it (the list of PlayerNation):
+// OfficerNo=<n>, then for each officer i < n the keys Officer<i><Field> with the fields Name, Ability, AbilityKnown,
+// Rank, YearsInRank, Special, Special2, BattleStars, Status, Fate and Id. Map areas name their commander by officer id
+// (MapData [MapAreas] MapArea<i>Commander, -1 = none); ships by Ship<n>CommanderId of their nation's ships section.
+struct OfficerRec {
+    std::vector<std::pair<std::string, std::string>> fields;  // in file order, without "Officer<i>"
+    std::string Get(const std::string& field, const std::string& def = "") const;
+};
+constexpr int kMaxOfficers = 5000, kMaxMapAreas = 1000;
+// The section's lines -> officers 0..OfficerNo-1. strict (a player's list on the host): only the game's fields, each
+// officer with an Id (a positive integer, no id twice), integers in the game's ranges except Name and Fate (text of at
+// most 200 bytes without CR/LF/NUL), no key twice, at most kMaxOfficers officers; anything else fails (err) and nothing
+// is taken. Not strict: what the game would not read is ignored.
+bool ParseOfficers(const std::vector<std::string>& lines, std::vector<OfficerRec>& out, bool strict, std::string& err);
+std::vector<std::string> OfficerLines(const std::vector<OfficerRec>& officers);  // renumbered 0..n-1
+std::set<int> OfficerIds(const std::vector<OfficerRec>& officers);
+// "MapArea<i>Commander=<id>" lines -> area index -> officer id (ids other than -1 only). strict: the key shape, an
+// integer, an area index below kMaxMapAreas, no area twice, every id one of `ids`.
+bool ParseAreaCommands(const std::vector<std::string>& lines, const std::set<int>& ids, std::map<int, int>& out,
+                       bool strict, std::string& err);
+std::vector<std::string> AreaCommandLines(const std::map<int, int>& cmd);
+// A MapData file's area commanders (ids other than -1; with `ids`, only those in it).
+std::map<int, int> MapAreaCommanders(const std::string& map, const std::set<int>* ids);
+// `map` with every MapArea<i>Commander of [MapAreas] set to cmd[i], -1 for the areas cmd doesn't name; `changed`: the
+// lines whose value changed.
+std::string WithAreaCommanders(const std::string& map, const std::map<int, int>& cmd, int* changed = nullptr);
+bool OffOfficerLines(const std::string& off, std::vector<std::string>& lines);  // false: no [Officers]
+// `off` with the lines of its [Officers] section replaced (appended if missing); every other byte stays.
+std::string WithOfficerLines(const std::string& off, const std::vector<std::string>& lines);
+// Nation K's ships' commanders in a .bcs: Ship<n>Id -> Ship<n>CommanderId.
+std::map<std::string, int> ShipCommanderIds(const IniDoc& bcs, int K);
+// Puts back the commander ids of K's ships that `byShipId` names (ships no longer there are skipped); returns the
+// lines changed.
+int SetShipCommanderIds(IniDoc& bcs, int K, const std::map<std::string, int>& byShipId);
+// K's ships whose commander id is not -1 and not one of `keep` get -1; returns how many.
+int ClearShipCommanders(IniDoc& bcs, int K, const std::set<int>& keep);
+// A joined player's turn and battle result: "officers.ini" = [Officers] of the slot's .off (the game saved its
+// PlayerNation's list there) and [AreaCmd], the MapData's area commanders that are officers of that list.
+bool BuildOfficersFile(const std::wstring& slotDir, int slot, std::string& out, int& officers, int& areas,
+                       std::string& err);
+// 0.8.0 (officers with simultaneous battles): a battle's officers merged per officer id into the host's record, as the
+// battle's ships are (ApplyBattleResult): `sent` = the list the battle's package carried, `host` = the record now (a
+// battle fought during the host's month: what the month did to the corps since the send), `battle` = the result's. A
+// field the battle did not change keeps the record's value, one only the battle changed takes the battle's; one both
+// changed: BattleStars the record's + the battle's change (>= 0), Status and Fate the record's when the record's
+// officer is not active (the month killed, captured or retired him: that stands), any other field the battle's. An
+// officer new in the battle's list is added; one it dropped goes unless the record changed him since the send; the
+// record's officers that were not sent stay. With host == sent (a battle of the battle phase) the battle's list.
+struct OfficerMergeNotes {
+    int battle = 0;  // officers with a field the battle changed
+    int month = 0;   // ... whose record (the host's month) had changed since the send as well
+    int stars = 0;   // officers whose stars both changed: the record's + the battle's
+    int fate = 0;    // officers the month made dead, captured or retired whose battle status was not taken
+    int added = 0, dropped = 0, kept = 0;  // new in the battle; dropped by it; the record's alone, kept
+    bool Any() const { return month || stars || fate || added || dropped || kept; }
+    std::string Text() const;
+};
+std::vector<OfficerRec> MergeOfficers(const std::vector<OfficerRec>& sent, const std::vector<OfficerRec>& host,
+                                      const std::vector<OfficerRec>& battle, OfficerMergeNotes* notes = nullptr);
 
 }  // namespace saveio

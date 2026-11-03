@@ -44,6 +44,16 @@ std::wstring SaveDir(int slot);  // "...\Save\Game<slot>\"
 // Same as the Save button (normal save into the current slot); false: it failed. quietInUse (0.7.1): a box of the game
 // that reports a file of the save in use by another program stays off the screen (the caller saves again).
 bool SaveGame(bool quietInUse = false);
+// 0.8.0 (simultaneous battles): the campaign in memory saved into another slot (>= 50) without a trace for the host's
+// player: the game's slot global switched for the call and put back, no box of the game, SaveQuestion put back, the
+// save counters and the last save's state left as they were (a step waiting for a save that works keeps waiting). A file
+// of it in use by another program: saved again at once, twice, 0.6 s apart (it holds the month). Refused in a save or an
+// event dialog. True if every file was written; ms: the save's time; why: the failure. SnapshotInProgress: inside it.
+bool SaveSnapshot(int slot, unsigned long& ms, std::string& why);
+bool SnapshotInProgress();
+// TEST ONLY (the bridge's `battles snapfail`): "fail" the next snapshot fails at once; "inuse" its .bcs is held without
+// sharing for <seconds> s when it begins (as OneDrive's sync holds a file); "off".
+std::string SetTestSnapshot(const std::string& mode, int seconds);
 // 0.7.1: every SaveBuildCampaign (the game's own and the mod's) is checked: a box of the game during the save (its
 // "Error in Save... procedure!" handlers show the error and carry on) or a file it had to write that is missing, old or
 // cut short makes it a failed save. Counters of the saves that worked and failed; whether the last save (of `slot`, -1
@@ -147,6 +157,11 @@ bool EventsAvailable();
 bool EventActive();  // an event dialog for a joined player is open (nation list reordered: don't load/save)
 bool GetEventInfo(int idx, int& cond, std::wstring& caption, bool& hostOnly);  // false if the slot is empty
 ClientEventResult RunClientEvent(int playerNation, int forcedIdx, int used[100]);  // forcedIdx -1 = random
+// 0.8.0: the game's monthly officer routine (PlayerNation.HandleOfficerStuff) for a joined player's nation K on the
+// player's PC, in the same view (its events need K at index 0 and K's relations); shown = an officer event used the
+// month's event slot. `messages`: the turn report lines it wrote. forcedEvent >= 0 (tests): the game's
+// HandleOfficerEvent(forcedEvent) alone instead (its random number picks the event).
+ClientEventResult RunClientOfficers(int playerNation, std::vector<std::wstring>& messages, int forcedEvent = -1);
 bool AdjustNationField(int nationIdx, const std::string& field, int value, bool isDelta);
 int NationIntField(int nationIdx, const std::string& field);  // INT_MIN if unknown
 
@@ -592,6 +607,8 @@ void OnAfterCopyGame(int fromSlot, int toSlot);  // the game's "Copy game" finis
 bool OnAIBattle(int a, int b, int countA, int countB, const std::wstring& area);
 // B6 (host): the game's CheckForBattles2 is about to look for the host's battle of the month (the joined nations' first).
 void OnBattleGenerator();
+// 0.8.0 (host): CheckForBattles2 returned: the host's battle search of the month is over (battle: its screen is open).
+void OnAfterBattleSearch(bool battle);
 // The game's DoBattle returned (opp = the opponent's nation index); the battle screen is open if it was fought.
 void OnDoBattleDone(int opp, bool result);
 // The game's LoadBuildCampaign returned (a battle in progress in that save is resumed inside it: the screen is open).
@@ -599,6 +616,8 @@ void OnAfterCampaignLoad();
 void OnBattleSlotSkippedTurn();  // a battle slot's close skipped DoStrategicTurn
 void OnStrategicTurnRuns();      // DoStrategicTurn runs (outside a battle slot)
 void OnCampaignLoading();        // LoadBuildCampaign is about to load a campaign
+// 0.8.0: a save of the campaign worked (SaveBuildCampaign; autosave: the slot's Autosave files).
+void OnCampaignSaved(int slot, bool autosave);
 bool InSession();                // a multiplayer session is up on this PC (hosting or joined)
 bool JoinedPlayerPC();           // this PC plays a joined nation in a session: its campaign is the host's copy
 // 0.6.1: nation idx (a real index) is played by a person and the game never declares a war between it and this PC's

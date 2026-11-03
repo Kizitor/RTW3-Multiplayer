@@ -1,5 +1,6 @@
 #include "nationplay.h"
 #include "game.h"
+#include "officers.h"
 #include "../../third_party/minhook/include/MinHook.h"
 #include <algorithm>
 #include <climits>
@@ -320,6 +321,9 @@ struct Rec {
     int fsWarned = 0;                  // the game's LeaderWarnedAboutForeignStations, for this nation
     bool hasDivisions = false;         // 0.6.1: the nation's campaign divisions from its last turn that sent them
     std::vector<std::string> divisions;  // ... as [CampaignDivisions] lines (validated, renumbered)
+    bool hasOfficers = false;            // 0.8.0: the nation's officer corps (its turns, its battles, the host's month)
+    std::vector<std::string> officers;   // ... as [Officers] lines (validated, renumbered)
+    std::vector<std::string> areaCmd;    // ... its area commands, "MapArea<i>Commander=<id>"
 };
 static std::map<int, Rec> g_recs;
 static std::wstring g_file;
@@ -374,6 +378,10 @@ static void HostSave() {
         d.Set(sec, "ForeignStationsWarned", std::to_string(r.second.fsWarned));
         PutReports(d, sec + "IntelReports", r.second.reports);
         if (r.second.hasDivisions) d.sections.push_back({sec + "Divisions", r.second.divisions});
+        if (r.second.hasOfficers) {
+            d.sections.push_back({sec + "Officers", r.second.officers});
+            d.sections.push_back({sec + "AreaCmd", r.second.areaCmd});
+        }
     }
     if (!WriteFileBytes(g_file, WriteIni(d))) Log("nations file: write FAILED (%s)", W2U(g_file).c_str());
 }
@@ -404,6 +412,14 @@ void HostAttach(const std::wstring& slotDir, const std::string& campaignKey) {
             r.hasDivisions = true;
             for (auto& l : ds->lines)
                 if (!l.empty()) r.divisions.push_back(l);
+        }
+        if (const IniSection* os = d.Find(sec + "Officers")) {
+            r.hasOfficers = true;
+            for (auto& l : os->lines)
+                if (!l.empty()) r.officers.push_back(l);
+            if (const IniSection* as = d.Find(sec + "AreaCmd"))
+                for (auto& l : as->lines)
+                    if (!l.empty()) r.areaCmd.push_back(l);
         }
     }
     Log("nations file: %d joined nations' records loaded", (int)g_recs.size());
@@ -557,6 +573,244 @@ std::string HostDivisionsInfo(int K) {
     std::string err;
     if (it != g_recs.end() && it->second.hasDivisions) saveio::ParseDivisions(it->second.divisions, divs, false, err);
     return "ok n=" + std::to_string(divs.size()) + " list=" + DivisionListText(divs);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Officers (0.8.0). The host's game holds each joined nation's corps in the nation's own list (loaded after every load
+// of the host's slot), so the month kills, captures and trains them and prices their ships natively; the records are
+// what the nations' turns and battles sent, and what the host's month made of them.
+
+int FleetSizeValue() { return A.fleetSize ? *A.fleetSize : -1; }
+
+bool HostHasOfficers(int K) {
+    auto it = g_recs.find(K);
+    return g_attached && it != g_recs.end() && it->second.hasOfficers;
+}
+
+// officers.ini -> validated, renumbered [Officers] lines and the area commands of officers in the list.
+static bool ParseOfficersFile(const std::string& bytes, std::vector<std::string>& officers, std::vector<std::string>& areas,
+                              int& n, std::string& err) {
+    IniDoc d = ParseIni(bytes);
+    const IniSection* s = d.Find("Officers");
+    if (!s) {
+        err = "no [Officers]";
+        return false;
+    }
+    std::vector<saveio::OfficerRec> list;
+    if (!saveio::ParseOfficers(s->lines, list, true, err)) return false;
+    std::map<int, int> cmd;
+    if (const IniSection* a = d.Find("AreaCmd"))
+        if (!saveio::ParseAreaCommands(a->lines, saveio::OfficerIds(list), cmd, true, err)) return false;
+    officers = saveio::OfficerLines(list);
+    areas = saveio::AreaCommandLines(cmd);
+    n = (int)list.size();
+    return true;
+}
+
+bool HostTakeOfficers(const Bundle& sub, int K, std::string& why) {
+    if (!g_attached || K < 1 || K > 8) {
+        why = "the records are not loaded";
+        return false;
+    }
+    const std::string* f = sub.Get("officers.ini");
+    if (!f) {
+        why = "none sent";
+        return false;
+    }
+    std::vector<std::string> officers, areas;
+    int n = 0;
+    if (!ParseOfficersFile(*f, officers, areas, n, why)) {
+        Log("officers of nation %d: the turn's list rejected (%s); the stored one stays", K, why.c_str());
+        return false;
+    }
+    Rec& r = RecOf(K);
+    r.officers = officers;
+    r.areaCmd = areas;
+    r.hasOfficers = true;
+    HostSave();
+    Log("officers of nation %d: %d stored from its turn (%d area commands)", K, n, (int)areas.size());
+    return true;
+}
+
+bool HostTakeBattleOfficers(const Bundle& res, int K, const std::vector<std::string>* sent) {
+    if (!g_attached || K < 1 || K > 8) return false;
+    const std::string* f = res.Get("officers.ini");
+    if (!f) return false;
+    std::vector<std::string> officers, areas;
+    int n = 0;
+    std::string why;
+    if (!ParseOfficersFile(*f, officers, areas, n, why)) {
+        Log("officers of nation %d: the battle's list rejected (%s); the stored one stays", K, why.c_str());
+        return false;
+    }
+    Rec& r = RecOf(K);
+    if (sent && !sent->empty() && r.hasOfficers) {
+        // 0.8.0: per officer id against what the package carried (a battle fought during the host's month: the record
+        // holds what the month did to the corps since; a battle of the battle phase: the record is what it carried)
+        std::vector<saveio::OfficerRec> s, h, b;
+        std::string err;
+        saveio::ParseOfficers(*sent, s, false, err);
+        saveio::ParseOfficers(r.officers, h, false, err);
+        saveio::ParseOfficers(officers, b, false, err);
+        saveio::OfficerMergeNotes notes;
+        std::vector<saveio::OfficerRec> m = saveio::MergeOfficers(s, h, b, &notes);
+        r.officers = saveio::OfficerLines(m);
+        r.hasOfficers = true;
+        HostSave();
+        Log("officers of nation %d: %d after its battle merged into the record (%d): %s", K, n, (int)m.size(),
+            notes.Text().c_str());
+        return true;
+    }
+    r.officers = officers;
+    r.hasOfficers = true;
+    // (the area commands stay: the battle's slot holds the ones the host sent)
+    HostSave();
+    Log("officers of nation %d: %d stored after its battle", K, n);
+    return true;
+}
+
+std::vector<std::string> HostRecordOfficers(int K) {
+    auto it = g_recs.find(K);
+    return g_attached && it != g_recs.end() && it->second.hasOfficers ? it->second.officers : std::vector<std::string>();
+}
+
+bool HostPutOfficers(Bundle& b, int K, bool own, const char* what, std::vector<std::string>* sentLines) {
+    if (K < 1 || K > 8) return false;
+    std::string* off = nullptr;
+    std::string* map = nullptr;
+    for (auto& f : b.files) {
+        if (f.first == "RTWGame{S}.off") off = &f.second;
+        if (f.first == "MapData{S}.dat") map = &f.second;
+    }
+    bool has = HostHasOfficers(K);
+    bool put = own && has;
+    std::vector<std::string> lines = {"OfficerNo=0"};
+    std::map<int, int> cmd;
+    int n = 0;
+    if (put) {
+        Rec& r = RecOf(K);
+        std::vector<saveio::OfficerRec> list;
+        std::string err;
+        saveio::ParseOfficers(r.officers, list, false, err);
+        lines = saveio::OfficerLines(list);
+        n = (int)list.size();
+        saveio::ParseAreaCommands(r.areaCmd, saveio::OfficerIds(list), cmd, false, err);
+    }
+    has = has && n > 0;  // (an empty corps is formed again: the game's never is)
+    int changed = 0;
+    if (off) *off = saveio::WithOfficerLines(*off, lines);
+    if (map) *map = saveio::WithAreaCommanders(*map, cmd, &changed);
+    if (sentLines) {
+        sentLines->clear();
+        if (own && off) *sentLines = lines;
+    }
+    if (!off || !map)
+        Log("officers of nation %d: the %s has no %s; left as it is", K, what, !off ? ".off" : "MapData");
+    else if (!own)
+        Log("officers of nation %d: an empty list in its %s (the player's mod doesn't keep the nation's own)", K, what);
+    else
+        Log("officers of nation %d: %s in its %s (%d area commands; %d area lines changed)", K,
+            has ? std::to_string(n).c_str() : "none stored yet: its PC forms the corps,", what, (int)cmd.size(), changed);
+    return has;
+}
+
+void HostOfficersToMemory(const char* why) {
+    if (!g_attached || !ofc::Available()) return;
+    std::string done;
+    for (auto& r : g_recs) {
+        int K = r.first;
+        if (!r.second.hasOfficers || ofc::LoadedThisLoad(K) || K >= game::NationCount()) continue;
+        int cmd = 0, n = ofc::LoadIntoNation(K, r.second.officers, &cmd);
+        if (n < 0) continue;
+        done += " " + std::to_string(K) + ":" + std::to_string(n) + "/" + std::to_string(cmd);
+    }
+    if (!done.empty()) Log("officers: the joined nations' corps in memory (%s; nation:officers/commanded ships):%s", why,
+                           done.c_str());
+}
+
+void HostOfficersFromMemory(const char* why) {
+    if (!g_attached || !ofc::Available()) return;
+    std::string done;
+    bool changed = false;
+    for (auto& r : g_recs) {
+        int K = r.first;
+        if (!r.second.hasOfficers || !ofc::LoadedThisLoad(K)) continue;
+        std::vector<std::string> lines;
+        if (!ofc::ReadNation(K, lines)) continue;
+        std::vector<saveio::OfficerRec> list;
+        std::string err;
+        if (!saveio::ParseOfficers(lines, list, false, err)) continue;
+        std::vector<std::string> norm = saveio::OfficerLines(list);
+        if (norm == r.second.officers) continue;
+        r.second.officers = norm;
+        changed = true;
+        done += " " + std::to_string(K) + ":" + std::to_string(list.size());
+    }
+    if (!changed) return;
+    HostSave();
+    Log("officers: the joined nations' corps back into the records (%s; nation:officers):%s", why, done.c_str());
+}
+
+int HostFixShipCommanders(const std::wstring& bcsPath, int K, const std::map<std::string, int>* keep) {
+    if (!HostHasOfficers(K)) return 0;
+    std::string bytes;
+    if (!ReadFileBytes(bcsPath, bytes)) return 0;
+    IniDoc d = ParseIni(bytes);
+    std::vector<saveio::OfficerRec> list;
+    std::string err;
+    saveio::ParseOfficers(RecOf(K).officers, list, false, err);
+    // only active officers command (the game nils the ship of a commander killed or captured: KillCommander,
+    // TransferCampaignShipDamage after a battle; ConnectOfficersToShips would connect a dead one again)
+    std::set<int> active;
+    for (auto& o : list)
+        if (o.Get("Status") == "0" && !o.Get("Id").empty()) active.insert(atoi(o.Get("Id").c_str()));
+    int back = keep ? saveio::SetShipCommanderIds(d, K, *keep) : 0;
+    int cleared = saveio::ClearShipCommanders(d, K, active);
+    if ((back || cleared) && !WriteFileBytes(bcsPath, WriteIni(d))) {
+        Log("officers of nation %d: the ships' commanders NOT written (the save is in use)", K);
+        return 0;
+    }
+    if (back || cleared)
+        Log("officers of nation %d: %d ship commander(s) the host kept put back (a turn without its officers), %d not "
+            "active in its list reset",
+            K, back, cleared);
+    return cleared;
+}
+
+std::string HostOfficersInfo(int K) {
+    if (!g_attached) return "error the joined nations' records are not loaded (host only)";
+    auto it = g_recs.find(K);
+    if (it == g_recs.end() || !it->second.hasOfficers) return "ok n=0 none";
+    std::vector<saveio::OfficerRec> list;
+    std::string err;
+    saveio::ParseOfficers(it->second.officers, list, false, err);
+    int active = 0, dead = 0, pow = 0, minId = INT_MAX, maxId = INT_MIN;
+    std::string first;
+    for (size_t i = 0; i < list.size(); i++) {
+        int st = atoi(list[i].Get("Status", "0").c_str()), id = atoi(list[i].Get("Id", "0").c_str());
+        active += st == 0;
+        dead += st == 1;
+        pow += st == 3;
+        minId = std::min(minId, id);
+        maxId = std::max(maxId, id);
+        if (i < 3) {
+            std::string nm = list[i].Get("Name");
+            for (char& c : nm)
+                if (c == ' ' || c == '|' || c == ':') c = '_';
+            first += std::to_string(id) + ":" + nm + ":" + list[i].Get("Rank") + ":" + std::to_string(st) + "|";
+        }
+    }
+    std::string stars;
+    for (auto& o : list)
+        if (atoi(o.Get("BattleStars", "0").c_str()) > 0)
+            stars += o.Get("Id") + ":" + o.Get("BattleStars") + ",";
+    std::string st;
+    for (auto& o : list)
+        if (o.Get("Status", "0") != "0") st += o.Get("Id") + ":" + o.Get("Status") + ",";
+    return "ok n=" + std::to_string(list.size()) + " active=" + std::to_string(active) + " dead=" +
+           std::to_string(dead) + " pow=" + std::to_string(pow) + " areas=" + std::to_string(it->second.areaCmd.size()) +
+           " ids=" + (list.empty() ? std::string("-") : std::to_string(minId) + "-" + std::to_string(maxId)) +
+           " stars=" + stars + " status=" + st + " first=" + first;
 }
 
 static bool HostIntelCost(int K, int& cost) {

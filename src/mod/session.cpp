@@ -5,6 +5,7 @@
 #include "lockstep.h"
 #include "nationplay.h"
 #include "net.h"
+#include "officers.h"
 #include "saveio.h"
 #include "warfx.h"
 #include "invasion.h"
@@ -39,6 +40,8 @@ struct Player {
     int relLevel = 0;        // relations v2: the player's PC runs the player's relation routines (hello `rel`; 0 = no)
     int genLevel = 0;        // 0.6.0: its PC replays the player's battle generator's attempts (hello `gen`; 0 = no)
     int divLevel = 0;        // 0.6.1: its PC loads and sends the nation's own campaign divisions (hello `div`; 0 = no)
+    bool simb = false;       // 0.8.0: its PC fights its battles during the host's month (hello `simb`; older: no)
+    int offLevel = 0;        // 0.8.0: its PC plays the nation's own officers (hello `off`; 0 = no)
 };
 
 // The ten nations of the game, offered for lobby picks before the host has a campaign.
@@ -194,6 +197,17 @@ static bool g_fightBattles = true;  // fight this nation's battles against AI na
 // the month whose event dialog was shown (the game gives the player one of the two a month), the setup from the header.
 static int g_relTurnSeq = -1;
 static int g_evShownSeq = -1;
+// 0.8.0 (client): the nation's own officers (officers.cpp): the month that formed its corps (no officer routine in it),
+// the month whose free promotion was reset; the corps of a month without the host's record (`offgen`).
+static int g_offGenMonth = -1;
+static int g_offMonth = -1;
+static bool g_testOfficersQuiet = false;  // TEST ONLY (RTW3MP_TEST_OFFICERS=quiet): no officer routine, no question
+static struct {  // TEST ONLY (host, `ofkill <nation> <ship> <pow> arm`): KillCommander once the month's turns are merged
+    int nation = -1, ship = -1;
+    bool pow = false;
+    bool month = false;  // (`armmonth`, 0.8.0: when DoStrategicTurn starts, after the battles sent during the month)
+} g_ofKillArm;
+static void ClientFormCorps(int K, int month);
 static game::PlayerTurnSetup g_relSetup;
 static std::string g_lastRelations = "none";
 // 0.6.1 (client): the host runs the player's rules for this nation (the month's header has `rel` or `kvp`): the game
@@ -295,6 +309,19 @@ struct BattleReq {
     // 0.7.2 (fix-battlesearch): the result's encounters (`enc`, a player's PC under welcome `gen` 5): each one's points
     // went to its own opponent (VP, war score); the chat names each one
     std::vector<BattleEnc> encs;
+    // 0.8.0 (simultaneous battles): fought during the host's month (`early`): a surprise attack (kind 2) from the
+    // month's start (its package `pre` made at the Turn, `prePacked`), a request of the player's generator (kind 1)
+    // from the month's snapshot saved at the generator's hook. `kept`: it waits for the end of the host's battle search
+    // (its nation is at war with the host's: the host's battle may be a live one against it). Its result is held
+    // (`held`, the whole message) until the battle phase, then merged first. gen: the player's hello `gen` at the send
+    // (a result is merged also after its player left). announce: the request's chat line, its end said once decided.
+    bool early = false, kept = false, prePacked = false;
+    Bundle pre;
+    std::string held, announce;
+    int gen = 0;
+    // 0.8.0 (officers): the nation's [Officers] lines the package carried (its record at the send; empty: none, an
+    // older player's mod): its result's officers are merged per officer id against them (HostTakeBattleOfficers)
+    std::vector<std::string> sentOff;
 };
 static std::vector<BattleReq> g_battles;
 static int g_battleNextId = 1;
@@ -302,6 +329,29 @@ static bool g_battlePhase = false, g_battleFinishing = false, g_battleMerged = f
 static std::string g_battlePhaseBytes;  // the host save when the battle phase began (restored if a reload fails)
 static int g_battleTimeoutSec = 30 * 60;
 static DWORD g_battleStatusTick = 0;
+// 0.8.0 (simultaneous battles): on for this PC (RTW3MP_SIMUL=0: off, as 0.7.2: a host sends every battle after its
+// month and announces no welcome `simb`, a player's PC announces no hello `simb`; tests: `battles simul`). Host: the
+// month (g_seq) of the snapshot in the scratch slot, -1 none; the battles of the month lost with a restart of the host's
+// game (player -> what), told to each player when they join. Client: the host's welcome `simb`.
+static bool g_simulOn = true;
+static int g_simulSeq = -1;
+static std::map<std::string, std::string> g_simulLost;
+static int g_hostSimb = 0;
+// TEST ONLY (`battles simulkeep 1`, host): every merge's inputs and output kept in RTW3MP\simul_test\ (the save as sent,
+// the host's save before the merge, the result's sections, the merged save; the month-end save at the battle phase's
+// start), so the suite checks the merge rules on exact files instead of racing the saves.
+static bool g_simulKeep = false;
+static void SimulKeep(const std::string& name, const std::string& bytes) {
+    if (!g_simulKeep) return;
+    std::wstring dir = ModDataDir() + L"simul_test\\";
+    EnsureDir(dir);
+    if (!WriteFileBytes(dir + U2W(name), bytes)) Log("TEST: simulkeep: %s NOT written", name.c_str());
+}
+// TEST ONLY (`battles simulhold <s>`, host): the battle phase waits up to <s> s after DoEndOfTurn while battles sent
+// during the month are still fought, so their results come during the month (held): a test of the held path that does
+// not depend on how long the host's own battle and the players' battles take.
+static int g_testSimulHoldSec = 0;
+static DWORD g_simulHoldSince = 0;
 // 0.7.0 (invasions, P3), host: a joined nation's invasions during the battle phase. Each battle of the nation takes
 // them to its PC (its battle slot) and the result brings them back; `base` is what the phase's first battle took,
 // `now` what the last result returned (the next battle takes it); applied by name after the phase's reload.
@@ -338,6 +388,7 @@ static struct {
     bool goOn = false;
     std::vector<BattleEnc> encs;
     int vpA = 0, evpA = 0;
+    bool offs = false;   // 0.8.0: the host keeps the nation's officers (its battle's header `offs`): the result has them
 } g_cb;
 static struct {  // TEST ONLY (`battles testraid <side> <J>`): the next raider check forces an interception
     int side = -1, J = -1;
@@ -804,7 +855,12 @@ static void LoadReservations() {
     g_kRelMonth.clear();
     g_kPeaceMonth.clear();
     g_enemyVPSeen = -1;
-    if (g_hostSlot > 0) nplay::HostAttach(game::SaveDir(g_hostSlot), CampaignKey());  // the joined nations' own records
+    if (g_hostSlot > 0) {
+        nplay::HostAttach(game::SaveDir(g_hostSlot), CampaignKey());  // the joined nations' own records
+        // 0.8.0: the open campaign is the host's slot loaded before its records were attached: their officers now
+        if (game::CurrentSlot() == g_hostSlot && game::NationCount() >= 9)
+            nplay::HostOfficersToMemory("the session's records");
+    }
     std::string s;
     if (g_hostSlot <= 0 || !ReadFileBytes(SessionFile(), s)) return;
     KV kv = KVDecode(s);
@@ -2196,7 +2252,8 @@ static void HostApplySurprise(Player& p, int K, const KV& kv, std::string& appli
     Log("battle request %d (surprise attack): nation %d vs %d, %d attempt(s):%s, played by %s", r.id, K, r.opp,
         (int)at.size(), pairs.c_str(), p.name.c_str());
     chat.push_back("Surprise attack? " + Nm(r.a) + " may strike " + Nm(r.b) + " at the war's start. " + p.name +
-                   " plays it after the month.");
+                   (g_simulOn && p.simb && p.battles ? " plays it during the host's month."  // 0.8.0
+                                                     : " plays it after the month."));
 }
 
 static void HostApplyRelations(Player& p, const KV& kv) {
@@ -2373,6 +2430,10 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     // turn sent, pruned to its ships in this month. A player whose mod doesn't load them (hello `div` 0) gets an empty
     // list: its game would look the nation's ships up among the host's nation (nil ships) and show the host's divisions.
     nplay::HostPutDivisions(b, p.nation, p.divLevel >= 1, "month");
+    // 0.8.0: the nation's own officers (its record) in the .off and its area commands in the map data instead of the
+    // host's. A player whose mod doesn't keep them (hello `off` 0) gets an empty list; one without a record yet forms
+    // the corps on its PC (`offgen`).
+    bool ownOfficers = nplay::HostPutOfficers(b, p.nation, p.offLevel >= 1, "month");
     KV h;
     h["seq"] = std::to_string(g_seq);
     h["nation"] = std::to_string(p.nation);
@@ -2440,6 +2501,10 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     }
     h["intel"] = "1";  // per-player intelligence: the player's turn carries its own (0.4.0 peers ignore the key)
     if (p.divLevel >= 1) h["divs"] = "1";  // 0.6.1: the .off holds the nation's own divisions (see above)
+    if (p.offLevel >= 1) {  // 0.8.0: ... and its own officers
+        h["offs"] = "1";
+        if (!ownOfficers) h["offgen"] = "1";
+    }
     {
         // The player's economy rules the host ran for this nation (economy.cpp; older clients ignore the keys): their
         // messages since the last state (sent once) and the nation's army offensive months (its budget's x 0.9).
@@ -2890,7 +2955,21 @@ static void BattleFallback(BattleReq& r, const std::string& why) {
     Log("battle %d: resolved by the game (%s)", r.id, why.c_str());
 }
 
-static void SendBattle(BattleReq& r) {
+// A battle's package: the slot's files (IDNo raised for the player's nation) and its .bcs as sent (the merge's base).
+static bool PackBattleFiles(BattleReq& r, int slot, Bundle& b, std::string& err) {
+    std::wstring dir = game::SaveDir(slot);
+    if (!ReadFileBytes(dir + L"RTWGame" + std::to_wstring(slot) + L".bcs", r.sentBcs)) {
+        err = "cannot read the save";
+        return false;
+    }
+    return saveio::BuildStateBundle(dir, slot, kIdStride * r.human, b, err);
+}
+
+static void SimulMarker();
+
+// pre: the package made at the Turn (0.8.0, a surprise attack fought during the host's month); fromSlot: the month's
+// snapshot (0.8.0, a request of the player's generator fought during the host's month); else the host's save now.
+static void SendBattle(BattleReq& r, const Bundle* pre = nullptr, int fromSlot = -1) {
     Player* p = PlayerOfNation(r.human);
     if (!p) {
         BattleFallback(r, "the player is not connected");
@@ -2899,8 +2978,11 @@ static void SendBattle(BattleReq& r) {
     Bundle b;
     std::string err;
     std::wstring dir = game::SaveDir(g_hostSlot);
+    bool early = pre || fromSlot >= 0;
     // The save as it is now: the results of this phase's earlier battles are merged into it already.
-    if (!ReadFileBytes(HostBcsPath(), r.sentBcs) || !saveio::BuildStateBundle(dir, g_hostSlot, kIdStride * r.human, b, err)) {
+    if (pre)
+        b = *pre;
+    else if (!PackBattleFiles(r, fromSlot >= 0 ? fromSlot : g_hostSlot, b, err)) {
         BattleFallback(r, "cannot package the game: " + err);
         return;
     }
@@ -2911,9 +2993,15 @@ static void SendBattle(BattleReq& r) {
     // game, uses the host's divisions (the joined nation is a computer nation there); both stay as they are.
     nplay::HostAttach(dir, CampaignKey());
     nplay::HostPutDivisions(b, r.human, true, "battle");
+    // 0.8.0: the nation's own officers and area commands (its battle slot's player commands them); an older mod's
+    // player gets an empty list, as its month. A battle during the host's month carries the record as it is at its
+    // send (the snapshot's own officers are the host's: the record is the nation's, kept from memory after each host
+    // save); the result is merged against what went out.
+    nplay::HostPutOfficers(b, r.human, p->offLevel >= 1, "battle", &r.sentOff);
     KV h;
     h["id"] = std::to_string(r.id);
     h["divs"] = "1";
+    if (p->offLevel >= 1) h["offs"] = "1";  // its result carries the officers after the battle
     h["nation"] = std::to_string(r.human);
     h["opp"] = std::to_string(r.opp);
     h["a"] = std::to_string(r.a);
@@ -2923,6 +3011,7 @@ static void SendBattle(BattleReq& r) {
     h["area"] = W2U(r.area);
     h["oppName"] = CampaignNationName(r.opp);
     h["timeout"] = std::to_string(g_battleTimeoutSec);
+    if (early) h["early"] = "1";  // 0.8.0: during the host's month (older players' PCs ignore it)
     if (!r.pvp && p->genLevel >= 1) {  // 0.6.0: the nation's own decline counts (its battle slot holds the host's)
         auto it = g_kDecl.find(r.human);
         h["dc"] = it == g_kDecl.end() ? "0:0" : std::to_string(it->second.first) + ":" + std::to_string(it->second.second);
@@ -2974,10 +3063,16 @@ static void SendBattle(BattleReq& r) {
     r.peer = p->peer;
     r.state = 1;
     r.sentTick = GetTickCount();
+    r.gen = p->genLevel;
+    r.early = early;
     if (p2) g_lsRelay[r.id] = {p->peer, p2->peer};
     net::Send(p->peer, net::MSG_BATTLE, payload);
-    Log("battle %d sent to %s (%u bytes)%s", r.id, p->name.c_str(), (unsigned)payload.size(),
-        p2 ? (", live against " + p2->name).c_str() : "");
+    Log("battle %d sent to %s (%u bytes)%s%s", r.id, p->name.c_str(), (unsigned)payload.size(),
+        p2 ? (", live against " + p2->name).c_str() : "",
+        pre ? ", during the host's month (the month's start)"
+            : fromSlot >= 0 ? (", during the host's month (the month's snapshot, slot " + std::to_string(fromSlot) + ")").c_str()
+                            : "");
+    if (early) SimulMarker();
 }
 
 // A battle between two players' nations: fought live when both players fight their battles and can play live ones
@@ -3129,11 +3224,13 @@ static int HostRunGenerator(int K, bool queue, std::string& out) {
         invs ? " (an invasion check)" : "", p->name.c_str());
     std::string more = std::string(raids ? ", or its raiders and patrols the enemy's" : "") +
                        (invs ? ", or its invasions bring a battle" : "");
-    AddChat("* Battle? " + CampaignNationName(K) + "'s " +
-            (first  ? "navy may meet the " + CampaignNationName(r.opp) + " navy" + InArea(r.area) + more
-             : invs ? "invasions may bring a battle" + std::string(raids ? ", or its raiders and patrols meet the enemy's" : "")
-                    : std::string("raiders and patrols may meet the enemy's")) +
-            ". " + p->name + " plays it after the month.");
+    // 0.8.0: the line's end (now, during the host's month, or after it) is said once the hook decided (HostSendEarly)
+    g_battles.back().announce =
+        "* Battle? " + CampaignNationName(K) + "'s " +
+        (first  ? "navy may meet the " + CampaignNationName(r.opp) + " navy" + InArea(r.area) + more
+         : invs ? "invasions may bring a battle" + std::string(raids ? ", or its raiders and patrols meet the enemy's" : "")
+                : std::string("raiders and patrols may meet the enemy's")) +
+        ". " + p->name;
     return r.id;
 }
 
@@ -3279,13 +3376,304 @@ static void HostRunInvasions() {
     if (ran) SaveReservations();  // the plans (`kinv`) of the new month
 }
 
+// ---------------------------------------------------------------------------------------------
+// 0.8.0, simultaneous battles (host). A joined player fights its battle of the month while the host's month goes on
+// (its own battle included), instead of after the host's whole month. A surprise attack (kind 2, from the player's
+// relation turn) is packed at the Turn from the slot's files (the month's start, single player's order: the war's
+// first battle) and sent at the generator's hook; the requests of the player's generator (kind 1) leave at the hook
+// (DoTurn2 after AreaMoveShips, the entry of the host's CheckForBattles2) from a snapshot of the month saved there into
+// the scratch slot (150 + the host's slot, RTW3MP_SNAP_SLOT): single player's own moment for the player's battle. A
+// nation at war with the host's waits for the end of the host's battle search (the host's battle may be a live one
+// against it: its player commands that side then, and its battle waits for the battle phase). The results that come
+// during the month are held and merged first in the battle phase into the month-end save, against the state each was
+// sent from (saveio::ApplyBattleResult and its rules for the fields both changed). Only between two PCs that announce
+// it (hello and welcome `simb`); kind 0 (the computer's generator: older players' PCs) and live battles between two
+// joined players stay in the battle phase.
+
+static int SimulSlot() {
+    static int env = -2;
+    if (env == -2) {
+        char b[16];
+        env = GetEnvironmentVariableA("RTW3MP_SNAP_SLOT", b, sizeof(b)) > 0 ? atoi(b) : 0;
+        if (env < 50 || env > 999 || env == g_clientSlot || env == g_battleSlot) env = 0;
+    }
+    return env ? env : 150 + g_hostSlot;
+}
+
+// The scratch slot's folder and everything in it (its save files and the marker), if it exists.
+static void SimulDeleteSlot(const char* why) {
+    g_simulSeq = -1;
+    if (g_hostSlot <= 0 || SimulSlot() < 50) return;
+    std::wstring dir = game::SaveDir(SimulSlot());
+    DWORD at = dir.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(dir.substr(0, dir.size() - 1).c_str());
+    if (at == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) return;
+    int n = 0, left = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            (DeleteFileW((dir + fd.cFileName).c_str()) ? n : left)++;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    bool gone = RemoveDirectoryW(dir.substr(0, dir.size() - 1).c_str()) != 0;
+    Log("simultaneous battles: the scratch slot %d deleted (%s): %d file(s)%s", SimulSlot(), why, n,
+        gone ? "" : (", the folder stays (" + std::to_string(left) + " file(s) in use)").c_str());
+}
+
+// The marker of the month's battles fought during the host's month (rtw3mp_simul.ini in the scratch slot): after a
+// restart of the host's game they are lost (in memory only), and the next session tells their players.
+static void SimulMarker() {
+    std::string s = "[Simul]\r\ncampaign=" + CampaignKey() + "\r\nseq=" + std::to_string(g_seq) + "\r\nbattles=";
+    for (auto& r : g_battles)
+        if (r.early && r.state == 1)
+            s += SafeText(r.player) + ":" + std::to_string(r.human) + ":" + std::to_string(r.opp) + ";";
+    s += "\r\n";
+    std::wstring dir = game::SaveDir(SimulSlot());
+    if (dir.empty()) return;
+    EnsureDir(dir);
+    WriteFileBytes(dir + L"rtw3mp_simul.ini", s);
+    g_simulSeq = g_seq;  // (the slot is deleted when the month is over)
+}
+
+// Host, a campaign opened in the lobby: a scratch slot left by a restart of the host's game during a month whose
+// battles were fought during it: those battles are lost; their players hear it when they join. The slot is deleted.
+static void SimulRestartCheck() {
+    std::string bytes;
+    if (g_hostSlot > 0 && ReadFileBytes(game::SaveDir(SimulSlot()) + L"rtw3mp_simul.ini", bytes)) {
+        IniDoc d = ParseIni(bytes);
+        std::string camp = d.Get("Simul", "campaign"), list;
+        if (camp == CampaignKey()) {
+            for (auto& e : Split(d.Get("Simul", "battles"), ';')) {
+                auto f = Split(e, ':');
+                if (f.size() < 3 || f[0].empty()) continue;
+                std::string what = CampaignNationName(atoi(f[1].c_str())) + " against " +
+                                   CampaignNationName(atoi(f[2].c_str()));
+                g_simulLost[f[0]] = what;
+                list += (list.empty() ? "" : ", ") + f[0] + ": " + what;
+            }
+            if (!list.empty()) {
+                Log("simultaneous battles: the host's game was restarted during month seq %s; the battles fought during "
+                    "it are lost: %s", d.Get("Simul", "seq").c_str(), list.c_str());
+                AddChat("* The host's game was restarted during a month: the battles fought during it are lost (" + list +
+                        ").");
+            }
+        }
+    }
+    SimulDeleteSlot("a new session");
+}
+
+static void Announce(BattleReq& r, const std::string& when) {
+    if (r.announce.empty()) return;
+    AddChat(r.announce + " plays it " + when + ".");
+    r.announce.clear();
+}
+
+// May this request be fought during the host's month? why: the reason if not; plain: a reason of the session (off on
+// the host, an older player's mod, the player gone), not of this month (said in the chat then).
+static bool SimulEligible(const BattleReq& r, std::string* why = nullptr, bool* plain = nullptr) {
+    auto no = [&](const char* w, bool p) {
+        if (why) *why = w;
+        if (plain) *plain = p;
+        return false;
+    };
+    if (!g_simulOn) return no("simultaneous battles are off on the host", true);
+    if (r.state != 0 || r.pvp || (r.kind != 1 && r.kind != 2)) return no("not a battle of the player's generator", true);
+    Player* p = PlayerOfNation(r.human);
+    if (!p || !p->battles) return no("the player is not connected", true);
+    if (!p->simb) return no("the player's mod fights its battles after the host's month (an older version)", true);
+    for (auto& o : g_battles)
+        if (&o != &r && r.kind == 1 && o.kind == 2 && o.human == r.human)
+            return no("the nation's surprise attack comes first", false);
+    for (auto& o : g_battles)
+        if (&o != &r && o.state == 1 && (o.human == r.human || (o.pvp && o.opp == r.human)))
+            return no("another battle of the nation is in progress", false);
+    return true;
+}
+
+// A request that waits for the battle phase after all; plain: as before 0.8.0 (no reason in the chat).
+static void SimulLate(BattleReq& r, const std::string& why, bool plain = false) {
+    bool said = r.announce.empty();
+    r.kept = r.prePacked = false;
+    r.pre.files.clear();
+    Log("battle %d (kind %d): after the month (%s)", r.id, r.kind, why.c_str());
+    Announce(r, plain ? "after the month" : "after the month (" + why + ")");
+    if (said && !plain)
+        AddChat("* " + r.player + " plays the battle of " + CampaignNationName(r.human) + " after the month (" + why + ").");
+}
+
+// At the Turn, after the merge and the reload: the month's surprise attacks packed from the slot's files (sent at the
+// generator's hook, once DoTurn2 runs; the autosave of DoTurn2 rewrites the slot's MapData and .sta before it).
+static void HostPackSurprises() {
+    for (auto& r : g_battles) {
+        if (r.kind != 2 || r.state != 0) continue;
+        r.prePacked = false;  // (a Turn that did not advance packs again)
+        r.pre.files.clear();
+        std::string err;
+        if (!SimulEligible(r)) continue;
+        if (!PackBattleFiles(r, g_hostSlot, r.pre, err)) {
+            Log("battle %d (surprise attack): not packed at the Turn (%s); after the month", r.id, err.c_str());
+            continue;
+        }
+        r.prePacked = true;
+        Log("battle %d (surprise attack): packed from the month's start (%u bytes); it goes out with the month", r.id,
+            (unsigned)r.pre.TotalBytes());
+    }
+}
+
+// The generator's hook, after the joined nations' generators: the month's battles go out now (above). firstId: the
+// first request of this hook (their chat lines are said here).
+static void HostSendEarly(int firstId) {
+    std::string why;
+    bool plain = false;
+    for (auto& r : g_battles) {  // the surprise attacks packed at the Turn
+        if (r.kind != 2 || r.state != 0 || !r.prePacked) continue;
+        if (!SimulEligible(r, &why, &plain)) {
+            SimulLate(r, why, plain);
+        } else if (game::AtWar(0, r.human)) {
+            r.kept = true;
+            Log("battle %d (surprise attack): waits for the end of the host's battle search (nation %d is at war with the "
+                "host's)", r.id, r.human);
+        } else {
+            SendBattle(r, &r.pre);
+            r.prePacked = false;
+            r.pre.files.clear();
+            if (r.state == 1) AddChat("* " + r.player + " plays the surprise attack of " + CampaignNationName(r.a) +
+                                      " on " + CampaignNationName(r.b) + " now, during the host's month.");
+        }
+    }
+    std::vector<BattleReq*> gen;
+    for (auto& r : g_battles) {
+        if (r.kind != 1 || r.state != 0 || r.kept) continue;
+        if (SimulEligible(r, &why, &plain))
+            gen.push_back(&r);
+        else if (r.id >= firstId)
+            SimulLate(r, why, plain);
+    }
+    if (!gen.empty()) {
+        unsigned long ms = 0;
+        int slot = SimulSlot();
+        bool ok = game::SaveSnapshot(slot, ms, why);
+        Log("simultaneous battles: the month's snapshot in slot %d: %s in %lu ms%s%s", slot, ok ? "saved" : "FAILED", ms,
+            ok ? "" : ": ", ok ? "" : why.c_str());
+        g_simulSeq = g_seq;  // (the slot, also what a failed save left there, is deleted when the month is over)
+        // 0.8.0 (officers): the joined nations' corps as the snapshot has them into their records (as after any save of
+        // the host's slot; the snapshot's save leaves them out: its .off is the host's list), so each package from it
+        // carries its nation's officers of that moment, as a package of the battle phase carries the month's end
+        if (ok) nplay::HostOfficersFromMemory("the month's snapshot");
+        for (BattleReq* r : gen) {
+            if (!ok) {
+                SimulLate(*r, "the host could not save the month's state for it");
+            } else if (!SimulEligible(*r, &why, &plain)) {  // (another request of the nation went out above)
+                SimulLate(*r, why, plain);
+            } else if (game::AtWar(0, r->human)) {
+                r->kept = true;
+                Log("battle %d: waits for the end of the host's battle search (nation %d is at war with the host's)",
+                    r->id, r->human);
+                Announce(*r, "during the host's month, once the host's own battle search is over");
+            } else {
+                SendBattle(*r, nullptr, slot);
+                if (r->state == 1) Announce(*r, "now, during the host's month");
+            }
+        }
+    }
+    for (auto& r : g_battles)  // (requests that went nowhere above: the computer's generator's, a dry run's)
+        Announce(r, "after the month");
+}
+
+// The host's battle search is over (CheckForBattles2 returned): the battles kept for a nation at war with the host's go
+// out now, unless the host's battle is a live one against it (they wait for the battle phase then, as before 0.8.0).
+static void HostSendKept() {
+    std::string why;
+    bool plain = false;
+    for (auto& r : g_battles) {
+        if (!r.kept || r.state != 0) continue;
+        r.kept = false;
+        if (g_lsHost.opp == r.human) {
+            SimulLate(r, CampaignNationName(r.human) + " fights the host's battle live first");
+            continue;
+        }
+        if (!SimulEligible(r, &why, &plain)) {
+            SimulLate(r, why, plain);
+            continue;
+        }
+        if (r.kind == 2) {
+            SendBattle(r, &r.pre);
+            r.prePacked = false;
+            r.pre.files.clear();
+        } else {
+            SendBattle(r, nullptr, SimulSlot());
+        }
+        if (r.state == 1)
+            AddChat("* " + r.player + " plays the battle of " + CampaignNationName(r.human) +
+                    " now, during the host's month.");
+    }
+}
+
+// Host, during the month: a battle sent during it whose player left (no result held) is no battle (kind 1 and 2: the
+// player's PC ends it as a single-player battle).
+static void SimulTick() {
+    for (auto& r : g_battles) {
+        if (!r.early || r.state != 1 || !r.held.empty()) continue;
+        Player* p = PlayerOfNation(r.human);
+        if (!p || p->peer != r.peer) BattleFallback(r, r.player + " disconnected");
+    }
+}
+
+// The battles fought during the host's month now (for the status line): "Captain: Germany vs Spain in ...; ...".
+static std::string SimulStatus() {
+    std::string s;
+    for (auto& r : g_battles)
+        if (r.early && r.state == 1 && r.held.empty())
+            s += (s.empty() ? "" : "; ") + r.player + ": " + CampaignNationName(r.human) + " vs " +
+                 CampaignNationName(r.opp) + InArea(r.area);
+    return s;
+}
+
+// The month did not run to its end (the Turn did not advance): the battles sent during it are called off (their held
+// results dropped); a surprise attack is queued again for the month's next Turn, a request of the player's generator
+// dropped (the generator runs again with the month).
+static void SimulCancel(const std::string& why) {
+    for (auto it = g_battles.begin(); it != g_battles.end();) {
+        BattleReq& r = *it;
+        if (!r.early && !r.kept) {
+            ++it;
+            continue;
+        }
+        Player* p = PlayerOfNation(r.human);
+        if (r.state == 1 && r.held.empty() && p && p->peer == r.peer) {
+            KV c;
+            c["id"] = std::to_string(r.id);
+            c["why"] = why;
+            net::Send(r.peer, net::MSG_BATTLE_CANCEL, KVEncode(c));
+        }
+        if (p && r.state == 1)
+            NoticeTo(*p, "Your battle of " + CampaignNationName(r.human) + " against " + CampaignNationName(r.opp) +
+                             " was called off: " + why + ".");
+        Log("battle %d (kind %d, during the host's month): called off (%s)%s", r.id, r.kind, why.c_str(),
+            r.held.empty() ? "" : "; its held result dropped");
+        if (r.kind == 2) {
+            r.state = 0;
+            r.early = r.kept = r.prePacked = false;
+            r.held.clear();
+            r.pre.files.clear();
+            ++it;
+        } else {
+            it = g_battles.erase(it);
+        }
+    }
+}
+
 static void HostRunBattleGenerators() {
     if (g_role != Role::Host || !g_turnRunning) return;
+    int firstId = g_battleNextId;
     for (int K = 1; K <= 8 && K < game::NationCount(); K++) {
         if (!B6On(K) || KWar(K) <= 0) continue;
         std::string out;
         HostRunGenerator(K, true, out);
     }
+    HostSendEarly(firstId);
 }
 
 // The game resolves a battle between two nations it runs. A battle of a joined player's nation against an AI nation is
@@ -3327,6 +3715,8 @@ static bool BattlesDone() {
     return true;
 }
 
+static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& body);  // (below)
+
 // Host, after the month and before the new month is sent: send each player its battles (one at a time) and wait. The
 // strategic screen is locked meanwhile: the save file is the campaign's state until the results are loaded.
 static void BattlePhaseTick() {
@@ -3346,6 +3736,22 @@ static void BattlePhaseTick() {
         g_battleMerged = false;
         game::SetStrategicEnabled(false);
         Log("battle phase: %d battle(s)", (int)g_battles.size());
+        SimulKeep("end_" + std::to_string(g_seq) + ".bcs", g_battlePhaseBytes);  // TEST
+        // 0.8.0: a battle still kept for the end of the host's battle search (the search ended without the mod
+        // hearing it) is sent now, as before 0.8.0; the results held during the month are merged first, by id, into
+        // the month-end save just saved
+        for (auto& r : g_battles)
+            if (r.kept) SimulLate(r, "the host's battle search did not end as expected");
+        for (auto& r : g_battles) {
+            if (r.held.empty() || r.state != 1) continue;
+            std::string d;
+            d.swap(r.held);
+            KV h;
+            std::string body;
+            UnpackHB(d, h, body);
+            Log("battle %d: its result held since the host's month merged now (%u bytes)", r.id, (unsigned)d.size());
+            HostApplyBattleResult(r, h, body);
+        }
     }
     for (auto& r : g_battles) {
         if (r.state == 1) {
@@ -3516,13 +3922,12 @@ static void CreditWarScore(int a, int b, int vpA, int vpB) {
         a < b ? vpA : vpB, a < b ? vpB : vpA, vp.first, vp.second);
 }
 
-static void HostOnBattleResult(Player& p, const std::string& data) {
-    KV h;
-    std::string body;
-    if (!UnpackHB(data, h, body)) return;
-    int id = KVInt(h, "id", -1);
-    for (auto& r : g_battles) {
-        if (r.id != id || r.state != 1 || r.peer != p.peer) continue;
+// A battle's result, applied: merged into the host's save (its outcome, decline counts, invasions, news, encounters,
+// war score), or the game's fallback. 0.8.0: a result held during the host's month is applied in the battle phase with
+// what the request kept at the send (its player's name and hello `gen`), also after its player left.
+static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& body) {
+    int id = r.id;
+    {
         std::string outcome = KVStr(h, "outcome");
         // "avoided" (0.4.1): the enemy declined battle on the player's PC (no battle, the player's VP gain is applied).
         bool avoided = outcome == "avoided";
@@ -3580,7 +3985,7 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
                 SaveReservations();
             }
         }
-        if (r.kind == 1 && p.genLevel >= 3) {  // 0.7.0: the raider checks' "thwarts" lines: the player's news
+        if (r.kind == 1 && r.gen >= 3) {  // 0.7.0: the raider checks' "thwarts" lines: the player's news
             for (auto& l : Split(KVStr(h, "news"), kSepRec)) {
                 if (l.empty()) continue;
                 g_playerNews[r.human].push_back(l.substr(0, 400));
@@ -3631,7 +4036,7 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         Bundle b;
         if ((outcome != "fought" && !avoided && !declined) || !b.Unpack(body)) {
             std::string why = KVStr(h, "why");
-            BattleFallback(r, outcome == "declined"                    ? p.name + " declined it"
+            BattleFallback(r, outcome == "declined"                    ? r.player + " declined it"
                               : outcome == "nobattle" && !why.empty()  ? why  // the surprise attack's; 0.7.1: no force
                               : outcome == "nobattle"                  ? "no battle came about"
                                                                        : "it was not fought (" + KVStr(h, "why", outcome) + ")");
@@ -3671,11 +4076,21 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         }
         std::string bytes, summary, err;
         IniDoc host;
+        saveio::MergeNotes notes;
         bool ok = ReadFileBytes(HostBcsPath(), bytes);
         if (ok) {
             host = ParseIni(bytes);
-            ok = saveio::ApplyBattleResult(host, r.sentBcs, r.human, r.opp, b, allowed, summary, err, r.raider != 0,
-                                           otherVP.empty() ? nullptr : &otherVP) &&
+            if (g_simulKeep) {  // TEST: the merge's inputs (the result's sections as one INI document)
+                std::string res;
+                for (auto& f : b.files)
+                    if (f.first.compare(0, 4, "sec:") == 0) res += "[" + f.first.substr(4) + "]\r\n" + f.second;
+                SimulKeep(std::to_string(id) + "_sent.bcs", r.sentBcs);
+                SimulKeep(std::to_string(id) + "_host.bcs", bytes);
+                SimulKeep(std::to_string(id) + "_result.ini", res);
+            }
+            // 0.8.0: a battle fought during the host's month keeps the month's Used marks (as a raider battle's)
+            ok = saveio::ApplyBattleResult(host, r.sentBcs, r.human, r.opp, b, allowed, summary, err,
+                                           r.raider != 0 || r.early, otherVP.empty() ? nullptr : &otherVP, &notes) &&
                  WriteFileBytes(HostBcsPath(), WriteIni(host));
         }
         if (!ok) {
@@ -3683,11 +4098,36 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
             BattleFallback(r, "its result could not be applied");
             return;
         }
+        if (notes.Any())  // 0.8.0: what the host's save changed since the send met the battle's changes
+            Log("battle %d: the host's save changed since the send (%s): %s", id,
+                r.early ? "a battle fought during the host's month" : "another battle's result", notes.Text().c_str());
+        if (g_simulKeep) SimulKeep(std::to_string(id) + "_merged.bcs", WriteIni(host));  // TEST
         r.state = 2;
         r.avoided = avoided;
         r.declined = declined;
         r.encs = encs;
         g_battleMerged = true;
+        // 0.8.0: the nation's officers after the battle (stars, the fates of sunk ships' commanders): the phase's reload
+        // puts them into its list. Its ships whose commander the battle killed or captured lose him, as the battle
+        // slot's save has it (ApplyBattleResult takes no CommanderId: other nations' ships come back without theirs).
+        // With simultaneous battles, merged per officer id against what its package carried: a battle fought during
+        // the host's month keeps what the month did to the corps since (a commander killed in it stays dead).
+        std::vector<std::string> offWas = g_simulKeep ? nplay::HostRecordOfficers(r.human) : std::vector<std::string>();
+        if (nplay::HostTakeBattleOfficers(b, r.human, r.sentOff.empty() ? nullptr : &r.sentOff)) {
+            nplay::HostFixShipCommanders(HostBcsPath(), r.human, nullptr);
+            if (g_simulKeep) {  // TEST: the officers' merge, its inputs and output
+                auto lines = [](const std::vector<std::string>& v) {
+                    std::string s = "[Officers]\r\n";
+                    for (auto& l : v) s += l + "\r\n";
+                    return s;
+                };
+                const std::string* res = b.Get("officers.ini");
+                SimulKeep(std::to_string(id) + "_offsent.ini", lines(r.sentOff));
+                SimulKeep(std::to_string(id) + "_offhost.ini", lines(offWas));
+                SimulKeep(std::to_string(id) + "_offresult.ini", res ? *res : std::string());
+                SimulKeep(std::to_string(id) + "_offmerged.ini", lines(nplay::HostRecordOfficers(r.human)));
+            }
+        }
         if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
         const std::string* deltas = b.Get("deltas");
         KV dk = deltas ? KVDecode(*deltas) : KV();
@@ -3718,6 +4158,33 @@ static void HostOnBattleResult(Player& p, const std::string& data) {
         else  // 0.7.2: each opponent's war score with its own encounters' points
             for (auto& x : byOpp)
                 CreditWarScore(r.human, x.first, std::max(0, x.second.first), std::max(0, x.second.second));
+        return;
+    }
+}
+
+static void HostOnBattleResult(Player& p, const std::string& data) {
+    KV h;
+    std::string body;
+    if (!UnpackHB(data, h, body)) return;
+    int id = KVInt(h, "id", -1);
+    for (auto& r : g_battles) {
+        if (r.id != id || r.state != 1 || r.peer != p.peer) continue;
+        if (!r.held.empty()) {
+            Log("battle %d: a second result from %s ignored (one is held)", id, p.name.c_str());
+            return;
+        }
+        if (r.early && !g_battlePhase) {  // 0.8.0: the host's month goes on; merged first in the battle phase
+            r.held = data;
+            Log("battle %d: the result (%s) held until the host's month is over (%u bytes)", id,
+                KVStr(h, "outcome").c_str(), (unsigned)data.size());
+            KV c;
+            c["from"] = "*";
+            c["text"] = "Your battle's result is with the host; the new month follows when the host's month is over.";
+            net::Send(p.peer, net::MSG_CHAT, KVEncode(c));
+            AddLocalChat("* " + p.name + "'s battle result is in; it is merged when the month is over.");
+            return;
+        }
+        HostApplyBattleResult(r, h, body);
         return;
     }
     Log("battle result %d from %s ignored", id, p.name.c_str());
@@ -3766,12 +4233,25 @@ static void RunHostTurn() {
         if (it == g_players.end()) continue;
         std::string err;
         ResetWriteFailed();
+        int K = it->second.nation;
+        // 0.8.0: the ships' commanders the host keeps for the nation (put back after the merge when the turn's officers
+        // are not taken: an older mod's turn names none)
+        std::map<std::string, int> keepCmd;
+        if (K >= 1 && K <= 8 && nplay::HostHasOfficers(K)) {
+            std::string hb;
+            if (ReadFileBytes(HostBcsPath(), hb)) keepCmd = saveio::ShipCommanderIds(ParseIni(hb), K);
+        }
         if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err)) {
             merged++;
             nplay::HostTakeSubmission(s.second, it->second.nation);  // its own intelligence spending and reports
             bool legacy = saveio::IsLegacySubmission(s.second) && it->second.nation >= 1 && it->second.nation <= 8;
             // 0.6.1: its own campaign divisions; 0.7.0: after a legacy turn only those of the new fleet (or none)
             nplay::HostTakeDivisions(s.second, it->second.nation, legacy);
+            if (K >= 1 && K <= 8) {  // 0.8.0: its own officers and area commands
+                std::string why;
+                bool took = nplay::HostTakeOfficers(s.second, K, why);
+                nplay::HostFixShipCommanders(HostBcsPath(), K, took ? nullptr : &keepCmd);
+            }
             if (legacy) {
                 g_legacyDone.insert(it->second.nation);  // (a resent first month offers no second build)
                 SaveReservations();
@@ -3808,8 +4288,15 @@ static void RunHostTurn() {
     if (!marks.empty())  // 0.7.0: InvadedThisTurn is not saved: the invasions begun last month keep their month
         Log("host turn: invaded this month kept across the reload: %d of %d", inv::RestoreMarked(marks), (int)marks.size());
     HostCheckInvasionPlans();  // 0.7.2: the joined nations' targets with the month's relations, before the month uses them
+    if (g_ofKillArm.nation >= 0 && !g_ofKillArm.month) {  // TEST ONLY (`ofkill ... arm`): a commander's fate in the
+        // month, as a sinking's
+        Log("TEST: officers: the armed KillCommander in the month: %s",
+            ofc::TestKill(g_ofKillArm.nation, g_ofKillArm.ship, g_ofKillArm.pow).c_str());
+        g_ofKillArm = {};
+    }
     Log("host turn: %d submissions merged, running turn", merged);
     if (g_enemyVPSeen < 0) g_enemyVPSeen = game::EnemyVP();  // the points before this month (see ShareEnemyVP)
+    HostPackSurprises();  // 0.8.0: the month's start, for the surprise attacks fought during the month
     game::RunOriginalTurn();
     g_idleSinceTick = 0;
     Log("host turn: click handler returned (endOfTurn=%d battle=%d)", g_afterTurnPending, game::BattleActive());
@@ -4183,9 +4670,12 @@ static void HostOnMessage(net::Msg& m) {
             p->relLevel = std::max(0, KVInt(kv, "rel"));  // relations v2 (older clients: none)
             p->genLevel = std::max(0, KVInt(kv, "gen"));  // 0.6.0: the player's battle generator (older clients: none)
             p->divLevel = std::max(0, KVInt(kv, "div"));  // 0.6.1: the nation's own divisions (older clients: none)
+            p->simb = KVInt(kv, "simb") != 0;              // 0.8.0: battles during the host's month (older clients: no)
+            p->offLevel = std::max(0, KVInt(kv, "off"));  // 0.8.0: the nation's own officers (older clients: none)
             Log("%s: mod %s, live-battle engine %d (this host: %d), player's relation rules %d, battle generator %d, "
-                "campaign divisions %d",
-                name.c_str(), p->mod.c_str(), p->lsLevel, MP_LS_LEVEL, p->relLevel, p->genLevel, p->divLevel);
+                "campaign divisions %d, battles during the host's month %d (this host: %d), officers %d",
+                name.c_str(), p->mod.c_str(), p->lsLevel, MP_LS_LEVEL, p->relLevel, p->genLevel, p->divLevel,
+                p->simb ? 1 : 0, g_simulOn ? 1 : 0, p->offLevel);
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -4216,8 +4706,18 @@ static void HostOnMessage(net::Msg& m) {
             // 5 (0.7.2, fix-battlesearch): the player's PC goes on after an encounter without a battle (the enemy's
             // or the player's decline, the no-force rule) as single player does; its result names each one (`enc`)
             w["gen"] = inv::Available() ? "5" : "3";
+            // 0.8.0: this host sends a player's battles during its month (to a player announcing hello `simb`)
+            w["simb"] = g_simulOn ? "1" : "0";
             net::Send(m.peer, net::MSG_WELCOME, KVEncode(w));
             AddChat("* " + name + " joined" + (p->nation > 0 ? " as " + CampaignNationName(p->nation) : ""));
+            {  // 0.8.0: a battle of this player fought during a month that a restart of the host's game lost
+                auto lost = g_simulLost.find(name);
+                if (lost != g_simulLost.end()) {
+                    NoticeTo(*p, "The host's game was restarted during the month: your battle (" + lost->second +
+                                     ") fought during the host's month is lost.");
+                    g_simulLost.erase(lost);
+                }
+            }
             BroadcastLobby();
             if (g_phase == Phase::Planning && p->nation > 0) {
                 int y = 0, mo = 0;
@@ -4538,6 +5038,10 @@ static void ClientApplyPendingState() {
         g_relSetup.peace.revolution = h.find("krevo") != h.end();  // B5: a 0.6.0 host
         g_relSetup.peace.revoPending = KVInt(h, "krevo", 0);
     }
+    // 0.8.0: a host that keeps the nation's own officers sends them in the month's .off (`offs`): the load trades the
+    // officer lists of nation 0 and this nation (officers.cpp); an older host's month keeps the game's own load.
+    bool hostOffs = KVInt(h, "offs", 0) == 1 && nation >= 1 && nation <= 8;
+    ofc::ClientSetMonth(nation, hostOffs);
     if (!game::LoadCampaign(g_clientSlot, nation)) {
         Notice("Loading the received game failed.");
         return;
@@ -4545,6 +5049,14 @@ static void ClientApplyPendingState() {
     if (g_saveStop == SaveStep::Submit || g_saveStop == SaveStep::Plans) {  // 0.7.1: that month is over
         Log("disk: %s no longer waits (a new month is loaded)", SaveStepName(g_saveStop));
         g_saveStop = SaveStep::None;
+    }
+    if (hostOffs) {  // 0.8.0: the month's free promotion; a nation the host keeps no officers for yet forms its corps
+        int ym = KVInt(h, "year") * 12 + KVInt(h, "month");
+        if (ym != g_offMonth) {
+            ofc::ClearFreePromotion();
+            g_offMonth = ym;
+        }
+        if (KVInt(h, "offgen", 0) == 1) ClientFormCorps(nation, ym);
     }
     if (legacyNow) {
         std::string info;
@@ -4657,6 +5169,19 @@ static std::vector<int> EncOthers(int opp) {
 
 static void SendBattleResult(int id, const std::string& outcome, const std::string& why, const Bundle* b,
                              const std::string& summary, const KV* extra = nullptr) {
+    Bundle withOff;  // 0.8.0: the nation's officers as the battle slot's game saved them after the battle
+    if (b && id == g_cb.id && g_cb.offs) {
+        std::string off, oerr;
+        int no = 0, na = 0;
+        withOff = *b;
+        if (saveio::BuildOfficersFile(game::SaveDir(g_battleSlot), g_battleSlot, off, no, na, oerr)) {
+            withOff.Add("officers.ini", off);
+            Log("battle %d: the result carries the nation's %d officers", id, no);
+        } else {
+            Log("battle %d: the nation's officers NOT in the result: %s", id, oerr.c_str());
+        }
+        b = &withOff;
+    }
     KV h;
     h["id"] = std::to_string(id);
     h["outcome"] = outcome;
@@ -4782,6 +5307,7 @@ static void ClientStartBattle() {
     g_cb.opp = opp;
     g_cb.area = area;
     g_cb.cancelled = false;
+    g_cb.offs = KVInt(h, "offs", 0) == 1;
     g_cb.starting = true;
     if (!game::LoadCampaign(g_battleSlot, 0)) {
         SendBattleResult(id, "failed", "cannot load the battle slot", nullptr, "");
@@ -4791,6 +5317,12 @@ static void ClientStartBattle() {
     game::SetBattleSlotMode(true);
     // 0.6.0 (B6 round 3): the month's state the slot lacks (ship-type flags, the month's resets; game.cpp)
     Log("battle %d: the month's state in the battle slot: %s", id, game::PrepareBattleSlotMonth().c_str());
+    if (g_cb.offs) {  // 0.8.0: the game's own load put the package's officers (the nation's record) in its list
+        int no = 0, na = 0, ns = 0, nr = 0;
+        ofc::Counts(no, na, ns, nr);
+        Log("battle %d: the battle slot holds the nation's %d officers (%d active), commanding %d of its ships%s", id, no,
+            na, ns, KVInt(h, "early", 0) == 1 ? " (a battle during the host's month)" : "");
+    }
     auto sw = [K](int v) { return v == 0 ? K : v == K ? 0 : v; };
     // The attempts: the game's call for a battle the computer's generator found (kind 0), or the player's generator's
     // attempts for this nation (kind 1, B6), replayed in order until one gives a battle, as the game's generator goes on
@@ -5240,6 +5772,12 @@ static void ClientStartBattle() {
     }
     g_cb.fighting = true;
     Log("battle %d: fighting nation %d vs %d in %s (slot %d)", id, K, opp, W2U(area).c_str(), g_battleSlot);
+    if (g_cb.offs) {  // 0.8.0: the nation's own officers command its ships in the battle (their battle stars come back)
+        int no = 0, na = 0, ns = 0, nr = 0;
+        ofc::Counts(no, na, ns, nr);
+        Log("battle %d: the nation's %d officers (%d active) command %d of its ships; in the battle: %s", id, no, na, ns,
+            lockstep::Debug({"ls", "commanders"}).c_str());
+    }
     if (KVInt(h, "pvp") && g_lsEnabled && lockstep::Available()) {  // the other side is a player: a live battle
         g_lsClientA = {};
         g_lsClientA.pending = true;
@@ -5395,6 +5933,69 @@ static void ClientIntelCheck() {
     game::RefreshUI();
 }
 
+// 0.8.0: the game's monthly officer routine for this nation (PlayerNation.HandleOfficerStuff in the events' view),
+// before the month's event roll as the game runs it in its one event slot: an officer event uses the slot (no random
+// event or intelligence check this month; the host counts it as the month's event). Its turn messages go to the chat.
+// Not in the month the corps was formed (a new campaign's first month has none).
+static bool ClientOfficerMonth(int month, int forcedEvent = -1) {
+    if (!ofc::ClientActive() || !ofc::MonthAvailable() || (g_testOfficersQuiet && forcedEvent < 0)) return false;
+    if (month == g_offGenMonth && forcedEvent < 0) {
+        Log("officers: no officer routine in the month the nation's corps was formed");
+        return false;
+    }
+    int seq = g_clientSeq;
+    std::vector<std::wstring> msgs;
+    game::ClientEventResult r = game::RunClientOfficers(g_myNation, msgs, forcedEvent);
+    if (!r.error.empty()) {
+        Log("officers: the month's officer routine: %s", r.error.c_str());
+        return false;
+    }
+    for (auto& m : msgs) AddLocalChat("* Officers: " + SafeText(W2U(m)).substr(0, 300));
+    std::string ten, ally, delta, set;
+    for (int i = 0; i < 9; i++) {
+        if (r.tension[i]) ten += std::to_string(i) + ":" + std::to_string(r.tension[i]) + ";";
+        if (r.alliance[i] >= 0) ally += std::to_string(i) + ":" + std::to_string(r.alliance[i]) + ";";
+    }
+    for (auto& d : r.fieldDelta) delta += d.first + ":" + std::to_string(d.second) + ";";
+    for (auto& s : r.fieldSet) set += s.first + ":" + std::to_string(s.second) + ";";
+    Log("officers: the month's officer routine for nation %d: %s, %d turn message(s); tension %s delta %s", g_myNation,
+        r.shown ? "an officer event (the month's event slot)" : "no officer event", (int)msgs.size(),
+        ten.empty() ? "-" : ten.c_str(), delta.empty() ? "-" : delta.c_str());
+    if (r.shown) {
+        g_evShownSeq = seq;  // relations v2: as after an event (one event a month)
+        KV kv;
+        kv["seq"] = std::to_string(seq);
+        kv["nation"] = std::to_string(g_myNation);
+        kv["event"] = "-2";
+        kv["caption"] = "Officers";
+        kv["tension"] = ten;
+        kv["alliance"] = ally;
+        kv["delta"] = delta;
+        kv["set"] = set;
+        net::Send(0, net::MSG_EVENT, KVEncode(kv));
+        g_lastEvent = "officers tension=" + ten + " delta=" + delta;
+    }
+    game::RefreshUI();
+    return r.shown;
+}
+
+// 0.8.0: a month whose host keeps no officers for this nation yet (`offgen`: a new campaign, or the first month after
+// both sides updated) forms the nation's corps as the game forms its player's in a new campaign (the turn's save takes
+// it to the host).
+static void ClientFormCorps(int K, int month) {
+    std::string sum;
+    bool ok = ofc::GenerateCorps(K, sum);
+    Log("officers: nation %d's corps %s: %s", K, ok ? "formed" : "NOT formed", sum.c_str());
+    if (!ok) return;
+    g_offGenMonth = month;
+    int officers = 0, active = 0, ships = 0, areas = 0;
+    ofc::Counts(officers, active, ships, areas);
+    AddLocalChat("* Officers: your nation has its own officer corps now: " + std::to_string(officers) +
+                 " officers, commanding " + std::to_string(ships) + " ships and " + std::to_string(areas) +
+                 " areas (the Officers tab). They go with your turns; the host keeps them for your nation.");
+    game::RefreshUI();
+}
+
 // forcedIdx >= 0: that event now (tests). Otherwise this month's roll: once per calendar month, even if the month
 // is sent again (rejoin, nation pick, a turn that didn't advance).
 static void ClientRunEvent(int forcedIdx) {
@@ -5412,6 +6013,10 @@ static void ClientRunEvent(int forcedIdx) {
         }
         g_evRolledMonth = month;
         SaveEventCooldowns();
+        if (ClientOfficerMonth(month)) {  // 0.8.0: an officer event used the month's event slot
+            Log("event: no event this month (an officer event used the month's event slot)");
+            return;
+        }
         if (std::uniform_int_distribution<int>(0, 99)(g_rng) >= g_eventChancePct) {
             ClientIntelCheck();
             g_lastEvent = "none";
@@ -5823,6 +6428,10 @@ static void ClientOnMessage(net::Msg& m) {
             // 0.6.1: this PC loads its nation's own campaign divisions (game.cpp d_LoadDivisions) and sends them with
             // its turn; the host then sends them back with the month instead of the host's own (else: an empty list)
             kv["div"] = game::DivisionsAvailable() ? "1" : "0";
+            kv["simb"] = g_simulOn ? "1" : "0";  // 0.8.0: this PC takes its battles during the host's month too
+            // 0.8.0: this PC plays its nation's own officers (officers.cpp: the month's officer lists traded) and sends
+            // them with its turns and battles; the host then keeps them and sends them back with the month
+            kv["off"] = ofc::Available() && ofc::MonthAvailable() ? "1" : "0";
             kv["cpu"] = x87::CpuVendor();  // (logged by both sides: a live battle's diagnostics name differing vendors)
             if (datafiles::Ready()) kv["dh"] = datafiles::Combined();  // the game data files (logged; checked at a start)
             net::Send(0, net::MSG_HELLO, KVEncode(kv));
@@ -5836,6 +6445,7 @@ static void ClientOnMessage(net::Msg& m) {
             g_phase = Phase::Lobby;
             g_haveState = false;
             nplay::ClientReset();
+            ofc::ClientReset();
             game::SetTurnButtonCaption(L"Turn");
             net::Shutdown();
             lockstep::OnPeerLost("the connection to the host was lost");
@@ -5854,6 +6464,7 @@ static void ClientOnMessage(net::Msg& m) {
             if (assigned != g_myName) AddChat("* That name was taken; you joined as " + assigned);
             g_myName = assigned;
             g_hostGen = std::max(0, KVInt(kv, "gen"));  // 0.6.0 (older hosts: none)
+            g_hostSimb = KVInt(kv, "simb");              // 0.8.0 (older hosts: none)
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -5909,7 +6520,9 @@ static void ClientOnMessage(net::Msg& m) {
             g_battleIn = m.data;
             g_battleInId = KVInt(h, "id", -1);
             Notice("Battle! " + W2U(game::NationName(g_myNation)) + " meets " + KVStr(h, "oppName") + " in " +
-                   KVStr(h, "area") + ". The battle starts as soon as your game is free.");
+                   KVStr(h, "area") + ". The battle starts as soon as your game is free." +
+                   (KVInt(h, "early") ? " The host's month goes on meanwhile; your result is merged when it is over."
+                                      : ""));  // 0.8.0
             break;
         }
         case net::MSG_BATTLE_CANCEL: {
@@ -5953,6 +6566,12 @@ void Init() {
     }
     if (GetEnvironmentVariableA("RTW3MP_EVENT_CHANCE", buf, sizeof(buf)) > 0)
         g_eventChancePct = std::max(0, std::min(100, atoi(buf)));
+    // TEST ONLY (0.8.0): RTW3MP_TEST_OFFICERS=quiet: no monthly officer routine and no commander question at Submit on
+    // this PC (the nation's corps, its trade, upload and auto-assignment stay): the scenarios of other features
+    if (GetEnvironmentVariableA("RTW3MP_TEST_OFFICERS", buf, sizeof(buf)) > 0 && std::string(buf) == "quiet") {
+        g_testOfficersQuiet = true;
+        Log("TEST: RTW3MP_TEST_OFFICERS=quiet: no monthly officer routine and no commander question on this PC");
+    }
     g_battleSlot = g_clientSlot + 10;
     if (GetEnvironmentVariableA("RTW3MP_BATTLE_SLOT", buf, sizeof(buf)) > 0) {
         int s = atoi(buf);
@@ -5960,11 +6579,18 @@ void Init() {
     }
     if (GetEnvironmentVariableA("RTW3MP_BATTLE_TIMEOUT", buf, sizeof(buf)) > 0) g_battleTimeoutSec = std::max(0, atoi(buf));
     if (GetEnvironmentVariableA("RTW3MP_LIVE_BATTLES", buf, sizeof(buf)) > 0) g_lsEnabled = atoi(buf) != 0;
+    // 0.8.0: RTW3MP_SIMUL=0 plays the battles as 0.7.2 did (after the host's month; tests: an older host or player)
+    if (GetEnvironmentVariableA("RTW3MP_SIMUL", buf, sizeof(buf)) > 0) g_simulOn = atoi(buf) != 0;
+    if (!g_simulOn) Log("simultaneous battles: off on this PC (RTW3MP_SIMUL=0)");
     if (AnnouncedLsLevel() != MP_LS_LEVEL)
         Log("TEST: RTW3MP_TEST_LS_LEVEL: this copy announces live-battle engine %d (its own is %d)", AnnouncedLsLevel(),
             MP_LS_LEVEL);
     // The month's news about a joined nation's foreign stations and trade protection goes to its player.
     nplay::SetNewsSink([](int nation, const std::string& line) { g_playerNews[nation].push_back(line); });
+    // 0.8.0: the month's crew training messages about a joined nation's commanded ships go to its player, not the host's
+    // screen (officers.cpp; any nation but the host's: one given to the computer may keep its officers' record)
+    ofc::SetHostGuards([](int nation) { return g_role == Role::Host && nation >= 1 && nation <= 8; },
+                       [](int nation, const std::string& line) { g_playerNews[nation].push_back(line); });
     lockstep::Hooks lh;
     // A live battle's lines are this PC's own: the host's AddChat would send every "* " line to all players (the other
     // player then read the host's side's game texts and pause reasons, and its own lines twice); the other player gets
@@ -6274,7 +6900,37 @@ std::string DebugBattles(const std::vector<std::string>& a) {
         }
         return "ok testdecline " + game::TestDeclineState();
     }
+    if (cmd == "simul") {  // 0.8.0, tests (any PC): simul [0|1]: simultaneous battles on this PC (a player's PC: its
+                           // next hello; the host: its next sends and welcomes)
+        if (a.size() > 2) {
+            g_simulOn = a[2] == "1";
+            Log("tests: simultaneous battles %s on this PC", g_simulOn ? "on" : "off");
+        }
+        std::string s = "ok simul=" + std::string(g_simulOn ? "1" : "0") + " hostsimb=" + std::to_string(g_hostSimb);
+        if (g_role == Role::Host) {
+            s += " slot=" + std::to_string(SimulSlot()) + " snapseq=" + std::to_string(g_simulSeq) + " players=";
+            for (auto& kv : g_players)
+                if (kv.second.welcomed) s += kv.second.name + ":" + (kv.second.simb ? "1" : "0") + ",";
+        }
+        return s;
+    }
     if (g_role != Role::Host) return "error host only";
+    if (cmd == "snapfail" && a.size() > 2) {  // 0.8.0, TEST: the next snapshot of the month fails / finds a file in use
+        return game::SetTestSnapshot(a[2], a.size() > 3 ? atoi(a[3].c_str()) : 1);
+    }
+    if (cmd == "simulkeep" && a.size() > 2) {  // 0.8.0, TEST: the merges' inputs and outputs kept (RTW3MP\simul_test)
+        g_simulKeep = a[2] == "1";
+        Log("TEST: simulkeep %s: every merge's inputs and output %s RTW3MP\\simul_test", g_simulKeep ? "on" : "off",
+            g_simulKeep ? "kept in" : "no longer kept in");
+        return std::string("ok simulkeep=") + (g_simulKeep ? "1" : "0");
+    }
+    if (cmd == "simulhold" && a.size() > 2) {  // 0.8.0, TEST: the battle phase waits for the battles of the month
+        g_testSimulHoldSec = std::max(0, std::min(1800, atoi(a[2].c_str())));
+        g_simulHoldSince = 0;
+        Log("TEST: simulhold: the battle phase waits up to %d s for the battles fought during the month",
+            g_testSimulHoldSec);
+        return "ok simulhold=" + std::to_string(g_testSimulHoldSec);
+    }
     if (cmd == "list") {
         std::string s = "ok phase=" + std::string(g_battlePhase ? "1" : "0") + " timeout=" +
                         std::to_string(g_battleTimeoutSec) + " battles=";
@@ -6283,7 +6939,9 @@ std::string DebugBattles(const std::vector<std::string>& a) {
                  ":" + BattleStateName(r.state) + (r.why.empty() ? "" : ":" + r.why) +
                  (r.kind ? ":kind=" + std::to_string(r.kind) + ":att=" + std::to_string(r.attempts.size()) : "") +
                  (r.declined ? ":declined" : r.avoided ? ":avoided" : "") +
-                 (r.raider ? ":raider=" + std::to_string(r.raider) : "") + "; ";
+                 (r.raider ? ":raider=" + std::to_string(r.raider) : "") +
+                 (r.early ? std::string(":early") : "") + (!r.held.empty() ? ":held" : "") +  // 0.8.0
+                 (r.kept ? ":kept" : "") + "; ";
         return s;
     }
     if (cmd == "gen" && a.size() > 2) {  // B6, tests: nation K's generator now; "queue" adds its request (month end)
@@ -6551,6 +7209,8 @@ void Leave() {
     net::SendAll(net::MSG_BYE, "");
     Sleep(50);
     net::Shutdown();
+    if (g_role == Role::Host) SimulDeleteSlot("the session ended");  // 0.8.0
+    g_simulLost.clear();
     if (g_role == Role::Client) game::SetTurnButtonCaption(L"Turn");
     g_role = Role::None;
     g_phase = Phase::Lobby;
@@ -6604,6 +7264,7 @@ void Leave() {
     g_submitForcedByHost = false;
     nplay::HostDetach();
     nplay::ClientReset();
+    ofc::ClientReset();
     g_pendingState.clear();
     g_saveStop = SaveStep::None;  // 0.7.1
     g_saveRetryAt = 0;
@@ -6732,6 +7393,7 @@ static void SyncHostCampaign() {
         }
         g_hostSlot = game::CurrentSlot();
         LoadReservations();
+        SimulRestartCheck();  // 0.8.0: battles of a month a restart of the host's game lost; the scratch slot deleted
         for (auto& kv : g_players) {
             Player& p = kv.second;
             if (!p.welcomed) continue;
@@ -6880,6 +7542,22 @@ void SubmitTurn() {
         Log("submit: cancelled at a Turn warning");
         return;
     }
+    // 0.8.0: the nation's own officers (a host that keeps them): the Turn's question about ships and divisions without a
+    // commander (No goes back, as in the game; not when the host's time limit submits), then the game's assignments of
+    // the Turn (DoTurn2: areas, divisions, ships).
+    bool ownOfficers = ofc::ClientActive();
+    if (ownOfficers && !g_submitForcedByHost && !g_testOfficersQuiet && !ofc::AskCommanders()) {
+        g_forceSubmitPending = false;
+        Notice("Not submitted: assign the commanders you want first (or answer Yes to have them assigned). Press Submit "
+               "when your orders are ready.");
+        Log("submit: cancelled at the commander question");
+        return;
+    }
+    if (ownOfficers) {
+        std::string sum;
+        ofc::AutoAssign(sum);
+        Log("officers: the Turn's assignments: %s", sum.c_str());
+    }
     LowDiskCheck("your turn");
     if (!StepSave()) {  // 0.7.1: no turn from broken files; it is submitted once a save works
         SaveStopped(SaveStep::Submit);
@@ -6894,6 +7572,16 @@ void SubmitTurn() {
         return;
     }
     nplay::ClientAddSubmission(b, game::SaveDir(g_clientSlot), g_clientSlot, g_myNation);  // own intelligence
+    if (ownOfficers) {  // 0.8.0: the nation's officers and area commands as its game saved them right before
+        std::string off, oerr;
+        int no = 0, na = 0;
+        if (saveio::BuildOfficersFile(game::SaveDir(g_clientSlot), g_clientSlot, off, no, na, oerr)) {
+            b.Add("officers.ini", off);
+            Log("officers: the turn carries %d officers and %d area commands", no, na);
+        } else {
+            Log("officers: NOT in the turn: %s", oerr.c_str());
+        }
+    }
     KV h;
     h["seq"] = std::to_string(g_clientSeq);
     if (g_hostGen >= 4) {  // 0.7.0: the nation's invasion target ("" none)
@@ -7223,6 +7911,37 @@ void DebugIntelCheck() {
     if (g_role == Role::Client && g_haveState && !game::EventActive()) ClientIntelCheck();
 }
 
+void DebugOfficerMonth(int forced) {
+    if (g_role != Role::Client || !g_haveState || game::EventActive()) {
+        Log("TEST: officers: the month's officer routine not run (not a joined player's month)");
+        return;
+    }
+    bool shown = ClientOfficerMonth(ClientMonth(), forced);
+    Log("TEST: officers: the month's officer routine (forced %d) -> %s", forced, shown ? "an officer event" : "no event");
+}
+
+void DebugOfficersQuiet(int on) {
+    if (on >= 0) g_testOfficersQuiet = on != 0;
+    Log("TEST: officers: quiet %d (no monthly officer routine, no commander question)", g_testOfficersQuiet ? 1 : 0);
+}
+
+void DebugArmOfficerKill(int nation, int ship, bool pow, bool month) {
+    g_ofKillArm.nation = nation;
+    g_ofKillArm.ship = ship;
+    g_ofKillArm.pow = pow;
+    g_ofKillArm.month = month;
+    Log("TEST: officers: KillCommander armed for nation %d's ship %d (pow %d): runs %s", nation, ship, pow ? 1 : 0,
+        month ? "when the month's DoStrategicTurn starts" : "once the month's turns are merged");
+}
+
+// "ok active=<0|1> month=<0|1> quiet=<0|1> gen=<Year*12+Month that formed the corps> promo=<Year*12+Month reset>
+// last=<last event>"
+std::string DebugOfficerState() {
+    return std::string("ok active=") + (ofc::ClientActive() ? "1" : "0") + " month=" +
+           (ofc::MonthAvailable() ? "1" : "0") + " quiet=" + (g_testOfficersQuiet ? "1" : "0") + " gen=" +
+           std::to_string(g_offGenMonth) + " promo=" + std::to_string(g_offMonth) + " last=" + g_lastEvent;
+}
+
 std::string DebugLastEvent() { return g_role == Role::Host ? g_lastHostEvent : g_lastEvent; }
 
 // Tests and diagnostics: live battles (`ls ...`, see lockstep::Debug). Session-level: `ls enable 0|1`, `ls session`,
@@ -7357,11 +8076,28 @@ void Tick() {
                 bool idle = g_battlePhase ? !game::ModalOpen() && !game::BattleActive()
                                           : !game::IsBusy() && !game::BattleActive();
                 if (idle && !lockstep::Busy()) {
-                    if (!g_battles.empty() && !BattlesDone()) {
+                    bool hold = false;  // TEST (`battles simulhold`): the phase waits for the battles of the month
+                    if (!g_battlePhase && g_testSimulHoldSec > 0 && !g_battles.empty() && !BattlesDone()) {
+                        std::string s = SimulStatus();
+                        if (!s.empty() && !g_simulHoldSince) {
+                            g_simulHoldSince = now;
+                            Log("TEST: simulhold: the battle phase waits up to %d s for the battles fought during the "
+                                "month (%s)", g_testSimulHoldSec, s.c_str());
+                        }
+                        hold = !s.empty() && now - g_simulHoldSince < (DWORD)g_testSimulHoldSec * 1000;
+                        if (!hold && g_simulHoldSince) {
+                            Log("TEST: simulhold: the battle phase starts after %lu s (%s)",
+                                (now - g_simulHoldSince) / 1000, s.empty() ? "their results are in" : "the time is up");
+                            g_simulHoldSince = 0;
+                        }
+                    }
+                    if (hold) {
+                    } else if (!g_battles.empty() && !BattlesDone()) {
                         BattlePhaseTick();  // the players fight their battles; the new month waits for them
                     } else if (g_battles.empty() || FinishBattlePhase()) {
                         g_afterTurnPending = false;
                         g_turnRunning = false;
+                        if (g_simulSeq >= 0) SimulDeleteSlot("the month is over");  // 0.8.0
                         ApplyDiplomacy();
                         HostRunInvasions();  // 0.7.0: after the battles, before the war counters' step
                         KWarMonthStep();
@@ -7385,6 +8121,8 @@ void Tick() {
                 if (now - g_idleSinceTick > 4000 && now - g_turnStartTick > 4000) {
                     g_turnRunning = false;
                     g_idleSinceTick = 0;
+                    SimulCancel("the host's turn did not advance");  // 0.8.0
+                    if (g_simulSeq >= 0) SimulDeleteSlot("the turn did not advance");
                     AddChat("* The turn did not advance; resending the current month");
                     BroadcastState();
                 }
@@ -7392,9 +8130,11 @@ void Tick() {
                 g_idleSinceTick = 0;
                 if (game::BattleActive() && now - g_lastStatusTick > 5000) {
                     g_lastStatusTick = now;
-                    BroadcastStatus("The host is fighting a battle...");
+                    std::string sb = SimulStatus();  // 0.8.0: the players' battles fought now too
+                    BroadcastStatus("The host is fighting a battle..." + (sb.empty() ? "" : " (" + sb + ")"));
                 }
             }
+            if (g_turnRunning && !g_battlePhase) SimulTick();  // 0.8.0: a battle of the month whose player left
         }
         if (g_phase == Phase::Planning && now - g_lastStatusTick > 3000) {
             g_lastStatusTick = now;
@@ -7634,6 +8374,7 @@ void OnAfterEndOfTurn(void* self) {
     if (mp::g_role == mp::Role::Host && mp::g_turnRunning) {
         mp::g_afterTurnPending = true;
         Log("DoEndOfTurn finished");
+        nplay::HostOfficersFromMemory("the month");  // 0.8.0: what the month did to the joined nations' officers
     }
 }
 
@@ -7909,6 +8650,16 @@ bool OnAIBattle(int a, int b, int countA, int countB, const std::wstring& area) 
 
 void OnBattleGenerator() { mp::HostRunBattleGenerators(); }
 
+void OnAfterBattleSearch(bool battle) {
+    using namespace mp;
+    if (g_role != Role::Host || !g_turnRunning) return;
+    int kept = (int)std::count_if(g_battles.begin(), g_battles.end(), [](const BattleReq& r) { return r.kept; });
+    if (!kept) return;
+    Log("the host's battle search is over (%s; live against nation %d): %d battle(s) kept for it",
+        battle ? "its battle screen is open" : "no battle", g_lsHost.opp, kept);
+    HostSendKept();
+}
+
 void OnDoBattleDone(int opp, bool result) {
     Log("DoBattle(opponent %d) -> %d, battle screen %s", opp, result ? 1 : 0, game::BattleActive() ? "open" : "closed");
     if (game::BattleActive()) mp::HostOnBattleStarted(opp);
@@ -7916,9 +8667,33 @@ void OnDoBattleDone(int opp, bool result) {
 
 void OnAfterCampaignLoad() {
     lockstep::OnCampaignLoaded();  // a resumed battle saved in a live battle: the computer commands side 1
+    // 0.8.0: a load of the host's slot: the joined nations' officers into their lists (the records are attached)
+    if (mp::g_role == mp::Role::Host && mp::g_hostSlot > 0 && game::CurrentSlot() == mp::g_hostSlot)
+        nplay::HostOfficersToMemory("a load of the host's slot");
+}
+void OnCampaignSaved(int slot, bool autosave) {
+    // 0.8.0: the joined nations' officers as the host's game has them now into the records (not while the battle phase
+    // waits for results: they write the records, and the phase's reload loads them; not the month's snapshot of
+    // simultaneous battles: another slot, whose packages take the records right after it)
+    if (mp::g_role == mp::Role::Host && mp::g_hostSlot > 0 && slot == mp::g_hostSlot && !mp::g_battlePhase &&
+        !game::SnapshotInProgress())
+        nplay::HostOfficersFromMemory(autosave ? "an autosave" : "a save");
 }
 void OnBattleSlotSkippedTurn() { lockstep::OnBattleSlotClosed(); }
-void OnStrategicTurnRuns() { lockstep::OnMonthRuns(); }
+void OnStrategicTurnRuns() {
+    lockstep::OnMonthRuns();
+    if (mp::g_role == mp::Role::Host && mp::g_turnRunning) {  // 0.8.0: (the host's battle, if any, is over now)
+        std::string s = mp::SimulStatus();
+        Log("the host's month: DoStrategicTurn runs; battles of the players during the month still fought: %s",
+            s.empty() ? "none" : s.c_str());
+        if (mp::g_ofKillArm.nation >= 0 && mp::g_ofKillArm.month) {  // TEST ONLY (`ofkill ... armmonth`): a commander's
+            // fate in the month after its battles went out, as DoStrategicTurn's sinkings give it
+            Log("TEST: officers: the armed KillCommander as DoStrategicTurn starts: %s",
+                ofc::TestKill(mp::g_ofKillArm.nation, mp::g_ofKillArm.ship, mp::g_ofKillArm.pow).c_str());
+            mp::g_ofKillArm = {};
+        }
+    }
+}
 void OnCampaignLoading() { lockstep::OnCampaignLoading(); }
 
 }  // namespace hookcb

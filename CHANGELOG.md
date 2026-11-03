@@ -9,6 +9,117 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.8.0 (2026-11-03)
+Two features that players asked for on 0.7.1: each joined player's nation now has its own officer corps, as the
+player's nation has in single player, and a joined player's battle of the month now starts while the host's month is
+still running, even while the host fights its own battle, instead of after the host's whole month.
+**Update the host and every player:** both features need 0.8.0 on the host and on the player's PC. With an older
+version on either PC, that player's nation has no officers of its own and its battles come after the host's month, as
+before. The protocol is still 3 and the live-battle engine still 18: players on 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3 and
+0.8.0 play a campaign and fight their live battles together.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.8.0)
+
+### New for joined players
+- **Your own officers** (reported as "the non-host player has no officers of their own"). Until now a joined
+  player's *Officers* tab was empty and their nation's ships had no commanders. Now your nation has its own officer
+  corps, as the player's nation has in single player:
+  - the *Officers* tab lists your officers, and the game's actions work on them as in single player: promotions (one
+    free promotion a month), renaming, moving an officer to the pool, and giving your ships, divisions and sea areas
+    their commanders;
+  - at the start of your month, before your random event, your game runs the game's monthly officer routine for your
+    nation: promotions, retirements, officers' abilities that become known, vacant area commands offered, new
+    officers in the pool, and now and then an officer event with the game's dialogs. As in single player, a month with
+    an officer event has no random event and no spying check. The routine's messages come in your chat ("* Officers:
+    ...");
+  - **Submit** asks the question of the game's Turn, "Some ships or divisions have no commander assigned. ...": *Yes*
+    has the commanders assigned, as the Turn does, and *No* takes you back to assign them yourself ("Not submitted:
+    assign the commanders you want first (or answer Yes to have them assigned). ..."). A submit forced by the host's
+    time limit asks nothing and has them assigned;
+  - the host keeps your corps between months, and its month does to your commanders what single player does to the
+    player's: commanders killed or taken prisoner (by submarines or mines, for example), and their effect on the
+    training of their crews and on the running costs of their ships (good and poor administrators). The training
+    messages about your ships come in your chat with the new month ("* Officers: The crew of ..."), not on the host's
+    screen;
+  - your battles against computer nations are fought with your commanders, and the commander of the battle's sea area
+    is yours (before, the host's): as in single player, he makes each of your ships there more or less likely to join
+    the battle. Your commanders' battle stars, and the fates of the commanders of ships sunk in the battle, come back
+    with the result;
+  - **Copy game** gives the copy your own officers, with their commands (before, the host's officers, unassigned).
+
+  Your corps is formed in a new campaign's first month, as the game forms its player's, and in a campaign that is
+  already going on in the first month that the host and you both run 0.8.0. Your chat says so: "* Officers: your
+  nation has its own officer corps now: ... (the Officers tab). They go with your turns; the host keeps them for your
+  nation." A legacy fleet built by hand gets its commanders from your corps at **Continue**, as in single player.
+- **Your battles during the host's month** (reported as "the non-host player can only generate 1 battle at a time":
+  the battles waited for the host). Until now the host sent the joined players their battles only after its whole
+  month, its own battle included. Now your battle of the month starts while the host's month is still running, at the
+  same time as the host's own battle and the other players' battles: the host sends it when its month comes to the
+  battle search, with the month's state of that moment (where single player fights the player's battle), and a
+  surprise attack at a war's start goes out then too, from the month's start. Everyone's chat says when each battle
+  is played ("* Battle? Germany's navy may meet the Spain navy in Northern Europe. Captain plays it now, during the
+  host's month."; "* Surprise attack? Japan may strike Germany at the war's start. Captain plays it during the host's
+  month.", then "* Captain plays the surprise attack of Japan on Germany now, during the host's month."). Your notice
+  of the battle adds "The host's month goes on meanwhile; your result is merged when it is over.", and once you have
+  fought it your chat says "* Your battle's result is with the host; the new month follows when the host's month is
+  over." While the host fights its own battle, the Multiplayer window's status names the players' battles ("The host
+  is fighting a battle... (Captain: Germany vs Spain in Northern Europe)"). After its month the host waits only for
+  the battles still being fought ("Battles in progress").
+  - The host merges the results when its month is over, with what its month did meanwhile: a ship's crew experience
+    and battle stars keep the month's change and get the battle's, its log keeps the entries of both, it gets the
+    longer of the two repair times, and a ship sunk in either stays sunk. Your officers are merged the same way: a
+    commander killed or captured in the host's month stays so, and your battle's stars are added. Once your result is
+    with the host, it is merged even if you leave the session.
+  - Some battles still come later. A battle of a nation at war with the host's nation waits until the host's own
+    battle search is over ("... Captain plays it during the host's month, once the host's own battle search is
+    over.", then "* Captain plays the battle of Germany now, during the host's month."), because the host's battle may
+    be a live one against that nation; when it is, the nation's battle comes after the month ("* Captain plays the
+    battle of Germany after the month (Germany fights the host's battle live first)."). A nation plays at most one
+    battle during the host's month: after a surprise attack, its battle of the month comes after the month ("...
+    plays it after the month (the nation's surprise attack comes first)."). Live battles between two joined players'
+    nations, and the battles that the computer's battle rules make for joined nations (players on 0.5.0 or older),
+    come after the month, as before, and so do the month's battles when the host can't save the month's state for them
+    ("... plays it after the month (the host could not save the month's state for it).").
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3 and 0.8.0 can join each
+  other's hosts and play the campaign together.
+- 0.8.0 keeps the live-battle engine of 0.6.1 and 0.7.0 to 0.7.3 (18): players on these versions fight their live
+  battles live, with each other and under a host on any of them. A player on 0.6.0 (engine 17) or older can't fight a
+  live battle with a host or player on 0.8.0.
+- Both features need 0.8.0 on the host and on the player's PC. The player's PC and the host tell each other what they
+  can do when the player joins, so a session can mix versions:
+  - a host on 0.8.0 and a player on an older version: the player's nation has no officers, as before, and its month
+    now comes with an empty list of officers, so the player's **Copy game** has none (before, it had the host's,
+    unassigned). Its battles come after the host's month, as before ("... Captain plays it after the month.");
+  - a host on an older version and a player on 0.8.0: everything as before (an empty *Officers* tab, no commanders and
+    no question about them at **Submit**, the host's officers in a **Copy game**, unassigned, and the battles after
+    the host's month).
+- Existing campaigns go on from where they are: a joined player's officer corps is formed in the first month that the
+  host and that player both run 0.8.0 (the chat says so), and their battles are played during the host's month from
+  then on.
+
+### Known issues
+- **Commanders in live battles:** a live battle uses only the first player's commanders (the host's in a battle
+  against the host). The second player's ships fight without theirs, as before 0.8.0, so those commanders win no
+  battle stars there, and the loss of their ship there neither kills nor captures them. Both sides' commanders would
+  need a new live-battle engine.
+- **A player on an older version under a host on 0.8.0** has no officers, as before, but their **Copy game** now has
+  none either (before, it had the host's, unassigned); under an older host, a player on 0.8.0 has no officers of
+  their own, as before (see Compatibility). Update the host and every player.
+- **A restart of the host's game during a month** loses the battles that the players fought during that month: when
+  the host hosts the campaign again, its chat lists them ("* The host's game was restarted during a month: the battles
+  fought during it are lost (Captain: Germany against Spain)."), and each of their players is told on joining again
+  ("The host's game was restarted during the month: your battle (Germany against Spain) fought during the host's month
+  is lost.").
+- **A computer nation's ships in two battles of one month:** when a computer nation is at war with the host's nation
+  and a joined player's, its ships can fight the host's battle and that player's in the same month, both from the
+  month's state before either battle. When the player's result is merged, the longer of the two repair times counts,
+  and a ship sunk in both battles counts in both, in the losses and in the victory points.
+- The known issues of 0.7.3 remain, except that a legacy fleet built by hand now gets commanders (0.7.0), and that a
+  surprise attack at a war's start is now played during the host's month instead of after it (0.6.0). It is still not
+  played at once as in single player: a war that ends before it is played drops it, and a restart of the host's game
+  during the month loses it.
+
 ## 0.7.3 (2026-11-03)
 A computer nation at war with a joined player's nation (and at peace with the host's nation) now fights that war as
 the computer fights the player in single player. Until now, one at war only with joined players' nations stayed on a

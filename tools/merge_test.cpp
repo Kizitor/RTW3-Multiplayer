@@ -1,0 +1,358 @@
+// Offline test of the battle-result merge (saveio::ApplyBattleResult), 0.8.0 simultaneous battles: the rules for the
+// ship fields that both the battle and the host's save changed since the battle was sent (CrewQuality and BattleStars
+// add the battle's change to the host's value, the battle's log entries follow the host's, RepairTime the larger, Used
+// the host's for a battle fought during the month, any other field the battle's), ships sunk or gone, new ships, the
+// losses' deltas; and today's merge of a battle sent from the month-end save (the host unchanged since the send). The
+// officers' merge (saveio::MergeOfficers, 0.8.0 integration): a battle's officers per officer id into the host's record.
+// Built and run by tools\merge_test.bat (no game needed). Optional: merge_test.exe <snapshot.bcs> <month-end.bcs> runs
+// a made-up battle on a real snapshot of a month and its month-end save (the sb80 POC's files) and checks the rules on
+// every ship of both nations.
+#include "../src/mod/saveio.h"
+
+#include <algorithm>
+#include <cstdio>
+
+static int g_fail = 0, g_pass = 0;
+
+static void Check(const char* what, bool ok, const std::string& detail = "") {
+    (ok ? g_pass : g_fail)++;
+    printf("%s %s%s%s\n", ok ? "PASS" : "FAIL", what, detail.empty() ? "" : ": ", detail.c_str());
+}
+
+// A ship block's lines for section Nation<n>Ships: Ship<i><Field>=<value>.
+struct Ship {
+    std::string id;
+    std::vector<std::pair<std::string, std::string>> f;
+};
+
+static std::string Section(const std::vector<Ship>& ships) {
+    std::string s;
+    for (size_t i = 0; i < ships.size(); i++) {
+        s += "Ship" + std::to_string(i) + "Id=" + ships[i].id + "\n";
+        for (auto& kv : ships[i].f) s += "Ship" + std::to_string(i) + kv.first + "=" + kv.second + "\n";
+    }
+    return s;
+}
+
+static std::string Bcs(const std::vector<Ship>& k1, const std::vector<Ship>& j3, int lossK = 0) {
+    std::string s = "[General]\nYear=1900\nMonth=3\n";
+    for (int n = 0; n < 9; n++) s += "[Nation" + std::to_string(n) + "]\nVP=10\nPrestige=5\nShipCount=0\n";
+    s += "[Nation1Ships]\n" + Section(k1) + "[Nation3Ships]\n" + Section(j3);
+    s += "[Nation1Losses]\nBB=" + std::to_string(lossK) + "\n[VERSION]\nVersion=1\n";
+    return s;
+}
+
+static Bundle Result(const std::vector<Ship>& k1, const std::vector<Ship>& j3, int lossK, int dVP) {
+    Bundle b;
+    b.Add("sec:Nation1Ships", Section(k1));
+    b.Add("sec:Nation3Ships", Section(j3));
+    b.Add("sec:Nation1Losses", "BB=" + std::to_string(lossK) + "\n");
+    KV d;
+    d["dVP_K"] = std::to_string(dVP);
+    d["dVP_J"] = "0";
+    d["dPrestige_K"] = "0";
+    d["dMorale_K"] = "0";
+    b.Add("deltas", KVEncode(d));
+    return b;
+}
+
+// The merged ship's fields by id (section Nation<n>Ships).
+static std::map<std::string, std::string> Fields(const IniDoc& d, int n, const std::string& id) {
+    std::map<std::string, std::string> out;
+    const IniSection* s = d.Find("Nation" + std::to_string(n) + "Ships");
+    if (!s) return out;
+    std::map<int, std::map<std::string, std::string>> by;
+    for (auto& l : s->lines) {
+        if (l.compare(0, 4, "Ship") != 0) continue;
+        size_t p = 4;
+        while (p < l.size() && isdigit((unsigned char)l[p])) p++;
+        size_t eq = l.find('=');
+        if (p == 4 || eq == std::string::npos) continue;
+        by[atoi(l.c_str() + 4)][l.substr(p, eq - p)] = l.substr(eq + 1);
+    }
+    for (auto& kv : by)
+        if (kv.second["Id"] == id) return kv.second;
+    return out;
+}
+
+static Ship S(const std::string& id, int cq, int stars, int repair, int used, const std::string& status,
+              const std::vector<std::string>& log) {
+    Ship s{id, {{"Name", "Ship " + id},
+                {"CrewQuality", std::to_string(cq)},
+                {"RepairTime", std::to_string(repair)},
+                {"Used", std::to_string(used)},
+                {"Status", status},
+                {"BattleStars", std::to_string(stars)},
+                {"NumberOfLogEntries", std::to_string(log.size())}}};
+    for (size_t i = 0; i < log.size(); i++) s.f.push_back({"LogEntry" + std::to_string(i), log[i]});
+    return s;
+}
+
+static void Synthetic() {
+    std::vector<std::string> l0 = {"January 1899 Laid down.", ""};
+    std::vector<std::string> lm = {"January 1899 Laid down.", "", "March 1900 The host's battle.", ""};
+    std::vector<std::string> lb = {"January 1899 Laid down.", "", "March 1900 Took part in a battle.", "In action.", ""};
+    // sent (the snapshot), the month's end (host), the battle's result
+    std::vector<Ship> sentK = {S("101", 6, 0, 0, 0, "0", l0), S("102", 6, 0, 2, 0, "0", l0), S("103", 24, 0, 0, 0, "0", l0),
+                               S("104", 5, 0, 0, 0, "0", l0), S("105", 5, 0, 0, 0, "0", l0), S("106", -3, 1, 4, 0, "0", l0)};
+    std::vector<Ship> sentJ = {S("301", 6, 0, 0, 0, "0", l0), S("302", 7, 0, 0, 0, "0", l0)};
+    std::vector<Ship> hostK = {S("101", 7, 1, 0, 0, "1", lm), S("102", 7, 0, 1, 0, "0", l0), S("103", 25, 0, 0, 0, "0", l0),
+                               S("106", -2, 1, 6, 0, "0", l0), S("107", 0, 0, 0, 0, "0", {"March 1900 Laid down.", ""})};
+    // (104 sunk in the month, 105 too; 107 new in the month)
+    std::vector<Ship> hostJ = {S("301", 7, 0, 0, 0, "0", l0), S("302", 8, 0, 0, 0, "0", l0)};
+    std::vector<Ship> resK = {S("101", 7, 2, 3, 1, "2", lb), S("102", 5, 0, 5, 0, "0", l0), S("103", 26, 0, 0, 0, "0", l0),
+                              S("104", 6, 0, 0, 0, "0", l0), S("106", -3, 1, 3, 0, "0", l0)};
+    // (105 sunk in the battle too)
+    std::vector<Ship> resJ = {S("302", 8, 0, 0, 0, "0", l0)};  // 301 sunk in the battle
+    std::string sent = Bcs(sentK, sentJ, 1);
+    IniDoc host = ParseIni(Bcs(hostK, hostJ, 3));
+    Bundle res = Result(resK, resJ, 2, 4);
+    std::string summary, err;
+    saveio::MergeNotes notes;
+    bool ok = saveio::ApplyBattleResult(host, sent, 1, 3, res, {1, 3}, summary, err, true, nullptr, &notes);
+    Check("a battle fought during the month: merged", ok, ok ? summary : err);
+    auto s101 = Fields(host, 1, "101"), s102 = Fields(host, 1, "102"), s103 = Fields(host, 1, "103");
+    auto s106 = Fields(host, 1, "106"), s107 = Fields(host, 1, "107");
+    Check("CrewQuality both +1 (6 -> month 7, battle 7): the month's + the battle's change = 8",
+          s101["CrewQuality"] == "8", s101["CrewQuality"]);
+    Check("CrewQuality month +1, battle -1 (6 -> 7, 5): 6", s102["CrewQuality"] == "6", s102["CrewQuality"]);
+    Check("CrewQuality at the game's bound (24 -> 25, 26): 25", s103["CrewQuality"] == "25", s103["CrewQuality"]);
+    Check("CrewQuality the battle did not change (-3 -> -2, -3): the month's -2", s106["CrewQuality"] == "-2",
+          s106["CrewQuality"]);
+    Check("BattleStars (0 -> month 1, battle 2): 3", s101["BattleStars"] == "3", s101["BattleStars"]);
+    Check("RepairTime both (2 -> month 1, battle 5): the larger 5", s102["RepairTime"] == "5", s102["RepairTime"]);
+    Check("RepairTime both (4 -> month 6, battle 3): the larger 6", s106["RepairTime"] == "6", s106["RepairTime"]);
+    Check("RepairTime only the battle (0 -> 0, 3): 3", s101["RepairTime"] == "3", s101["RepairTime"]);
+    Check("Used of a battle fought during the month (0 -> month 0, battle 1): the month's 0 (keepUsed)", s101["Used"] == "0", s101["Used"]);
+    Check("another field both changed (Status 0 -> month 1, battle 2): the battle's 2", s101["Status"] == "2",
+          s101["Status"]);
+    Check("the log: the month's 4 entries, then the battle's 3 new ones (7)",
+          s101["NumberOfLogEntries"] == "7" && s101["LogEntry2"] == "March 1900 The host's battle." &&
+              s101["LogEntry3"] == "" && s101["LogEntry4"] == "March 1900 Took part in a battle." &&
+              s101["LogEntry5"] == "In action." && s101["LogEntry6"] == "",
+          "n=" + s101["NumberOfLogEntries"] + " [2]=" + s101["LogEntry2"] + " [4]=" + s101["LogEntry4"]);
+    Check("a ship sunk in the month stays gone (104), also one sunk in both (105)",
+          Fields(host, 1, "104").empty() && Fields(host, 1, "105").empty());
+    Check("a ship new in the month stays (107)", s107["CrewQuality"] == "0", s107["Name"]);
+    Check("a ship sunk in the battle is removed (J's 301); J's 302 merged (7 -> 8, 8: 9)",
+          Fields(host, 3, "301").empty() && Fields(host, 3, "302")["CrewQuality"] == "9",
+          Fields(host, 3, "302")["CrewQuality"]);
+    Check("ShipCount follows (nation 1: 101, 102, 103, 106, 107)", host.Get("Nation1", "ShipCount", "") == "5",
+          host.Get("Nation1", "ShipCount", ""));
+    Check("Losses: the host's 3 + the battle's 1 = 4; VP 10 + 4", host.Get("Nation1Losses", "BB", "") == "4" &&
+                                                                   host.Get("Nation1", "VP", "") == "14",
+          host.Get("Nation1Losses", "BB", "") + " / " + host.Get("Nation1", "VP", ""));
+    Check("the notes count the rules (CrewQuality 4 ships with one at the bound, stars 1, logs 1, repair 2, Status 1, "
+          "2 gone in the month, 1 of them sunk in the battle too)",
+          notes.added["CrewQuality"] == 4 && notes.clamped == 1 && notes.added["BattleStars"] == 1 && notes.logs == 1 &&
+              notes.repair == 2 && notes.other["Status"] == 1 && notes.monthGone == 2 && notes.bothGone == 1,
+          notes.Text());
+
+    // Today's battle: sent from the month-end save, the host unchanged since: the battle's values, as before 0.8.0.
+    IniDoc host2 = ParseIni(sent);
+    saveio::MergeNotes n2;
+    ok = saveio::ApplyBattleResult(host2, sent, 1, 3, res, {1, 3}, summary, err, false, nullptr, &n2);
+    auto t101 = Fields(host2, 1, "101");
+    Check("a battle sent from the month-end save (the host unchanged): the battle's values (CrewQuality 7, stars 2, "
+          "Status 2, the battle's 5 log entries)",
+          ok && t101["CrewQuality"] == "7" && t101["BattleStars"] == "2" && t101["Status"] == "2" &&
+              t101["NumberOfLogEntries"] == "5" && t101["LogEntry2"] == "March 1900 Took part in a battle." &&
+              Fields(host2, 1, "103")["CrewQuality"] == "26" && !n2.Any(),
+          ok ? summary + " | " + n2.Text() : err);
+
+    // Used without keepUsed (a battle sent after the month): the battle's value.
+    IniDoc host3 = ParseIni(Bcs(hostK, hostJ, 3));
+    ok = saveio::ApplyBattleResult(host3, sent, 1, 3, res, {1, 3}, summary, err, false);
+    Check("Used without keepUsed (a battle sent after the month): the battle's 1", ok && Fields(host3, 1, "101")["Used"] == "1",
+          Fields(host3, 1, "101")["Used"]);
+}
+
+static std::string ReadAll(const char* path) {
+    std::string s;
+    FILE* f = fopen(path, "rb");
+    if (!f) return s;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+    fclose(f);
+    return s;
+}
+
+// A made-up battle on a real snapshot: every ship of nations K and J that is in both saves gets CrewQuality +1,
+// BattleStars +1, RepairTime 7 and one log entry in the battle; the merge must give the month-end value + 1 for both
+// counters, the larger RepairTime and the month's log followed by the battle's entry.
+static void RealFiles(const char* snapPath, const char* endPath, int K, int J) {
+    std::string snap = ReadAll(snapPath), end = ReadAll(endPath);
+    if (snap.empty() || end.empty()) {
+        Check("the snapshot and the month-end save read", false, std::string(snapPath) + ", " + endPath);
+        return;
+    }
+    IniDoc s = ParseIni(snap);
+    Bundle res;
+    int changed = 0;
+    for (int n : {K, J}) {
+        const IniSection* sec = s.Find("Nation" + std::to_string(n) + "Ships");
+        if (!sec) continue;
+        std::map<int, std::map<std::string, std::string>> by;
+        std::vector<std::pair<int, std::string>> order;
+        for (auto& l : sec->lines) {
+            size_t p = 4, eq = l.find('=');
+            while (p < l.size() && isdigit((unsigned char)l[p])) p++;
+            if (l.compare(0, 4, "Ship") != 0 || p == 4 || eq == std::string::npos) continue;
+            int i = atoi(l.c_str() + 4);
+            if (!by.count(i)) order.push_back({i, ""});
+            by[i][l.substr(p, eq - p)] = l.substr(eq + 1);
+        }
+        std::string out;
+        for (auto& [i, unused] : order) {
+            auto& f = by[i];
+            f["CrewQuality"] = std::to_string(atoi(f["CrewQuality"].c_str()) + 1);
+            f["BattleStars"] = std::to_string(atoi(f["BattleStars"].c_str()) + 1);
+            f["RepairTime"] = "7";
+            int nl = atoi(f["NumberOfLogEntries"].c_str());
+            f["LogEntry" + std::to_string(nl)] = "March 1900 The test battle.";
+            f["LogEntry" + std::to_string(nl + 1)] = "";
+            f["NumberOfLogEntries"] = std::to_string(nl + 2);
+            for (auto& kv : f) out += "Ship" + std::to_string(i) + kv.first + "=" + kv.second + "\n";
+            changed++;
+        }
+        res.Add("sec:Nation" + std::to_string(n) + "Ships", out);
+    }
+    KV d;
+    d["dVP_K"] = d["dVP_J"] = d["dPrestige_K"] = d["dMorale_K"] = "0";
+    res.Add("deltas", KVEncode(d));
+    IniDoc host = ParseIni(end), month = ParseIni(end);
+    std::string summary, err;
+    saveio::MergeNotes notes;
+    bool ok = saveio::ApplyBattleResult(host, snap, K, J, res, {K, J}, summary, err, true, nullptr, &notes);
+    Check("the snapshot's battle merged into the month-end save", ok, ok ? summary + " | " + notes.Text() : err);
+    if (!ok) return;
+    int ships = 0, bad = 0, monthCq = 0;
+    std::string first;
+    for (int n : {K, J}) {
+        const IniSection* sec = month.Find("Nation" + std::to_string(n) + "Ships");
+        if (!sec) continue;
+        std::set<std::string> ids;
+        for (auto& l : sec->lines) {
+            size_t p = 4;
+            while (p < l.size() && isdigit((unsigned char)l[p])) p++;
+            if (l.compare(0, 4, "Ship") == 0 && p > 4 && l.compare(p, 3, "Id=") == 0) ids.insert(l.substr(p + 3));
+        }
+        for (auto& id : ids) {
+            auto m = Fields(month, n, id), o = Fields(s, n, id), h = Fields(host, n, id);
+            if (o.empty()) continue;  // new in the month: kept as it was
+            ships++;
+            if (m["CrewQuality"] != o["CrewQuality"]) monthCq++;
+            int cq = atoi(m["CrewQuality"].c_str()) + 1;
+            if (m["CrewQuality"] != o["CrewQuality"]) cq = std::max(-25, std::min(25, cq));  // (both changed)
+            int nl = atoi(m["NumberOfLogEntries"].c_str());
+            int rt = m["RepairTime"] == o["RepairTime"] ? 7 : std::max(atoi(m["RepairTime"].c_str()), 7);
+            bool good = h["CrewQuality"] == std::to_string(cq) &&
+                        h["BattleStars"] == std::to_string(atoi(m["BattleStars"].c_str()) + 1) &&
+                        h["RepairTime"] == std::to_string(rt) && h["NumberOfLogEntries"] == std::to_string(nl + 2) &&
+                        h["LogEntry" + std::to_string(nl)] == "March 1900 The test battle." &&
+                        h["LogEntry" + std::to_string(nl - 1)] == m["LogEntry" + std::to_string(nl - 1)] &&
+                        h["Used"] == m["Used"] && h["Status"] == m["Status"];
+            if (!good && first.empty())
+                first = "nation " + std::to_string(n) + " ship " + id + ": CrewQuality " + o["CrewQuality"] + "/" +
+                        m["CrewQuality"] + " -> " + h["CrewQuality"];
+            bad += !good;
+        }
+    }
+    Check("every ship of both nations: the month-end's CrewQuality and BattleStars + 1, RepairTime the larger, the "
+          "month's log then the battle's entry, Used and Status the month's",
+          ships > 0 && bad == 0,
+          std::to_string(ships) + " ships (" + std::to_string(monthCq) + " with the month's own CrewQuality change), " +
+              std::to_string(bad) + " wrong" + (first.empty() ? "" : "; first: " + first));
+}
+
+// 0.8.0 (officers with simultaneous battles): saveio::MergeOfficers, a battle's officers merged per officer id into the
+// host's record.
+static std::vector<saveio::OfficerRec> Officers(const std::vector<std::vector<std::string>>& rows) {
+    // rows: {Id, Status, BattleStars, Fate, Rank}
+    std::vector<std::string> lines = {"OfficerNo=" + std::to_string(rows.size())};
+    for (size_t i = 0; i < rows.size(); i++) {
+        std::string p = "Officer" + std::to_string(i);
+        lines.push_back(p + "Name=Officer " + rows[i][0]);
+        lines.push_back(p + "Ability=1");
+        lines.push_back(p + "AbilityKnown=0");
+        lines.push_back(p + "Rank=" + rows[i][4]);
+        lines.push_back(p + "YearsInRank=2");
+        lines.push_back(p + "Special=0");
+        lines.push_back(p + "Special2=0");
+        lines.push_back(p + "BattleStars=" + rows[i][2]);
+        lines.push_back(p + "Status=" + rows[i][1]);
+        lines.push_back(p + "Fate=" + rows[i][3]);
+        lines.push_back(p + "Id=" + rows[i][0]);
+    }
+    std::vector<saveio::OfficerRec> out;
+    std::string err;
+    saveio::ParseOfficers(lines, out, true, err);
+    return out;
+}
+
+static const saveio::OfficerRec* OfficerById(const std::vector<saveio::OfficerRec>& v, const std::string& id) {
+    for (auto& o : v)
+        if (o.Get("Id") == id) return &o;
+    return nullptr;
+}
+
+static void OfficerMerge() {
+    // sent: what the package carried; host: the record at the merge (the host's month since the send); battle: the result
+    auto sent = Officers({{"11", "0", "1", "", "1"}, {"12", "0", "0", "", "2"}, {"13", "0", "2", "", "0"},
+                          {"14", "0", "0", "", "1"}, {"15", "0", "3", "", "3"}, {"16", "0", "0", "", "0"},
+                          {"19", "0", "0", "", "1"}});
+    auto host = Officers({{"11", "0", "1", "", "1"}, {"12", "1", "0", "Killed when his ship struck a mine", "2"},
+                          {"13", "0", "3", "", "0"}, {"14", "0", "0", "", "1"}, {"15", "0", "3", "", "3"},
+                          {"16", "0", "0", "", "1"}, {"17", "0", "0", "", "0"}, {"19", "1", "0", "Lost at sea", "1"}});
+    auto battle = Officers({{"11", "0", "2", "", "1"}, {"12", "0", "1", "", "2"}, {"13", "0", "4", "", "0"},
+                            {"14", "3", "0", "Captured", "1"}, {"16", "0", "0", "", "0"}, {"18", "0", "0", "", "0"},
+                            {"19", "3", "0", "Captured", "1"}});
+    saveio::OfficerMergeNotes notes;
+    auto m = saveio::MergeOfficers(sent, host, battle, &notes);
+    auto get = [&](const std::string& id, const char* f) {
+        const saveio::OfficerRec* o = OfficerById(m, id);
+        return o ? o->Get(f) : std::string("(gone)");
+    };
+    Check("officers: a star of the battle (11: 1 -> 2) taken", get("11", "BattleStars") == "2", get("11", "BattleStars"));
+    Check("officers: killed in the host's month after the send (12), a star in the battle: dead, his fate and the star",
+          get("12", "Status") == "1" && get("12", "Fate") == "Killed when his ship struck a mine" &&
+              get("12", "BattleStars") == "1",
+          get("12", "Status") + " " + get("12", "Fate") + " " + get("12", "BattleStars"));
+    Check("officers: stars both changed (13: 2 -> month 3, battle 4): 3 + 2 = 5", get("13", "BattleStars") == "5",
+          get("13", "BattleStars"));
+    Check("officers: captured in the battle (14): POW, the battle's fate", get("14", "Status") == "3" &&
+          get("14", "Fate") == "Captured", get("14", "Status") + " " + get("14", "Fate"));
+    Check("officers: one the battle's list dropped, unchanged in the record since the send (15): gone",
+          OfficerById(m, "15") == nullptr);
+    Check("officers: promoted in the record since the send (16: rank 0 -> 1), the battle unchanged: the record's 1",
+          get("16", "Rank") == "1", get("16", "Rank"));
+    Check("officers: new in the record since the send (17) kept, new in the battle (18) added",
+          OfficerById(m, "17") && OfficerById(m, "18"), std::to_string(m.size()) + " officers");
+    Check("officers: dead in the host's month (19), captured in the battle: dead, the month's fate",
+          get("19", "Status") == "1" && get("19", "Fate") == "Lost at sea", get("19", "Status") + " " + get("19", "Fate"));
+    Check("officers: the notes (5 changed by the battle, 3 of them in the month too, stars 1, fate 1, added 1, dropped "
+          "1, kept 1)",
+          notes.battle == 5 && notes.month == 3 && notes.stars == 1 && notes.fate == 1 && notes.added == 1 &&
+              notes.dropped == 1 && notes.kept == 1,
+          notes.Text());
+    // a battle of the battle phase: the record is what the package carried: exactly the battle's list
+    auto m2 = saveio::MergeOfficers(sent, sent, battle, nullptr);
+    Check("officers: a battle sent from the record as it is (host == sent): the battle's list, in its order",
+          saveio::OfficerLines(m2) == saveio::OfficerLines(battle),
+          std::to_string(m2.size()) + " vs " + std::to_string(battle.size()));
+    // dead in both (the month: a mine; the battle: his ship sunk): the month's fate
+    auto b3 = Officers({{"12", "1", "0", "Went down with his ship", "2"}});
+    auto m3 = saveio::MergeOfficers(Officers({{"12", "0", "0", "", "2"}}),
+                                    Officers({{"12", "1", "0", "Killed when his ship struck a mine", "2"}}), b3, nullptr);
+    Check("officers: dead in the month and in the battle: the month's fate",
+          m3.size() == 1 && m3[0].Get("Fate") == "Killed when his ship struck a mine", m3.empty() ? "" : m3[0].Get("Fate"));
+}
+
+int main(int argc, char** argv) {
+    Synthetic();
+    OfficerMerge();
+    if (argc >= 3) RealFiles(argv[1], argv[2], argc > 3 ? atoi(argv[3]) : 1, argc > 4 ? atoi(argv[4]) : 7);
+    printf("%d passed, %d failed\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}
