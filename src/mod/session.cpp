@@ -42,6 +42,7 @@ struct Player {
     int divLevel = 0;        // 0.6.1: its PC loads and sends the nation's own campaign divisions (hello `div`; 0 = no)
     bool simb = false;       // 0.8.0: its PC fights its battles during the host's month (hello `simb`; older: no)
     int offLevel = 0;        // 0.8.0: its PC plays the nation's own officers (hello `off`; 0 = no)
+    int lsofLevel = 0;       // 0.8.1: its PC's live battles carry both sides' commanders (hello `lsof`; 0 = no)
 };
 
 // The ten nations of the game, offered for lobby picks before the host has a campaign.
@@ -151,6 +152,10 @@ static int g_kWarSteppedSeq = -1;                         // the month (g_seq) w
 // The joined nations whose relations follow the player's rules (relations v2, B2: the last player who held the nation
 // runs the player's relation routines; kept per campaign), and the ones a test switched on (bridge `relrules`).
 static std::set<int> g_relNations, g_relForced;
+// 0.8.1 (host): the joined nations whose last player's mod kept the nation's own officers (hello `off`; noted with each
+// month sent to it, kept per campaign for the months the player is away), and the ones a test takes as an older mod's
+// player's (bridge `ofuncmd old`): AdjustCrewQuality's rule for ships without a commander (UncommandedRuleFor).
+static std::set<int> g_offNations, g_testOldOff;
 // Relations v2, B3 (host): each such nation's own per-relation state, kept for it as the game keeps nation 0's in the
 // other nations' records: their war plans against it (WillGoToWar) and its tech-sharing deals (TechSharing), nine values
 // each, saved with the month; its past wars (opponent, end as Year*12+Month, winner 1 it / 2 the other / 0 unknown) and
@@ -207,6 +212,15 @@ static struct {  // TEST ONLY (host, `ofkill <nation> <ship> <pow> arm`): KillCo
     bool pow = false;
     bool month = false;  // (`armmonth`, 0.8.0: when DoStrategicTurn starts, after the battles sent during the month)
 } g_ofKillArm;
+// TEST ONLY (0.8.1, fix-sunktwice; host `battles sinkmonth <nation> <ship>`): that ship lost in the host's month after
+// the month's battles went out, as the month's own sinkings lose one, when its DoStrategicTurn starts (or, armed later,
+// at once, before the battle phase's save): sunk in a joined player's battle of the month too, a ship sunk twice.
+// g_strategicRan: the host's DoStrategicTurn of the month being processed has started.
+static struct {
+    int nation = -1, ship = -1;
+} g_testSinkMonth;
+static bool g_strategicRan = false;
+static void TestSinkMonthNow(const char* when, bool phase);
 static void ClientFormCorps(int K, int month);
 static game::PlayerTurnSetup g_relSetup;
 static std::string g_lastRelations = "none";
@@ -322,8 +336,19 @@ struct BattleReq {
     // 0.8.0 (officers): the nation's [Officers] lines the package carried (its record at the send; empty: none, an
     // older player's mod): its result's officers are merged per officer id against them (HostTakeBattleOfficers)
     std::vector<std::string> sentOff;
+    // 0.8.1 (fix-sunktwice): ships its battle lost that the host's month had lost already (counted once: the merge took
+    // the battle's loss and points of them out): the chat line's note, e.g. " (Italy's CA Zara was already sunk in the
+    // host's battle: not counted twice, 230 VP fewer for Germany)"
+    std::string twiceNote;
+    // 0.8.1 (both sides' commanders in a live battle between two players): the second player's nation's [Officers]
+    // lines the package carried (`of2`; empty: none): the result's `lsoff<opp>.ini` is merged against them
+    // (HostTakeBattleOfficers2: only what a battle changes)
+    std::vector<std::string> sentOff2;
 };
 static std::vector<BattleReq> g_battles;
+// 0.8.1 (fix-sunktwice): the ships each merged battle of the battle phase lost (ship id -> its player's name): a later
+// merge that lost them too names that battle in its chat line
+static std::map<std::string, std::string> g_phaseLost;
 static int g_battleNextId = 1;
 static bool g_battlePhase = false, g_battleFinishing = false, g_battleMerged = false;
 static std::string g_battlePhaseBytes;  // the host save when the battle phase began (restored if a reload fails)
@@ -389,6 +414,9 @@ static struct {
     std::vector<BattleEnc> encs;
     int vpA = 0, evpA = 0;
     bool offs = false;   // 0.8.0: the host keeps the nation's officers (its battle's header `offs`): the result has them
+    // 0.8.1: a live battle between two players with both sides' commanders: the second player's nation (the package's
+    // `of2`) whose officers this battle slot holds (its result carries them back as lsoff<of2>.ini); -1 none
+    int of2 = -1;
 } g_cb;
 static struct {  // TEST ONLY (`battles testraid <side> <J>`): the next raider check forces an interception
     int side = -1, J = -1;
@@ -420,6 +448,7 @@ static struct {
     bool pending = false;
     int bid = -1, opp = -1;
     bool autoStrike = false;  // the host's carrier-strike option for this battle (the battle message's autostrike=)
+    bool peerOfficers = false;  // 0.8.1: both sides' commanders (the battle message's `of2`): StartInfo.peerOfficers
     std::string p2;
     DWORD since = 0, lastTry = 0;
 } g_lsClientA;
@@ -499,6 +528,18 @@ static void NoticeTo(const Player& p, const std::string& text) {
 // Host: may this player's PC fight a live battle with the host's engine? (Both PCs of a live battle, and the host,
 // need the same live-battle engine level, MP_LS_LEVEL.)
 static bool SameLiveEngine(const Player& p) { return p.lsLevel == MP_LS_LEVEL; }
+
+// 0.8.1: this PC's live battles can carry both sides' commanders (hello and welcome `lsof`; engine level 18 kept: a
+// live battle uses them only when both PCs, and for a battle between two players also the host, announce them).
+static bool LiveOfficers() { return g_lsEnabled && lockstep::Available() && ofc::LiveAvailable(); }
+
+// The officers in an [Officers] section's lines (OfficerNo and the game's keys of each officer), for the logs.
+static int OfficerCount(const std::vector<std::string>& lines) {
+    std::vector<saveio::OfficerRec> list;
+    std::string err;
+    saveio::ParseOfficers(lines, list, false, err);
+    return (int)list.size();
+}
 
 // Why a player's PC can't fight live battles with this host's (another live-battle level), in player language, for
 // the reader: the player p themselves, the host, or another player. Both levels; the mod versions too when they differ
@@ -827,6 +868,9 @@ static void SaveReservations() {
         std::string rr;
         for (int n : g_relNations) rr += std::to_string(n) + ",";
         kv["relRules"] = rr;
+        std::string orr;  // 0.8.1
+        for (int n : g_offNations) orr += std::to_string(n) + ",";
+        kv["offRules"] = orr;
     }
     kv["diplomacyDate"] = HostDate();  // pending decisions belong to this month only
     WriteFileBytes(SessionFile(), KVEncode(kv));
@@ -846,6 +890,7 @@ static void LoadReservations() {
     g_kWarSteppedSeq = -1;
     economy::ClearState();
     g_relNations.clear();
+    g_offNations.clear();
     g_kLend.clear();
     g_kRevo.clear();
     g_kWill.clear();
@@ -880,6 +925,10 @@ static void LoadReservations() {
     for (auto& e : Split(KVStr(kv, "relRules"), ',')) {
         int n = atoi(e.c_str());
         if (n >= 1 && n <= 8) g_relNations.insert(n);
+    }
+    for (auto& e : Split(KVStr(kv, "offRules"), ',')) {  // 0.8.1: any save of the campaign (a player's mod, not a month's)
+        int n = atoi(e.c_str());
+        if (n >= 1 && n <= 8) g_offNations.insert(n);
     }
     for (auto& e : Split(KVStr(kv, "klend"), ',')) {  // B5 (d): any save of the campaign (the game never resets it)
         int n = atoi(e.c_str());
@@ -1119,6 +1168,36 @@ static void NoteRelRules() {
             g_relNations.erase(p.nation);
         Log("relations v2: nation %d follows the %s rules (%s)", p.nation, on ? "player's" : "computer's", p.name.c_str());
     }
+}
+
+// 0.8.1: a joined nation's player whose mod keeps the nation's own officers (hello `off`), noted with each month sent to
+// it: while the player is away, the nation keeps what its last player had (kept per campaign).
+static void NoteOffRules(const Player& p) {
+    if (p.nation < 1 || p.nation > 8) return;
+    bool on = p.offLevel >= 1, was = g_offNations.count(p.nation) > 0;
+    if (on == was) return;
+    if (on)
+        g_offNations.insert(p.nation);
+    else
+        g_offNations.erase(p.nation);
+    SaveReservations();
+    Log("officers: nation %d's player %s the nation's own officers (%s): its ships without a commander %s", p.nation,
+        on ? "keeps" : "has no", p.name.c_str(),
+        on ? "lose crew quality as the game's player's" : "keep their crew quality (an older mod: none has a commander)");
+}
+
+// 0.8.1 (officers.cpp, SetUncommandedRule): AdjustCrewQuality's rule for its player's ships without a commander applies
+// to a joined nation whose player's mod keeps the nation's own officers (1; the nation's corps must also be in memory),
+// not to one whose player's mod has none (-1: an older mod's nation has no commanders at all), and is not the business
+// of a computer nation (0: as the game).
+static int UncommandedRuleFor(int K) {
+    if (g_role != Role::Host || K < 1 || K > 8 || !hookcb::IsHumanRemoteNation(K)) return 0;
+    if (g_testOldOff.count(K)) return -1;
+    for (auto& kv : g_players) {
+        const Player& p = kv.second;
+        if (p.connected && p.welcomed && p.nation == K) return p.offLevel >= 1 ? 1 : -1;
+    }
+    return g_offNations.count(K) ? 1 : -1;
 }
 
 static std::string NationPlayerName(int n) {
@@ -2434,6 +2513,7 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     // host's. A player whose mod doesn't keep them (hello `off` 0) gets an empty list; one without a record yet forms
     // the corps on its PC (`offgen`).
     bool ownOfficers = nplay::HostPutOfficers(b, p.nation, p.offLevel >= 1, "month");
+    NoteOffRules(p);  // 0.8.1: (the month's rule for its ships without a commander while the player is away)
     KV h;
     h["seq"] = std::to_string(g_seq);
     h["nation"] = std::to_string(p.nation);
@@ -3054,6 +3134,20 @@ static void SendBattle(BattleReq& r, const Bundle* pre = nullptr, int fromSlot =
         h["pvp"] = "1";
         h["p2"] = p2->name;
         h["autostrike"] = g_autoStrike ? "1" : "0";  // the host's carrier-strike option (lockstep StartInfo)
+        // 0.8.1: both sides' commanders, when this host and both players' PCs carry them: the second player's nation's
+        // officers (its record) for the first player's battle slot, which commands its ships with them (`of2`)
+        r.sentOff2.clear();
+        if (LiveOfficers() && p->lsofLevel >= 1 && p2->lsofLevel >= 1) {
+            std::vector<std::string> lines = nplay::HostRecordOfficers(r.opp);
+            if (!lines.empty()) {
+                std::string text = "[Officers]\r\n";
+                for (auto& l : lines) text += l + "\r\n";
+                b.Add("rtw3mp_lsoff" + std::to_string(r.opp) + ".ini", text);
+                h["of2"] = std::to_string(r.opp);
+                r.sentOff2 = lines;
+            }
+            Log("battle %d: both sides' commanders: nation %d's %d officers go with it", r.id, r.opp, OfficerCount(lines));
+        }
     }
     std::string payload = PackHB(KVEncode(h), b.Pack());
     if (payload.size() > net::MaxMessageBytes()) {
@@ -3717,12 +3811,68 @@ static bool BattlesDone() {
 
 static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& body);  // (below)
 
+// TEST ONLY (0.8.1, `battles sinkmonth`): the armed ship lost now, in the host's month. `result` (ship 0): at the battle
+// phase's start, before its save, the first ship of the nation that a result held this month lost (sunk in a player's
+// battle of the month: a ship sunk twice).
+static int TestLostByHeld(int n) {  // the first ship of nation n a held result lost (alive in the save it was sent from)
+    auto lost = [n](const std::string& text) {  // ship id -> RepairTime >= 100 in [Nation<n>Ships]
+        std::map<std::string, std::pair<std::string, bool>> by;
+        std::string sec = "[Nation" + std::to_string(n) + "Ships]";
+        bool in = false;
+        for (auto& l : Split(text, '\n')) {
+            std::string s = l;
+            if (!s.empty() && s.back() == '\r') s.pop_back();
+            if (!s.empty() && s[0] == '[') {
+                in = s == sec;
+                continue;
+            }
+            size_t p = 4;
+            if (!in || s.compare(0, 4, "Ship") != 0) continue;
+            while (p < s.size() && isdigit((unsigned char)s[p])) p++;
+            std::string k = s.substr(0, p);
+            if (s.compare(p, 3, "Id=") == 0) by[k].first = s.substr(p + 3);
+            if (s.compare(p, 11, "RepairTime=") == 0) by[k].second = atoi(s.c_str() + p + 11) >= 100;
+        }
+        std::map<std::string, bool> out;
+        for (auto& x : by)
+            if (!x.second.first.empty()) out[x.second.first] = x.second.second;
+        return out;
+    };
+    for (auto& r : g_battles) {
+        if (!r.early || r.held.empty()) continue;
+        KV h;
+        std::string body;
+        Bundle b;
+        if (!UnpackHB(r.held, h, body) || !b.Unpack(body)) continue;
+        const std::string* sec = b.Get("sec:Nation" + std::to_string(n) + "Ships");
+        if (!sec) continue;
+        auto was = lost(r.sentBcs), now = lost("[Nation" + std::to_string(n) + "Ships]\n" + *sec);
+        for (auto& x : now)
+            if (x.second && was.count(x.first) && !was[x.first]) return atoi(x.first.c_str());
+    }
+    return -1;
+}
+
+static void TestSinkMonthNow(const char* when, bool phase) {
+    if (g_testSinkMonth.nation < 0 || (g_testSinkMonth.ship == 0 && !phase)) return;
+    int n = g_testSinkMonth.nation, s = g_testSinkMonth.ship;
+    g_testSinkMonth = {};
+    if (s == 0 && (s = TestLostByHeld(n)) < 0) {
+        Log("TEST: sinkmonth: no ship of nation %d lost in a result held this month (%s)", n, when);
+        return;
+    }
+    std::string err = game::TestSinkShip(n, s, L"Sunk in battle (TEST) with " + game::NationName(0) + L" ships.");
+    Log("TEST: sinkmonth: nation %d's ship %d lost in the host's month (%s): %s", n, s, when,
+        err.empty() ? "ok (SinkShip, AddShipToTotalLosses, the Fate of a battle's sinking)" : err.c_str());
+}
+
 // Host, after the month and before the new month is sent: send each player its battles (one at a time) and wait. The
 // strategic screen is locked meanwhile: the save file is the campaign's state until the results are loaded.
 static void BattlePhaseTick() {
     if (!g_battlePhase) {
         if (SaveStopWaiting(SaveStep::Battles)) return;  // 0.7.1: after a failed save, until a save works
         LowDiskCheck("the battles");
+        TestSinkMonthNow("armed after DoStrategicTurn: before the battle phase's save", true);  // (TEST ONLY, 0.8.1)
         if (!StepSave()) {  // 0.7.1: the battles wait (their results go into the saved month)
             SaveStopped(SaveStep::Battles);
             return;
@@ -3734,6 +3884,7 @@ static void BattlePhaseTick() {
         }
         g_battlePhase = true;
         g_battleMerged = false;
+        g_phaseLost.clear();
         game::SetStrategicEnabled(false);
         Log("battle phase: %d battle(s)", (int)g_battles.size());
         SimulKeep("end_" + std::to_string(g_seq) + ".bcs", g_battlePhaseBytes);  // TEST
@@ -3843,9 +3994,11 @@ static bool FinishBattlePhase() {
                                                              std::to_string(e.dK) + " VP."
                                 : e.kind == "fought"
                                     ? (r.raider ? "The raider battle of " + K + " against " + J + in + " was " +
-                                                      (r.raider == 2 ? "auto-resolved" : "fought") + " by " + r.player + "."
+                                                      (r.raider == 2 ? "auto-resolved" : "fought") + " by " + r.player +
+                                                      r.twiceNote + "."
                                                 : std::string(r.invasion ? "The invasion battle of " : "The battle of ") + K +
-                                                      " against " + J + in + " was fought by " + r.player + ".")
+                                                      " against " + J + in + " was fought by " + r.player +
+                                                      r.twiceNote + ".")
                                     : "No battle of " + K + " against " + J + in + " (VP " + std::to_string(e.dK) + "/" +
                                           std::to_string(e.dJ) + ")."));
             }
@@ -3866,11 +4019,12 @@ static bool FinishBattlePhase() {
                                                CampaignNationName(r.opp) + InArea(r.area) + "."
                             : r.raider   ? "The raider battle of " + CampaignNationName(r.human) + " against " +
                                              CampaignNationName(r.opp) + InArea(r.area) + " was " +
-                                             (r.raider == 2 ? "auto-resolved" : "fought") + " by " + r.player + "."
+                                             (r.raider == 2 ? "auto-resolved" : "fought") + " by " + r.player +
+                                             r.twiceNote + "."
                                          : std::string(r.invasion ? "The invasion battle of " : "The battle of ") +
                                                CampaignNationName(r.human) + " against " +
                                                CampaignNationName(r.opp) + InArea(r.area) + " was fought by " +
-                                               r.player + "."));
+                                               r.player + r.twiceNote + "."));
             continue;
         }
         if (r.state != 3) continue;
@@ -3898,6 +4052,7 @@ static bool FinishBattlePhase() {
         Log("battle %d resolved by the game: %s", r.id, fought ? "battle" : "no battle");
     }
     g_battles.clear();
+    g_phaseLost.clear();
     g_battlePhase = g_battleFinishing = g_battleMerged = false;
     g_battlePhaseBytes.clear();
     return true;
@@ -3925,6 +4080,30 @@ static void CreditWarScore(int a, int b, int vpA, int vpB) {
 // A battle's result, applied: merged into the host's save (its outcome, decline counts, invasions, news, encounters,
 // war score), or the game's fallback. 0.8.0: a result held during the host's month is applied in the battle phase with
 // what the request kept at the send (its player's name and hello `gen`), also after its player left.
+// 0.8.1 (fix-sunktwice): the chat line's note on the ships the battle lost that the host's month had lost already:
+// " (Italy's CA Zara was already sunk in the host's battle: not counted twice, 230 VP fewer for Germany)".
+static std::string TwiceNote(const BattleReq& r, const saveio::MergeNotes& n) {
+    std::string ships;
+    for (size_t i = 0; i < n.twice.size(); i++) {
+        const saveio::LossTwice& t = n.twice[i];
+        auto it = g_phaseLost.find(t.id);
+        std::string where = it != g_phaseLost.end() ? "sunk in " + it->second + "'s battle"
+                            : t.host.empty()       ? "gone from its fleet in the host's month"
+                            : t.host.rfind("Sunk in battle", 0) == 0 || t.host.rfind("Sunk in duel", 0) == 0 ||
+                                    t.host.find("Sunk in raider battle") != std::string::npos
+                                ? "sunk in the host's battle"
+                            : t.host == "Scrapped" ? "scrapped in the host's month"
+                                                   : "lost in the host's month (" + t.host + ")";
+        ships += (i == 0 ? "" : i + 1 == n.twice.size() ? " and " : ", ") + CampaignNationName(t.nation) + "'s " +
+                 t.type + " " + t.name + (n.twice.size() > 1 ? " (" + where + ")" : " was already " + where);
+    }
+    if (n.twice.size() > 1) ships += " were already lost";
+    std::string pts;
+    if (n.cutK > 0) pts += ", " + std::to_string(n.cutK) + " VP fewer for " + CampaignNationName(r.human);
+    if (n.cutJ > 0) pts += ", " + std::to_string(n.cutJ) + " VP fewer for " + CampaignNationName(r.opp);
+    return " (" + ships + ": not counted twice" + pts + ")";
+}
+
 static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& body) {
     int id = r.id;
     {
@@ -4074,6 +4253,25 @@ static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& 
                     if (f.first == "deltas") f.second = KVEncode(d0);
             }
         }
+        {  // 0.8.1 (fix-sunktwice): the battle's own points (after encounters: the fought one's) and how the game gave
+           // them (a raider battle auto-resolved: each lost ship's alone), for the ships it lost that the host's month
+           // had lost already
+            KV d1;
+            if (const std::string* dp = b.Get("deltas")) d1 = KVDecode(*dp);
+            bool set = false;
+            if (!encs.empty() && encs.back().kind == "fought") {
+                d1["bVP_K"] = std::to_string(encs.back().dK);
+                d1["bVP_J"] = std::to_string(encs.back().dJ);
+                set = true;
+            }
+            if (r.raider == 2) {
+                d1["bQuick"] = "1";
+                set = true;
+            }
+            if (set)
+                for (auto& f : b.files)
+                    if (f.first == "deltas") f.second = KVEncode(d1);
+        }
         std::string bytes, summary, err;
         IniDoc host;
         saveio::MergeNotes notes;
@@ -4084,6 +4282,7 @@ static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& 
                 std::string res;
                 for (auto& f : b.files)
                     if (f.first.compare(0, 4, "sec:") == 0) res += "[" + f.first.substr(4) + "]\r\n" + f.second;
+                if (const std::string* dp = b.Get("deltas")) res += "[deltas]\r\n" + *dp;  // (0.8.1: the points)
                 SimulKeep(std::to_string(id) + "_sent.bcs", r.sentBcs);
                 SimulKeep(std::to_string(id) + "_host.bcs", bytes);
                 SimulKeep(std::to_string(id) + "_result.ini", res);
@@ -4101,6 +4300,24 @@ static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& 
         if (notes.Any())  // 0.8.0: what the host's save changed since the send met the battle's changes
             Log("battle %d: the host's save changed since the send (%s): %s", id,
                 r.early ? "a battle fought during the host's month" : "another battle's result", notes.Text().c_str());
+        if (!notes.twice.empty()) {  // 0.8.1 (fix-sunktwice): a ship can be sunk only once
+            for (auto& t : notes.twice)
+                Log("battle %d: nation %d's %s %s (ship %s) was lost in the host's month (%s) and in the battle (%s): "
+                    "counted once: the host's ship kept, %s, %s", id, t.nation, t.type.c_str(), t.name.c_str(),
+                    t.id.c_str(), t.host.empty() ? "gone from the host's save" : t.host.c_str(),
+                    t.fate.empty() ? "gone from the result" : t.fate.c_str(),
+                    t.counter.empty() ? "no loss counter of the battle taken back" : (t.counter + " -1").c_str(),
+                    t.side < 0 ? "its side not known: no points taken off"
+                    : t.points <= 0 ? "no points of it in the battle"
+                                    : (std::to_string(t.points) + " raw points" + (t.estimated ? " (estimated)" : "") +
+                                       " of " + (t.side == 1 ? "nation " + std::to_string(r.human)
+                                                             : "nation " + std::to_string(r.opp)))
+                                          .c_str());
+            Log("battle %d: points taken off for them: nation %d %d, nation %d %d (%s)", id, r.human, notes.cutK, r.opp,
+                notes.cutJ, notes.cutHow.c_str());
+            r.twiceNote = TwiceNote(r, notes);
+        }
+        for (auto& sid : notes.lostNow) g_phaseLost[sid] = r.player;
         if (g_simulKeep) SimulKeep(std::to_string(id) + "_merged.bcs", WriteIni(host));  // TEST
         r.state = 2;
         r.avoided = avoided;
@@ -4128,6 +4345,12 @@ static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& 
                 SimulKeep(std::to_string(id) + "_offmerged.ini", lines(nplay::HostRecordOfficers(r.human)));
             }
         }
+        // 0.8.1: a live battle between two players with both sides' commanders: the second player's nation's officers
+        // after it (the first player's PC kept them in its battle slot), merged against what the package carried; only
+        // what a battle changes (battle stars, the dead and the captured); its ships lose a commander who is no longer
+        // active, as the battle slot's own nation's do
+        if (r.pvp && !r.sentOff2.empty() && nplay::HostTakeBattleOfficers2(b, r.opp, r.sentOff2))
+            nplay::HostFixShipCommanders(HostBcsPath(), r.opp, nullptr);
         if (r.pvp) LsEndRelay(r.id, "the battle's result arrived");
         const std::string* deltas = b.Get("deltas");
         KV dk = deltas ? KVDecode(*deltas) : KV();
@@ -4154,10 +4377,17 @@ static void HostApplyBattleResult(BattleReq& r, const KV& h, const std::string& 
                              : "",
             encText.empty() ? "" : ("; " + std::to_string(encs.size()) + " encounter(s): " + encText).c_str());
         if (encs.empty())
-            CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K")), std::max(0, KVInt(dk, "dVP_J")));
-        else  // 0.7.2: each opponent's war score with its own encounters' points
+            CreditWarScore(r.human, r.opp, std::max(0, KVInt(dk, "dVP_K") - notes.cutK),
+                           std::max(0, KVInt(dk, "dVP_J") - notes.cutJ));
+        else {  // 0.7.2: each opponent's war score with its own encounters' points (0.8.1: the battle's less the cut)
+            if ((notes.cutK || notes.cutJ) && encs.back().kind == "fought") {
+                auto& f = byOpp[encs.back().opp];
+                f.first -= notes.cutK;
+                f.second -= notes.cutJ;
+            }
             for (auto& x : byOpp)
                 CreditWarScore(r.human, x.first, std::max(0, x.second.first), std::max(0, x.second.second));
+        }
         return;
     }
 }
@@ -4211,6 +4441,7 @@ static void RunHostTurn() {
     g_hostWantsTurn = false;
     g_phase = Phase::Processing;
     g_turnRunning = true;
+    g_strategicRan = false;
     g_afterTurnPending = false;
     g_turnStartTick = GetTickCount();
     BroadcastLobby();
@@ -4330,6 +4561,7 @@ static void HostTryStartLockstep() {
     si.peerName = p->name;
     si.sideNames[0] = CampaignNationName(0);
     si.sideNames[1] = CampaignNationName(g_lsHost.opp);
+    si.peerOfficers = LiveOfficers() && p->lsofLevel >= 1;  // 0.8.1: both sides' commanders (the player's hello `lsof`)
     int peer = p->peer;
     si.send = [peer](const std::string& s) { net::Send(peer, net::MSG_LOCKSTEP, s); };
     std::string err;
@@ -4479,7 +4711,7 @@ static bool HostOfferRejoin(Player& p, std::string* why = nullptr, bool manual =
         int peer = p.peer;
         std::string err;
         auto send = [peer](const std::string& s) { net::Send(peer, net::MSG_LOCKSTEP, s); };
-        if (!lockstep::Rejoin(ri.bid, p.name, send, err)) return no(err);
+        if (!lockstep::Rejoin(ri.bid, p.name, send, err, LiveOfficers() && p.lsofLevel >= 1)) return no(err);
         g_lsHost.opp = p.nation;
         g_lsHost.peer = p.peer;
         g_lsHost.name = p.name;
@@ -4503,7 +4735,9 @@ static bool HostOfferRejoin(Player& p, std::string* why = nullptr, bool manual =
     g_lsRelay[rel->id] = {rel->peer, p.peer};
     rel->sentTick = GetTickCount();
     rel->player2 = p.name;
-    net::Send(rel->peer, net::MSG_LOCKSTEP, lockstep::RejoinRequestMessage(rel->id, p.name));
+    // (0.8.1: `lsof` when the host and both players' PCs carry both sides' commanders)
+    net::Send(rel->peer, net::MSG_LOCKSTEP,
+              lockstep::RejoinRequestMessage(rel->id, p.name, LiveOfficers() && a->lsofLevel >= 1 && p.lsofLevel >= 1));
     NoticeTo(p, "Your live battle against " + against + " (" + a->name + ") is still running: " + a->name +
                     "'s PC starts it again with you at its next minute. The battle loads in a moment.");
     AddChat("* " + p.name + " is back: " + a->name + "'s live battle against " + nation + " starts again with " +
@@ -4672,10 +4906,13 @@ static void HostOnMessage(net::Msg& m) {
             p->divLevel = std::max(0, KVInt(kv, "div"));  // 0.6.1: the nation's own divisions (older clients: none)
             p->simb = KVInt(kv, "simb") != 0;              // 0.8.0: battles during the host's month (older clients: no)
             p->offLevel = std::max(0, KVInt(kv, "off"));  // 0.8.0: the nation's own officers (older clients: none)
+            p->lsofLevel = std::max(0, KVInt(kv, "lsof"));  // 0.8.1: both sides' commanders (older clients: none)
             Log("%s: mod %s, live-battle engine %d (this host: %d), player's relation rules %d, battle generator %d, "
                 "campaign divisions %d, battles during the host's month %d (this host: %d), officers %d",
                 name.c_str(), p->mod.c_str(), p->lsLevel, MP_LS_LEVEL, p->relLevel, p->genLevel, p->divLevel,
                 p->simb ? 1 : 0, g_simulOn ? 1 : 0, p->offLevel);
+            Log("%s: both sides' commanders in live battles %d (this host: %d)", name.c_str(), p->lsofLevel,
+                LiveOfficers() ? 1 : 0);
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -4708,6 +4945,8 @@ static void HostOnMessage(net::Msg& m) {
             w["gen"] = inv::Available() ? "5" : "3";
             // 0.8.0: this host sends a player's battles during its month (to a player announcing hello `simb`)
             w["simb"] = g_simulOn ? "1" : "0";
+            // 0.8.1: this host's live battles carry both sides' commanders (with a player announcing hello `lsof`)
+            w["lsof"] = LiveOfficers() ? "1" : "0";
             net::Send(m.peer, net::MSG_WELCOME, KVEncode(w));
             AddChat("* " + name + " joined" + (p->nation > 0 ? " as " + CampaignNationName(p->nation) : ""));
             {  // 0.8.0: a battle of this player fought during a month that a restart of the host's game lost
@@ -5167,6 +5406,25 @@ static std::vector<int> EncOthers(int opp) {
     return v;
 }
 
+// 0.8.1 (fix-sunktwice): a fought battle's own points as the game counted them at its end, in the result's deltas
+// (`vp0`, `vp1`: HandleBattleAftermath's raw VP0/VP1; `sunk`: "id:side:points,..." of each ship sunk in it), so the host
+// takes a ship its month had sunk already out of the battle's points as the game counted it; older hosts ignore them.
+static void AddBattlePoints(Bundle& res, int id) {
+    int vp0 = 0, vp1 = 0;
+    std::string sunk;
+    if (!game::BattlePoints(vp0, vp1, sunk)) return;
+    for (auto& f : res.files)
+        if (f.first == "deltas") {
+            KV d = KVDecode(f.second);
+            d["vp0"] = std::to_string(vp0);
+            d["vp1"] = std::to_string(vp1);
+            d["sunk"] = sunk;
+            f.second = KVEncode(d);
+        }
+    Log("battle %d: the battle's own points: raw VP %d/%d; ships sunk in it (id:side:points): %s", id, vp0, vp1,
+        sunk.empty() ? "none" : sunk.c_str());
+}
+
 static void SendBattleResult(int id, const std::string& outcome, const std::string& why, const Bundle* b,
                              const std::string& summary, const KV* extra = nullptr) {
     Bundle withOff;  // 0.8.0: the nation's officers as the battle slot's game saved them after the battle
@@ -5181,6 +5439,24 @@ static void SendBattleResult(int id, const std::string& outcome, const std::stri
             Log("battle %d: the nation's officers NOT in the result: %s", id, oerr.c_str());
         }
         b = &withOff;
+    }
+    int of2 = -1;  // 0.8.1: the second player's nation's officers after the live battle (this PC's memory)
+    if (b && id == g_cb.id && g_cb.of2 >= 1) {
+        std::vector<std::string> lines;
+        if (ofc::ReadNation(g_cb.of2, lines) && !lines.empty()) {
+            if (b != &withOff) {
+                withOff = *b;
+                b = &withOff;
+            }
+            std::string text = "[Officers]\r\n";
+            for (auto& l : lines) text += l + "\r\n";
+            withOff.Add("lsoff" + std::to_string(g_cb.of2) + ".ini", text);
+            of2 = g_cb.of2;
+            Log("battle %d: the result carries nation %d's %d officers (both sides' commanders)", id, of2,
+                OfficerCount(lines));
+        } else {
+            Log("battle %d: nation %d's officers NOT in the result (not readable)", id, g_cb.of2);
+        }
     }
     KV h;
     h["id"] = std::to_string(id);
@@ -5209,6 +5485,7 @@ static void SendBattleResult(int id, const std::string& outcome, const std::stri
     int dcOwn = 0, dcEnemy = 0;  // 0.6.0: the nation's decline counts after it (the game's, in the battle slot)
     if (id == g_cb.id && g_cb.dc && game::BattleSlotMode() && game::GetDeclineCounts(dcOwn, dcEnemy))
         h["dc"] = std::to_string(dcOwn) + ":" + std::to_string(dcEnemy);
+    if (of2 >= 1) h["of2"] = std::to_string(of2);  // 0.8.1: lsoff<of2>.ini (older hosts never ask for it)
     if (id == g_cb.id && g_cb.inv && game::BattleSlotMode() && outcome != "failed") {
         // 0.7.0 (invasions, P3): the nation's invasions and plan as the battle slot's game left them
         inv::KState one[9];
@@ -5233,6 +5510,7 @@ static void LeaveBattleSlot() {
     game::SetBattleSlotMode(false);
     g_cb.fighting = g_cb.starting = false;
     g_cb.id = -1;
+    g_cb.of2 = -1;
     std::wstring own = game::SaveDir(g_clientSlot) + L"RTWGame" + std::to_wstring(g_clientSlot) + L".bcs";
     if (g_myNation > 0 && FileExists(own) && !game::LoadCampaign(g_clientSlot, g_myNation))
         Notice("Loading your game again failed; it loads with the next month.");
@@ -5296,9 +5574,48 @@ static void ClientStartBattle() {
     }
     std::wstring dir = game::SaveDir(g_battleSlot);
     std::string err, summary;
+    // 0.8.1: a live battle between two players with both sides' commanders: the second player's nation's officers
+    // (`of2`, rtw3mp_lsoff<of2>.ini: not a save file) and its ships' commander ids, which MakeNationPlayer clears for
+    // every other nation, put back after it (the battle's setup gives its ships their commanders)
+    int of2 = KVInt(h, "pvp") && KVInt(h, "of2", -1) == opp && LiveOfficers() ? opp : -1;
+    std::vector<std::string> of2Lines;
+    for (auto it = b.files.begin(); it != b.files.end();) {
+        if (it->first.compare(0, 12, "rtw3mp_lsoff") != 0) {
+            ++it;
+            continue;
+        }
+        if (of2 >= 1 && it->first == "rtw3mp_lsoff" + std::to_string(of2) + ".ini")
+            for (auto& l : Split(it->second, '\n')) {
+                std::string t = l;
+                if (!t.empty() && t.back() == '\r') t.pop_back();
+                if (!t.empty() && t[0] != '[') of2Lines.push_back(t);
+            }
+        it = b.files.erase(it);
+    }
+    std::map<std::string, int> of2Ids;  // the second player's ships' commanders: ship id -> officer id
+    auto of2Keep = [&]() {
+        std::string bcs;
+        if (of2 >= 1 && ReadFileBytes(dir + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", bcs))
+            of2Ids = saveio::ShipCommanderIds(ParseIni(bcs), of2);
+        return true;
+    };
+    auto of2Back = [&]() {
+        std::wstring path = dir + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs";
+        std::string bcs;
+        if (of2 < 1 || of2Ids.empty() || !ReadFileBytes(path, bcs)) return true;
+        IniDoc d = ParseIni(bcs);
+        int n = saveio::SetShipCommanderIds(d, of2, of2Ids);
+        if (n && !WriteFileBytes(path, WriteIni(d))) {
+            err = "cannot write the battle slot";
+            return false;
+        }
+        Log("battle %d: both sides' commanders: nation %d's %d officers, %d of its ships' commanders kept in the battle "
+            "slot", id, of2, OfficerCount(of2Lines), n);
+        return true;
+    };
     if (dir.empty() || !saveio::ApplyStateBundle(b, dir, g_battleSlot, err) || !BattleSlotDivisions(h, dir, K) ||
-        !saveio::MakeNationPlayer(dir, g_battleSlot, K, {}, summary, err, game::OwnWarCounter()) ||
-        !ReadFileBytes(dir + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", g_cb.before)) {
+        !of2Keep() || !saveio::MakeNationPlayer(dir, g_battleSlot, K, {}, summary, err, game::OwnWarCounter()) ||
+        !of2Back() || !ReadFileBytes(dir + L"RTWGame" + std::to_wstring(g_battleSlot) + L".bcs", g_cb.before)) {
         SendBattleResult(id, "failed", "cannot prepare the battle slot: " + err, nullptr, "");
         return;
     }
@@ -5308,8 +5625,18 @@ static void ClientStartBattle() {
     g_cb.area = area;
     g_cb.cancelled = false;
     g_cb.offs = KVInt(h, "offs", 0) == 1;
+    g_cb.of2 = -1;
     g_cb.starting = true;
-    if (!game::LoadCampaign(g_battleSlot, 0)) {
+    if (of2 >= 1 && !of2Lines.empty()) ofc::SetBattleLists({{of2, of2Lines}});
+    bool loaded = game::LoadCampaign(g_battleSlot, 0);
+    std::string of2Loaded = ofc::EndBattleLoad();
+    if (of2 >= 1 && !of2Lines.empty()) {
+        g_cb.of2 = of2Loaded.find(":-1/") == std::string::npos && !of2Loaded.empty() ? of2 : -1;
+        Log("battle %d: both sides' commanders: nation %d's officers in the battle slot: %s (nation:officers/ships "
+            "commanded)%s",
+            id, of2, of2Loaded.empty() ? "none" : of2Loaded.c_str(), g_cb.of2 < 1 ? "; NOT loaded: its ships fight without" : "");
+    }
+    if (!loaded) {
         SendBattleResult(id, "failed", "cannot load the battle slot", nullptr, "");
         LeaveBattleSlot();
         return;
@@ -5785,6 +6112,7 @@ static void ClientStartBattle() {
         g_lsClientA.opp = opp;
         g_lsClientA.p2 = KVStr(h, "p2", "the other player");
         g_lsClientA.autoStrike = KVInt(h, "autostrike") != 0;
+        g_lsClientA.peerOfficers = g_cb.of2 >= 1 && LiveOfficers();  // 0.8.1: the host said both PCs take them
         g_lsClientA.since = GetTickCount();
         g_lsRole = 'A';
         lockstep::Hold("waiting for " + g_lsClientA.p2 + " to join the battle", g_lsClientA.bid);
@@ -5811,6 +6139,7 @@ static void ClientTryStartLockstep() {
     si.peerName = g_lsClientA.p2;
     si.sideNames[0] = W2U(game::NationName(0));  // the battle slot: this player's nation is nation 0
     si.sideNames[1] = W2U(game::NationName(g_lsClientA.opp));
+    si.peerOfficers = g_lsClientA.peerOfficers;  // 0.8.1: both sides' commanders (the battle message's `of2`)
     si.send = [](const std::string& s) { net::Send(0, net::MSG_LOCKSTEP, s); };
     std::string err;
     bool retry = false;
@@ -5845,6 +6174,7 @@ static void ClientBattleTick() {
             if (SaveBattleSlot(after, err) &&
                 saveio::ExtractBattleResult(g_cb.before, after, g_cb.K, g_cb.opp, res, summary, err,
                                             EncOthers(g_cb.opp))) {
+                AddBattlePoints(res, id);
                 SendBattleResult(id, "fought", "", &res, summary);
                 AddChat("* Battle result sent to the host (" + summary + ").");
             } else {
@@ -6432,6 +6762,8 @@ static void ClientOnMessage(net::Msg& m) {
             // 0.8.0: this PC plays its nation's own officers (officers.cpp: the month's officer lists traded) and sends
             // them with its turns and battles; the host then keeps them and sends them back with the month
             kv["off"] = ofc::Available() && ofc::MonthAvailable() ? "1" : "0";
+            // 0.8.1: this PC's live battles carry both sides' commanders (officers.cpp: the battle's officer lists)
+            kv["lsof"] = LiveOfficers() ? "1" : "0";
             kv["cpu"] = x87::CpuVendor();  // (logged by both sides: a live battle's diagnostics name differing vendors)
             if (datafiles::Ready()) kv["dh"] = datafiles::Combined();  // the game data files (logged; checked at a start)
             net::Send(0, net::MSG_HELLO, KVEncode(kv));
@@ -6465,6 +6797,8 @@ static void ClientOnMessage(net::Msg& m) {
             g_myName = assigned;
             g_hostGen = std::max(0, KVInt(kv, "gen"));  // 0.6.0 (older hosts: none)
             g_hostSimb = KVInt(kv, "simb");              // 0.8.0 (older hosts: none)
+            Log("joined %s: both sides' commanders in live battles: the host %d, this PC %d", KVStr(kv, "host").c_str(),
+                KVInt(kv, "lsof"), LiveOfficers() ? 1 : 0);  // 0.8.1 (older hosts: none)
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -6591,6 +6925,11 @@ void Init() {
     // screen (officers.cpp; any nation but the host's: one given to the computer may keep its officers' record)
     ofc::SetHostGuards([](int nation) { return g_role == Role::Host && nation >= 1 && nation <= 8; },
                        [](int nation, const std::string& line) { g_playerNews[nation].push_back(line); });
+    // 0.8.1: the month's crew quality of a joined nation's ships without a commander as the game's player's (officers.cpp)
+    ofc::SetUncommandedRule([](int nation) { return UncommandedRuleFor(nation); });
+    // 0.8.1: after a battle the messages about a commander show on his own player's PC only (B: its nation in A's
+    // campaign while the live battle's copy is on screen)
+    ofc::SetViewerNation([] { return lockstep::ViewerNation(); });
     lockstep::Hooks lh;
     // A live battle's lines are this PC's own: the host's AddChat would send every "* " line to all players (the other
     // player then read the host's side's game texts and pause reasons, and its own lines twice); the other player gets
@@ -6931,6 +7270,22 @@ std::string DebugBattles(const std::vector<std::string>& a) {
             g_testSimulHoldSec);
         return "ok simulhold=" + std::to_string(g_testSimulHoldSec);
     }
+    if (cmd == "sinkmonth" && a.size() > 2) {  // 0.8.1, TEST: a ship lost in the host's month (fix-sunktwice)
+        if (a[2] == "off") {
+            g_testSinkMonth = {};
+            return "ok sinkmonth=off";
+        }
+        int n = atoi(a[2].c_str()), s = a.size() > 3 ? (a[3] == "result" ? 0 : atoi(a[3].c_str())) : -1;
+        if (n < 1 || n > 8 || s < 0) return "error usage: sinkmonth <nation> <campaign ship id>|result | off";
+        if (g_battlePhase) return "error the battle phase has begun";
+        g_testSinkMonth.nation = n;
+        g_testSinkMonth.ship = s;
+        Log("TEST: sinkmonth: %s of nation %d is lost in the host's month (%s)",
+            s ? ("ship " + std::to_string(s)).c_str() : "the first ship a result held this month lost", n,
+            s ? "when its DoStrategicTurn starts, or at once if it has" : "at the battle phase's start, before its save");
+        if (s && g_turnRunning && g_strategicRan) TestSinkMonthNow("DoStrategicTurn had started: now", false);
+        return "ok sinkmonth=" + std::to_string(n) + ":" + (s ? std::to_string(s) : std::string("result"));
+    }
     if (cmd == "list") {
         std::string s = "ok phase=" + std::string(g_battlePhase ? "1" : "0") + " timeout=" +
                         std::to_string(g_battleTimeoutSec) + " battles=";
@@ -7239,6 +7594,8 @@ void Leave() {
     g_invPlanFromHost = false;
     g_relNations.clear();
     g_relForced.clear();
+    g_offNations.clear();
+    g_testOldOff.clear();
     g_kLend.clear();
     g_kRevo.clear();
     g_kWill.clear();
@@ -7430,6 +7787,7 @@ void ReleaseNation(int idx) {
     g_reserved.erase(idx);
     g_relNations.erase(idx);
     g_relForced.erase(idx);
+    g_offNations.erase(idx);
     for (auto& p : g_players)
         if (p.second.nation == idx) {
             p.second.nation = -1;
@@ -7943,6 +8301,29 @@ std::string DebugOfficerState() {
 }
 
 std::string DebugLastEvent() { return g_role == Role::Host ? g_lastHostEvent : g_lastEvent; }
+
+// "nations=<K>:<UncommandedRuleFor(K)>,... saved=<g_offNations> old=<g_testOldOff>" (host)
+std::string DebugUncommandedRule() {
+    auto list = [](const std::set<int>& s) {
+        std::string o;
+        for (int n : s) o += std::to_string(n) + ",";
+        return o;
+    };
+    std::string s = "nations=";
+    for (int k = 1; k <= 8; k++) s += std::to_string(k) + ":" + std::to_string(UncommandedRuleFor(k)) + ",";
+    return s + " saved=" + list(g_offNations) + " old=" + list(g_testOldOff);
+}
+
+std::string DebugUncommandedOld(int nation, bool old) {
+    if (g_role != Role::Host || nation < 1 || nation > 8) return "error host only, nation 1-8";
+    if (old)
+        g_testOldOff.insert(nation);
+    else
+        g_testOldOff.erase(nation);
+    Log("TEST: officers: nation %d's player %s for the rule of ships without a commander", nation,
+        old ? "taken as an older mod's (no officers of its own)" : "as its hello says again");
+    return "ok " + DebugUncommandedRule();
+}
 
 // Tests and diagnostics: live battles (`ls ...`, see lockstep::Debug). Session-level: `ls enable 0|1`, `ls session`,
 // `ls autostrike [0|1]` (the host's option "Computer flies carrier strikes in live battles", as its check box sets it),
@@ -8609,6 +8990,12 @@ void OnAfterDesignStudies(void* self) {
 // policy): do the same for the joined players' nations, once per month, and tell them when a change takes effect.
 void OnAfterReduceTimeLimits(void* self) {
     using namespace mp;
+    // 0.8.1: what the month's crew training (AdvanceShipConstruction) did to the joined nations' ships without a commander
+    std::string uc = ofc::TakeUncommandedMonth();
+    if (!uc.empty() && g_role == Role::Host)
+        Log("officers: the month's crew quality of the joined nations' ships without a commander (the game's rule for "
+            "its player's: one less 1 in 5):%s",
+            uc.c_str());
     if (g_role != Role::Host || g_phase == Phase::Lobby || !game::DoctrineAvailable()) return;
     if (g_doctrineSeq == g_seq) {
         Log("doctrine: already advanced this month");
@@ -8686,6 +9073,8 @@ void OnStrategicTurnRuns() {
         std::string s = mp::SimulStatus();
         Log("the host's month: DoStrategicTurn runs; battles of the players during the month still fought: %s",
             s.empty() ? "none" : s.c_str());
+        mp::g_strategicRan = true;
+        mp::TestSinkMonthNow("as its DoStrategicTurn starts", false);  // (TEST ONLY, 0.8.1: `battles sinkmonth`)
         if (mp::g_ofKillArm.nation >= 0 && mp::g_ofKillArm.month) {  // TEST ONLY (`ofkill ... armmonth`): a commander's
             // fate in the month after its battles went out, as DoStrategicTurn's sinkings give it
             Log("TEST: officers: the armed KillCommander as DoStrategicTurn starts: %s",

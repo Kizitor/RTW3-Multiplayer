@@ -674,6 +674,39 @@ std::vector<std::string> HostRecordOfficers(int K) {
     return g_attached && it != g_recs.end() && it->second.hasOfficers ? it->second.officers : std::vector<std::string>();
 }
 
+bool HostTakeBattleOfficers2(const Bundle& res, int K, const std::vector<std::string>& sent) {
+    if (!g_attached || K < 1 || K > 8 || sent.empty()) return false;
+    const std::string* f = res.Get("lsoff" + std::to_string(K) + ".ini");
+    if (!f) {
+        Log("officers of nation %d: none came back from its live battle; the record stays", K);
+        return false;
+    }
+    std::vector<std::string> officers, areas;
+    int n = 0;
+    std::string why;
+    if (!ParseOfficersFile(*f, officers, areas, n, why)) {
+        Log("officers of nation %d: the live battle's list rejected (%s); the record stays", K, why.c_str());
+        return false;
+    }
+    Rec& r = RecOf(K);
+    if (!r.hasOfficers) return false;
+    std::vector<saveio::OfficerRec> s, h, b;
+    std::string err;
+    saveio::ParseOfficers(sent, s, false, err);
+    saveio::ParseOfficers(r.officers, h, false, err);
+    saveio::ParseOfficers(officers, b, false, err);
+    int changed = 0;
+    std::vector<saveio::OfficerRec> only = saveio::BattleOnlyOfficers(s, b, &changed);
+    saveio::OfficerMergeNotes notes;
+    std::vector<saveio::OfficerRec> m = saveio::MergeOfficers(s, h, only, &notes);
+    r.officers = saveio::OfficerLines(m);
+    HostSave();
+    Log("officers of nation %d: %d after the live battle (the other player's PC) merged into the record (%d): %d took "
+        "battle stars or a fate; %s",
+        K, n, (int)m.size(), changed, notes.Text().c_str());
+    return true;
+}
+
 bool HostPutOfficers(Bundle& b, int K, bool own, const char* what, std::vector<std::string>* sentLines) {
     if (K < 1 || K > 8) return false;
     std::string* off = nullptr;

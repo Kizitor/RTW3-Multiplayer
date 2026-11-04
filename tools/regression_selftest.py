@@ -923,6 +923,81 @@ def simul_samples():
     check('simul_expected: never the ship\'s CommanderId (0.8.0 officers: the merge takes none; the dead and captured '
           'are cleared by the officers\' merge)', 'CommanderId' not in got and got.get('BattleStars') == '1', got)
     officer_samples()
+    sunktwice_samples()
+
+
+def sunktwice_samples():
+    """0.8.1 (fix-sunktwice): battle_simul S's model of saveio::ApplyBattleResult for a ship sunk in the host's month and
+    in the player's battle (simul_twice, simul_expected and simul_merge_check's `lost`; the game's formulas as
+    tools/merge_test.cpp checks them) and its log patterns (TWICE_RE, TWICE_CUT_RE) on lines of src/mod's formats."""
+    check('log_adjusted_vp as GetLogAdjustedVP (merge_test: 0, 2, 1712, 4946); approx_ship_vp as GetApproxVP; '
+          'battle_points_cut measured / estimated alone / quick',
+          (R.log_adjusted_vp(0), R.log_adjusted_vp(1), R.log_adjusted_vp(25000), R.log_adjusted_vp(80000)) ==
+          (0, 2, 1712, 4946) and R.approx_ship_vp('CA', 12500) == 25000 and R.approx_ship_vp('CV', 20000) == 20000
+          and R.battle_points_cut(4946, 80000, 45100) == 4946 - R.log_adjusted_vp(34900)
+          and R.battle_points_cut(1712, -1, 25000) == 1712
+          and R.battle_points_cut(5000, -1, 0, True, (25000, 2400)) == 1712 + R.log_adjusted_vp(2400),
+          (R.log_adjusted_vp(25000), R.log_adjusted_vp(80000)))
+
+    def ship(sid, typ, disp, rt, fate, cq='5'):
+        return sid, dict(Name=f'Ship {sid}', ShipType=typ, Displacement=str(disp), RepairTime=str(rt), Fate=fate,
+                         CrewQuality=cq, NumberOfLogEntries='0')
+
+    def sec(ships):
+        return {f'Ship{i}{k}': v for i, (sid, f) in enumerate(ships) for k, v in dict(f, Id=sid).items()}
+    hf, bf = 'Sunk in battle  off Sicily with British ships.', 'Sunk in battle  in the Ionian Sea with German ships.'
+    s301, h301, r301 = ship('301', 'CA', 12500, 0, 'XXX'), ship('301', 'CA', 12500, 100, hf, '7'), \
+        ship('301', 'CA', 12500, 100, bf, '7')
+    s302, r302 = ship('302', 'DD', 1200, 0, 'XXX'), ship('302', 'DD', 1200, 100, bf)
+    s303, r303 = ship('303', 'CL', 5000, 0, 'XXX'), ship('303', 'CL', 5000, 3, 'XXX', '7')
+    loss = lambda **kw: {k: str(kw.get(k, 0)) for k in ('CALost', 'DDLost', 'CLLost')}  # noqa: E731
+    dK, dJ = R.log_adjusted_vp(80000), R.log_adjusted_vp(12000)
+    cut = R.log_adjusted_vp(80000) - R.log_adjusted_vp(80000 - 27000)
+    files = dict(sent={'Nation1': {'VP': '100'}, 'Nation3': {'VP': '50'}, 'Nation3Ships': sec([s301, s302, s303]),
+                       'Nation3Losses': loss(CALost=2)},
+                 host={'Nation1': {'VP': '130'}, 'Nation3': {'VP': '70'}, 'Nation3Ships': sec([h301, s302, s303]),
+                       'Nation3Losses': loss(CALost=3)},
+                 result={'Nation3Ships': sec([r301, r302, r303]), 'Nation3Losses': loss(CALost=3, DDLost=1),
+                         'deltas': dict(dVP_K=str(dK), dVP_J=str(dJ), vp0='80000', vp1='12000',
+                                        sunk='301:1:27000,302:1:2600')})
+    files['merged'] = {'Nation1': {'VP': str(130 + dK - cut)}, 'Nation3': {'VP': str(70 + dJ)},
+                       'Nation3Ships': sec([h301, r302, ship('303', 'CL', 5000, 3, 'XXX', '7')]),
+                       'Nation3Losses': loss(CALost=3, DDLost=1)}
+    tw = R.simul_twice(files, 1, 3)
+    check('simul_twice: 301 lost in the host\'s month and in the battle, counted once (the host\'s ship kept, CALost '
+          '3 = the host\'s, the points of the per-ship data off nation 1: GetLogAdjustedVP(80000) - (80000 - 27000)); '
+          '302 sunk in the battle only: DDLost +1, its points stay; no difference in the merged save',
+          [t['id'] for t in tw['twice']] == ['301'] and tw['twice'][0]['counter'] == 'CALost' and
+          tw['cut'] == (cut, 0) and tw['losses'][(3, 'CALost')] == 3 and tw['losses'][(3, 'DDLost')] == 1 and
+          not tw['bad'], tw)
+    bad = dict(files, merged=dict(files['merged'], Nation1={'VP': str(130 + dK)},
+                                  Nation3Ships=sec([r301, r302, ship('303', 'CL', 5000, 3, 'XXX', '7')]),
+                                  Nation3Losses=loss(CALost=4, DDLost=1)))
+    tw = R.simul_twice(bad, 1, 3)
+    check('simul_twice: the merge of 0.8.0 (the battle\'s Fate on the host\'s sunk ship, CALost 4, the VP with the '
+          'ship\'s points) found: three differences', len(tw['bad']) == 3, tw['bad'])
+    est = dict(files, result=dict(files['result'], deltas=dict(dVP_K=str(dK), dVP_J=str(dJ))))
+    tw = R.simul_twice(est, 1, 3)
+    check('simul_twice: a 0.8.0 player\'s result (no per-ship points): estimated (GetApproxVP 25000 off the raw total '
+          'of the battle\'s points)', tw['twice'][0]['estimated'] and tw['twice'][0]['points'] == 25000 and
+          tw['cut'][0] == R.battle_points_cut(dK, -1, 25000), tw['cut'])
+    got, rules = R.simul_expected(dict(s301[1]), dict(h301[1]), dict(r301[1]), True)
+    check('simul_expected: a ship the host\'s month lost since the send: nothing of the battle\'s (the host\'s as it is)',
+          got == {} and rules == ['lost in the month'], (got, rules))
+    mc = R.simul_merge_check(files, True)
+    check('simul_merge_check: the ship lost in the host\'s month counted `lost`, kept as the host had it; no difference',
+          mc['lost'] == 1 and not mc['bad'], mc)
+    lines = ("10:00:01.000 [1] battle 7: nation 3's CA Zara (ship 301) was lost in the host's month (Sunk in battle "
+             "(TEST) with Britain ships.) and in the battle (Sunk in battle  in the Ionian Sea with German ships.): "
+             "counted once: the host's ship kept, CALost -1, 27000 raw points of nation 1\n"
+             "10:00:01.001 [1] battle 7: points taken off for them: nation 1 2637, nation 3 0 (the player's PC's "
+             "per-ship points, raw VP 80000/12000)")
+    t1, t2 = re.search(R.TWICE_RE, lines, re.M), re.search(R.TWICE_CUT_RE, lines, re.M)
+    check('TWICE_RE / TWICE_CUT_RE: the host\'s two lines (battle, nation, type, name, ship, the host\'s fate with its '
+          'parentheses, the counter; the points taken off)',
+          t1 and t1.group(1, 2, 3, 4, 5) == ('7', '3', 'CA', 'Zara', '301') and t1[6].endswith('Britain ships.') and
+          'CALost -1' in t1[8] and t2 and t2.group(1, 2, 3, 4, 5) == ('7', '1', '2637', '3', '0'),
+          (t1.groups() if t1 else None, t2.groups() if t2 else None))
 
 
 def officer_samples():
@@ -979,6 +1054,50 @@ def officer_samples():
           and [x[:3] for x in re.findall(R.OF_MERGED_RE, hl, re.M)] == [('1', '24', '25')],
           (R.simul_officer_puts(hl), re.findall(R.OF_CLIENT_RE, cl), re.findall(R.OF_SLOT_RE, cl),
            re.findall(R.OF_MERGED_RE, hl, re.M)))
+
+
+def lscmd_samples():
+    """0.8.1 (reg-081), the suite's fixes of the 0.8.1 release regression: both sides' commanders' checks of a battle
+    without a commanded ship of the second side (a battle of destroyers, which never have a commander): lscmd_in_battle
+    (the nation's commanded ships of the host's campaign in the battle, `ls commanders cship`), lscmd_c1 and
+    lscmd_stars' SKIP-note when no commander of side 1 fought; treaty g)'s possessions with a rebellion in the treaty
+    month (treaty_moves)."""
+    check('lscmd_c1: side 1\'s commanded ships of the start\'s reply (0/11 -> 0, 3/30 -> 3; no start -> None)',
+          (R.lscmd_c1(({'side1': '0/11'}, {})), R.lscmd_c1(({'side1': '3/30'}, {'side1': '3/30'})), R.lscmd_c1(None))
+          == (0, 3, None))
+    save = {'Nation2Ships': {'Ship0Id': '9', 'Ship0CommanderId': '120604', 'Ship1Id': '10', 'Ship1CommanderId': '-1',
+                             'Ship2Id': '11', 'Ship2CommanderId': '120605'}}
+    replies = {'9': 'ok side1=1/11 ship=9:1:0:120604', '11': 'ok side1=1/11 ship=11:-:-:-'}
+    keep = (R.read_save, R.lscmd)
+    asked = []
+    try:
+        R.read_save = lambda p: save
+        R.lscmd = lambda port, *a: (asked.append(a), R.kvs(replies.get(str(a[1]), 'ok')))[1]
+        ids, inb = R.lscmd_in_battle(R.C, 2)
+    finally:
+        R.read_save, R.lscmd = keep
+    check('lscmd_in_battle: the nation\'s ships with a commander in slot 1 (9, 11; not 10: -1) and of them those in A\'s '
+          'battle (`ls commanders cship 9` -> side 1; 11 not in it)', sorted(ids) == ['11', '9'] and
+          inb == {'9': '9:1:0:120604'} and sorted(x[1] for x in asked) == ['11', '9'], (ids, inb, asked))
+    n0 = len(R.results)
+    rows0 = {'1': dict(BattleStars='2', Status='0'), '2': dict(BattleStars='0', Status='0')}
+    rows1 = {'1': dict(BattleStars='2', Status='0'), '2': dict(BattleStars='0', Status='0')}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        r0 = R.lscmd_stars('b) M1 commanders', rows0, rows1, 2, 0)
+        n1 = len(R.results)
+        r1 = R.lscmd_stars('b) M1 commanders', rows0, dict(rows1, **{'2': dict(BattleStars='1', Status='1')}), 2, 2)
+    del R.results[n0:]
+    check('lscmd_stars: no commander of side 1 in the battle (commanded 0): a SKIP-note, no check; with commanders the '
+          'stars must rise (2 -> 3, officer 2 dead since)', r0 is None and n1 == n0 and 'SKIP-note b) M1 commanders: no '
+          'commander of the second side' in out.getvalue() and r1 is True, (r0, n1 - n0, r1, out.getvalue()[-300:]))
+    moved = {'Corsica', 'Senegal', 'Polynesia', 'Liaotung Peninsula'}
+    gained = {'Corsica', 'Senegal', 'Polynesia'}
+    t1 = R.treaty_moves(moved, gained, {'Liaotung Peninsula': 'Neutral', 'Corsica': 'Germany'}.get)
+    t2 = R.treaty_moves(moved, gained, {'Liaotung Peninsula': 'Italy'}.get)
+    check('treaty_moves (treaty g), reg-081): the loser\'s losses the winner gained are the treaty\'s; one the game\'s '
+          'rebellion took that month (owner Neutral) apart; any other owner listed (a failure)',
+          t1 == (gained, {'Liaotung Peninsula'}, {}) and t2 == (gained, set(), {'Liaotung Peninsula': 'Italy'}), (t1, t2))
 
 
 def battlegen_samples():
@@ -1437,6 +1556,7 @@ def main():
     divisions_samples()
     simul_samples()
     battlegen_samples()
+    lscmd_samples()
     sandbox = os.path.abspath('regression_selftest_sandbox')
     if os.path.exists(sandbox):
         shutil.rmtree(sandbox)

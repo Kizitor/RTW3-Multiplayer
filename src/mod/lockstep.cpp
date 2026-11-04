@@ -19,6 +19,7 @@
 #include "datafiles.h"
 #include "delphi.h"
 #include "game.h"
+#include "officers.h"
 #include "saveio.h"
 #include "x87.h"
 #include "../../third_party/minhook/include/MinHook.h"
@@ -1555,15 +1556,38 @@ static void HashFields(uint64_t* g, void* obj, const FieldSpec* fs, size_t n) {
 struct HashResult {
     uint64_t all = 0, group[G_COUNT] = {};
     int ships = 0, sunk = 0, divisions = 0, air = 0, torps = 0, sides[2] = {};
+    uint64_t cmd = 0;  // 0.8.1: the ships' commanders (only with both sides' commanders: g_hashCommanders)
 };
 
 static bool TypeFlagsNow(uint8_t out[3]);  // (the campaign's ship-type flags; below)
 static bool g_typeFlagsHash = true;  // TEST ONLY (`ls shiptypes nohash`): the flags out of the state hash (as 0.4.1 RC)
+// 0.8.1: a battle with both sides' commanders (the start's `of2`) has each ship's commander (TOfficer Id, Ability,
+// Special1/2, Status; -1 for none) in the state hash, folded into `all` (the log's `cmd=`): a PC that missed a list
+// shows at READY. Without `of2` the hash is engine level 18's.
+static bool g_hashCommanders = false;
+
+static void HashCommander(uint64_t& h, void* ship) {
+    static int fCmd = dl::Field("TFightingShip", "Commander"), fId = dl::Field("TOfficer", "Id"),
+               fAb = dl::Field("TOfficer", "Ability"), fS1 = dl::Field("TOfficer", "Special1"),
+               fS2 = dl::Field("TOfficer", "Special2"), fSt = dl::Field("TOfficer", "Status");
+    if (fCmd < 0 || fId < 0 || fAb < 0 || fS1 < 0 || fS2 < 0 || fSt < 0) return;
+    void* o = dl::At<void*>(ship, fCmd);
+    int32_t v[5] = {-1, 0, 0, 0, 0};
+    if (o) {
+        v[0] = dl::At<int32_t>(o, fId);
+        v[1] = dl::At<int32_t>(o, fAb);
+        v[2] = dl::At<uint8_t>(o, fS1);
+        v[3] = dl::At<uint8_t>(o, fS2);
+        v[4] = dl::At<uint8_t>(o, fSt);
+    }
+    Fnv(h, v, sizeof(v));
+}
 
 static HashResult StateHash() {
     ResolveSpecs();
     HashResult r;
     for (auto& g : r.group) g = 1469598103934665603ull;
+    r.cmd = 1469598103934665603ull;
     void* divs = List(E.divisionsVar);
     int sunkOff = g_shipFields[10].off;
     for (int i = 0; i < dl::ListCount(divs); i++) {
@@ -1584,6 +1608,7 @@ static HashResult StateHash() {
             HashFields(r.group, s, g_shipFields, sizeof(g_shipFields) / sizeof(g_shipFields[0]));
             std::string mb = MountBytes(s);
             Fnv(r.group[G_AMMO], mb.data(), mb.size());
+            if (g_hashCommanders) HashCommander(r.cmd, s);
         }
     }
     void* air = List(E.airVar);
@@ -1631,6 +1656,7 @@ static HashResult StateHash() {
     if (CampaignDateNow(date)) Fnv(r.all, date, sizeof(date));
     uint8_t types[3];  // engine level 17: the ship-type flags the identification reads (TypeFlagsNow)
     if (g_typeFlagsHash && TypeFlagsNow(types)) Fnv(r.all, types, sizeof(types));
+    if (g_hashCommanders) Fnv(r.all, &r.cmd, sizeof(r.cmd));  // 0.8.1: both sides' commanders
     return r;
 }
 
@@ -1720,7 +1746,9 @@ std::string HashLine(const char* tag) {
                   (unsigned long long)(g_draws[2] - g_drawsAt[2]), g_simState, m ? dl::At<int>(m, E.fGameSpeed) : -99);
     int32_t date[3];
     if (n > 0 && n < (int)sizeof(b) && CampaignDateNow(date))
-        snprintf(b + n, sizeof(b) - n, " date=%d-%02d-%02d", date[0], date[1], date[2]);
+        n += snprintf(b + n, sizeof(b) - n, " date=%d-%02d-%02d", date[0], date[1], date[2]);
+    if (g_hashCommanders && n > 0 && n < (int)sizeof(b))  // 0.8.1: both sides' commanders (in `all`)
+        snprintf(b + n, sizeof(b) - n, " cmd=%08x", (unsigned)(h.cmd ^ (h.cmd >> 32)));
     for (int k = 0; k < 3; k++) g_drawsAt[k] = g_draws[k];
     return b;
 }
@@ -2757,6 +2785,18 @@ static struct Session {
     int mslHeldCalls[2] = {0, 0};  // automatic missile fire calls with that side held
     int mslOrders = 0, mslReplays = 0, mslFired = 0, mslSkipped = 0, ssmRefused = 0, mslSubsUnchecked = 0;
     std::string startFaw = "11", startPmt;  // B: Fire at will per side and the pending missile targets of the start
+    // Both sides' commanders (0.8.1; engine level 18 kept: only between two PCs that announced them, `lsof`). A's start
+    // carries the other nations' officer lists (`of2=1`, `ofn=`, files rtw3mp_lsoff<N>.ini: the game's writer on A's
+    // memory at the snapshot); both PCs load them before the battle save's commander lookup (officers.cpp).
+    bool peerOf2 = false;     // A: the other PC takes them (StartInfo.peerOfficers)
+    bool of2Refused = false;  // A: its `ready` did not confirm them: none for the rest of this battle
+    bool of2 = false;         // this epoch's start carries them (both PCs)
+    std::string ofn;          // the nations whose lists it carries ("2", "2,5"; may be empty)
+    std::map<int, std::vector<std::string>> of2Lists;  // ... and their lists (A: sent, B: received) for this PC's loads
+    std::string of2Loaded;    // this PC's last load: "<nation>:<officers>/<ships commanded>,..."
+    int of2Found = 0;         // ... the commanders the battle save's lookup found in them
+    std::set<int> of2Sent;    // A: the nations whose lists a start of this battle carried (every later start too)
+    int viewerSerial = -1;    // B: game::DoBattleCalls() when this battle came (ViewerNation: still the same battle)
 } S;
 
 static unsigned g_cwSaved = 0;  // B: this PC's own x87 control word while A's is in use
@@ -2803,6 +2843,7 @@ static struct RejoinTry {
     SendFn send;
     DWORD since = 0, lastLog = 0, lastRunNote = 0;
     bool gateLogged = false;
+    bool peerOfficers = false;  // 0.8.1: the returning player's PC takes both sides' commanders
 } g_rjTry;
 static DWORD g_tRejoin = 60000;  // the longest wait for a quiet minute boundary (then the computer keeps side 1)
 
@@ -4492,7 +4533,7 @@ struct DfKind {
 // salvo (`torp`) and a missile salvo (`msl`, engine level 9) only at the release of the boundary they were given at:
 // their firing solution is for that moment.
 static const DfKind kDfKinds[] = {{"chforce", false}, {"lead", false}, {"turnaway", false}, {"autorun", false},
-                                  {"torp", true},     {"msl", true}};
+                                  {"torp", true},     {"msl", true},   {"tsink", false}};
 
 static const DfKind* DfFind(const std::string& kind) {
     for (auto& k : kDfKinds)
@@ -4518,6 +4559,7 @@ static std::string DfText(const std::string& kind, const std::vector<std::string
                                     : "Auto-run on";
         if (kind == "torp") return "Torpedo salvo of " + KeyName(a[0]);  // (the target by its true name: logs only)
         if (kind == "msl") return "Missile salvo of " + KeyName(a[0]);   // (likewise)
+        if (kind == "tsink") return "TEST sinking of " + KeyName(a[0]);  // (TEST ONLY, 0.8.1: `ls testsink`)
     }
     return kind;
 }
@@ -5440,6 +5482,21 @@ static void RunDeferred(int actor, const std::string& item, int relN) {
         auto it = w.objOf.find(key);
         return it == w.objOf.end() ? nullptr : it->second;
     };
+    if (kind == "tsink") {  // TEST ONLY (0.8.1, `ls testsink`): the game's debug Sink (TfrmMain.Sink1Click: CurrentFloatPoints 0,
+        // Sinking 10) on both PCs, with Sinking 2: CheckSunk counts it down each minute, the ship sinks within 2 minutes
+        static int fFloat = dl::Field("TFightingShip", "CurrentFloatPoints"),
+                   fSinking = dl::Field("TFightingShip", "Sinking");
+        void* ship = obj(a[0]);
+        if (!IsFightingShip(ship)) return skip("the ship is gone");
+        if (dl::At<uint8_t>(ship, E.fSunk)) return skip("the ship was sunk");
+        if (fFloat <= 0 || fSinking <= 0) return skip("the fields were not found");
+        dl::At<int>(ship, fFloat) = 0;
+        dl::At<int>(ship, fSinking) = 2;
+        Log("lockstep: TEST: deferred sinking of %s (side %d) carried out at minute %d: CurrentFloatPoints 0, Sinking 2 "
+            "(as the game's debug Sink)",
+            W2U(ObjName(ship)).c_str(), dl::At<int>(ship, E.fShipSide), relN);
+        return;
+    }
     if (kind == "torp") {  // torp <ship> <mount index> <target> <angle bits> <speed> <range> <manual>
         if (!g_featTorp) return skip("manual torpedo salvoes are not available on this PC");
         if (a.size() < 7) return skip("an order this PC doesn't know");
@@ -6694,7 +6751,16 @@ static bool LoadSnapshot(int slot, uint32_t seed, int speed, int fastest, bool f
         SetRng(2, seed);
         g_sharedOther = true;
         g_quiet++;
+        // 0.8.1: both sides' commanders: the start's lists go into their nations' lists inside the load, before the
+        // battle save's commander lookup (officers.cpp); the state hash has the commanders
+        g_hashCommanders = S.of2;
+        if (S.of2) ofc::SetBattleLists(S.of2Lists);
         ok = LoadCampaignGuarded(slot);  // an exception counts as a failed load; the flags below are reset anyway
+        S.of2Loaded = ofc::EndBattleLoad(&S.of2Found);
+        if (S.of2)
+            Log("lockstep: both sides' commanders: the officer lists of nations %s loaded (nation:officers/ships "
+                "commanded: %s); the battle save's lookup found %d commanders in them",
+                S.ofn.empty() ? "-" : S.ofn.c_str(), S.of2Loaded.empty() ? "none" : S.of2Loaded.c_str(), S.of2Found);
         g_quiet--;
         g_sharedOther = false;
         // Both PCs continue from the same stream position even if a stray timer drew numbers during the load (the
@@ -8948,6 +9014,7 @@ static void Cleanup() {
     // commanded for this player (auto-run) are theirs again; the game's own auto-run button works from now on.
     bool handBack = S.isA && S.autoRun[0] && !g_loading && BattleForm();
     SetRng(0, 0);
+    g_hashCommanders = false;  // (0.8.1)
     FreezeView();  // keep this PC's view (as in a single-player battle)
     if (!g_loading) UnlockMissilePanel();  // (Fire at will keeps this player's setting: the game's own rule from here)
     // This PC's own battle preferences as before the battle (B ran with A's; on either PC the Preferences dialog's
@@ -9661,6 +9728,18 @@ static std::string TestPendingTarget(int i) {
     memcpy(pt, (uint8_t*)best + fLoc, 8);
     return std::to_string(i) + ":" + Hex(pt, 12) + ";";
 }
+
+// 0.8.1: the commanders of the battle's ships now (TFightingShip.Commander; whose lists a start must carry).
+static bool Of2AllLoaded();  // (below)
+static std::vector<void*> BattleCommanders() {
+    static int fCmd = dl::Field("TFightingShip", "Commander");
+    std::vector<void*> out;
+    void* ships = E.allShipsVar ? List(E.allShipsVar) : nullptr;
+    for (int i = 0; fCmd > 0 && i < dl::ListCount(ships); i++)
+        if (void* s = dl::ListItem(ships, i))
+            if (void* o = dl::At<void*>(s, fCmd)) out.push_back(o);
+    return out;
+}
 static bool StartTransfer(bool resync, std::string& err) {
     if (!BattleForm()) {
         err = "no battle";
@@ -9706,6 +9785,25 @@ static bool StartTransfer(bool resync, std::string& err) {
     int slot = game::CurrentSlot();
     Bundle b;
     if (!BuildBundle(slot, b, err)) return false;
+    // 0.8.1: both sides' commanders, for a PC that announced them (else every lookup is PlayerNation's, as 0.8.0): the
+    // nations whose officers command the battle's ships now, the opponent's (also when none of its officers commands a
+    // ship: its sunk ships' commanders still get their fates at the end, and the result takes its list from this PC's
+    // memory) and those an earlier start of this battle carried; their lists from this PC's memory (both PCs load them)
+    S.of2 = S.peerOf2 && !S.of2Refused && ofc::LiveAvailable();
+    S.of2Lists.clear();
+    S.ofn.clear();
+    if (S.of2) {
+        std::set<int> more = S.of2Sent;
+        more.insert(S.opp);
+        S.of2Lists = ofc::BattleLists(BattleCommanders(), more);
+        for (auto& e : S.of2Lists) {
+            std::string text = "[Officers]\r\n";
+            for (auto& l : e.second) text += l + "\r\n";
+            b.Add("rtw3mp_lsoff" + std::to_string(e.first) + ".ini", text);
+            S.ofn += (S.ofn.empty() ? "" : ",") + std::to_string(e.first);
+            S.of2Sent.insert(e.first);
+        }
+    }
     std::string body = b.Pack();
     KV h;
     h["t"] = "start";
@@ -9739,6 +9837,10 @@ static bool StartTransfer(bool resync, std::string& err) {
     std::string pa = S.preAutoF[0] + "/" + S.preAutoF[1];
     h["pa"] = pa;  // the forces' computer control before auto-run per side (Auto-run off gives it back)
     h["autostrike"] = S.autoStrike ? "1" : "0";  // the computer flies both sides' carrier strikes (AirstrikeSimSide)
+    if (S.of2) {  // 0.8.1: the other nations' officer lists travel (rtw3mp_lsoff<N>.ini); B echoes `of2` in its ready
+        h["of2"] = "1";
+        h["ofn"] = S.ofn;
+    }
     if (S.rejoin && !S.everRunning) {  // a dropped player is back (B: its chat; a restart if B still has the battle)
         h["rj"] = "1";
         h["min"] = std::to_string(Minute());
@@ -9752,12 +9854,21 @@ static bool StartTransfer(bool resync, std::string& err) {
     Log("lockstep: battle %d epoch %d sent (%u files, %u bytes, seed %u, speed %d, fastest %d, auto-run %s%s)", S.bid,
         S.epoch, (unsigned)b.files.size(), (unsigned)body.size(), S.seed, speed, fastest, autoState.c_str(),
         S.rejoin && !S.everRunning ? ", rejoin" : "");
+    if (S.of2 || S.peerOf2)
+        Log("lockstep: both sides' commanders: %s", S.of2 ? ("on, the officer lists of nations " +
+                                                             (S.ofn.empty() ? std::string("none") : S.ofn) + " sent").c_str()
+                                                           : "off for this battle (the other PC did not take them)");
     x87::SetSoft(S.softMath);
     x87::ResetCounts();
     datafiles::SetPhase("battle load");  // (TEST ONLY probe: RTW3MP_TEST_FILELOG)
     if (!LoadSnapshot(slot, S.seed, speed, fastest, !resync && !S.everRunning, ai0, ai1, autoState, ncap, faw, pmt, pa,
                       err))
         return false;
+    if (S.of2 && !Of2AllLoaded()) {  // (0.8.1) this PC's own load missed a list: none from the next load on
+        S.of2Refused = true;
+        Log("lockstep: both sides' commanders: a list did not load here (%s): the next load goes without them",
+            S.of2Loaded.c_str());
+    }
     S.st = St::WaitReady;
     CanonBegin();
     S.myReadyHash = HashNow();
@@ -9847,6 +9958,44 @@ static void ACheckReady() {
 
 // ---- B ----
 
+// 0.8.1: every officer list of the start was loaded on this PC ("<nation>:<officers>/<ships>,...", -1 = failed).
+static bool Of2AllLoaded() {
+    int n = 0;
+    for (auto& e : Split(S.of2Loaded, ',')) {
+        if (e.empty()) continue;
+        size_t c = e.find(':');
+        if (c == std::string::npos || atoi(e.c_str() + c + 1) < 0) return false;
+        n++;
+    }
+    return n == (int)S.of2Lists.size();
+}
+
+// 0.8.1: the start's officer lists (rtw3mp_lsoff<N>.ini, `[Officers]` and the game's lines) out of the bundle: they
+// are not battle files (never written into the slot).
+static void TakeOfficerLists(Bundle& b) {
+    S.of2Lists.clear();
+    for (auto it = b.files.begin(); it != b.files.end();) {
+        const std::string& name = it->first;
+        int n = -1;
+        if (name.compare(0, 12, "rtw3mp_lsoff") == 0 && name.size() > 16 &&
+            name.compare(name.size() - 4, 4, ".ini") == 0)
+            n = atoi(name.c_str() + 12);
+        if (n < 0) {
+            ++it;
+            continue;
+        }
+        if (S.of2 && n >= 1 && n <= 8) {
+            std::vector<std::string> lines;
+            for (auto& l : Split(it->second, '\n')) {
+                std::string t = l;
+                if (!t.empty() && t.back() == '\r') t.pop_back();
+                if (!t.empty() && t[0] != '[') lines.push_back(t);
+            }
+            S.of2Lists[n] = lines;
+        }
+        it = b.files.erase(it);
+    }
+}
 static void TryLoadQueued() {
     if (!S.loadQueued || S.inAction || S.minuteRunning || g_loading) return;
     std::string wait;
@@ -9857,7 +10006,9 @@ static void TryLoadQueued() {
     std::string err, body;
     body.swap(S.pendingStart);
     Bundle b;
-    if (!b.Unpack(body))
+    bool unpacked = b.Unpack(body);
+    if (unpacked) TakeOfficerLists(b);  // (0.8.1)
+    if (!unpacked)
         err = "damaged battle files";
     else if (WriteBattleFiles(b, S.slot, err)) {
         FixFlagFiles(S.slot, S.gameDirA);
@@ -9923,6 +10074,10 @@ static void TryLoadQueued() {
     KV kv;
     kv["t"] = "ready";
     kv["lv"] = std::to_string(AnnouncedLsLevel());  // A drops a PC with another live-battle engine (0.3.x: none)
+    if (S.of2) {  // 0.8.1: this PC took the start's officer lists (each one loaded); A's start without them otherwise
+        kv["of2"] = Of2AllLoaded() ? "1" : "0";
+        kv["ofl"] = (S.of2Loaded.empty() ? std::string("-") : S.of2Loaded) + "/" + std::to_string(S.of2Found);
+    }
     CanonBegin();
     S.myReadyHash = HashNow();  // (also for this PC's report when the loaded battles differ)
     kv["g"] = ReadyParts();     // engine level 16: what differs, in A's diagnostics (ReadyDiag)
@@ -10036,6 +10191,7 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
         S.bid = bid;
         S.slot = slot;
         S.send = replyTo;
+        S.viewerSerial = game::DoBattleCalls();  // (0.8.1: ViewerNation while this battle's copy is on screen)
         ResetSimSides();
         if (!g_cwSaved) g_cwSaved = FpuCw();  // this PC's own x87 control word (A's is used during the battle)
         S.ownCw = g_cwSaved;
@@ -10108,6 +10264,10 @@ static void BOnStart(const KV& h, std::string& body, SendFn replyTo) {
     S.startPa = KVStr(h, "pa", "/");       // the forces' computer control before auto-run (applied after the load)
     S.opp = KVInt(h, "opp", S.opp);        // A's opponent nation (this player's) in the campaign of A's battle files
     S.autoStrike = KVInt(h, "autostrike") != 0;  // the battle's carrier-strike rule, as A decided it
+    // 0.8.1: both sides' commanders (A sends `of2` only to a PC that announced `lsof`; the lists are in the body)
+    S.of2 = KVInt(h, "of2") != 0 && ofc::LiveAvailable();
+    S.ofn = KVStr(h, "ofn");
+    if (KVInt(h, "of2") != 0 && !S.of2) Log("lockstep: both sides' commanders: NOT available on this PC");
     S.pendingStart.swap(body);
     S.loadQueued = true;
     S.st = St::Loading;
@@ -10131,7 +10291,8 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
     }
     if (t == "rejoin") {  // the host: the second player of a relayed battle this PC dropped them from is back
         std::string err, who = KVStr(h, "p2", "the other player");
-        if (!Rejoin(bid, who, replyTo, err)) {
+        // (0.8.1: `lsof` from a host that knows the returning player takes both sides' commanders)
+        if (!Rejoin(bid, who, replyTo, err, KVInt(h, "lsof") == 1)) {
             Log("lockstep: rejoin of battle %d by %s refused: %s", bid, who.c_str(), err.c_str());
             KV kv;
             kv["t"] = "norejoin";
@@ -10218,6 +10379,12 @@ static void HandleMessage(const KV& h, std::string& body, SendFn replyTo) {
             if (S.peerLevel != MP_LS_LEVEL) {
                 DropPeer(LevelMismatchText(S.peerName, S.peerLevel));
                 return;
+            }
+            if (S.of2) {  // 0.8.1: did B take both sides' commanders? (else the next load goes without them)
+                bool took = KVInt(h, "of2") == 1;
+                Log("lockstep: both sides' commanders: %s's PC %s (%s)", S.peerName.c_str(),
+                    took ? "loaded the officer lists" : "did NOT load the officer lists", KVStr(h, "ofl", "-").c_str());
+                if (!took) S.of2Refused = true;
             }
             S.peerReady = true;
             S.peerReadyHash = KVStr(h, "h");
@@ -10520,6 +10687,7 @@ bool StartAsA(const StartInfo& info, std::string& err, bool& retry) {
     if (info.bid != S.bid) Log("lockstep: battle id %d (held as %d)", info.bid, S.bid);
     S.bid = info.bid;
     S.opp = info.opp;
+    S.peerOf2 = info.peerOfficers;  // 0.8.1: the start carries both sides' commanders (`of2`) only for such a PC
     S.myName = info.myName;
     S.peerName = info.peerName;
     S.sideNames[0] = info.sideNames[0];
@@ -10636,6 +10804,7 @@ static void RejoinTick() {
     si.sideNames[0] = g_rj.sideNames[0];
     si.sideNames[1] = g_rj.sideNames[1];
     si.send = g_rjTry.send;
+    si.peerOfficers = g_rjTry.peerOfficers;  // 0.8.1: the returning player's PC (its hello's / the host's `lsof`)
     bool gameAuto = g_featAutoRun && E.fAutoRun >= 0 && dl::At<uint8_t>(m, E.fAutoRun) != 0;
     int fastest = FastestShared() && FastestDown(m) ? 1 : 0;
     bool resumed = g_rj.resumed, held = g_rj.held;
@@ -10720,7 +10889,7 @@ bool Rejoinable(RejoinInfo& out) {
     return true;
 }
 
-bool Rejoin(int bid, const std::string& peerName, SendFn send, std::string& err) {
+bool Rejoin(int bid, const std::string& peerName, SendFn send, std::string& err, bool peerOfficers) {
     RejoinInfo ri;
     if (!Rejoinable(ri)) {
         err = ri.why;
@@ -10741,6 +10910,7 @@ bool Rejoin(int bid, const std::string& peerName, SendFn send, std::string& err)
     g_rjTry.side1 = ri.sideNames[1].empty() ? std::string("side 1") : ri.sideNames[1];
     g_rjTry.send = send;
     g_rjTry.since = GetTickCount();
+    g_rjTry.peerOfficers = peerOfficers;
     Log("lockstep: rejoin: %s is back for battle %d (dropped at minute %d: %s)%s: no new minute starts; the battle "
         "starts again at the next minute boundary (minute %d, t=%s)",
         peerName.c_str(), bid, ri.dropMinute, ri.why.c_str(), again ? " (again)" : "", Minute(), ClockText().c_str());
@@ -10753,14 +10923,23 @@ void CancelRejoin(const std::string& why) { RejoinGiveUp(why); }
 
 bool RejoinPending() { return g_rjTry.want; }
 
-std::string RejoinRequestMessage(int bid, const std::string& peerName) {
+std::string RejoinRequestMessage(int bid, const std::string& peerName, bool peerOfficers) {
     KV kv;
     kv["t"] = "rejoin";
     kv["bid"] = std::to_string(bid);
     kv["epoch"] = "0";
     kv["p2"] = peerName;
     kv["lv"] = std::to_string(AnnouncedLsLevel());
+    if (peerOfficers) kv["lsof"] = "1";  // 0.8.1: the returning player's PC takes both sides' commanders
     return PackHB(KVEncode(kv), "");
+}
+
+int ViewerNation() {
+    // B: this player's nation in A's campaign (the battle's opponent) while this live battle's copy is on screen (its
+    // end and the battle aftermath included; a later battle of the player's own is another DoBattle)
+    if (!S.isA && S.opp >= 1 && S.viewerSerial >= 0 && game::DoBattleCalls() == S.viewerSerial && BattleVisible())
+        return S.opp;
+    return -1;
 }
 
 static void NoteDispatchInSim(const char* what);
@@ -12031,6 +12210,14 @@ std::string Debug(const std::vector<std::string>& a) {
         void* ships = List(E.allShipsVar);
         int n[2] = {}, cmd[2] = {};
         std::string ids[2];
+        std::map<int, int> own[2];  // 0.8.1: per side, the nations whose lists hold the commanders (-1: none)
+        static int fCShip = dl::Field("TFightingShip", "CShipRefId");
+        // 0.8.1: the first ship of side 1 afloat whose commander is another nation's: its index in the battle's ship
+        // list, the officer's id and the campaign ship's id (CShipRefId: a sunk ship leaves the list, `cship` finds it);
+        // cand1: the first three such ships
+        int first1 = -1, first1Id = -1, first1CShip = -1;
+        std::string cand1;
+        int ncand = 0;
         for (int i = 0; i < dl::ListCount(ships); i++) {
             void* s = dl::ListItem(ships, i);
             if (!s) continue;
@@ -12040,9 +12227,89 @@ std::string Debug(const std::vector<std::string>& a) {
             if (!o) continue;
             cmd[side]++;
             ids[side] += std::to_string(dl::At<int>(o, fOId)) + ",";
+            int owner = ofc::OwnerOf(o);
+            own[side][owner]++;
+            if (side == 1 && owner >= 1 && !(E.fSunk > 0 && dl::At<uint8_t>(s, E.fSunk))) {
+                int cs = fCShip > 0 ? dl::At<int>(s, fCShip) : -1;
+                if (first1 < 0) {
+                    first1 = i;
+                    first1Id = dl::At<int>(o, fOId);
+                    first1CShip = cs;
+                }
+                if (ncand++ < 3)
+                    cand1 += (cand1.empty() ? "" : ",") + std::to_string(i) + ":" + std::to_string(dl::At<int>(o, fOId)) +
+                             ":" + std::to_string(cs);
+            }
         }
+        std::string one;  // `ls commanders cship <id>`: that ship's side, sunk flag and commander id (the battle's ship
+        if (a.size() > 3 && arg(2) == "cship" && fCShip > 0) {  // list or a division's; a sunk ship leaves both: -:-:-)
+            int want = atoi(arg(3, "-1").c_str());
+            void* divs = List(E.divisionsVar);
+            for (int i = 0; i < dl::ListCount(divs) && one.empty(); i++) {
+                void* dv = dl::ListItem(divs, i);
+                void* dsh = dv ? dl::At<void*>(dv, E.fShips) : nullptr;
+                for (int j = 0; j < dl::ListCount(dsh) && one.empty(); j++) {
+                    void* s = dl::ListItem(dsh, j);
+                    if (!IsFightingShip(s) || dl::At<int>(s, fCShip) != want) continue;
+                    void* o = dl::At<void*>(s, fCmd);
+                    one = " ship=" + std::to_string(want) + ":" + std::to_string(dl::At<int>(s, E.fShipSide)) + ":" +
+                          std::to_string(E.fSunk > 0 ? (int)dl::At<uint8_t>(s, E.fSunk) : -1) + ":" +
+                          std::to_string(o ? dl::At<int>(o, fOId) : -1);
+                }
+            }
+            if (one.empty()) one = " ship=" + std::to_string(want) + ":-:-:-";
+        }
+        auto owners = [](const std::map<int, int>& m) {
+            std::string s;
+            for (auto& e : m) s += (s.empty() ? "" : ",") + std::to_string(e.first) + "x" + std::to_string(e.second);
+            return s.empty() ? std::string("-") : s;
+        };
+        // (0.8.1) the battle's commander mode: of2 = both sides' commanders, ofn = the nations whose lists the start
+        // carried, loaded = this PC's last load ("<nation>:<officers>/<ships commanded>"), found = the battle save's
+        // commanders found in them
         return "ok side0=" + std::to_string(cmd[0]) + "/" + std::to_string(n[0]) + " side1=" + std::to_string(cmd[1]) +
-               "/" + std::to_string(n[1]) + " ids0=" + ids[0] + " ids1=" + ids[1];
+               "/" + std::to_string(n[1]) + " ids0=" + ids[0] + " ids1=" + ids[1] + " own0=" + owners(own[0]) +
+               " own1=" + owners(own[1]) + " of2=" + (S.of2 ? "1" : "0") + " ofn=" + (S.ofn.empty() ? "-" : S.ofn) +
+               " loaded=" + (S.of2Loaded.empty() ? "-" : S.of2Loaded) + " found=" + std::to_string(S.of2Found) +
+               " peer=" + (S.peerOf2 ? "1" : "0") + " refused=" + (S.of2Refused ? "1" : "0") +
+               " viewer=" + std::to_string(ViewerNation()) + " first1=" + std::to_string(first1) + ":" +
+               std::to_string(first1Id) + ":" + std::to_string(first1CShip) + " cand1=" + (cand1.empty() ? "-" : cand1) +
+               one;
+    }
+    // 0.8.1 (fix-sunktwice), any battle on this PC (the host's own, a battle slot's): `ls cships` (read only) -> `ok
+    // n=<ships> ships=<side>:<campaign ship id>:<sunk 0|1>:<name>;...`; TEST `ls sink <campaign ship id>` -> `ok sunk
+    // <name> side=<s>`: the battle screen's own debug Sink on that ship (TfrmMain.Sink1Click 0xdea050:
+    // CurrentFloatPoints := 0, Sinking := 10), so the battle sinks it by its own rules (its loss, points, fate)
+    if (c == "cships" || c == "sink") {
+        if (!Resolve() || !BattleForm() || !E.allShipsVar) return "error no battle";
+        static int fFloat = dl::Field("TFightingShip", "CurrentFloatPoints"), fSinking = dl::Field("TFightingShip", "Sinking");
+        if (E.fCShipRef < 0 || E.fShipSide < 0 || E.fSunk < 0 || fFloat < 0 || fSinking < 0)
+            return "error the ship fields were not found";
+        void* ships = List(E.allShipsVar);
+        int want = c == "sink" ? atoi(arg(2, "-1").c_str()) : -1;
+        std::string out;
+        int n = 0;
+        for (int i = 0; i < dl::ListCount(ships); i++) {
+            void* s = dl::ListItem(ships, i);
+            if (!s) continue;
+            int id = dl::At<int>(s, E.fCShipRef), side = dl::At<int>(s, E.fShipSide);
+            bool sunk = dl::At<uint8_t>(s, E.fSunk) != 0 || dl::At<int>(s, fSinking) > 0;
+            std::string name = W2U(ObjName(s));
+            if (c == "sink" && id == want && want > 0) {
+                if (sunk) return "error " + name + " is sunk already";
+                dl::At<int>(s, fFloat) = 0;
+                dl::At<int>(s, fSinking) = 10;
+                Log("TEST: ls sink: %s (campaign ship %d, side %d) set sinking, as the battle screen's Sink", name.c_str(),
+                    id, side);
+                return "ok sunk " + name + " side=" + std::to_string(side);
+            }
+            for (char& ch : name)
+                if (ch == ';' || ch == ':') ch = ' ';
+            out += std::to_string(side) + ":" + std::to_string(id) + ":" + (sunk ? "1" : "0") + ":" + name + ";";
+            n++;
+        }
+        if (c == "sink") return "error no ship with campaign id " + arg(2) + " in this battle";
+        return "ok n=" + std::to_string(n) + " ships=" + out;
     }
     if (c == "airforce") {  // ls airforce <force index>: its routine air ops settings and the land-CAP requests
         if (!Resolve() || !BattleForm()) return "error no battle";
@@ -12319,6 +12586,19 @@ std::string Debug(const std::vector<std::string>& a) {
                       : QueueForceLead(c == "turnaway", dl::ListItem(forces, atoi(arg(2, "-1").c_str())),
                                        dl::ListItem(divs, atoi(arg(3, "-1").c_str())), err);
         return ok ? "ok" : "error " + err;
+    }
+    if (c == "testsink") {  // TEST ONLY (0.8.1): ls testsink <all-ships index>: the game's debug Sink on that ship at the
+        // next release, on both PCs (a deferred action of this PC's player; the minutes after it sink her)
+        std::string err;
+        if (!CanOrderNow(err)) return "error " + err;
+        void* ship = dl::ListItem(List(E.allShipsVar), atoi(arg(2, "-1").c_str()));
+        if (!IsFightingShip(ship)) return "error no such ship";
+        World w;
+        Walk(w);
+        auto k = w.keyOf.find(ship);
+        if (k == w.keyOf.end()) return "error the ship is not in the battle";
+        if (!QueueDeferred("tsink", {k->second, "0"}, err, "", false)) return "error " + err;
+        return "ok " + W2U(ObjName(ship));
     }
     if (c == "desync") return S.forceDesync = 1, "ok (this PC's next minute differs)";
     if (c == "testreadydiff")  // TEST ONLY: this PC's next live load differs (A finds that the loaded battles differ)

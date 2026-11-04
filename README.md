@@ -56,7 +56,7 @@ Built for Rule the Waves 3 **1.01.44** (Steam). What changed in each version: [C
 ## Install
 Every player:
 1. Close the game.
-2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.8.0-win32.zip`) from the
+2. Download `RTW3MP-<version>-win32.zip` (for example `RTW3MP-0.8.1-win32.zip`) from the
    [latest release](https://github.com/Kizitor/RTW3-Multiplayer/releases/latest) and extract all its files into the
    game folder, next to `RTW3.exe`. When you update, replace the older files.
    On Steam, the game folder is Library > right-click Rule the Waves 3 > Manage > Browse local files.
@@ -206,11 +206,15 @@ Your screen shows your own nation's side of the campaign:
   check). Its messages come in your chat ("* Officers: ..."). Your officers go to the host with your turn, and the
   host keeps them between months: in its month your commanders can be killed or captured (by submarines or mines, for
   example), and they change their crews' training and their ships' running costs, as in single player; the training
-  messages about your ships come in your chat with the new month. Your battles against computer nations are fought
-  with your commanders, under your own commander of the battle's sea area, and their battle stars and fates come back
-  with the result. Your corps is formed in a new campaign's first month, or in a campaign that is already going on in
-  the first month that the host and you both run 0.8.0 (your chat says "* Officers: your nation has its own officer
-  corps now: ..."). (Before 0.8.0 the tab was empty and your ships had no commanders.)
+  messages about your ships come in your chat with the new month. With 0.8.1 on the host, your ships without a
+  commander (destroyers and the other types that never get one included) also lose a point of crew quality now and
+  then, as the player's ships do in single player: each of them with a chance of 1 in 5 a month, without a message.
+  (Before 0.8.1 only the host's ships did.) Your battles against computer nations are fought with your commanders,
+  under your own commander of the battle's sea area, and their battle stars and fates come back with the result; with
+  0.8.1 your live battles too (see [Battles between players](#battles-between-players-live)). Your corps is formed in
+  a new campaign's first month, or in a campaign that is already going on in the first month that the host and you
+  both run 0.8.0 (your chat says "* Officers: your nation has its own officer corps now: ..."). (Before 0.8.0 the tab
+  was empty and your ships had no commanders.)
 - **Ship data:** the game's *View data* (the ship lists' popup menu) shows your own ships' data. (Before 0.7.1 it
   showed nothing, or another nation's ship.)
 - **Invasion targets:** the game's *Set invasion target* button (in a possession's details on the strategic map) is
@@ -486,8 +490,12 @@ computer, as in single player.
   when the host's month is over."), even if you leave the session meanwhile, together with what the month did since
   the battle was sent: a ship's crew experience and battle stars keep the month's change and get your battle's, its
   log keeps the entries of both, it gets the longer of the two repair times, and a ship sunk in either stays sunk.
-  Your officers are merged the same way: a commander killed or captured in the host's month stays so, and your
-  battle's stars are added.
+  With 0.8.1 on the host, a ship sunk both in the host's battle and in yours counts once, in the losses and in the
+  victory points: the host's month keeps the sinking, and your battle's loss of that ship and its points are taken
+  out. Everyone's chat says so ("* The battle of Germany against Spain in ... was fought by Captain (Spain's B San
+  Leandro was already sunk in the host's battle: not counted twice, 1164 VP fewer for Germany)."); the same goes for
+  a ship that the host's month lost in another way after your battle was sent. Your officers are merged the same
+  way: a commander killed or captured in the host's month stays so, and your battle's stars are added.
 - **Declining:** with 0.6.0 on the host and on your PC, a battle you decline (on the map or in the preview) counts as
   in single player: the enemy gets its points, and after the game's warnings repeated declines cost prestige or fleet
   morale. The host keeps your nation's own count of declined battles. Everyone's chat shows it ("* Captain declined
@@ -556,12 +564,12 @@ players in the battle need **Fight my battles** on (the host's own box makes no 
 joining a session). If it is off, the host fights its battle against that nation's ships under computer control, and a
 battle between two joined players' nations is resolved by the game.
 - **Same live-battle engine:** a live battle needs the same live-battle engine on both players' PCs. 0.4.1, 0.5.0 and
-  0.6.0 have the same one (17), 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3 and 0.8.0 a new one (18), older versions others. A
-  host on 0.4.0 or newer checks it for every live battle: its own battle against a player with another engine is
-  fought against the computer, and a battle between two joined players is resolved by the game unless both have the
-  host's engine. The chat and the players' notices say why, naming both versions (from a host on 0.5.0 or newer, for
-  example "live battles need the same live-battle engine on both PCs: the host has 0.6.1 (engine 18), you have 0.6.0
-  (engine 17)"; older hosts say "the same mod version"), and the month goes on. A
+  0.6.0 have the same one (17), 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.8.0 and 0.8.1 a new one (18), older versions
+  others. A host on 0.4.0 or newer checks it for every live battle: its own battle against a player with another
+  engine is fought against the computer, and a battle between two joined players is resolved by the game unless both
+  have the host's engine. The chat and the players' notices say why, naming both versions (from a host on 0.5.0 or
+  newer, for example "live battles need the same live-battle engine on both PCs: the host has 0.6.1 (engine 18), you
+  have 0.6.0 (engine 17)"; older hosts say "the same mod version"), and the month goes on. A
   host on 0.3.x checks no versions: when it fights its own battle against a player on 0.4.0 or newer, the player's
   game refuses the battle with a notice, its chat naming both live-battle levels, and the host's computer fights the
   player's side. Two joined players with the same engine (0.4.0 or newer) fight their battle against each other live
@@ -584,6 +592,12 @@ battle between two joined players' nations is resolved by the game.
   screen's *Preferences* they stay as they are until it ends (display options change at once). If the two PCs ever
   disagree, the battle is reloaded on both from the leading PC's state (a short
   pause); orders given in the last minute are dropped, and the chat lists the commands that were not carried out.
+- **Commanders:** with 0.8.1 on both players' PCs (and, in a battle between two joined players, on the host), each
+  side's ships fight with their own commanders, whose abilities count as in single player. The second player's
+  commanders win battle stars, and when their ship sinks they can be killed, captured or rescued, as the first
+  player's are; their *Officers* tab shows it with the next month. With an older version on any of these PCs, only
+  the first player's commanders fight, and the second player's ships have none (see
+  [Known limitations](#known-limitations)).
 - **The clock is shared.** *Run one minute*, *Run 5 minutes*, *Run until break*, *Pause*, the game speed box and its
   arrows, and *Fastest available* work for both players: the battle advances when both are ready, and stops for both
   when one pauses or the game stops for a sighting. A new speed, *Fastest available*, and orders given while a minute
@@ -654,7 +668,7 @@ again first if it stopped; if you are still connected, press *Leave*, then *Join
 the battle loads on your PC (also from the title screen), and you command your ships again from its next minute. The
 battle stops at that minute until both PCs have loaded it. You need **Fight my battles**, and the host needs 0.4.0 or
 newer with the same live-battle engine as yours (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1, 0.7.2,
-0.7.3 and 0.8.0 a new one); otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
+0.7.3, 0.8.0 and 0.8.1 a new one); otherwise the computer keeps your ships (a host on 0.4.0 or newer tells you why).
 
 **When the host's game stops** (it crashes or is closed) during its live battle against a joined player, the joined
 player's game leaves the battle and the session. To go on:
@@ -743,11 +757,19 @@ players' nations for the rest of that month. A battle between two joined players
   division training don't change them. They don't shape a live battle against the host, or the second player's side
   of a live battle between two joined players: the other player's game sets those battles up, and the player's nation
   is a computer nation there.
-- **Live battles use only the first player's commanders** (the host's in a battle against the host; see
-  [Battles between players](#battles-between-players-live)). The second player's ships fight without theirs, so those
-  commanders win no battle stars there, and the loss of their ship there neither kills nor captures them. Divisions
-  have no commanders of their own in a live battle (the game's battle save keeps none; a division then uses its
-  flagship's). Both sides' commanders would need a new live-battle engine.
+- **Commanders in live battles** (see [Battles between players](#battles-between-players-live)): with an older
+  version than 0.8.1 on either player's PC, or on the host in a battle between two joined players, a live battle
+  uses only the first player's commanders (the host's in a battle against the host), as before: the second player's
+  ships fight without theirs, so those commanders win no battle stars there, and the loss of their ship there
+  neither kills nor captures them. Even with 0.8.1, when the host's game stops during its live battle and the battle
+  is resumed (see
+  [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops)), the joined
+  player's ships fight on without their commanders. The game's question whether to cashier an officer after a poor
+  showing never comes for the second player's officers. In a battle between two joined players, the prestige and
+  fleet morale that a band of the second player's commander gives as his ship goes down are lost. The first player's
+  battle message log shows the game's lines about the second player's commanders who survive the loss of their ship
+  ("... is picked up by a fishing boat and returns a week after the battle."). Divisions have no commanders of their
+  own in a live battle (the game's battle save keeps none; a division then uses its flagship's).
 - **Your relations and intelligence on your screen** are your own nation's (see
   [Joining a session](#joining-a-session)). Unless the host and your PC have 0.5.0 or newer, the line under your
   nation's name names your enemy instead of the months at war, which the game keeps only for the host's nation. The
@@ -770,13 +792,15 @@ players' nations for the rest of that month. A battle between two joined players
   played during the host's month (with 0.8.0 on the host and on your PC; else after the month), not at once as in
   single player, so a war that ends before it is played drops it. A computer nation at war with both the host's
   nation and yours can fight the host's battle and yours in the same month, both from the month's state before either
-  battle: when your result is merged, the longer of the two repair times counts, and a ship sunk in both battles
-  counts in both, in the losses and in the victory points. A computer nation's takeover of an unowned possession at a
-  war's start comes a little less often than in single player. When you leave a battle before its end, disconnect or
-  don't finish it within the time limit, the encounters without a battle that its search found before it are lost
-  with it: their points and a decline's other consequences don't count. With an older version than 0.7.2 on the host
-  or on your PC, the month's first encounter without a battle (the computer's navy declines, you decline, or a side
-  has no ships there that can fight) ends the search, where single player's goes on.
+  battle: when your result is merged, the longer of the two repair times counts. A ship sunk in both battles counts
+  once with 0.8.1 on the host (see [Battles against AI nations](#battles-against-ai-nations)), though your battle
+  keeps the prestige and fleet morale it gave; under a host on 0.8.0 it counts in both, in the losses and in the
+  victory points. A computer nation's takeover of an unowned possession at a war's start comes a little
+  less often than in single player. When you leave a battle before its end, disconnect or don't finish it within the
+  time limit, the encounters without a battle that its search found before it are lost with it: their points and a
+  decline's other consequences don't count. With an older version than 0.7.2 on the host or on your PC, the month's
+  first encounter without a battle (the computer's navy declines, you decline, or a side has no ships there that can
+  fight) ends the search, where single player's goes on.
 - **Your computer enemies** (with 0.7.3 on the host) fight your nation as the computer fights the player in single
   player (see *War effects* in [Your nation's relations, wars and money](#your-nations-relations-wars-and-money)),
   with a few differences. A computer nation has one player: the host's nation when it is at war with it, else the
@@ -819,8 +843,8 @@ players' nations for the rest of that month. A battle between two joined players
 - **Resigning** is not possible during a session: leave the session first.
 - **Versions and slots:** the host refuses players with another game version, and players whose mod version can't
   play with the host's (0.1, 0.2 and 0.3 or newer can't play together). A live battle also needs the same live-battle
-  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3 and 0.8.0
-  a newer one), and a host on 0.4.0 or newer pairs only players with its own (see
+  engine on both players' PCs (0.4.1, 0.5.0 and 0.6.0 have the same one, 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.8.0 and
+  0.8.1 a newer one), and a host on 0.4.0 or newer pairs only players with its own (see
   [Battles between players](#battles-between-players-live)). Joined players use save slot 77, and slot 87 for their
   battles. Since 0.8.0 the host saves the month's state for the battles fought during its month in one more slot,
   150 + the slot of the campaign it hosts (`Game151` for slot 1), and deletes that slot when the month is over.
@@ -911,8 +935,8 @@ players' nations for the rest of that month. A battle between two joined players
   0.6.1 and newer leave that file out.
 - **"... live battles need the same live-battle engine" in the chat** (from a host on 0.4.1 or older: "... the same
   mod version"): both players of a live battle need versions with the same live-battle engine (0.4.1, 0.5.0 and 0.6.0
-  have the same one; 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3 and 0.8.0 have a new one), and a host on 0.4.0 or newer needs
-  both on its own; until then, such battles are fought against the computer or resolved by the game. See
+  have the same one; 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.8.0 and 0.8.1 have a new one), and a host on 0.4.0 or newer
+  needs both on its own; until then, such battles are fought against the computer or resolved by the game. See
   [Upgrading from an older version](#upgrading-from-an-older-version).
 - **The computer took over your ships in a live battle, or the host's game stopped during one:** see
   [When a player drops out or the host's game stops](#when-a-player-drops-out-or-the-hosts-game-stops).
@@ -989,6 +1013,20 @@ players' nations for the rest of that month. A battle between two joined players
   [Battles against AI nations](#battles-against-ai-nations)).
 
 ### Upgrading from an older version
+- **0.8.1** plays with 0.8.0, 0.7.3, 0.7.2, 0.7.1, 0.7.0, 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host
+  and every player:
+  - 0.8.1 has the live-battle engine of 0.6.1 and 0.7.0 to 0.8.0 (18): players on these versions fight their live
+    battles together, a player on 0.6.0 or older can't (see 0.6.1 below).
+  - Both sides' commanders in a live battle need 0.8.1 on both players' PCs, and on the host too in a battle between
+    two joined players. With an older version on any of them, the battle is still fought live, as before, with the
+    first player's commanders only.
+  - A computer nation's ship sunk both in the host's battle and in yours counts once with 0.8.1 on the host (your
+    battles during the host's month need 0.8.0 or newer on your PC anyway). With 0.8.1 on your PC too, the host takes
+    out the ship's points as your battle counted them; with 0.8.0, it uses the game's own estimate of a sunk ship's
+    points. A host on 0.8.0 still counts such a ship in both battles.
+  - Your ships without a commander lose crew quality as the player's ships do in single player with 0.8.1 on the host
+    and 0.8.0 or newer on your PC (your own officers). Under a host on 0.8.0 they keep it, as before; with an older
+    version than 0.8.0 on your PC your nation has no officers, and its ships keep their crew quality under any host.
 - **0.8.0** plays with 0.7.3, 0.7.2, 0.7.1, 0.7.0, 0.6.x, 0.5.0, 0.4.x and 0.3.x (protocol 3). Update the host and
   every player:
   - 0.8.0 has the live-battle engine of 0.6.1 and 0.7.0 to 0.7.3 (18): players on these versions fight their live

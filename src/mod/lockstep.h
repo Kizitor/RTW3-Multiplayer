@@ -49,6 +49,9 @@ struct StartInfo {
     bool campaignSlot = false; // the host's own battle in its campaign slot (Save writes a crash checkpoint there)
     int opp = -1;              // A: BattleOpponentIdx (the save marks the battle in progress with it)
     bool autoStrike = false;   // the host's option: the computer flies both sides' carrier strikes (engine level 7)
+    // 0.8.1: the other PC takes both sides' commanders (its hello `lsof`; for K1 vs K2 the package's `of2`): the start
+    // carries the other nations' officer lists (`of2=1`), else every commander lookup is PlayerNation's (0.8.0)
+    bool peerOfficers = false;
     std::string myName;        // this PC's player name (shown to the other player)
     std::string peerName;      // the other player's name (chat lines)
     std::string sideNames[2];  // nation names of side 0 and side 1
@@ -166,12 +169,16 @@ struct RejoinInfo {
 bool Rejoinable(RejoinInfo& out);
 // A: `peerName` (reached through `send`) is back for battle `bid`: no new minute starts any more; at the next minute
 // boundary the battle is started again with them (the computer keeps side 1 if that fails or takes too long). False +
-// err: not possible now.
-bool Rejoin(int bid, const std::string& peerName, SendFn send, std::string& err);
+// err: not possible now. peerOfficers (0.8.1): the returning player's PC takes both sides' commanders (StartInfo).
+bool Rejoin(int bid, const std::string& peerName, SendFn send, std::string& err, bool peerOfficers = false);
 void CancelRejoin(const std::string& why);  // the returning player left again before the battle was sent
 bool RejoinPending();
 // The host to A of a relayed battle (two players' nations): its second player is back (A answers with a start or with
-// "norejoin" and the reason).
-std::string RejoinRequestMessage(int bid, const std::string& peerName);
+// "norejoin" and the reason). peerOfficers (0.8.1, `lsof`): that player's PC takes both sides' commanders.
+std::string RejoinRequestMessage(int bid, const std::string& peerName, bool peerOfficers = false);
+// 0.8.1: the nation of this PC's player in the campaign on screen during and after a live battle as B (its side's
+// nation in A's campaign: the battle's opponent); -1 otherwise (PlayerNation's). The battle aftermath's guard shows a
+// commander's messages on his own player's PC only.
+int ViewerNation();
 
 }  // namespace lockstep

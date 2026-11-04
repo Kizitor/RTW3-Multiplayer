@@ -197,6 +197,10 @@ bool BattlesAvailable();
 void SetBattleSlotMode(bool on);  // a battle slot: the battle screen's close doesn't run the rest of a month
 bool BattleSlotMode();
 bool BattleAftermathSeen();       // the battle ended with the game's aftermath (VP, prestige) in battle slot mode
+// 0.8.1 (fix-sunktwice): the battle's own points in battle slot mode, as the game counted them at its end: the raw
+// VP0/VP1 HandleBattleAftermath got (before GetLogAdjustedVP) and "id:side:points,..." for each ship sunk in it
+// (GetShipDamagePointValue; side 0 = the player's). False if no aftermath was seen since the slot mode began.
+bool BattlePoints(int& vp0, int& vp1, std::string& sunk);
 // countA/countB: the ships when the battle was found (logged); the routine gets both nations' ships that can fight in
 // the area now, and is not called (false, no battle) if either has none.
 bool ResolveAIBattle(int a, int b, int countA, int countB, const std::wstring& area,
@@ -563,6 +567,9 @@ std::string MovePossession(const std::wstring& name, int from, int to, bool remo
 std::string HandOverShip(int id, int from, int to, const std::wstring& name, const std::wstring& reason,
                          const std::wstring& renamedLine);  // by CShipId in `from`'s list
 std::string SetPossessionWarState(const PeaceTaken& t);  // by name; `t.owner` must own it
+// TEST ONLY (0.8.1, host `battles sinkmonth`): the ship (by CShipId) of nation n lost now as the month's own sinkings
+// lose one (SinkShip, AddShipToTotalLosses) with this Fate; "" or why not.
+std::string TestSinkShip(int n, int id, const std::wstring& fate);
 bool SetNationFlag(int idx, const std::string& field, bool value);  // a Boolean field (HasLostWar, Blockaded)
 int NationFlag(int idx, const std::string& field);                  // -1 if unknown
 // B5 (warfx.cpp): told after every call of the game's CheckBlockadeStatus (the load's, after its victory points were

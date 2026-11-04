@@ -112,6 +112,11 @@ void DebugOfficersQuiet(int on);  // TEST ONLY: RTW3MP_TEST_OFFICERS=quiet switc
 // DoStrategicTurn starts, after the battles sent during the month
 void DebugArmOfficerKill(int nation, int ship, bool pow, bool month = false);
 std::string DebugOfficerState();
+// TEST ONLY (host, 0.8.1): the rule for the joined nations' ships without a commander per nation (`ofuncmd`:
+// "nations=<K>:<1 applies|-1 not (no officers of its own)|0 not a joined nation>,..."); `ofuncmd old <K> 1|0` takes
+// nation K's player as an older mod's (hello without `off`) for the rule.
+std::string DebugUncommandedRule();
+std::string DebugUncommandedOld(int nation, bool old);
 std::string DebugLastEvent();    // tests: last event sent (client) or applied (host)
 std::string DebugWarVP(int a, int b, int va, int vb, bool set);  // tests (host): read or set a war's victory points
 std::string DebugTerms(int a, int b);                            // tests (host): the peace terms right now

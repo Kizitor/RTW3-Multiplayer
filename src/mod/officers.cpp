@@ -18,7 +18,8 @@
 //   address) and runs AssignofficerstoUncommandedAreas, ...Divisions and PlayerNation.AssignOfficersToUncommandedShips.
 // - The new campaign (0xbc98c2): AddOfficerToPool(0) FleetSize+3 times, (2) FleetSize+1 times, (3) FleetSize +
 //   GlobalNavalPower + 1 times, AssignofficerstoUncommandedAreas, PlayerNation.AssignOfficersToUncommandedShips.
-// - AdjustCrewQuality(frm, ship, nation) shows picture messages for any nation's commanded ship.
+// - AdjustCrewQuality(frm, ship, nation) shows picture messages for any nation's commanded ship; its rule for a ship
+//   without a commander (1 in 5 a month: one crew quality less) tests aNation = PlayerNation (see FindUncmdSite).
 
 namespace ofc {
 
@@ -27,11 +28,19 @@ static struct Api {
     int fOName = -1, fOId = -1, fORank = -1, fOStatus = -1;
     int fCmd = -1, fCmdId = -1, fACmd = -1, fACmdId = -1, fDCmd = -1;
     int fSLList = -1, fSLCount = -1;
+    int fCrew = -1, fShipStatus = -1, fInPlay = -1, fRepair = -1;  // TCampaignShip
+    // 0.8.1 (live battles with both sides' commanders)
+    int fFSCmd = -1, fPrestige = -1, fMorale = -1, fRetire = -1;
     void *mConnect = nullptr, *mLoader = nullptr, *mWriter = nullptr, *mSLCreate = nullptr, *mSLAdd = nullptr,
          *mFree = nullptr, *mAddPool = nullptr, *mAssignAreas = nullptr, *mAssignDivs = nullptr,
          *mAssignShips = nullptr, *mQuestion = nullptr, *mKill = nullptr, *mAdjustCrew = nullptr,
-         *mIsCommanded = nullptr;
+         *mIsCommanded = nullptr, *mGetId = nullptr, *mTransfer = nullptr;
     uint8_t** freePromo = nullptr;  // the cell holding the address of the free-promotion byte
+    // AdjustCrewQuality's rule for a ship without a commander: its PlayerNation test (the hook's site), the rule's end
+    // and the game's Random it calls
+    uint8_t* ucSite = nullptr;
+    void *ucAfter = nullptr, *ucRandom = nullptr;
+    uint32_t sacRet = 0;            // the return address of the .sac ship reader's GetOfficerWithId call
     bool lists = false, month = false;
 } A;
 
@@ -47,6 +56,39 @@ static void* CallBefore(void* fn, void* next, size_t maxLen) {
     return nullptr;
 }
 
+// AdjustCrewQuality's rule for a ship without a commander (1.01.44: 0xcb2a7e, after the training by status and place):
+//   +00 cmp dword ptr [ebx+Commander],0   +07 jne <the commander's part>   +09 cmp esi,[edi+PlayerNation]
+//   +0f jne <after>   +15 mov eax,5   +1a call Random   +1f dec eax   +20 jne <after>
+//   +26 dec dword ptr [ebx+CrewQuality]   +29 jmp <after>
+// (EBX: aShip, ESI: aNation, EDI: Self). The hook's site is the PlayerNation test (6 bytes, nothing relative: MinHook
+// moves it into the trampoline). Exactly one in the routine, its three exits the same address, the call the game's
+// System.Random (`push eax; call [Random32Proc]`).
+static void FindUncmdSite() {
+    uint8_t* fn = (uint8_t*)A.mAdjustCrew;
+    if (!fn || A.fCmd <= 0 || A.fPlayer <= 0 || A.fCrew <= 0 || A.fCrew >= 0x80) return;
+    auto le = [](std::vector<int>& p, int v) {
+        for (int i = 0; i < 4; i++) p.push_back((v >> (8 * i)) & 0xFF);
+    };
+    std::vector<int> p = {0x83, 0xBB};
+    le(p, A.fCmd);
+    p.insert(p.end(), {0x00, 0x75, -1, 0x3B, 0xB7});
+    le(p, A.fPlayer);
+    p.insert(p.end(), {0x0F, 0x85, -1, -1, -1, -1, 0xB8, 0x05, 0x00, 0x00, 0x00, 0xE8, -1, -1, -1, -1, 0x48, 0x0F, 0x85, -1,
+                       -1, -1, -1, 0xFF, 0x4B, A.fCrew, 0xE9, -1, -1, -1, -1});
+    const size_t len = 0x1000;
+    uint8_t* at = dl::FindPattern(fn, len, p);
+    if (!at || dl::FindPattern(at + 1, (size_t)(fn + len - (at + 1)), p)) return;
+    auto target = [](uint8_t* end, uint8_t* imm) { return end + *(int32_t*)imm; };
+    uint8_t* after = target(at + 0x15, at + 0x11);
+    uint8_t* rnd = target(at + 0x1f, at + 0x1b);
+    if (after != target(at + 0x26, at + 0x22) || after != target(at + 0x2e, at + 0x2a) || after <= at + 0x2e ||
+        after >= fn + len || !InImage((uintptr_t)rnd) || rnd[0] != 0x50 || rnd[1] != 0xFF || rnd[2] != 0x15)
+        return;
+    A.ucSite = at + 9;
+    A.ucAfter = after;
+    A.ucRandom = rnd;
+}
+
 // Does `fn` load the UTF-16 literal `text` (`mov edx, <literal>`) within its first maxLen bytes?
 static bool LoadsLiteral(uint8_t* fn, size_t maxLen, const wchar_t* text) {
     size_t n = wcslen(text) * 2;
@@ -56,6 +98,29 @@ static bool LoadsLiteral(uint8_t* fn, size_t maxLen, const wchar_t* text) {
         if (InImage(a) && InImage(a + n) && memcmp((void*)a, text, n) == 0) return true;
     }
     return false;
+}
+
+// The .sac ship reader's lookup of a ship's commander (1.01.44: 0xdda984): `call GetOfficerWithId; mov edx, [ebp+x];
+// mov [edx+TFightingShip.Commander], eax`, the only call of GetOfficerWithId whose result goes into a battle ship.
+// Returns the call's return address (0: not exactly one).
+static uint32_t FindSacLookup() {
+    if (!A.mGetId || A.fFSCmd <= 0) return 0;
+    std::vector<int> pat = {0xE8, -1, -1, -1, -1, 0x8B, 0x55, -1, 0x89, 0x82};
+    for (int i = 0; i < 4; i++) pat.push_back((A.fFSCmd >> (8 * i)) & 0xFF);
+    uint8_t* start = (uint8_t*)dl::g_base + 0x1000;
+    size_t len = dl::g_size - 0x1000;
+    uint32_t found = 0;
+    int hits = 0;
+    for (uint8_t* p = start;;) {
+        uint8_t* q = dl::FindPattern(p, len - (size_t)(p - start), pat);
+        if (!q) break;
+        if (CallTarget(q) == A.mGetId) {
+            hits++;
+            found = (uint32_t)(uintptr_t)(q + 5);
+        }
+        p = q + 1;
+    }
+    return hits == 1 ? found : 0;
 }
 
 bool Resolve() {
@@ -70,6 +135,10 @@ bool Resolve() {
     A.fOStatus = dl::Field("TOfficer", "Status");
     A.fCmd = dl::Field("TCampaignShip", "Commander");
     A.fCmdId = dl::Field("TCampaignShip", "CommanderId");
+    A.fCrew = dl::Field("TCampaignShip", "CrewQuality");
+    A.fShipStatus = dl::Field("TCampaignShip", "Status");
+    A.fInPlay = dl::Field("TCampaignShip", "InPlay");
+    A.fRepair = dl::Field("TCampaignShip", "RepairTime");
     A.fACmd = dl::Field("TMapArea", "AreaCommander");
     A.fACmdId = dl::Field("TMapArea", "CommanderId");
     A.fDCmd = dl::Field("TCampaignDivision", "Commander");
@@ -120,12 +189,25 @@ bool Resolve() {
               A.fCmd >= 0 && A.fCmdId >= 0 && A.fACmd >= 0 && A.fACmdId >= 0 && A.fSLList >= 0 && A.fSLCount >= 0 &&
               A.mConnect && A.mLoader && A.mWriter && A.mSLCreate && A.mSLAdd && A.mFree;
     A.month = A.lists && A.fGNP >= 0 && A.mAddPool && A.mAssignAreas && A.mAssignDivs && A.mAssignShips;
+    if (A.lists) FindUncmdSite();
+    // 0.8.1: live battles with both sides' commanders (the .sac reader's lookup) and the battle aftermath's guard
+    A.mGetId = dl::Method("TBuilderNation", "GetOfficerWithId");
+    A.mTransfer = dl::Method("TfrmBuildCamp", "TransferCampaignShipDamage");
+    A.fFSCmd = dl::Field("TFightingShip", "Commander");
+    A.fPrestige = dl::Field("TBuilderNation", "Prestige");
+    A.fMorale = dl::Field("TBuilderNation", "FleetMorale");
+    A.fRetire = dl::Field("TfrmBuildCamp", "AnOfficerToRetire");
+    A.sacRet = A.lists ? FindSacLookup() : 0;
     Log("Officers of the joined players: %s; their month (the pool, the auto-assignment): %s; the Turn's question: %s; "
-        "the free promotion: %s (loader rva %#x, writer rva %#x)",
+        "the free promotion: %s (loader rva %#x, writer rva %#x); live battles with both sides' commanders: %s (the "
+        "battle save's lookup rva %#x); the battle aftermath's guard: %s",
         A.lists ? "ok" : "UNAVAILABLE", A.month ? "ok" : "UNAVAILABLE",
         A.mQuestion ? "ok" : "not found (not asked)", A.freePromo ? "ok" : "not found (not reset)",
         A.mLoader ? (unsigned)((uintptr_t)A.mLoader - dl::g_base) : 0u,
-        A.mWriter ? (unsigned)((uintptr_t)A.mWriter - dl::g_base) : 0u);
+        A.mWriter ? (unsigned)((uintptr_t)A.mWriter - dl::g_base) : 0u, A.sacRet ? "ok" : "UNAVAILABLE",
+        A.sacRet ? (unsigned)(A.sacRet - 5 - dl::g_base) : 0u,
+        A.lists && A.mTransfer && A.fFSCmd > 0 && A.fPrestige > 0 && A.fMorale > 0 && A.fRetire > 0 ? "ok"
+                                                                                                   : "UNAVAILABLE");
     return A.lists;
 }
 
@@ -230,6 +312,14 @@ static bool TradeAndConnect(void* nation, int K) {
     return true;
 }
 
+static void LoadBattleLists(void* nation);  // (0.8.1: live battles with both sides' commanders; below)
+static bool g_battlePendingAny = false;
+static std::map<int, std::vector<std::string>> g_battlePending;  // the next load's battle lists (SetBattleLists)
+static std::vector<int> g_battleNations;   // ... loaded by this load: the .sac reader's lookup searches them
+static std::string g_battleLoaded;         // "<nation>:<officers>/<ships>,..." of this load
+static int g_sacFound = 0;                 // commanders the .sac reader found in them
+static volatile uint32_t g_sacRetHook = 0;  // A.sacRet while the lookup is on, else 0
+
 extern "C" void __stdcall OF_Connect(void* nation) {
     if (g_tradeK > 0 && !g_tradeDone) {
         g_tradeDone = true;
@@ -242,6 +332,7 @@ extern "C" void __stdcall OF_Connect(void* nation) {
         if (done) return;
     }
     dl::Call(ConnectFn(), U(nation));
+    if (g_battlePendingAny) LoadBattleLists(nation);
 }
 
 // ConnectOfficersToShips(Self=EAX): a register procedure without stack arguments.
@@ -256,6 +347,10 @@ extern "C" __declspec(naked) void OF_dConnect() {
 void OnLoadStart() {
     g_loaded.clear();
     g_tradeDone = false;
+    g_sacRetHook = 0;  // (0.8.1) the lookup only after this load's own battle lists are in
+    g_battleNations.clear();
+    g_battleLoaded.clear();
+    g_sacFound = 0;
 }
 
 LoadScope::LoadScope(int slot, int playerIdx) {
@@ -335,10 +430,197 @@ bool ReadNation(int K, std::vector<std::string>& lines) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Host guards: AdjustCrewQuality's picture messages about a joined nation's ships
+// 0.8.1: live battles with both sides' commanders. A's snapshot names each ship's commander by id in the .sac, and the
+// game's resume looks every id up in PlayerNation's list alone (the .sac ship reader's GetOfficerWithId call): the other
+// side's commanders were lost on both PCs. With the battle's lists (the start carries them; both PCs load the same text
+// before the same lookup) the other nations' officers are in their own lists before the reader runs, and an id
+// PlayerNation doesn't hold is looked up there (officer ids are unique: a joined nation's come from IDNo + 20000 K).
 
+int OwnerOf(void* officer) {
+    if (!officer || !A.lists) return -1;
+    for (int i = 0, n = game::NationCount(); i < n; i++) {
+        void* l = dl::At<void*>(game::Nation(i), A.fOfficers);
+        for (int j = 0, c = dl::ListCount(l); j < c; j++)
+            if (dl::ListItem(l, j) == officer) return i;
+    }
+    return -1;
+}
+
+extern "C" void* o_ofGetId = nullptr;
+bool LiveAvailable() { return A.lists && A.sacRet != 0 && o_ofGetId != nullptr; }
+
+std::map<int, std::vector<std::string>> BattleLists(const std::vector<void*>& officers, const std::set<int>& more) {
+    std::map<int, std::vector<std::string>> out;
+    if (!LiveAvailable()) return out;
+    int pn = game::PlayerIndex();
+    std::set<int> nations;
+    for (void* o : officers) {
+        int n = OwnerOf(o);
+        if (n >= 1 && n <= 8 && n != pn) nations.insert(n);
+    }
+    for (int n : more) {
+        void* nat = n >= 1 && n <= 8 && n != pn ? game::Nation(n) : nullptr;
+        if (nat && dl::ListCount(dl::At<void*>(nat, A.fOfficers)) > 0) nations.insert(n);
+    }
+    for (int n : nations) {
+        std::vector<std::string> lines;
+        if (ReadNation(n, lines)) out[n] = lines;
+    }
+    return out;
+}
+
+void SetBattleLists(const std::map<int, std::vector<std::string>>& lists) {
+    g_battlePending = lists;
+    g_battlePendingAny = !lists.empty() && LiveAvailable();
+}
+
+static void LoadBattleLists(void* nation) {
+    if (nation != game::PlayerNation()) return;  // (PlayerNation's own connection comes first in LoadBuildCampaign)
+    g_battlePendingAny = false;
+    std::map<int, std::vector<std::string>> lists;
+    lists.swap(g_battlePending);
+    for (auto& e : lists) {
+        int cmd = 0, n = LoadIntoNation(e.first, e.second, &cmd);
+        g_battleLoaded += (g_battleLoaded.empty() ? "" : ",") + std::to_string(e.first) + ":" + std::to_string(n) + "/" +
+                          std::to_string(cmd);
+        if (n >= 0) g_battleNations.push_back(e.first);
+    }
+    if (!g_battleNations.empty()) g_sacRetHook = A.sacRet;
+}
+
+std::string EndBattleLoad(int* found) {
+    if (found) *found = g_sacFound;
+    std::string s = g_battleLoaded;
+    g_sacRetHook = 0;
+    g_battlePendingAny = false;
+    g_battlePending.clear();
+    g_battleNations.clear();
+    g_battleLoaded.clear();
+    g_sacFound = 0;
+    return s;
+}
+
+// The .sac reader asked PlayerNation (Self) for a commander id: then the battle's other lists.
+extern "C" void* __stdcall OF_SacLookup(void* self, int id) {
+    void* r = (void*)(uintptr_t)dl::Call(o_ofGetId, U(self), (uint32_t)id);
+    if (r || id == -1) return r;
+    for (int n : g_battleNations) {
+        void* nat = game::Nation(n);
+        if (!nat || nat == self) continue;
+        r = (void*)(uintptr_t)dl::Call(o_ofGetId, U(nat), (uint32_t)id);
+        if (r) {
+            g_sacFound++;
+            return r;
+        }
+    }
+    return nullptr;
+}
+
+// GetOfficerWithId(Self=EAX, anId=EDX): TOfficer in EAX. Only the .sac reader's call (its return address) while the
+// lookup is on goes through OF_SacLookup.
+extern "C" __declspec(naked) void OF_dGetId() {
+    __asm {
+        mov ecx, [esp]
+        cmp ecx, g_sacRetHook
+        jne orig
+        push edx
+        push eax
+        call OF_SacLookup
+        ret
+    orig:
+        jmp dword ptr [o_ofGetId]
+    }
+}
+
+// The battle's aftermath (TransferCampaignShipDamage, every battle) for a ship whose commander is not PlayerNation's:
+// on the host a joined nation's ships carry their commanders also in a battle the host fights against the computer, and
+// in a live battle with both sides' commanders the other side's do on both PCs.
+extern "C" void* o_ofTransfer = nullptr;
+static std::function<int()> g_viewer;
+static std::vector<std::wstring> g_bandTexts;
 static std::function<bool(int)> g_isJoined;
 static std::function<void(int, const std::string&)> g_news;
+
+void SetViewerNation(std::function<int()> viewerNation) { g_viewer = viewerNation; }
+
+static void EndBandCapture() { g_bandTexts = lockstep::EndTextCapture(); }
+
+static void TransferGuarded(uint32_t self, uint32_t ship, uint32_t loss, bool capture) {
+    __try {
+        dl::Call(o_ofTransfer, self, ship, loss);
+    } __finally {
+        if (capture) EndBandCapture();
+    }
+}
+
+extern "C" void __stdcall OF_Transfer(void* self, void* ship, uint32_t loss) {
+    void *off = nullptr, *pn = nullptr, *own = nullptr;
+    int owner = -1;
+    try {
+        off = ship && A.fFSCmd > 0 ? dl::At<void*>(ship, A.fFSCmd) : nullptr;
+        pn = game::PlayerNation();
+        owner = off ? OwnerOf(off) : -1;
+        own = owner >= 0 ? game::Nation(owner) : nullptr;
+    } catch (...) {
+        own = nullptr;
+    }
+    if (!off || !own || !pn || own == pn || !self) {
+        dl::Call(o_ofTransfer, U(self), U(ship), loss);
+        return;
+    }
+    int p0 = dl::At<int>(pn, A.fPrestige), m0 = dl::At<int>(pn, A.fMorale);
+    void* retire0 = dl::At<void*>(self, A.fRetire);
+    int viewer = g_viewer ? g_viewer() : -1;
+    if (viewer < 0) viewer = game::PlayerIndex();
+    bool capture = viewer != owner && lockstep::BeginTextCapture();  // (the box shows on its own player's PC only)
+    g_bandTexts.clear();
+    TransferGuarded(U(self), U(ship), loss, capture);
+    try {
+        int dp = dl::At<int>(pn, A.fPrestige) - p0, dm = dl::At<int>(pn, A.fMorale) - m0;
+        std::string name = W2U(dl::ReadUStr(dl::At<void*>(off, A.fOName)));
+        if (dp || dm) {
+            dl::At<int>(pn, A.fPrestige) = p0;
+            dl::At<int>(pn, A.fMorale) = m0;
+            dl::At<int>(own, A.fPrestige) += dp;
+            dl::At<int>(own, A.fMorale) += dm;
+            Log("officers: after the battle: %s of nation %d: prestige %+d and fleet morale %+d go to nation %d (the game "
+                "gives them to the player's nation)",
+                name.c_str(), owner, dp, dm, owner);
+        }
+        void* retire = dl::At<void*>(self, A.fRetire);
+        if (retire == off && retire != retire0) {
+            dl::At<void*>(self, A.fRetire) = retire0;
+            Log("officers: after the battle: %s of nation %d is not the player's to cashier (kept from the month's "
+                "question)",
+                name.c_str(), owner);
+        }
+        for (auto& t : g_bandTexts) {
+            std::string u = W2U(t);
+            for (char& c : u)
+                if (c == '\r' || c == '\n') c = ' ';
+            Log("officers: after the battle: the message about nation %d's officer kept from this screen: %s", owner,
+                u.substr(0, 200).c_str());
+            if (g_news && g_isJoined && g_isJoined(owner)) g_news(owner, "Officers: " + u);
+        }
+        g_bandTexts.clear();
+    } catch (...) {
+    }
+}
+
+// TransferCampaignShipDamage(Self=EAX, aShip=EDX, LossRisk=CL): a register procedure without stack arguments.
+extern "C" __declspec(naked) void OF_dTransfer() {
+    __asm {
+        push ecx
+        push edx
+        push eax
+        call OF_Transfer
+        ret
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Host guards: AdjustCrewQuality's picture messages about a joined nation's ships (g_isJoined, g_news: above)
+
 extern "C" void* o_ofAdjust = nullptr;
 static std::vector<std::wstring> g_adjTexts;
 
@@ -389,6 +671,109 @@ extern "C" __declspec(naked) void OF_dAdjust() {
         push eax
         call OF_Adjust
         ret
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The month (host, 0.8.1): AdjustCrewQuality's rule for its player's ships without a commander (FindUncmdSite: one crew
+// quality less when Random(5) = 1, no message; the game tests aNation = PlayerNation) for each joined nation with its own
+// corps: the same roll with the game's Random, at the same place in the routine (after the training by status and place,
+// before the working up, the nation's rules and the bounds). The session answers for the nation (SetUncommandedRule);
+// its corps must be in memory (LoadIntoNation since the last load: its ships' commanders connected). Any other ship goes
+// on with the game's test: PlayerNation's gets the game's own roll, the computer's none.
+
+static std::function<int(int)> g_ucRule;
+extern "C" void* o_ofUncmd = nullptr;       // MinHook's trampoline: the game's PlayerNation test, then back to its jne
+extern "C" void* g_ofUncmdAfter = nullptr;  // the rule's end (the target of its jne and jmp)
+struct UcCount {
+    int rolls = 0, lost = 0, skipped = 0;
+};
+static UcCount g_ucMonth[9], g_ucTest[9];  // the month's (logged by TakeUncommandedMonth), the tests' (`ofcrew`)
+static int g_ucOwn = 0;                    // TEST: PlayerNation's ships sent on to the game's own roll (`ofcrew`)
+static bool g_ucTesting = false, g_ucOff = false, g_ucHooked = false;
+
+void SetUncommandedRule(std::function<int(int)> rule) { g_ucRule = rule; }
+
+// 1: the ship was rolled for (the routine goes on after the rule), 0: the game's test decides.
+extern "C" int __stdcall OF_Uncmd(void* nation, void* ship) {
+    try {
+        if (g_ucOff || !g_ucRule || !nation || !ship || !A.ucRandom || game::EventActive()) return 0;
+        UcCount* c = g_ucTesting ? g_ucTest : g_ucMonth;
+        if (nation == game::PlayerNation()) {
+            if (g_ucTesting) g_ucOwn++;
+            return 0;
+        }
+        int k = game::NationIndex(nation);
+        if (k < 1 || k > 8) return 0;
+        int r = g_ucRule(k);
+        if (r == 0) return 0;  // not a joined nation: the computer's ships, as in the game
+        if (r < 0 || !g_loaded.count(k)) {
+            c[k].skipped++;
+            return 0;
+        }
+        c[k].rolls++;
+        if ((int)dl::Call(A.ucRandom, 5) == 1) {
+            dl::At<int>(ship, A.fCrew) -= 1;
+            c[k].lost++;
+        }
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// At the rule's PlayerNation test (EBX: aShip, ESI: aNation; nothing else is read): a joined nation's ship rolled for ->
+// the rule's end; any other -> the game's test (the trampoline). popad keeps the flags of `test`.
+extern "C" __declspec(naked) void OF_dUncmd() {
+    __asm {
+        pushad
+        push ebx
+        push esi
+        call OF_Uncmd
+        test eax, eax
+        popad
+        jnz rolled
+        jmp dword ptr [o_ofUncmd]
+    rolled:
+        jmp dword ptr [g_ofUncmdAfter]
+    }
+}
+
+std::string TakeUncommandedMonth() {
+    std::string s;
+    for (int k = 1; k <= 8; k++) {
+        UcCount& c = g_ucMonth[k];
+        if (c.rolls)
+            s += " nation " + std::to_string(k) + ": " + std::to_string(c.rolls) + " ships, " + std::to_string(c.lost) +
+                 " lost one;";
+        else if (c.skipped)
+            s += " nation " + std::to_string(k) + ": " + std::to_string(c.skipped) +
+                 " ships, not applied (no corps of its own);";
+        c = UcCount();
+    }
+    return s;
+}
+
+std::string UncommandedInfo() {
+    std::string s = std::string("ok rule=") + (!g_ucHooked ? "unavailable" : g_ucOff ? "off" : "on") + " site=";
+    char b[16];
+    snprintf(b, sizeof(b), "%#x", A.ucSite ? (unsigned)((uintptr_t)A.ucSite - dl::g_base) : 0u);
+    s += b;
+    s += " own=" + std::to_string(g_ucOwn);
+    for (int k = 1; k <= 8; k++)
+        s += " n" + std::to_string(k) + "=" + std::to_string(g_ucTest[k].rolls) + "/" + std::to_string(g_ucTest[k].lost) +
+             "/" + std::to_string(g_ucTest[k].skipped);
+    return s;
+}
+
+void UncommandedTest(const std::string& what) {
+    if (what == "reset") {
+        for (auto& c : g_ucTest) c = UcCount();
+        g_ucOwn = 0;
+    } else if (what == "off" || what == "on") {
+        g_ucOff = what == "off";
+        Log("TEST: officers: the rule for the joined nations' ships without a commander %s", g_ucOff ? "off (the game's "
+            "own: its player's ships only)" : "on");
     }
 }
 
@@ -469,6 +854,23 @@ void InstallHooks() {
     if (!A.lists) return;
     HookOne(A.mConnect, (void*)&OF_dConnect, &o_ofConnect, "ConnectOfficersToShips");
     HookOne(A.mAdjustCrew, (void*)&OF_dAdjust, &o_ofAdjust, "AdjustCrewQuality");
+    // 0.8.1: the rule for ships without a commander, for the joined nations with their own corps (host)
+    g_ofUncmdAfter = A.ucAfter;
+    if (A.ucSite) HookOne(A.ucSite, (void*)&OF_dUncmd, &o_ofUncmd, "AdjustCrewQuality (ships without a commander)");
+    g_ucHooked = A.ucSite && o_ofUncmd;
+    if (g_ucHooked)
+        Log("Officers: the game's rule for its player's ships without a commander (AdjustCrewQuality: 1 in 5 a month "
+            "loses one crew quality) for the joined nations with their own corps: ok (the test at rva %#x, the rule's "
+            "end at rva %#x)",
+            (unsigned)((uintptr_t)A.ucSite - dl::g_base), (unsigned)((uintptr_t)A.ucAfter - dl::g_base));
+    else
+        Log("Officers: the game's rule for its player's ships without a commander for the joined nations: UNAVAILABLE "
+            "(%s; their ships keep their crew quality, as before 0.8.1)",
+            A.ucSite ? "hook" : "the rule's code not found (another game version?)");
+    // 0.8.1: the .sac reader's commander lookup (only its call, found above) and the battle aftermath's guard
+    if (A.sacRet) HookOne(A.mGetId, (void*)&OF_dGetId, &o_ofGetId, "GetOfficerWithId");
+    if (A.mTransfer && A.fFSCmd > 0 && A.fPrestige > 0 && A.fMorale > 0 && A.fRetire > 0 && A.fOName >= 0)
+        HookOne(A.mTransfer, (void*)&OF_dTransfer, &o_ofTransfer, "TransferCampaignShipDamage");
     // the ship sheet: only when its argument count is the one the detour copies (ret 0x24 at its end)
     void* sheet = dl::Method("TdlgShipStatus", "ExecuteShipStatusStrategic");
     if (sheet && dl::FindPattern((uint8_t*)sheet, 0x1000, {0xC2, 0x24, 0x00}))
@@ -711,12 +1113,28 @@ std::string TestKill(int nation, int ship, bool pow) {
            std::to_string((int)dl::At<uint8_t>(o, A.fOStatus)) + " cmd=" + (dl::At<void*>(sh, A.fCmd) ? "1" : "0");
 }
 
-std::string TestAdjustCrew(int nation, int ship) {
+std::string TestAdjustCrew(int nation, int ship, int count, bool setCrew, int crew) {
     void* f = game::BuildCamp();
     void* sh = ShipOf(nation, ship);
-    if (!A.lists || !A.mAdjustCrew || !f || !sh || game::EventActive()) return "error no such ship";
-    if (!Guarded3(A.mAdjustCrew, U(f), U(sh), U(game::Nation(nation)))) return "error the game raised an exception";
-    return "ok";
+    if (!A.lists || !A.mAdjustCrew || !f || !sh || game::EventActive() || (setCrew && A.fCrew < 0))
+        return "error no such ship";
+    int down = 0, same = 0, up = 0, other = 0;
+    bool ok = true;
+    if (setCrew && count == 0) dl::At<int>(sh, A.fCrew) = crew;
+    g_ucTesting = true;
+    for (int i = 0; i < count && ok; i++) {
+        if (setCrew) dl::At<int>(sh, A.fCrew) = crew;
+        ok = Guarded3(A.mAdjustCrew, U(f), U(sh), U(game::Nation(nation)));
+        if (!ok || !setCrew) continue;
+        int d = dl::At<int>(sh, A.fCrew) - crew;
+        (d == -1 ? down : d == 0 ? same : d == 1 ? up : other)++;
+    }
+    g_ucTesting = false;
+    if (!ok) return "error the game raised an exception";
+    if (!setCrew) return "ok";
+    return "ok crew=" + std::to_string(crew) + " runs=" + std::to_string(count) + " down=" + std::to_string(down) +
+           " same=" + std::to_string(same) + " up=" + std::to_string(up) + " other=" + std::to_string(other) +
+           " now=" + std::to_string(dl::At<int>(sh, A.fCrew));
 }
 
 std::string TestSet(int nation, int id, const std::string& field, int value) {
@@ -745,21 +1163,30 @@ std::string TestSet(int nation, int id, const std::string& field, int value) {
     return "error no such officer";
 }
 
-// The commander of a nation's ship: "ok ship=<i> id=<officer id or -1> special=<s1>,<s2> rank=<r>", or the first
-// commanded ship of the nation (ship -1).
+// The commander of a nation's ship: "ok ship=<i> id=<officer id or -1> [special=<s1>,<s2> rank=<r>] crew=<CrewQuality>
+// status=<TShipStatus> op=<1: operational as the month's crew training takes it>", or the first commanded ship of the
+// nation (ship -1).
 std::string ShipCommander(int nation, int ship) {
     void* nat = game::Nation(nation);
     if (!A.lists || !nat) return "error no such nation";
+    auto state = [](void* sh) {
+        if (A.fCrew < 0 || A.fShipStatus < 0 || A.fInPlay < 0 || A.fRepair < 0) return std::string();
+        int st = dl::At<uint8_t>(sh, A.fShipStatus);
+        bool op = st != 7 && st != 9 && dl::At<int>(sh, A.fRepair) == 0 && dl::At<uint8_t>(sh, A.fInPlay) != 0;
+        return " crew=" + std::to_string(dl::At<int>(sh, A.fCrew)) + " status=" + std::to_string(st) + " op=" +
+               (op ? "1" : "0");
+    };
     for (int j = ship < 0 ? 0 : ship, c = game::ShipCount(nat); j < c; j++) {
         void* sh = game::Ship(nat, j);
         void* o = sh ? dl::At<void*>(sh, A.fCmd) : nullptr;
         if (ship >= 0 || o) {
-            if (!o) return "ok ship=" + std::to_string(j) + " id=-1";
+            if (!sh) return "error no such ship";
+            if (!o) return "ok ship=" + std::to_string(j) + " id=-1" + state(sh);
             static int fS1 = dl::Field("TOfficer", "Special1"), fS2 = dl::Field("TOfficer", "Special2");
             return "ok ship=" + std::to_string(j) + " id=" + std::to_string(dl::At<int>(o, A.fOId)) + " special=" +
                    std::to_string(fS1 >= 0 ? dl::At<uint8_t>(o, fS1) : -1) + "," +
                    std::to_string(fS2 >= 0 ? dl::At<uint8_t>(o, fS2) : -1) + " rank=" +
-                   std::to_string(A.fORank >= 0 ? dl::At<int>(o, A.fORank) : -1);
+                   std::to_string(A.fORank >= 0 ? dl::At<int>(o, A.fORank) : -1) + state(sh);
         }
     }
     return "error no commanded ship";

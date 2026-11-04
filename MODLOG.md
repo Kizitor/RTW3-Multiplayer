@@ -265,6 +265,14 @@ belong to 0.4.0.
     [simultaneous battles: the design](#investigation-2026-11-01-simultaneous-battles-the-design-v080-dev)
   - Testing:
     [the 0.8.0 release candidate dist_rc080_1](#testing-2026-11-03-the-080-release-candidate-dist_rc080_1-v080)
+- **0.8.1** (fixes of known issues of 0.8.0: both sides' commanders in live battles, a computer ship sunk in two
+  battles of one month, the crew quality of ships without a commander; its entries carry "0.8.1-dev" or "0.8.1")
+  - Fix:
+    [a joined nation's ships without a commander lose crew quality as the host's](#fix-2026-11-03-a-joined-nations-ships-without-a-commander-lose-crew-quality-as-the-hosts-v081-dev)
+    [a computer ship sunk in the host's battle and in a joined player's battle of the same month is counted once](#fix-2026-11-03-a-computer-ship-sunk-in-the-hosts-battle-and-in-a-joined-players-battle-of-the-same-month-is-counted-once-v081-dev)
+    [live battles with both sides' commanders](#fix-2026-11-03-live-battles-with-both-sides-commanders-v081-dev)
+  - Testing:
+    [the 0.8.1 release candidate dist_rc081_1](#testing-2026-11-04-the-081-release-candidate-dist_rc081_1-v081)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -9603,3 +9611,450 @@ logs of every run are kept with the developers' session files (`r801\logs_*`).
   conditions (passed again); officers and simultaneous battles work as described, together and across versions both
   ways (each feature's flag keeps the older side on its own behaviour), with the held results (by the TEST hold and
   naturally), the restart notice, and the officers' deaths and losses through the merges.
+
+## Fix 2026-11-03: a joined nation's ships without a commander lose crew quality as the host's (v0.8.1-dev)
+A known issue of 0.8.0: "The crew quality penalty for uncommanded ships must not apply only to the host." Since 0.8.0
+each joined nation K has its own officer corps, but the game's monthly rule that lowers the crew quality of ships without
+a commander still ran for the host's nation only.
+
+**The game's rule** (static reading of 1.01.44; [GAME-INTERNALS](docs/GAME-INTERNALS.md#officers)):
+- `DoStrategicTurn` -> `ReduceTimeLimits` (0xce1dcf) -> `AdvanceShipConstruction` (0xc7c536): once a month, for the
+  nations 0 to 8 (`[ebp-0x30]` up to 9) and each ship of their `ShipList` in play and `IsOperational`,
+  `AdjustCrewQuality(aShip, aNation)` (0xcd94bb, its only caller; the `TdlgFilter` reference is the RTTI table).
+- `AdjustCrewQuality` 0xcb27c8 (Self = frmBuildCamp, EBX = aShip, ESI = aNation, EDI = Self): the training by status and
+  place, then at 0xcb2a7e `cmp dword ptr [ebx+0xcc],0; jne 0xcb2aac` (the commander's part) `; cmp esi,[edi+0x3204];
+  jne 0xcb2c7f; mov eax,5; call Random; dec eax; jne 0xcb2c7f; dec dword ptr [ebx+0x1d]; jmp 0xcb2c7f`: a ship whose
+  `Commander` is nil loses one `CrewQuality` when `Random(5)` = 1, only when aNation is `PlayerNation`. No message, no
+  bound at that point (the routine's -25 floor comes later), no `IsCommandedShip` test: destroyers, corvettes and every
+  type that never gets a commander lose it too. After it: the working up, the nation's rules (PoorEducation,
+  GovernmentType 5, GovernmentType 3 with SurpriseAttack), the commander's ability, the bounds and the late years.
+- The computer's ships never have a commander and the test is the player's: in single player only the player's ships
+  without a commander lose crew quality, 1 in 5 a month, on top of their training (an Active ship at home gains one a
+  month up to 14: the player's then hover at 13 or 14).
+- Nothing else of the campaign penalizes a missing commander for PlayerNation only: a scan of every routine that tests
+  `[reg+0xcc]` against nil (`cmp`, or `mov` and `test`) and reads `[reg+0x3204]` found the raider sinkings
+  (`CheckRaiderSinkings`: a raider's commander changes its odds for any nation, without one nothing), the battle's
+  `TransferCampaignShipDamage`, `AdvanceShipConstruction`'s commissioning (index 0 with the preference) and the
+  screens (`UpdateShipListLine`, `DoShipListLine`, `AssignOfficer`, `ReassignOfficer`, `OfficerToleratesTransfer`,
+  `DoCampDivShipLine`, *Send ashore*, the ship sheet). `TCampaignDivision.AdjustExperience` gives a division its
+  commander's experience; without one, nothing. Battles need nothing here: K's against the computer are fought on K's
+  PC with K as nation 0 and its own corps (the game's rules for its player); live battles as in 0.8.0.
+
+**Live before** (the released dist_rc080_1; `FILES\uc81\crew_probe.py`: the suite's session on the slot 1 fixture, four
+real months 1900/8 to 1900/12, the host's save read after each; per nation the active ships without a commander in two
+consecutive saves with a crew quality where the month's training gives a fixed step, +2 from -2 to 1, +1 from 2 to 12,
+at home and elsewhere): the month's step was one short in 13 of 94 of the host's (nation 0), 0 of 56 of the joined
+player's nation 1 (Germany, with its own corps) and 0 of 155 of the stand-in's nation 2 (no corps, as the computer's).
+So the host's lost crew quality, the joined nation's never (0.8^56 = 4e-6 for no loss by chance). The same with the
+fix (dist_uc81_1): nation 0 22 of 93, nation 1 11 of 56 (the host log's monthly counts, 1, 3, 3 and 4 of 14, are the
+saves' own), nation 2 0 of 155. The runs took 105 s (the before run, its summary cut short by an error of the probe's
+own after the cleanup) and 96 s of game time.
+
+**Where, and why there.** In the host's month, as the game does: `AdvanceShipConstruction` is the rule's only caller and
+runs once a month on the host, with K's commanders connected (0.8.0 loads K's corps into K's list after every load of
+the host's slot), and K's PC runs no month (its battle slot skips `DoStrategicTurn`). On K's PC the rule would run on
+another state: after the host's month (a commander killed or captured in it, `KillCommander`, ships repaired,
+commissioned or moved in it) and once more after a rejoin. The result goes where every other change of the host's month
+goes: the host's save and K's month package; K's turn carries it back with K's own changes (its officer events); a
+battle fought during the month adds its change to the host's value (0.8.0's merge, CrewQuality within -25..25), so
+nothing of either side is lost.
+
+**Fix** (`officers.cpp`, `session.cpp`; protocol 3 and the live-battle engine 18 unchanged):
+- A hook at the rule's PlayerNation test (rva 0x482a87; `FindUncmdSite`: the 46 bytes from the commander test to the
+  rule's `jmp`, with the RTTI offsets of `Commander`, `PlayerNation` and `CrewQuality`, exactly once in the routine, its
+  three exits the same address, the call the game's `System.Random`; the 6-byte `cmp` moves into MinHook's
+  trampoline). The detour (`OF_dUncmd`: `pushad`, the callback, `popad` keeping the flags) asks `OF_Uncmd(aNation,
+  aShip)`: for a joined nation the rule applies to, the game's roll (`Random(5)` = 1 -> `CrewQuality` - 1) and on to the
+  rule's end (rva 0x482c7f, 0xcb2c7f); any other ship to the trampoline, the game's own test (the host's: its roll; the
+  computer's: none). So K's ship gets the roll at the same place of the routine as the host's (after the training,
+  before the working up, the nation's rules and the bounds), with the same random generator.
+- Whom (`UncommandedRuleFor`, 1 / -1 / 0): a joined nation (`IsHumanRemoteNation`) whose player's mod keeps the
+  nation's own officers (the connected player's hello `off` >= 1; while it is away, what its last player had:
+  `g_offNations`, noted with each month sent to it, `offRules` in the session file, dropped when the nation goes to the
+  computer), and (officers.cpp) whose corps is in the host's memory (`LoadIntoNation` since the last load). Not applied
+  (-1, counted "not applied"): a joined nation whose player's mod has no officers (an older version: none of its ships
+  ever has a commander, all would lose crew quality with no way to assign one), one without a record yet (the month its
+  PC forms the corps: none on the host), a test's `ofuncmd old`. Not the business of the rule (0): the computer's
+  nations. Outside a hosted session (single player, a joined player's PC) nothing changes: the rule answers 0.
+- Messages: the game shows nothing for this rule, so K gets nothing either; the crew quality shows in K's ship list and
+  ship sheet with the month. The host's log, once a month (`OnAfterReduceTimeLimits`): "officers: the month's crew
+  quality of the joined nations' ships without a commander (the game's rule for its player's: one less 1 in 5): nation
+  1: 14 ships, 3 lost one; nation 2: 38 ships, not applied (no corps of its own);"; at the start "Officers: the game's
+  rule for its player's ships without a commander (...) for the joined nations with their own corps: ok (the test at
+  rva 0x482a87, the rule's end at rva 0x482c7f)" (or UNAVAILABLE: the ships keep their crew quality, as 0.8.0);
+  "officers: nation K's player keeps|has no the nation's own officers ..." when that changes.
+- Mixed versions (the host's month only): a 0.8.1 host gives the rule to a 0.8.0 player's nation too (its hello has
+  `off`; nothing changes on its PC), never to an older player's; a 0.8.0 host gives it to no joined nation.
+- A ship commissioned in the host's month gets no commander there even when the player answered *Yes To All* (the game
+  assigns at commissioning for index 0 only); the Turn's assignments on the player's PC give her one at the next Submit,
+  before the month that first trains her, as in single player.
+
+**Tests** (`scenario_officers` j), `of_uncommanded`; TESTING.md): the start line and the months' lines (nation 1 rolled
+each month, never the stand-in's nation 2); probes of 200 runs of the game's routine on active ships with the crew
+quality set to 15 before each (`ofcrew <n> <ship> 200 15`, new: there the training and these nations' rules change
+nothing, so a run gives one less only by the rule). Without the rule (`ofuncmd off`, the game's own test): nation 1's
+ship 0 of 200, the host's 44; with it: the host's 44, nation 1's 39 (`ofuncmd` n1=200/39/200: 200 rolled, 39 lost one,
+200 not applied under `old`), nation 1's commanded ship (her commander made Ability 0 without specials) 0 losses and 29
+gains (her commander's one more 1 in 7), the stand-in's nation 2 and nation 1 under `ofuncmd old 1 1` 0 of 200; the
+ships and the commander put back. Bridge: `ofcrew ... [crew]`, `ofuncmd [reset|off|on]`, `ofuncmd old <K> 1|0` (TEST
+ONLY), `ofship` with ` crew= status= op=`.
+- Runs (dist_uc81_1, RTW3MP.dll AFC2F84F0E87974F...; `FILES\uc81`): `--only session,officers` 88/88 twice (session
+  17/17, officers 71/71; game open 116 and 115 s; the second run's probes: without the rule nation 1's ship 0 and the
+  host's 35 of 200, with it the host's 40 and nation 1's 41, the commanded ship 0 losses and 20 gains; the months
+  1, 2 and 4 of 14 or 15), `--group relations` 556/556 (game open 1177 s; 28 months, nation 1's ships without a
+  commander rolled 377 times and 61 lost one, the stand-in's nation 2 never; three `SKIP-note`s, the game's draws as
+  before: no declined battle in `battle_generator` d), every encounter of g) against one nation, `battle_surprise` b)'s
+  takeover skipped); no game error box in any run; after each run v0.8.0 back in the game folder (SHA-256 8972DE54...),
+  slots 1 and 9 and the Preferences as before. With the before and after probes: game open about 27 minutes in all.
+
+**Files:** `src/mod/officers.cpp`/`.h` (the site, the hook, the counters, the tests' `ofcrew` crew and `ofship` state),
+`src/mod/session.cpp`/`.h` (`UncommandedRuleFor`, `NoteOffRules`, `offRules`, the month's log line, `ofuncmd`),
+`src/mod/bridge.cpp`, `tools/regression.py` (j), docs.
+
+## Fix 2026-11-03: a computer ship sunk in the host's battle and in a joined player's battle of the same month is counted once (v0.8.1-dev)
+The known issue of 0.8.0 (CHANGELOG 0.8.0, Known issues: "A computer nation's ships in two battles of one month ...
+a ship sunk in both battles counts in both, in the losses and in the victory points."). With
+[simultaneous battles](#feature-2026-11-02-simultaneous-battles-v080-dev) the host sends a joined player's battle from a
+snapshot of the month taken at the battle search (scratch slot 151), before the host's own battle, and merges the
+player's held result in the battle phase into the month-end save; a computer nation J at war with the host's nation and
+with the player's nation K can lose the same ship in both battles: both start from the month's state. The user asked to
+fix it. Mechanism in [ARCHITECTURE](docs/ARCHITECTURE.md#simultaneous-battles-080) ("A ship sunk twice is counted
+once"), the game facts in [GAME-INTERNALS](docs/GAME-INTERNALS.md#tactical-battles) ("A lost ship, a battle's losses and
+its points").
+
+**What was counted twice** (static, 1.01.44; the 0.8.0 merge code; the live run dev1 below):
+- *A lost ship stays in its nation's list.* The battle's end (`TransferCampaignShipDamage` 0xd55dd8) gives a sunk ship
+  `Fate` "Sunk in battle <name> with <adjective> ships.", the date in `Reinforcement`, `RepairTime` 100 (0xd560b9), its
+  commander's fate; the save writes every ship and the game's "Ships sunk or scrapped" list is `RepairTime` >= 100
+  (`DisplayNationShips` 0xca657d); the month's sinkings (`SinkShip`, `QuickResolveRaiderBattle`, the AI battles) set
+  100 as well, a scrapping 101. GAME-INTERNALS said a battle's sunk ships leave the list (the 0.8.0 POC): corrected. So
+  the 0.8.0 rule for a ship gone from the host's save ("stays gone, the battle's changes dropped (sunk in both: in the
+  losses of both, accepted)") never met a ship sunk in both: the field rules merged it.
+- *The 0.8.0 merge of a ship sunk in both.* `Fate`: both changed, the battle's (the player's battle's text over the
+  host's: "... off Northwestern Spain with German ships." for a ship the host's battle sank); `RepairTime` both 100;
+  `BattleStars` and `CrewQuality`: the host's + the battle's change (a dead ship trained twice); the log: the player's
+  battle's entries after the host's (two sinkings in one log); `[NationJLosses]`: the battle's delta added to the host's
+  (its counter of the ship's type, +1 in each battle: `ShowResultScreen` 0xdc4154 counts every sinking or sunk ship by
+  type, 0xdc4644 -> 0xdc40b8); K's VP: `dVP_K` = the player's VP change with the ship's points in it (a sunk ship: 4 x
+  `GetShipOriginalPointValue`, x2 HVU, /2 obsolete, in the side's VP0, log-adjusted by `HandleBattleAftermath`'s
+  `GetLogAdjustedVP`), while the host's VP had them from its own battle; the war score K-J (`CreditWarScore`) with the
+  same `dVP_K`. Not twice: J's VP (`dVP_J`: J's points from K's ships), the host's EnemyVP (never merged), the turn
+  messages (the player's battle's stay on its PC; only raider checks' news are merged), the "Ships sunk or scrapped"
+  list (one entry per ship, with the player's battle's `Fate`).
+- *The other cases.* Sunk in one battle and damaged in the other: one sinking, counted once; two battles from one state
+  can be ordered either way (damaged first, sunk later, as a single-player month allows), so the damage's points
+  stay; the merge kept the host's sinking (`RepairTime` the larger) but took the player's battle's damage, log and
+  training onto the host's sunk ship. Captured or surrendered: none in the career's tactical battles (those texts
+  belong to `TfrmCampaign`, the operational campaign mode, and to officers). Interned: only after a raider battle
+  (`DoAfterRaiderBattle` 0xcd1c78: `Status` 7, or scuttled: `SinkShip`, `AddShipToTotalLosses`, "Scuttled after battle
+  damage", no points): its `Status` 7 went onto a ship the host's month had sunk, its scuttling counted a second loss.
+  Prestige and fleet morale: drawn by the battle's victory level (`HandleBattleAftermath`), not per ship.
+- *Reproduced.* Offline, the 0.8.0 `saveio.cpp` against this branch's in a harness of the session folder (`st81\
+  before_after.cpp`): a made-up month (Italy's CA Zara sunk in the host's battle and in Germany's) gave Italy's
+  `CALost` 3 -> 4, Germany's VP +2613 (1647 of them the Zara's), the Zara's `Fate` the battle's, stars 2, crew 9, log 8;
+  live (run dev1: the battle_simul part below alone): Spain's CA Princesa de Asturias (445) sunk in Captain's battle and
+  in the host's month, the 0.8.0 merge on the run's kept files: Spain's `CALost` 1 -> 2, Germany's VP +847 (all of it
+  the cruiser's: the battle's raw VP0 11132 was hers), her `Fate` "... off Northwestern Spain with German ships.".
+
+**The rule: the host's month keeps the sinking.** The host's month is merged first (the player's held result goes into
+the month-end save), and its battle's effects are all over the host's game (its VP and EnemyVP, prestige, turn
+messages, the officers, the ship's commander); the player's result is a three-way diff from the snapshot and can drop
+one ship. A ship can be sunk only once, so the player's battle loses that sinking: its loss (the counter of the ship's
+type, while the battle's delta of it has one) and its points, off the side that gained them (J's ship: K's points; K's
+ship, e.g. one the host's battle sank as J's enemy's ally: J's), and none of the battle's changes to the ship are taken.
+The same for any loss in the host's month since the send (`RepairTime` from below 100 to 100 or more: a raider, a
+submarine, a mine, an AI battle, a scrapping; another player's battle merged before) and for a ship gone from the host's
+save that the battle lost. A ship the host's month lost that the battle only damaged keeps the month's state too.
+- *Its points as the game counted them in that battle.* The result's `deltas` of a 0.8.1 player's PC carry the battle's
+  own points (`vp0`, `vp1`: `HandleBattleAftermath`'s raw VP0/VP1, from the existing aftermath hook; `sunk`:
+  "id:side:points,..." from a new hook of `TFightingShip.GetShipDamagePointValue` in battle slot mode, the value
+  `ShowResultScreen` summed for each sinking or sunk ship); the host takes `GetLogAdjustedVP(VP0) -
+  GetLogAdjustedVP(VP0 - points)` (`saveio::LogAdjustedVP`: Round(0.8 x (Round(3 Sqrt v) + v div 15)), banker's
+  rounding as the FPU's). A 0.8.0 player's result has no per-ship points: the host estimates them with the game's own
+  `GetApproxVP` (2 x displacement for BB, BC, B, CA, CL, DD, KE, else the displacement; the value
+  `QuickResolveRaiderBattle` gives a sunk ship) against the smallest raw total the battle's points come from, only for a
+  ship of K or J whose `Fate` in the result is a battle's sinking; after encounters the fought battle's own points
+  (`bVP_K`, `bVP_J`, set by the host from `enc`); a raider battle auto-resolved: `GetLogAdjustedVP(GetApproxVP)` of
+  each ship, as the game gives them (`bQuick`). The war score takes the same points. Prestige and morale stay the
+  battle's (its level and random draws cannot be replayed).
+
+**Fix** (`saveio.cpp`, `session.cpp`, `game.cpp`, `lockstep.cpp`):
+- `saveio::ApplyBattleResult`: `LostShip` (`RepairTime` >= 100); a ship lost in the host's save since the send is
+  merged as the host has it (`MergeNotes.monthLost`); one the battle lost too (or gone from the host's save and lost in
+  the battle) goes into `MergeNotes.twice` (`LossTwice`: nation, id, name, type, the host's and the battle's fates,
+  side, points, estimated, the counter taken back); the losses sections after every ship: each counter the battle's
+  delta less the ships lost twice of its type (`LossCounterOf`); the points cut (`BattlePointsCut`) off `dVP_K`/`dVP_J`
+  before they are added; the summary "VP 0/248 (the battle's 847/248 less 847/0 for ships lost in the host's month too),
+  ..., 1 ship(s) lost twice counted once"; `MergeNotes.lostNow` (the ships the merge took as the battle's losses).
+- `HostApplyBattleResult`: `bVP_K`/`bVP_J`/`bQuick` into the deltas; the log lines `battle N: nation J's CA ... (ship
+  445) was lost in the host's month (<its Fate>) and in the battle (<the battle's>): counted once: the host's ship kept,
+  CALost -1, 11132 raw points of nation 1` and `battle N: points taken off for them: nation 1 847, nation 7 0 (the
+  player's PC's per-ship points, raw VP 11132/2439)`; `CreditWarScore` with the cut (after encounters off the fought
+  one's opponent); the battle phase's chat line ends "... was fought by Captain (Spain's CA Princesa de Asturias was
+  already sunk in the host's battle: not counted twice, 847 VP fewer for Germany)." (`TwiceNote`; "sunk in Bot's
+  battle" when another player's battle merged before in the phase sank it, `g_phaseLost`; "lost in the host's month
+  (<Fate>)", "scrapped in the host's month"); the kept result of TEST `simulkeep` has its `[deltas]`.
+- The player's PC: `game::BattlePoints` (the aftermath's VP0/VP1 and the sunk ships' points since the battle slot mode
+  began; false when the ships' points hook is not installed, so the host estimates then), `AddBattlePoints` into a
+  fought battle's result (log `battle B: the battle's own points: raw VP 11132/2439; ships sunk in it
+  (id:side:points): 445:1:11132`).
+- TEST tools: `ls cships`, `ls sink <id>` (the battle screen's own debug Sink, `TfrmMain.Sink1Click`), host `battles
+  sinkmonth <J> <id>|result` (`game::TestSinkShip`: `SinkShip`, `AddShipToTotalLosses`, the Fate of a battle's sinking;
+  `result`: at the battle phase's start before its save, the first ship of J a result held this month lost).
+
+**Versions.** The merge runs on the host: a 0.8.1 host counts a ship sunk twice once with any player whose results come
+during the month (0.8.0 and later: per-ship points from 0.8.1 players, estimated for 0.8.0 ones); a 0.8.0 host ignores a
+0.8.1 player's `vp0`/`vp1`/`sunk` (unknown keys of `deltas`) and merges as 0.8.0. Protocol 3 and the live-battle engine
+18 unchanged; no hello or welcome flag.
+
+**Tests.**
+- `tools\merge_test.bat`: 48/48 (17 new: the game's formulas; a month with ships lost twice (the host's battle, a
+  torpedo, a gone one, K's own, the ally's), one lost in the month and only damaged in the battle, the battle's own
+  losses, the per-ship points, the estimate, a raider battle auto-resolved, the battle's own points after encounters,
+  a raider scuttled after a raider battle, a battle sent after the month).
+- `tools\regression_selftest.py`: 169/169 (`simul_twice`, `log_adjusted_vp`, `battle_points_cut`, `simul_expected`'s
+  and `simul_merge_check`'s lost ships, `TWICE_RE`/`TWICE_CUT_RE`).
+- `battle_simul` part S (TESTING.md; `simul_sunk_twice`): the host at war with Captain's enemy J1 too, Captain's battle
+  against J1 injected; in a battle of Captain against J1 sent during the host's month, its first J1 ship sunk with the
+  battle screen's own Sink, and in the host's month (its own battle when the ship fights there too, else `sinkmonth ...
+  result`: the first J1 ship the held result lost, that one or one the battle sank by itself); the merge's kept files
+  against saveio's rules (`simul_twice`), the host's lines, the war score, the chat; up to three months; the suite's
+  model of the merge (`simul_expected`, `simul_merge_check`, `simul_merge_changes`) keeps a ship lost in the host's
+  month as the host had it.
+
+| Run | Args | Dist | Checks | Game open |
+|---|---|---|---|---|
+| dev1 | `--only session,battle_simul` with `RTW3MP_TEST_SIMUL_PART=S` (part S alone) | dist_st1 | 39/40: S c)'s regex did not take the log's CRLF (fixed); the case seen: Captain's battle 1 sank Spain's CA 445 (`ls sink`), the host's month lost her (`sinkmonth result`), merged once: `CALost -1`, 847 of 847 VP taken off, war score 1-7 +0/+248, the chat's note | 234 s |
+| b1 | `--only session,battle_simul` | dist_st1 | 169/169: M1-M8 and R as before (e) with the lost-ship rule); S: Captain's battle 16 sank Spain's CA Infanta Maria Teresa (432; raw VP0 8856, all hers), the host's month lost her (`sinkmonth result`): `CALost` once, 698 VP off Germany (of 698), war score 1-7 +0/+709, the chat "... was fought by Captain (Spain's CA Infanta Maria Teresa was already sunk in the host's battle: not counted twice, 698 VP fewer for Germany)."; the 0.8.0 merge on its kept files: `CALost` 1 -> 2, Germany +698, her `Fate` the battle's | 834 s |
+| (b2) | `--only session,battle_simul` | dist_st1 | stopped by the runner's mistake at 100/100 (through M4): the waiting chain stopped after it had taken the lock; the wrappers' cleanup ran (v0.8.0 back, slots identical) | - |
+| b2 | `--only session,battle_simul` | dist_st2 (the final build) | 192/194: two FAILs of S a), the test's: (1) Captain's battle 18 sank Spain's DDs Terror (441) and Alcala Galiano (442) by itself and the CA 445 with `ls sink`; `sinkmonth result` sank the first ship the held result lost, the Terror, and S a) looked for 445; the merge was right: "nation 7's DD Terror (ship 441) was lost in the host's month (Sunk in battle (TEST) ...) and in the battle (Sunk in battle  off Northwestern Spain with German ships.): counted once: the host's ship kept, DDLost -1, 732 raw points of nation 1", "points taken off for them: nation 1 46" (GetLogAdjustedVP(17130) - GetLogAdjustedVP(16398) = 1228 - 1182), "VP 1397/611 (the battle's 1443/611 less 46/0 ...)", war score 1-7 +1397/+611; the kept files by `simul_twice`: nothing off (`DDLost` 2 = the host's 1 + the battle's 2 - 1); the 0.8.0 merge on them: `DDLost` 3, Germany +1443, the Terror's `Fate`, stars 1, crew 21 and log 23 the battle's (a sunk ship trained); (2) the second month's injected battle went after the month (Captain's battle 21 was in progress), not the case. Fixed in `regression.py`: the checks follow the ship the host's month lost, only a battle sent during the host's month, three months | 1232 s |
+| b4 | `--only session,battle_simul` | dist_st2 | 183/183; S (the first month): the case of the known issue itself: Spain's B San Leandro (438) fought in the host's own battle and in Captain's battle 18 of the same month, sunk in both (`ls sink` on both battle screens; both battles): the host's battle's `Fate` "Sunk in battle  at Cantabrian Sea with British ships." kept, `BLost` once, 1164 VP off Germany (her 19292 raw points of the battle's 40275: GetLogAdjustedVP 2630 - 1466), Captain's battle's VP 1466/354 merged, war score 1-7 +1466/+354, the chat "... was fought by Captain (Spain's B San Leandro was already sunk in the host's battle: not counted twice, 1164 VP fewer for Germany)."; the 0.8.0 merge on its kept files: `BLost` 1 -> 2, Germany +2630, her `Fate` the player's battle's, stars 2, crew 23, log 10 (both sinkings) | 1069 s |
+| r1 | `--only session,battles,battle_generator,battle_invasion` | dist_st2 | 441/441 (the usual notes: no natural request of the battle months, the game's own choices in e2), e3), h), i1)); no game error box | 1071 s |
+| b3 | `--only session,battle_simul` | dist_st2 | 184/184; S (the first month): Captain's battle 18 sank Spain's CA Almirante Oquendo (509; `ls sink`), the host's month lost her (`sinkmonth result`): `CALost` once (3), 703 VP off Germany (her 11132 raw points of the battle's 21136: GetLogAdjustedVP 1476 - 773), war score 1-7 +773/+324, the chat "... (Spain's CA Almirante Oquendo was already sunk in the host's battle: not counted twice, 703 VP fewer for Germany)."; the 0.8.0 merge on its kept files: `CALost` 3 -> 4, Germany +1476, her `Fate`, stars and log the battle's | 796 s |
+
+The final build is dist_st2 (RTW3MP.dll SHA-256 A4A0EDCE33B5DD10..., version.dll A46DF00E083CFBDD...); dist_st1 differed only in
+`game::BattlePoints` (st2: false when the ships' points hook is not installed, so the host estimates instead of taking
+no points; from a review). Each run's wrapper: the game lock, v0.8.0 (dist_rc080_1) reinstalled after it, slots 1 and 9 and
+`Preferences` identical to the backup, no slot of the run left.
+
+## Fix 2026-11-03: live battles with both sides' commanders (v0.8.1-dev)
+The known issue of 0.8.0 "Live battles use only the first player's commanders": a live battle (both PCs fight the same
+battle in lockstep) resumed the first player's (A's) snapshot, whose commander lookup knows only A's officers, so the
+second player's ships (the host vs a joined player: the player's; two joined players K1 vs K2: K2's) fought without
+their commanders, who won no battle stars and were neither killed nor captured with their ship. Fixed (branch
+`fix-lscmd` from dev-081 d20fb38) as a per-battle capability between PCs that announce it: **live-battle engine level
+18 and protocol 3 stay**, and a live battle with any 0.6.1-0.8.0 PC (or, between two joined players, a 0.6.1-0.8.0
+host) is fought exactly as in 0.8.0 ([ARCHITECTURE](docs/ARCHITECTURE.md#both-sides-commanders-081)).
+- **Found** (static reading of 1.01.44, proven by the runs below; [GAME-INTERNALS](docs/GAME-INTERNALS.md#officers),
+  "Found while building 0.8.1"):
+  - In the battle a commander acts through `TFightingShip.Commander` (+0xac1) and the specials' checks of the ship or
+    her division (the division's commander, else its flagship's): hit chance, rate of fire, damage control, fires,
+    torpedoes, missile hits, CAP, the minute's movement and fire phase (all simulation, run alike on both PCs); a bridge
+    hit kills him; a sunk ship's survivors' pickup saves him (a battle star; a Japanese officer after 1930 may commit
+    suicide). A resumed battle has no division commanders (not in the `.sac`); the area commander weighs only the
+    player's (side 0) ships' joining at A's setup.
+  - Both PCs resume A's `.sac` inside `LoadBuildCampaign`; its ship reader looks each `Ship<i>Commander` up with
+    `PlayerNation.GetOfficerWithId` (the call at 0xdda984), A's nation 0 only. The host's own battle against a joined
+    nation already has that nation's commanders at the setup (0.8.0's `HostOfficersToMemory`), so the snapshot holds
+    their ids, which the resume did not find; K1's battle slot (`MakeNationPlayer`) clears every other nation's ship
+    commanders, so K2's ships had none even at the setup.
+  - The aftermath (both PCs; the campaign takes A's) gives every ship's commander, either side, the battle star and a
+    sunk ship's commander his fate (POW 20 %, rescued by chance or his specials, a MusicLover's band, or dead) with no
+    nation test: the band's prestige and fleet morale go to PlayerNation, and an officer of Ability < 0 can become the
+    one `DoStrategicTurn` offers to cashier. Latent since 0.8.0: the host's battle against a joined nation fought by the
+    computer has the nation's commanders (a band would raise the host's prestige; the host could be asked to cashier
+    the nation's officer).
+  - The live engine's level checks are strict equality (`BOnStart`, A's ready, the host's `SameLiveEngine`), but
+    unknown header keys are ignored and `WriteBattleFiles` skips unknown file names: an optional key and file sent only
+    to PCs that announced them keep level 18. So the compatible design was taken and implemented.
+- **The fix** (`officers.cpp`, `lockstep.cpp`, `session.cpp`, `nationplay.cpp`, `saveio.cpp`):
+  - Hello and welcome `lsof=1`; A uses the mode only when its B announced it (the host for its battle against the
+    player; K1's PC when the host's battle message has `of2`, which the host sends only when it and both players'
+    PCs announce `lsof`; a rejoin carries the returning player's).
+  - The start (also every resync and rejoin): `of2=1`, `ofn=<nations>` and, per nation (not A's), its list as
+    `rtw3mp_lsoff<N>.ini`: the opponent's (when it has officers, also with none of them commanding a ship of the
+    battle), any other nation's whose officers command the battle's ships and every list an earlier start of the battle
+    carried. Both PCs load each list into its nation right after PlayerNation's own connection; a hook of
+    `GetOfficerWithId`, gated on the battle save reader's call, finds the other ids there. B's ready echoes
+    `of2`/`ofl`; a PC that missed a list answers `of2=0` and A turns the mode off for the battle. With `of2` each ship's
+    commander (id, ability, specials, status) is part of the state hash (`cmd=`).
+  - Results: host vs K: the host's game (A) gives K's officers their stars and fates in memory, which reach K's record
+    (`HostOfficersFromMemory`) and K's PC with the next month. K1 vs K2: the host's battle message carries K2's record,
+    K1's PC keeps K2's ships' commander ids over `MakeNationPlayer` and loads the list into its battle slot, and the
+    result brings the list back (`lsoff<K2>.ini`), merged per officer id with only what a battle changes
+    (`saveio::BattleOnlyOfficers`: stars up by at most 2, Active to Dead or POW with the fate; no officer added or
+    dropped).
+  - The aftermath's guard (a `TransferCampaignShipDamage` hook, only for a commander who is not PlayerNation's): a
+    band's prestige and fleet morale go to the officer's own nation in that game and its picture box shows only on his
+    player's PC (the host sends the text with the month); another nation's officer is never offered for cashiering.
+    This also closes the latent 0.8.0 case above.
+- **What players see** (all PCs 0.8.1): in a live battle the second player's ships fight with their own commanders,
+  whose abilities and specials count; they win battle stars and, when their ship sinks, may be killed, captured or
+  rescued as the first player's are; the officer list shows it with the next month. With an older PC in the battle (or
+  an older host of a battle between two players): live battles as in 0.8.0.
+- **Tests** ([TESTING](docs/TESTING.md)): `ls commanders` (each side's commander ids and owner nations, the mode,
+  `cship <id>`), TEST `ls testsink` (a deferred order: both PCs sink the ship at the same minute); `officers` a) the
+  `lsof` announcement; `lockstep` b), c), h), `lockstep_month`, `lockstep_pvp` and `twopc` (b), c)): both sides'
+  commanders equal on both PCs at the start, every minute's hash with them equal, up to two of the second side's
+  commanded ships sunk on both PCs, their commanders' fates and the side's stars in the host's memory or the nation's
+  record (and the client's next month); `merge_test` `OfficerBattleOnly` (40/40); self-test 162/162.
+- **Runs** (checks, seconds with the game open; every run took and released the game lock, the released 0.8.0 put back
+  after it (hash checked), slots 1/9 and the Preferences identical to their backup, no `RTW3.exe` left; no game error
+  box in any run; the logs with the developers' session files, `lc81\logs_*`):
+  - Offline: every build without warnings, self-test 162/162, `merge_test` 40/40.
+  - `--only session,officers,lockstep` (dist_lc_1, the first live probe): 117/118 (216 s).
+  - `--only session,officers,lockstep,lockstep_month,lockstep_pvp,twopc`: dist_lc_2 283/286 (594 s), dist_lc_5
+    298/299 (628 s) and 273/273 (567 s), and the final **dist_lc_6** (9220378) **273/273 (534 s) and 273/273 (653 s)**.
+  - `--group relations` (dist_lc_6): 543/543 (1132 s); `SKIP-note`s `battle_generator` d) and h) (the game's draws).
+  - Mixed versions against the released 0.8.0 (dist_rc080_1; [TESTING](docs/TESTING.md#mixed-versions)): a) a 0.8.1
+    host (the Steam folder) with a 0.8.0 player (`r721\game_a`) 25/25 (114 s): the host's line "Captain: both sides'
+    commanders in live battles 0 (this host: 1)"; b) a 0.8.0 host with a 0.8.1 player 25/25 (118 s): the player's line
+    "joined Admiral: both sides' commanders in live battles: the host 0, this PC 1". In both, after one processed month
+    (the player's corps, 24 officers, kept by the host and commanding 16 of nation 1's ships in its memory), the host's
+    test battle against nation 1 was fought live as the 0.8.0 battle: no `of2` in either log, side 1 without commanders
+    on both PCs (0/31, 0/30), the same commanders per side, READY and 8 minutes equal, no DESYNC; then the drop and the
+    host's battle to its end; no game error box, exception or engine notice.
+  - What the failures found: the first runs' sunk-ship checks looked for the TEST-sunk ships in the battle's ship
+    list, which a sunk ship leaves (with her division's) in the minute she sinks: the checks now want her gone or sunk
+    on both PCs and side 1 smaller (adb4a67, the test's). dist_lc_5's new count check of a battle between two players
+    (the officers the host sent equal to those that came back) found the month's second fought battle (small ships:
+    no commanded ship of the second side in it) started without that nation's list: the first player's own reload
+    emptied it and the result carried no officers (the host's merge took nothing, the record unchanged); the start
+    now always carries the opponent's list (9220378). Three log lines counted the list's lines as officers (0f7b29e,
+    67bb4b4).
+  - The second side's commanders of the TEST-sunk ships over the live runs: 8 killed (" Went down with <ship>"), 1
+    captured, 19 rescued (picked up in the battle or by the aftermath's chance), each with a battle star: in the host's
+    memory (`lockstep` h)), in the nation's record after the month (`lockstep_month`, `lockstep_pvp`) and in the
+    client's next month. The aftermath's guard kept 7 of nation 1's officers (in 6 battles, on the host and, in
+    `lockstep_pvp`, on the first player's PC) from the cashier question ("... of nation 1 is not the player's to
+    cashier"); no band came up.
+- **Limits:** a battle resumed from the host's save after its game restarted loads before the records: from then on the
+  joined side fights without commanders (as in 0.8.0). The other side's survivors' lines ("... is picked up by a fishing
+  boat ...") appear in A's battle message log, as the game's own lines. The game's question after a battle whether to
+  cashier an officer of a poor showing comes only for the first player's own officers (A's game asks it; the second
+  player's are kept from it). Between two joined players a band of the second player's officer adds its prestige in
+  the first player's battle slot only (not carried back).
+
+## Testing 2026-11-04: the 0.8.1 release candidate dist_rc081_1 (v0.8.1)
+The final regression of 0.8.1 on its release candidate dist_rc081_1 (int-081 5bb2432: 0.8.1, live-battle engine 18,
+protocol 3; RTW3MP.dll SHA-256 4922A950EB23950B..., version.dll 987F05EA1027A650...): the released 0.8.0 with its three
+fixes, [the crew rule for a joined nation's ships without a
+commander](#fix-2026-11-03-a-joined-nations-ships-without-a-commander-lose-crew-quality-as-the-hosts-v081-dev), [a
+computer ship sunk twice counted
+once](#fix-2026-11-03-a-computer-ship-sunk-in-the-hosts-battle-and-in-a-joined-players-battle-of-the-same-month-is-counted-once-v081-dev)
+and [both sides' commanders in live
+battles](#fix-2026-11-03-live-battles-with-both-sides-commanders-v081-dev), run together for the first time (each had
+been tested on its own branch). It ran on 2026-11-04 from 00:44 to 07:11 as chains of detached runs, each taking and
+releasing the game lock, on the reg-081 runner (int-081 5bb2432 and the suite fixes below; each run on the runner of
+its start), installed from the frozen snapshot (`--dist`), the released 0.8.0 (dist_rc080_1, RTW3MP.dll
+8972DE54535FF675...) put back after every run (hash checked); slots 1 and 9 and the Preferences identical to the first
+run's backup after every run, the save folders as before (Game1, Game2, Game9), no folder copy, `python` or `RTW3.exe`
+left, the game lock released. The logs of every run are kept with the developers' session files (`r811\logs_*`).
+- **Runs** (checks, seconds with the game open):
+  - Offline: self-test 169/169 (173/173 with the suite fixes below), `merge_test` 57/57.
+  - `--only session,officers,battle_simul,lockstep,lockstep_month,lockstep_pvp,twopc` twice: 445/447 (1772 s; the two
+    failures the suite's, below) and 449/449 (1656 s); `--group relations` 530/530 (1177 s); the mixed cases (below)
+    135/135 (418 s), 114/114 (338 s) and 114/114 (468 s); the default run (`--legacy-fixture`, 38 scenarios) 2031/2037
+    (5416 s); the whole `--stress` run (45 scenarios, `--missile-fixture`, `--legacy-fixture`) 2497/2512 (9152 s); run
+    again: `--only treaty,ai_war,player_copy` 165/165 (248 s), `--stress --only lockstep_stress` 142/142 (1480 s),
+    `--only battle_generator,battle_invasion,lockstep_limits,lockstep_data` 393/393 (1050 s).
+  - With the game open: 23175 s (6 h 26 min).
+- **Game error boxes: none from the product.** One of the game's own, provoked by the suite: in the default run's
+  `player_copy` f) the client (PID 57580), out of the session and playing its throwaway copy (slot 78) in single player,
+  met "Error in CheckForWar procedure! Access violation at address 00BD59C1 in module 'RTW3.exe'. Read of address
+  00000004" in the copy's month (03:25:05). `ai_war` had left nation 1 at war with Russia, the copy carried the war
+  ([General] War 3), and f) ended it with a raw `settension 0 3 5`, which leaves the game's war counter above 0 with no
+  enemy (slot 78 after the month: War 4, no nation's Tension above 9); the game's CheckForWar then takes
+  `GetRandomEnemy`'s nil in its "... has entered the war against ... on our side!" path (the box's address is that
+  read, rva 0x4559c1: [GAME-INTERNALS](docs/GAME-INTERNALS.md#relations-wars-and-battles-nation-0s-and-the-others);
+  `battle_simul`'s box of 2026-11-02 had the same cause). f) now sets the copy's counter to 0 as a peace does
+  (fdfbfe0); the copy was at war again in the re-run and in the `--stress` run, its month without a box. Besides it only
+  `disk_full`'s own boxes ("not enough space on the disk" on each copy and the file-in-use box of its g), inside its
+  windows) in the default and the `--stress` run. No exception, DESYNC or engine notice outside the tests' own.
+- **0.8.1 as tested**:
+  - Both sides' commanders in live battles: `officers` a) the `lsof` announcement in every run; `lockstep` b), c), h)
+    37/37 in all four runs (the second feature run: side 1 17/33 commanded by nation 1's officers on both copies, found
+    17); two of side 1's commanded ships sunk by TEST on both copies, their commanders' fates in the host's memory
+    (killed and rescued; rescued twice; rescued twice; rescued twice); `lockstep_month` with its record after the month
+    (killed, stars 37 -> 38; rescued and captured, 35 -> 37; in the `--stress` run captured, 111 -> 112, and rescued and
+    captured, 112 -> 117) and the player's new month the same; `lockstep_pvp` (nation 2's officers sent with the battle,
+    the same number merged back, "N took battle stars or a fate": rescued twice, stars 7 -> 9; rescued, 8 -> 9; killed
+    twice, 10 -> 14); `twopc` b), c) under two-PC conditions (63/63 three times, 87/87). In the feature, group, default
+    and `--stress` runs 87 live loads with both sides' commanders ("on, the officer lists of nations ... sent"), each
+    answered by the other PC's "loaded the officer lists" but one (`lockstep_rejoin`'s level test, refused by design);
+    never "off for this battle", "did NOT load", "NOT loaded" or "NOT in the result"; 38 loads found no commander of the
+    second side (battles of destroyers, and the 1935 and 1958 campaigns, whose opponents have no corps yet); every
+    minute's hash with the commanders equal. The aftermath's guard naturally once ("Clausen of nation 1 is not the
+    player's to cashier"); no band.
+  - A computer ship sunk twice: `battle_simul` S in all four runs (Spain's CA Infanta Maria Teresa sunk in the host's
+    own battle and in Captain's, 692 VP off Germany; the same ship by `sinkmonth result`, 698; Japan's DD Fumizuki, 114;
+    Spain's B Alejandro I, 1226), the merge counted once with the per-ship points of the 0.8.1 PC. **Naturally once**
+    (the default run's `battle_simul`, battle 77): Bot's nation (France) lost its DD Fauconneau in the host's month,
+    torpedoed by the Austrian submarine SSC U 5, and in Bot's battle against Austria-Hungary off Tunisia: "counted once:
+    the host's ship kept, DDLost -1, 732 raw points of nation 8", 45 VP off Austria-Hungary ("VP 909/1937 (the battle's
+    909/1982 less 0/45 ...)"). The player's PC added the battle's own points to 115 fought results (30 with ships sunk).
+  - The crew rule: `officers` j) in all four runs (72/72 twice, 73/73 twice); the host's monthly lines rolled nation 1
+    in every month with its corps (255 months, 2942 ships, 586 lost one: 19.9 %) and Bot's nation 2 while it had its
+    own (92 months, 1987 ships, 378 lost one), never the stand-in's nation 2 without one (152 months "not applied (no
+    corps of its own)").
+  - Their interactions: the crew rule's change survived the held results' merge ("the host's value + the battle's
+    change: CrewQuality N ship(s)" in 66 of the 67 merges on a host save the month had changed); 247 officer merges of
+    held or battle-phase results and 6 of live battles between players, the record's counts equal to the host's memory
+    at every "corps in memory" line (no odd count), ids distinct in every `officers` reply; a battle of nation 1 against
+    a computer nation sent after the month because nation 1 "fights the host's battle live first" (13 times), merged
+    after the live battle's officers; the ships lost twice were computer ships or a destroyer, none with a commander.
+- **Mixed versions** ([TESTING](docs/TESTING.md#mixed-versions), the driver `mixed_081.py`, `r811`): a) a 0.8.1 host
+  with a 0.8.0 player (`r721\game_a`) 135/135 and 114/114 (the second with lc81's test battle), b) a 0.8.0 host with a
+  0.8.1 player 114/114: the join lines with `simb` and `off` both ways and `lsof` 0 on the older side ("Captain: both
+  sides' commanders in live battles 0 (this host: 1)"; "joined Admiral: ...: the host 0, this PC 1"); the officers the
+  same in the host's record, its memory and the player's list after every month; nation 1's battles sent during the
+  host's month, the fought ones merged; the live battles 0.8.0's on both PCs (no "both sides' commanders" line, of2=0
+  peer=0, side 1 without commanders though 7, 8 and 14 of nation 1's commanded ships were in them), 452, 514 and 436
+  minutes equal and the test battles 8, no DESYNC. The expected differences: the crew rule only with a 0.8.1 host (a:
+  every month on the 0.8.0 player's nation, its hello has `off`; b: none); the battle's own points only from a 0.8.1
+  player (b: "battle 2: the battle's own points: raw VP 497/1691 ...", merged by the 0.8.0 host as 0.8.0; a: none, a
+  ship sunk twice would be estimated by `GetApproxVP`); no ship was sunk twice in them.
+- **Natural occurrences** (the logs of every run, from its start: `r811\nat_scan81.py`, `off_scan.py`, `inuse_scan.py`):
+  battles sent during the host's month 150 (feature runs 10 and 11, the group run 21, the default run 49, `--stress`
+  51, mixed 8), results held because they came during the host's month 52 (22 more under `simulhold`), each merged
+  first in the battle phase; the merge rules on a host save the month had changed 67 times; results with two or more
+  encounters 91, "the search goes on" 241; the division stance guard 37 times without a box (divisions whose lead or
+  target division had no ships left, on both PCs and the third copy, in `ship_status`, `war_effects`,
+  `battle_generator`, `battle_surprise`, `battle_simul`, `legacy_fleet` and live battles of `lockstep_ui`,
+  `lockstep_strike` and `lockstep_missiles`); one real file in use (the `--stress` run's host month save in
+  `ship_status`, `RTWGame1.bcs` saved again 2 s later, no box), as under dist_rc071_2 to dist_rc080_1. `disk_growth`
+  kept every list and line count through its seven save and reload cycles (the host's `[Officers]` 430 lines and its
+  record of nation 1 24, the client's 265).
+- **Failures and their classes:** no product fault.
+  - The suite's, fixed and passed again: `lockstep_pvp` b) M1's start and stars checks in the first feature run (the
+    injected battle 21 between nations 1 and 2 in Northern Europe, 3:3 ships, held only destroyers and coastal
+    batteries of nation 2, which never have a commander: side 1 0/11 while both PCs had loaded nation 2's list,
+    2:27/18, found 0; a `SKIP-note` now when none of the nation's commanded ships of slot 1 is in the battle, 60d24e0;
+    the default run's `lockstep_month` met it too and passed on it); `treaty` g) in the default run (three checks: the
+    game's rebellion took Liaotung Peninsula from France in the treaty month, owner Neutral, and the checks took it for
+    a ceded possession; the treaty itself right: 3 claimed possessions, 3 ships, prestige +2, resources -500; 7f518cf);
+    `player_copy` f) and `session`'s whole-run box check in the default run (the CheckForWar box above, fdfbfe0);
+    `battle_generator` h) in the `--stress` run (attempt 0 the player's decline as planned, but the game asked the
+    computer no decision there, "declined 0x, fought 0x", and the check wanted the switch's "fought 1x"; 63e48b0);
+    `battle_invasion` u1) in the `--stress` run (J the USA, every free possession beyond nation 1's invasion range of
+    400 nm, the game's own box "Possession is beyond your invasion range!" for each; 63e48b0).
+  - The game's conditions, passed when run again: `lockstep_data` b) in the default run and the whole `lockstep_stress`
+    in the `--stress` run (13 checks: "Enemy unable to challenge our forces in the area! Gain 102405 VP!": `pocbattle 1
+    0` in 1907 found no ship of nation 1 that could fight in Northern Europe; S2 timed out waiting for the client's load
+    on it).
+  - `SKIP-note`s, the game's draws as before: `battles` natural requests, `war_effects` M1 (no ship under construction),
+    `ship_status` once (the battle slot rewritten for the next battle before it was read), `battle_generator` d) and h),
+    `battle_invasion` e2), e3) and i1), `lockstep_ui` e), `battle_simul` M1 a)/b) once, R)'s empty Game151 folder once,
+    mixed a)'s first war months (declined or avoided).
+- **Suite fixes** (reg-081): 60d24e0 (both sides' commanders: a battle without a commanded ship of the second side),
+  7f518cf (`treaty` g) with a rebellion), fdfbfe0 (`player_copy` f)'s war counter), 63e48b0 (`battle_generator` h)
+  without the computer's decision, `battle_invasion` u1) beyond the range); self-test 173/173; TESTING.md (the catalog,
+  the game times, Mixed versions, Known traps).
+- **Verdict: GO** for dist_rc081_1 (RTW3MP.dll 4922A950EB23950B..., version.dll 987F05EA1027A650...): no product
+  fault and no game error box from the product in any run (the one CheckForWar box came from the suite's own raw peace
+  in a single-player copy: fixed in the suite, not seen again; besides it only `disk_full`'s own); every default and
+  `--stress` scenario and the `--group relations` set passed on this candidate, its failures the suite's (fixed, passed
+  again) or the game's known conditions (passed again); the three fixes work as described, together and across versions
+  both ways (the older side keeps 0.8.0's behaviour: live battles without the second side's commanders, no crew rule
+  under a 0.8.0 host, no per-ship points from a 0.8.0 player), with the held results, the live battles' officers and
+  the merges.

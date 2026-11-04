@@ -9,6 +9,85 @@ The *protocol* is the version of the network messages: a host refuses players wh
 battles also have their own version, the live-battle engine: a live battle is fought only when both of its players
 have the same one, and a host on 0.4.0 or newer also requires its own.
 
+## 0.8.1 (2026-11-04)
+Two known issues of 0.8.0 are fixed: in a live battle the second player's ships now fight with their own commanders,
+who win battle stars and can be killed, captured or rescued when their ship sinks, and a computer nation's ship sunk
+both in the host's battle and in a joined player's battle of the same month now counts once. Also fixed: a joined
+player's ships without a commander now lose crew quality now and then, as the player's ships do in single player.
+**Update the host and every player:** both sides' commanders in a live battle need 0.8.1 on both players' PCs, and on
+the host too in a battle between two joined players; the other two fixes need 0.8.1 on the host. The protocol is
+still 3 and the live-battle engine still 18: players on 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.8.0 and 0.8.1 play a
+campaign and fight their live battles together.
+[Release notes](https://github.com/Kizitor/RTW3-Multiplayer/releases/tag/v0.8.1)
+
+### Fixed
+- **Commanders in live battles** (a known issue of 0.8.0): a live battle used only the first player's commanders (the
+  host's in a battle against the host). The second player's ships fought without theirs: their abilities didn't
+  count, they won no battle stars there, and the loss of their ship neither killed nor captured them. Now the second
+  player's ships fight with their own commanders too, whose abilities and special abilities count in the battle as
+  the first player's do. They win battle stars, and when their ship sinks they can be killed, captured or rescued, as
+  the first player's commanders are (a hit on the bridge can kill them too); the second player's *Officers* tab shows
+  it with the next month. After a battle, the prestige and fleet morale that a commander's band gives as his ship
+  goes down (one of the officers' special abilities) now go to his own nation instead of the first player's, and the
+  game's question "Post battle analysis shows that ... made some rather questionable tactical decisions in the recent
+  battle. ... Do you want to cashier ...?" no longer comes for another nation's officer. This also fixes the host's
+  battles against a joined player's nation that the computer fights for that player: since 0.8.0 the nation's ships
+  have their commanders there, so such a band raised the host's prestige, and the host could be asked to cashier one
+  of the nation's officers.
+- **A computer nation's ship sunk in two battles of one month** (a known issue of 0.8.0): when a computer nation is
+  at war with the host's nation and a joined player's, its ships can fight the host's battle and the player's battle
+  in the same month, both from the month's state before either battle. A ship sunk in both battles counted in both,
+  in the losses and in the victory points. Now it counts once: the host's month keeps the sinking, and the player's
+  battle no longer adds that ship's loss, its points (in the victory points and in the war score) or anything else it
+  did to that ship. Everyone's chat says so when the result is merged ("* The battle of Germany against Spain in ...
+  was fought by Captain (Spain's B San Leandro was already sunk in the host's battle: not counted twice, 1164 VP
+  fewer for Germany)."). The same goes for a ship that the host's month lost in another way after the player's
+  battle was sent (sunk by a submarine or a mine, for example), and for one sunk in another player's battle whose
+  result was merged first.
+- **The crew quality of a joined player's ships without a commander:** in single player, each of the player's ships
+  in service that has no commander (destroyers and the other types that never get one included) loses one point of
+  crew quality with a chance of 1 in 5 each month, on top of its training, without a message. In the host's month the
+  game applied this rule only to the host's nation, so since 0.8.0, when joined players got their own officers, their
+  ships without a commander escaped it. The host now applies the rule to every joined player's nation that has its
+  own officers, at the same point of the game's monthly crew training and with the game's own random numbers. As in
+  single player there is no message: the crew quality shows in your ship list with the new month.
+
+### Compatibility
+- Protocol 3: players on 0.3.x, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.8.0 and 0.8.1 can
+  join each other's hosts and play the campaign together.
+- 0.8.1 keeps the live-battle engine of 0.6.1 and 0.7.0 to 0.8.0 (18): players on these versions fight their live
+  battles live, with each other and under a host on any of them. A player on 0.6.0 (engine 17) or older can't fight
+  a live battle with a host or player on 0.8.1.
+- Each fix works on the PCs that run 0.8.1, so update the host and every player:
+  - both sides' commanders: 0.8.1 on both players' PCs, and on the host too in a battle between two joined players.
+    With an older version on any of them, the battle is still fought live, exactly as in 0.8.0: with the first
+    player's commanders only. The band and the cashier question in the host's battles that the computer fights for a
+    joined player's nation: 0.8.1 on the host;
+  - a ship sunk in two battles counted once: the host's fix (battles during the host's month need 0.8.0 or newer on
+    the player's PC anyway). With a player on 0.8.1 the host takes out the ship's points as the player's battle
+    counted them; with an older player it uses the game's own estimate of a sunk ship's points. A host on 0.8.0
+    still counts such a ship in both battles;
+  - the crew quality of ships without a commander: the host's fix, for players on 0.8.0 or newer (the versions with
+    their own officers). A player on an older version has no officers, so none of their ships can have a commander:
+    their ships keep their crew quality, as before. A host on 0.8.0 applies the rule to no joined player's nation.
+- Existing campaigns go on from where they are.
+
+### Known issues
+- **Commanders in live battles:** with an older version on either player's PC (or on the host in a battle between two
+  joined players), a live battle is fought with the first player's commanders only, as in 0.8.0. When the host's game
+  stops during its live battle and the battle is resumed from the host's save, the joined player's ships fight on
+  without their commanders, as before. The game's question whether to cashier an officer after a poor showing never
+  comes for the second player's officers. In a battle between two joined players, the prestige and fleet morale that
+  a band of the second player's commander gives are lost: they stay in the first player's battle. The first player's
+  battle message log shows the game's lines about the second player's commanders who survive the loss of their ship
+  ("... is picked up by a fishing boat and returns a week after the battle."). Divisions still have no commanders of
+  their own in a live battle (the game's battle save keeps none): a division uses its flagship's.
+- **A computer nation's ships in two battles of one month** still fight both battles from the month's state before
+  either: when the player's result is merged, the longer of the two repair times counts, and the player's battle
+  keeps the prestige and fleet morale it gave, which come from its outcome as a whole.
+- The known issues of 0.8.0 remain, except the two that 0.8.1 fixes (above): a live battle used only the first
+  player's commanders, and a computer nation's ship sunk in two battles of one month counted in both.
+
 ## 0.8.0 (2026-11-03)
 Two features that players asked for on 0.7.1: each joined player's nation now has its own officer corps, as the
 player's nation has in single player, and a joined player's battle of the month now starts while the host's month is

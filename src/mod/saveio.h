@@ -92,6 +92,23 @@ bool MakeNationPlayer(const std::wstring& slotDir, int slot, int K, const std::v
 // -25..25, AdjustCrewQuality; stars >= 0), the log entries the battle added (from the sent NumberOfLogEntries on) follow
 // the host's, RepairTime takes the larger, any other field the battle's value (as before). Ships gone from the host's
 // save stay gone (the battle's changes dropped), new ones stay. `notes` (optional) counts what these rules did.
+// 0.8.1 (fix-sunktwice): a lost ship stays in its nation's list (the game's sunk or scrapped ships: RepairTime >= 100,
+// with its Fate). A ship the host's save lost since the send (sunk in the host's battle, by a raider, a submarine, an AI
+// battle, scrapped) stays as the host has it: none of the battle's changes to it are taken. If the battle lost it too (a
+// ship can be sunk only once: the host's month, merged first, keeps it), the battle's loss of it is not counted again:
+// its nation's losses counter of its type (the battle's delta, while it has one) and the battle's points for it
+// (LossTwice; BattlePointsCut) are taken out of the merge; the same for a ship gone from the host's save that the battle
+// lost. The rest of the battle is merged as before.
+struct LossTwice {
+    int nation = 0;               // the ship's nation (host numbering)
+    std::string id, name, type;   // Id, Name, ShipType of the sent save
+    std::string host;             // the host's Fate of it ("" = gone from the host's save)
+    std::string fate;             // the battle's Fate of it ("" = gone from the result)
+    int side = -1;                // its side in the battle: 0 = K's (its points were J's), 1 = J's (K's), -1 unknown
+    long long points = 0;         // the battle's raw points for it (the player's PC's, or the estimate), 0 = none
+    bool estimated = false;       // points estimated on the host (GetApproxVP: no per-ship points in the result)
+    std::string counter;          // the losses counter taken back ("" = the battle counted none of its type)
+};
 struct MergeNotes {
     std::map<std::string, int> added;  // CrewQuality, BattleStars: host + the battle's change (field -> ships)
     std::map<std::string, int> other;  // other fields both changed to different values: the battle's (field -> ships)
@@ -99,12 +116,41 @@ struct MergeNotes {
     int repair = 0;     // ships whose RepairTime both changed (the larger kept)
     int clamped = 0;    // CrewQuality sums the game's bounds cut
     int monthGone = 0;  // ships of the sent save no longer in the host's (their battle changes dropped)
-    int bothGone = 0;   // ... of them also sunk in the battle (counted in the losses by both)
-    bool Any() const { return !added.empty() || !other.empty() || logs || repair || monthGone; }
+    int bothGone = 0;   // ... of them also lost in the battle (0.8.1: in `twice`, counted once)
+    int monthLost = 0;  // 0.8.1: ships the host's save lost since the send (RepairTime >= 100): kept as the host has them
+    std::vector<LossTwice> twice;  // 0.8.1: ships lost (or gone) in the host's month and lost in the battle too
+    std::vector<std::string> lostNow;  // 0.8.1: ids of the ships the battle lost that the merge took as lost
+    int cutK = 0, cutJ = 0;        // 0.8.1: the points taken off dVP_K / dVP_J for them
+    std::string cutHow;            // 0.8.1: how the points were found ("the player's PC's per-ship points", ...)
+    bool Any() const {
+        return !added.empty() || !other.empty() || logs || repair || monthGone || monthLost || !twice.empty();
+    }
     std::string Text() const;
+    std::string TwiceText() const;  // 0.8.1: one line on the ships lost twice (empty if none)
 };
+// 0.8.1: the game's TfrmBuildCamp.GetLogAdjustedVP (0xcc07d8), what HandleBattleAftermath adds to a nation's VP for a
+// battle's raw points: v <= 0 -> 0, else Round(0.8 x (Round(3 x Sqrt(v)) + v div 15)) (Round: to even, the FPU's).
+long long LogAdjustedVP(long long v);
+// 0.8.1: TCampaignShip.GetApproxVP (0xd583fc), the game's estimate of a lost ship's points outside a battle screen
+// (QuickResolveRaiderBattle): BB, BC, B, CA, CL, DD, KE: 2 x Displacement, other types: Displacement.
+long long ApproxShipVP(const std::string& shipType, long long displacement);
+// 0.8.1: the points to take off a battle's points `battle` (what its side gained, log-adjusted) for ships of the other
+// side worth `raw` raw points. raw0 >= 0: the side's raw total (the player's PC measured it):
+// LogAdjustedVP(raw0) - LogAdjustedVP(raw0 - raw); raw0 < 0: the raw total estimated as the smallest r with
+// LogAdjustedVP(r) >= battle. quick (a raider battle auto-resolved: each ship's points log-adjusted alone): the sum of
+// LogAdjustedVP of each ship's (`each`). The result is within 0..max(0, battle).
+long long BattlePointsCut(long long battle, long long raw0, long long raw, bool quick = false,
+                          const std::vector<long long>& each = {});
+// The losses counter of [Nation<n>Losses] that a battle adds a lost ship of this ShipType to ("" for none): BB BBLost,
+// BC BCLost, B BLost, CA CALost, CL CLLost, CV CVLost, CVL CVLLost, DD DDLost, KE MSLost, LT LTLost, SS SSLost, TR/AMC/AV
+// AUXLost (ShowResultScreen 0xdc4154 -> 0xdc40b8 and its merchants' table; AddShipToTotalLosses 0xd0ae10).
+std::string LossCounterOf(const std::string& shipType);
 bool ExtractBattleResult(const std::string& beforeBcs, const std::string& afterBcs, int K, int J, Bundle& out,
                          std::string& summary, std::string& err, const std::vector<int>& more = {});
+// 0.8.1: the result's `deltas` may carry the battle's own points as the player's PC measured them (a 0.8.1 player's PC:
+// `vp0`/`vp1` = HandleBattleAftermath's raw VP0/VP1, `sunk` = "id:side:points,..." = GetShipDamagePointValue of each
+// ship sunk in it at the battle's end, side 0 = the player's); the host adds `bVP_K`/`bVP_J` (the battle's own points
+// when the request had encounters before it) and `bQuick` (1: a raider battle auto-resolved). Older hosts ignore them.
 bool ApplyBattleResult(IniDoc& host, const std::string& sentBcs, int K, int J, const Bundle& result,
                        const std::vector<int>& allowed, std::string& summary, std::string& err, bool keepUsed = false,
                        const std::map<int, int>* otherVP = nullptr, MergeNotes* notes = nullptr);
@@ -212,5 +258,12 @@ struct OfficerMergeNotes {
 };
 std::vector<OfficerRec> MergeOfficers(const std::vector<OfficerRec>& sent, const std::vector<OfficerRec>& host,
                                       const std::vector<OfficerRec>& battle, OfficerMergeNotes* notes = nullptr);
+// 0.8.1 (a live battle between two players with both sides' commanders): the second player's nation's officers come
+// back from the first player's PC. Only what a battle changes is taken from `battle` into each officer `sent` holds:
+// BattleStars up by at most 2, Status Active -> Dead (1) or POW (3) with its Fate; no officer is added or dropped, every
+// other field stays `sent`'s. `changed`: the officers that took something. The result goes into MergeOfficers as the
+// battle's list.
+std::vector<OfficerRec> BattleOnlyOfficers(const std::vector<OfficerRec>& sent, const std::vector<OfficerRec>& battle,
+                                           int* changed = nullptr);
 
 }  // namespace saveio

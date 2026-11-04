@@ -1,5 +1,6 @@
 #include "saveio.h"
 #include <algorithm>
+#include <cmath>
 
 // ---------------------------------------------------------------------------------------------
 // INI
@@ -1165,10 +1166,91 @@ std::string MergeNotes::Text() const {
     if (logs) s += std::string(s.empty() ? "" : "; ") + "the battle's log entries after the host's: " + std::to_string(logs) + " ship(s)";
     if (repair) s += std::string(s.empty() ? "" : "; ") + "RepairTime the larger: " + std::to_string(repair) + " ship(s)";
     if (!other.empty()) s += std::string(s.empty() ? "" : "; ") + "the battle's value over the host's change: " + list(other) + " ship(s)";
+    if (monthLost)
+        s += std::string(s.empty() ? "" : "; ") + std::to_string(monthLost) +
+             " ship(s) lost in the host's save since the send, kept as the host has them";
     if (monthGone)
         s += std::string(s.empty() ? "" : "; ") + std::to_string(monthGone) + " ship(s) gone from the host's save since the send" +
-             (bothGone ? " (" + std::to_string(bothGone) + " also sunk in the battle: in the losses of both)" : "");
+             (bothGone ? " (" + std::to_string(bothGone) + " also lost in the battle)" : "");
+    if (!twice.empty()) s += std::string(s.empty() ? "" : "; ") + TwiceText();
     return s;
+}
+
+std::string MergeNotes::TwiceText() const {
+    if (twice.empty()) return "";
+    std::string s = std::to_string(twice.size()) + " ship(s) lost in the host's month and in the battle, counted once (";
+    for (size_t i = 0; i < twice.size(); i++) {
+        const LossTwice& t = twice[i];
+        s += (i ? ", " : "") + std::string("nation ") + std::to_string(t.nation) + " " + t.type + " " + t.name + " " +
+             t.id + ": " + (t.counter.empty() ? "no loss counter" : t.counter + " -1") + ", " +
+             (t.side < 0 ? "its side not known: no points" : t.points <= 0 ? "no points"
+                                                                            : std::to_string(t.points) + " raw points" +
+                                                                                  (t.estimated ? " (estimated)" : ""));
+    }
+    s += "); points taken off: K " + std::to_string(cutK) + ", J " + std::to_string(cutJ) +
+         (cutHow.empty() ? "" : " (" + cutHow + ")");
+    return s;
+}
+
+long long LogAdjustedVP(long long v) {
+    if (v <= 0) return 0;
+    double inner = std::nearbyint(std::sqrt((double)v) * 3.0) + (double)(v / 15);
+    return (long long)std::nearbyint(inner * 0.8);
+}
+
+long long ApproxShipVP(const std::string& shipType, long long displacement) {
+    for (const char* t : {"BB", "BC", "B", "CA", "CL", "DD", "KE", "MS"})
+        if (shipType == t) return 2 * displacement;
+    return displacement;
+}
+
+long long BattlePointsCut(long long battle, long long raw0, long long raw, bool quick, const std::vector<long long>& each) {
+    long long cut = 0;
+    if (quick) {
+        for (long long e : each) cut += LogAdjustedVP(e);
+    } else if (raw > 0) {
+        long long total = raw0;
+        if (total < 0) {  // the smallest raw total the game log-adjusts to the battle's points
+            if (battle <= 0) return 0;
+            long long lo = 1, hi = 1;
+            while (LogAdjustedVP(hi) < battle && hi < (1LL << 40)) hi *= 2;
+            while (lo < hi) {
+                long long mid = lo + (hi - lo) / 2;
+                if (LogAdjustedVP(mid) >= battle)
+                    hi = mid;
+                else
+                    lo = mid + 1;
+            }
+            total = lo;
+        }
+        cut = LogAdjustedVP(total) - LogAdjustedVP(std::max(0LL, total - raw));
+    }
+    return std::min(std::max(0LL, battle), std::max(0LL, cut));
+}
+
+std::string LossCounterOf(const std::string& t) {
+    static const char* kMap[][2] = {{"BB", "BBLost"}, {"BC", "BCLost"}, {"B", "BLost"},   {"CA", "CALost"},
+                                    {"CL", "CLLost"}, {"CV", "CVLost"}, {"CVL", "CVLLost"}, {"DD", "DDLost"},
+                                    {"KE", "MSLost"}, {"MS", "MSLost"}, {"LT", "LTLost"},  {"SS", "SSLost"},
+                                    {"TR", "AUXLost"}, {"AMC", "AUXLost"}, {"AV", "AUXLost"}};
+    for (auto& m : kMap)
+        if (t == m[0]) return m[1];
+    return "";
+}
+
+// A ship's field value ("" if it has none).
+static std::string ShipValue(const ShipBlock& b, const char* key) {
+    size_t n = strlen(key);
+    for (auto& f : b.fields)
+        if (f.size() > n && f.compare(0, n, key) == 0 && f[n] == '=') return f.substr(n + 1);
+    return "";
+}
+
+// 0.8.1: lost (sunk, scrapped or a museum ship): the game's own test of its "Ships sunk or scrapped" list (RepairTime
+// >= 100; DisplayNationShips 0xca657d). A battle's sinking sets 100 (TransferCampaignShipDamage 0xd560b9).
+static bool LostShip(const ShipBlock& b) {
+    std::string v = ShipValue(b, "RepairTime");
+    return !v.empty() && atoi(v.c_str()) >= 100;
 }
 
 bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J, const Bundle& result,
@@ -1176,6 +1258,8 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
                        const std::map<int, int>* otherVP, MergeNotes* notes) {
     IniDoc sent = ParseIni(sentBcs);
     IniDoc host = hostOut;  // committed only if everything applies
+    MergeNotes own;
+    MergeNotes* nt = notes ? notes : &own;  // (the ships lost twice are needed for the losses and the points)
     std::vector<std::pair<std::string, const std::string*>> secs;
     int skipped = 0;
     for (auto& f : result.files) {
@@ -1197,24 +1281,44 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
         }
         secs.push_back({name, &f.second});
     }
+    const std::string* d = result.Get("deltas");
+    KV kv = d ? KVDecode(*d) : KV();
+    // 0.8.1: the battle's own points of the ships it sank, as the player's PC measured them (a 0.8.1 player)
+    bool measured = kv.count("vp0") && kv.count("vp1");
+    std::map<std::string, std::pair<int, long long>> sunkPts;  // ship id -> (its side, its raw points)
+    for (auto& e : Split(KVStr(kv, "sunk"), ',')) {
+        auto f = Split(e, ':');
+        if (f.size() == 3 && !f[0].empty()) sunkPts[f[0]] = {atoi(f[1].c_str()), atoll(f[2].c_str())};
+    }
+    // 0.8.1: a ship the host's month lost (or no longer has) since the send that the battle lost too
+    auto lostTwice = [&](int idx, const ShipBlock& o, const ShipBlock* h, const ShipBlock* r) {
+        LossTwice t;
+        t.nation = idx;
+        t.id = o.id;
+        t.name = ShipValue(o, "Name");
+        t.type = ShipValue(o, "ShipType");
+        t.host = h ? ShipValue(*h, "Fate") : "";
+        t.fate = r ? ShipValue(*r, "Fate") : "";
+        t.side = idx == K ? 0 : idx == J ? 1 : -1;
+        auto p = sunkPts.find(o.id);
+        if (p != sunkPts.end()) {  // sunk on the battle screen: its points there
+            t.side = p->second.first == 0 ? 0 : 1;
+            t.points = p->second.second;
+        } else if (!measured && t.side >= 0 && t.fate.find("Sunk in ") != std::string::npos) {
+            // a battle's sinking (TransferCampaignShipDamage's Fate), no per-ship points: the game's own estimate
+            t.points = ApproxShipVP(t.type, atoll(ShipValue(o, "Displacement").c_str()));
+            t.estimated = true;
+        }
+        nt->twice.push_back(t);
+    };
     int changedShips = 0, removedShips = 0, changedFields = 0;
     for (auto& sp : secs) {
         const std::string& name = sp.first;
         int idx = atoi(name.c_str() + 6);
         IniSection* hs = host.Find(name);
         const IniSection* os = sent.Find(name);
-        if (!hs || !os) continue;
+        if (!hs || !os || name.find("Losses") != std::string::npos) continue;  // (the losses after every ship)
         IniSection rs{name, SplitLines(*sp.second)};
-        bool ships = name.find("Losses") == std::string::npos;
-        if (!ships) {  // Losses: counters, add what the battle added
-            for (auto& l : rs.lines) {
-                size_t eq = l.find('=');
-                if (eq == std::string::npos) continue;
-                std::string key = l.substr(0, eq);
-                AddToKey(host, name, key, atoi(l.c_str() + eq + 1) - atoi(sent.Get(name, key, "0").c_str()));
-            }
-            continue;
-        }
         std::vector<ShipBlock> hShips, oShips, rShips;
         std::vector<std::string> hOther, oOther, rOther;
         ParseShips(*hs, hShips, hOther);
@@ -1229,14 +1333,18 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
             err = "ships without an id in " + name;
             return false;
         }
-        if (notes) {  // 0.8.0: ships gone from the host's save since the send (sunk in the month, ...)
+        {  // 0.8.0: ships gone from the host's save since the send; 0.8.1: one the battle lost too is counted once
             std::set<std::string> inHost;
             for (auto& b : hShips) inHost.insert(b.id);
-            for (auto& ob : oShips)
-                if (!inHost.count(ob.id)) {
-                    notes->monthGone++;
-                    if (!res.count(ob.id)) notes->bothGone++;
+            for (auto& ob : oShips) {
+                if (inHost.count(ob.id)) continue;
+                nt->monthGone++;
+                auto r = res.find(ob.id);
+                if (!LostShip(ob) && (r == res.end() || LostShip(*r->second))) {
+                    nt->bothGone++;
+                    lostTwice(idx, ob, nullptr, r == res.end() ? nullptr : r->second);
                 }
+            }
         }
         std::vector<ShipBlock> merged;
         for (auto& b : hShips) {
@@ -1246,10 +1354,20 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
                 continue;
             }
             auto r = res.find(b.id);
-            if (r == res.end()) {  // sunk in the battle (no longer in the list)
-                removedShips++;
+            if (!LostShip(*o->second) && LostShip(b)) {
+                // 0.8.1: lost in the host's save since the send (its battle, a raider, ...): as the host has it; a ship
+                // the battle lost too is counted once (the battle's loss and points of it are taken out below)
+                nt->monthLost++;
+                if (r == res.end() || LostShip(*r->second)) lostTwice(idx, *o->second, &b, r == res.end() ? nullptr : r->second);
+                merged.push_back(b);
                 continue;
             }
+            if (r == res.end()) {  // sunk in the battle (no longer in the list)
+                removedShips++;
+                if (!LostShip(*o->second)) nt->lostNow.push_back(b.id);
+                continue;
+            }
+            if (!LostShip(*o->second) && LostShip(*r->second)) nt->lostNow.push_back(b.id);  // (0.8.1)
             // Only the fields the battle changed (relative to what was sent), never the player's intel. 0.8.0: a field
             // the host's save changed since the send as well follows the rules of MergeNotes (saveio.h). Never the
             // commanders (0.8.0): a battle doesn't assign any (a sunk ship is gone with hers); in the battle's slot only
@@ -1309,13 +1427,57 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
         }
         hs->lines = ShipLines(merged, hOther);
     }
-    const std::string* d = result.Get("deltas");
-    KV kv = d ? KVDecode(*d) : KV();
+    for (auto& sp : secs) {  // Losses: counters, add what the battle added (0.8.1: not again for a ship lost twice)
+        const std::string& name = sp.first;
+        int idx = atoi(name.c_str() + 6);
+        if (name.find("Losses") == std::string::npos || !host.Find(name) || !sent.Find(name)) continue;
+        std::vector<std::pair<std::string, int>> delta;
+        for (auto& l : SplitLines(*sp.second)) {
+            size_t eq = l.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = l.substr(0, eq);
+            delta.push_back({key, atoi(l.c_str() + eq + 1) - atoi(sent.Get(name, key, "0").c_str())});
+        }
+        for (auto& t : nt->twice) {
+            if (t.nation != idx) continue;
+            std::string c = LossCounterOf(t.type);
+            for (auto& dk : delta)
+                if (!c.empty() && dk.first == c && dk.second > 0) {
+                    dk.second--;
+                    t.counter = c;
+                    break;
+                }
+        }
+        for (auto& dk : delta) AddToKey(host, name, dk.first, dk.second);
+    }
+    // 0.8.1: the points of the ships lost twice, off the side that got them (K's for J's side's ships, J's for K's)
+    int dK = KVInt(kv, "dVP_K"), dJ = KVInt(kv, "dVP_J");
+    if (!nt->twice.empty()) {
+        bool quick = KVInt(kv, "bQuick", 0) == 1;
+        int bK = kv.count("bVP_K") ? KVInt(kv, "bVP_K") : dK, bJ = kv.count("bVP_J") ? KVInt(kv, "bVP_J") : dJ;
+        long long raw[2] = {0, 0};
+        std::vector<long long> each[2];
+        bool any = false;
+        for (auto& t : nt->twice) {
+            if (t.side < 0 || t.points <= 0) continue;
+            raw[t.side == 0 ? 1 : 0] += t.points;  // a ship of side 1 gave side 0 (K) its points
+            each[t.side == 0 ? 1 : 0].push_back(t.points);
+            any = true;
+        }
+        long long vp0 = measured ? atoll(KVStr(kv, "vp0").c_str()) : -1, vp1 = measured ? atoll(KVStr(kv, "vp1").c_str()) : -1;
+        nt->cutK = (int)BattlePointsCut(std::min(dK, bK), vp0, raw[0], quick, each[0]);
+        nt->cutJ = (int)BattlePointsCut(std::min(dJ, bJ), vp1, raw[1], quick, each[1]);
+        nt->cutHow = !any       ? "no points of them in the battle"
+                     : measured ? "the player's PC's per-ship points, raw VP " + KVStr(kv, "vp0") + "/" + KVStr(kv, "vp1")
+                     : quick    ? "a raider battle auto-resolved: GetLogAdjustedVP(GetApproxVP) of each, as the game"
+                                : "estimated: GetApproxVP, the battle's raw VP from its points " + std::to_string(bK) +
+                                   "/" + std::to_string(bJ);
+    }
     std::string nk = "Nation" + std::to_string(K), nj = "Nation" + std::to_string(J);
-    AddToKey(host, nk, "VP", KVInt(kv, "dVP_K"));
+    AddToKey(host, nk, "VP", dK - nt->cutK);
     AddToKey(host, nk, "Prestige", KVInt(kv, "dPrestige_K"));
     AddToKey(host, nk, "FleetMorale", KVInt(kv, "dMorale_K"));
-    AddToKey(host, nj, "VP", KVInt(kv, "dVP_J"));
+    AddToKey(host, nj, "VP", dJ - nt->cutJ);
     std::string others;  // 0.7.2: the points of the request's other opponents (their encounters')
     if (otherVP)
         for (auto& o : *otherVP) {
@@ -1326,8 +1488,14 @@ bool ApplyBattleResult(IniDoc& hostOut, const std::string& sentBcs, int K, int J
         }
     hostOut = host;
     summary = std::to_string(changedShips) + " ships changed (" + std::to_string(changedFields) + " fields), " +
-              std::to_string(removedShips) + " removed, VP " + KVStr(kv, "dVP_K", "0") + "/" + KVStr(kv, "dVP_J", "0") +
+              std::to_string(removedShips) + " removed, VP " + std::to_string(dK - nt->cutK) + "/" +
+              std::to_string(dJ - nt->cutJ) +
+              (nt->cutK || nt->cutJ ? " (the battle's " + std::to_string(dK) + "/" + std::to_string(dJ) + " less " +
+                                          std::to_string(nt->cutK) + "/" + std::to_string(nt->cutJ) +
+                                          " for ships lost in the host's month too)"
+                                    : "") +
               ", prestige " + KVStr(kv, "dPrestige_K", "0") +
+              (nt->twice.empty() ? "" : ", " + std::to_string(nt->twice.size()) + " ship(s) lost twice counted once") +
               (skipped ? ", " + std::to_string(skipped) + " section(s) of other players skipped" : "") +
               (others.empty() ? "" : ", VP of the other opponents: " + others);
     return true;
@@ -1979,6 +2147,37 @@ std::vector<OfficerRec> MergeOfficers(const std::vector<OfficerRec>& sent, const
         n.kept++;
     }
     if (notes) *notes = n;
+    return out;
+}
+
+std::vector<OfficerRec> BattleOnlyOfficers(const std::vector<OfficerRec>& sent, const std::vector<OfficerRec>& battle,
+                                           int* changed) {
+    std::map<std::string, const OfficerRec*> b;
+    for (auto& o : battle) b[o.Get("Id")] = &o;
+    std::vector<OfficerRec> out;
+    int n = 0;
+    for (auto& s : sent) {
+        OfficerRec m = s;
+        auto it = b.find(s.Get("Id"));
+        if (it != b.end()) {
+            const OfficerRec& o = *it->second;
+            bool any = false;
+            long long ss = atoll(s.Get("BattleStars", "0").c_str()), bs = atoll(o.Get("BattleStars", "0").c_str());
+            if (bs > ss) {
+                SetOfficerField(m, "BattleStars", std::to_string(ss + std::min(bs - ss, 2LL)));
+                any = true;
+            }
+            std::string st = o.Get("Status", "0");
+            if (s.Get("Status", "0") == "0" && (st == "1" || st == "3")) {
+                SetOfficerField(m, "Status", st);
+                SetOfficerField(m, "Fate", o.Get("Fate"));
+                any = true;
+            }
+            n += any;
+        }
+        out.push_back(m);
+    }
+    if (changed) *changed = n;
     return out;
 }
 

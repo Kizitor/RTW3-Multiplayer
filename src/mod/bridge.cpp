@@ -153,8 +153,9 @@ static std::string Execute(const std::string& line) {
     }
     // 0.8.0, officers (async: the game's dialogs may show): ofmonth [n]: client, the month's officer routine now (n: the
     // game's officer event with that random number); ofask: client, the Turn's commander question (logged); ofcrew
-    // <nation> <ship> [count] (TEST ONLY): the game's AdjustCrewQuality on that ship, count times (through the host's
-    // guard)
+    // <nation> <ship> [count] [crew] (TEST ONLY): the game's AdjustCrewQuality on that ship, count times (through the
+    // host's guard); 0.8.1: with crew, the ship's CrewQuality set to it before each run and the outcomes counted (count
+    // 0: only set)
     if (cmd == "ofmonth") {
         if (game::EventActive()) return "error an event dialog is open";
         int forced = atoi(arg(1, "-1").c_str());
@@ -166,10 +167,12 @@ static std::string Execute(const std::string& line) {
                "ok";
     }
     if (cmd == "ofcrew") {
-        int n = atoi(arg(1, "-1").c_str()), s = atoi(arg(2, "-1").c_str()), c = std::max(1, std::min(500, atoi(arg(3, "1").c_str())));
-        RunOnMainThread([n, s, c] {
-            std::string r;
-            for (int i = 0; i < c; i++) r = ofc::TestAdjustCrew(n, s);
+        int n = atoi(arg(1, "-1").c_str()), s = atoi(arg(2, "-1").c_str());
+        bool setCrew = args.size() > 4;
+        int crew = atoi(arg(4, "0").c_str());
+        int c = std::max(setCrew ? 0 : 1, std::min(500, atoi(arg(3, "1").c_str())));
+        RunOnMainThread([n, s, c, setCrew, crew] {
+            std::string r = ofc::TestAdjustCrew(n, s, c, setCrew, crew);
             Log("TEST: officers: AdjustCrewQuality on nation %d's ship %d, %d time(s) -> %s", n, s, c, r.c_str());
         });
         return "ok";
@@ -464,6 +467,13 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "ofset")  // TEST ONLY: ofset <nation> <officer id|-1> <field> <value>
             return ofc::TestSet(atoi(arg(1, "-1").c_str()), atoi(arg(2, "-1").c_str()), arg(3), atoi(arg(4, "0").c_str()));
         if (cmd == "ofship") return ofc::ShipCommander(atoi(arg(1, "-1").c_str()), atoi(arg(2, "-1").c_str()));
+        // TEST ONLY (0.8.1, host): ofuncmd [reset|off|on]: the rule for the joined nations' ships without a commander
+        // (counted in `ofcrew` runs); ofuncmd old <K> 1|0: nation K's player taken as an older mod's (no officers)
+        if (cmd == "ofuncmd") {
+            if (arg(1) == "old") return mp::DebugUncommandedOld(atoi(arg(2, "0").c_str()), arg(3, "1") != "0");
+            if (args.size() > 1) ofc::UncommandedTest(arg(1));
+            return ofc::UncommandedInfo() + " " + mp::DebugUncommandedRule();
+        }
         if (cmd == "ofget") return ofc::OfficerText(atoi(arg(1, "-1").c_str()), atoi(arg(2, "-1").c_str()), arg(3, "any"));
         if (cmd == "doctrine") {  // doctrine <nation>: training priorities, pending ones, months left; missile storage
             game::DoctrineState d = game::GetDoctrine(atoi(arg(1).c_str()));

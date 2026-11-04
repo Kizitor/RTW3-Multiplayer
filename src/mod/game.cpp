@@ -136,6 +136,12 @@ static bool g_inTurn = false;
 static bool g_noDefer = false;         // ResolveAIBattle: the game's own resolution runs
 static bool g_battleSlotMode = false;  // this PC fights a joined player's battle in its battle slot
 static bool g_battleAftermath = false; // HandleBattleAftermath ran in battle slot mode
+// 0.8.1 (fix-sunktwice): the battle's own points in battle slot mode: HandleBattleAftermath's raw VP0/VP1 and the
+// GetShipDamagePointValue of each ship sunk at the battle's end (campaign ship id -> its side, its points)
+static int g_bpVP0 = 0, g_bpVP1 = 0;
+static bool g_bpSeen = false;
+static std::map<int, std::pair<int, int>> g_bpSunk;
+static int g_fBpShipRef = -1, g_fBpSide = -1, g_fBpSunk = -1, g_fBpSinking = -1;
 static int g_ownWar = INT_MIN;          // a joined player's PC: its own nation's war counter from the host (or unknown)
 static volatile bool g_legacySkip = false;  // a joined player's legacy build runs on this PC (EnterLegacyBuild)
 extern "C" int __stdcall CB_SkipCampaignStep(int which);
@@ -1813,7 +1819,12 @@ extern "C" int __stdcall CB_BeforeVP(int kind, uint32_t edx, uint32_t ecx, void*
     VPCtx& c = g_vpStack[d];
     c.kind = kind;
     c.a = c.b = -1;
-    if (kind == 0 && g_battleSlotMode) g_battleAftermath = true;
+    if (kind == 0 && g_battleSlotMode) {
+        g_battleAftermath = true;
+        g_bpVP0 = (int)edx;  // (0.8.1: the battle's raw points of each side, before GetLogAdjustedVP)
+        g_bpVP1 = (int)ecx;
+        g_bpSeen = true;
+    }
     __try {
         if (!TreatiesAvailable()) return d;
         if (kind == 0) {  // HandleBattleAftermath: the host's battle against BattleOpponentIdx
@@ -1889,6 +1900,39 @@ extern "C" __declspec(naked) void d_BattleAftermath() {  // (Self, VP0, VP1, aVi
         pop eax
         add esp, 4
         ret 4
+    }
+}
+
+// 0.8.1 (fix-sunktwice): TFightingShip.GetShipDamagePointValue (Self): Integer, the points a ship's damage gives the
+// other side; the battle's end (ShowResultScreen 0xdc464b) sums it for every ship, a sunk one counting 4 x its original
+// point value. In battle slot mode the value of each sunk ship is kept for the result (`sunk`), so the host can take
+// the points of a ship the host's month had sunk already out of the battle's, as the game counted them.
+extern "C" void* o_ShipDamagePoints = nullptr;
+static bool ReadSunkShip(void* ship, int& id, int& side) {  // (SEH: no objects with destructors here)
+    __try {
+        id = dl::At<int>(ship, g_fBpShipRef);
+        side = dl::At<int>(ship, g_fBpSide);
+        return dl::At<uint8_t>(ship, g_fBpSunk) != 0 || dl::At<int>(ship, g_fBpSinking) > 0;  // GetDamageState 4
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+extern "C" void __stdcall CB_ShipDamagePoints(void* ship, int points) {
+    if (!g_battleSlotMode || !ship || g_fBpShipRef < 0 || g_fBpSide < 0 || g_fBpSunk < 0 || g_fBpSinking < 0) return;
+    int id = 0, side = 0;
+    if (ReadSunkShip(ship, id, side) && id > 0) g_bpSunk[id] = {side, points};
+}
+extern "C" __declspec(naked) void d_ShipDamagePoints() {
+    __asm {
+        push eax
+        call dword ptr [o_ShipDamagePoints]
+        push eax
+        push eax
+        push dword ptr [esp + 8]
+        call CB_ShipDamagePoints
+        pop eax
+        add esp, 4
+        ret
     }
 }
 
@@ -4542,6 +4586,33 @@ std::string HandOverShip(int id, int from, int to, const std::wstring& name, con
     return "";
 }
 
+// TEST ONLY (0.8.1, fix-sunktwice; host `battles sinkmonth`): a ship of nation n lost in the month as the game's own
+// sinkings in the month lose one (a raider's, a submarine's: TfrmBuildCamp.SinkShip, RepairTime 100 and Status 8, and
+// AddShipToTotalLosses, its nation's losses counter of its type +1), with the Fate of a battle's sinking.
+std::string TestSinkShip(int n, int id, const std::wstring& fate) {
+    static void* mSink = dl::Method("TfrmBuildCamp", "SinkShip");
+    static void* mLoss = dl::Method("TfrmBuildCamp", "AddShipToTotalLosses");
+    static int fRepair = dl::Field("TCampaignShip", "RepairTime"), fFate = dl::Field("TCampaignShip", "Fate"),
+               fType = dl::Field("TCampaignShip", "ShipType");
+    void* f = BuildCamp();
+    void* nat = Nation(n);
+    if (!f || !nat || !mSink || !mLoss || fRepair < 0 || fFate < 0 || fType < 0 || !A.mUStrAsg || A.fShipId < 0)
+        return "unavailable";
+    void* ship = nullptr;
+    for (int i = 0; i < ShipCount(nat) && !ship; i++) {
+        void* s = Ship(nat, i);
+        if (s && dl::At<int>(s, A.fShipId) == id) ship = s;
+    }
+    if (!ship) return "not among nation " + std::to_string(n) + "'s ships";
+    if (dl::At<int>(ship, fRepair) >= 100) return "lost already";
+    dl::Call(mSink, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)ship, (uint32_t)(uintptr_t)nat);
+    uint32_t st[1] = {1};
+    dl::Call(mLoss, (uint32_t)(uintptr_t)f, (uint32_t)(uintptr_t)nat, dl::At<uint8_t>(ship, fType), 1, st);
+    dl::ConstUStr u(fate);
+    dl::Call(A.mUStrAsg, (uint32_t)(uintptr_t)((uint8_t*)ship + fFate), u.ptr());
+    return "";
+}
+
 std::string SetPossessionWarState(const PeaceTaken& t) {
     if (!PeaceAvailable()) return "unavailable";
     void* owner = t.owner >= 0 ? Nation(t.owner) : nullptr;
@@ -6303,9 +6374,21 @@ bool BattlesAvailable() { return A.battles && BuildCamp(); }
 void SetBattleSlotMode(bool on) {
     g_battleSlotMode = on;
     g_battleAftermath = false;
+    g_bpSeen = false;
+    g_bpSunk.clear();
 }
 bool BattleSlotMode() { return g_battleSlotMode; }
 bool BattleAftermathSeen() { return g_battleAftermath; }
+bool BattlePoints(int& vp0, int& vp1, std::string& sunk) {
+    sunk.clear();
+    if (!g_bpSeen || !o_ShipDamagePoints) return false;  // (without the ships' points the host estimates them)
+    vp0 = g_bpVP0;
+    vp1 = g_bpVP1;
+    for (auto& s : g_bpSunk)
+        sunk += (sunk.empty() ? "" : ",") + std::to_string(s.first) + ":" + std::to_string(s.second.first) + ":" +
+                std::to_string(s.second.second);
+    return true;
+}
 
 static void* AreaByName(const std::wstring& name) {
     void* f = BuildCamp();
@@ -8808,6 +8891,17 @@ bool InstallHooks() {
             aftermathHook = Hook(A.mBattleAftermath, (void*)&d_BattleAftermath, &o_BattleAftermath, "HandleBattleAftermath");
         if (A.mAIBattle) aiBattleHook = Hook(A.mAIBattle, (void*)&d_AIBattleDefer, &o_AIBattle, "DoBattleBetweenAINations");
         if (A.mRaiderBattle) Hook(A.mRaiderBattle, (void*)&d_RaiderBattle, &o_RaiderBattle, "QuickResolveRaiderBattle");
+    }
+    if (aftermathHook) {  // 0.8.1 (fix-sunktwice): each sunk ship's points in a joined player's battle (its result's)
+        g_fBpShipRef = dl::Field("TFightingShip", "CShipRefId");
+        g_fBpSide = dl::Field("TFightingShip", "Side");
+        g_fBpSunk = dl::Field("TFightingShip", "Sunk");
+        g_fBpSinking = dl::Field("TFightingShip", "Sinking");
+        void* m = dl::Method("TFightingShip", "GetShipDamagePointValue");
+        bool f = g_fBpShipRef > 0 && g_fBpSide > 0 && g_fBpSunk > 0 && g_fBpSinking > 0;
+        if (!f || !m || !Hook(m, (void*)&d_ShipDamagePoints, &o_ShipDamagePoints, "GetShipDamagePointValue"))
+            Log("The battle's points of each sunk ship: UNAVAILABLE (fields %d/%d/%d/%d, method %p): the host estimates them",
+                g_fBpShipRef, g_fBpSide, g_fBpSunk, g_fBpSinking, m);
     }
     // Joined players' battles need the aftermath and AI-battle hooks and the month-step skip in a battle slot.
     A.battles = A.battles && aftermathHook && aiBattleHook &&

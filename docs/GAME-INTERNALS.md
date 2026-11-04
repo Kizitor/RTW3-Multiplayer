@@ -1466,7 +1466,8 @@ Static reading of 1.01.44 and live runs of 2026-11-01 on 0.7.1 (MODLOG
   `AreaCommander` changes the score that decides whether each of the player's (side 0) ships joins the force (`Ability`
   +-5, GoodAdmin +10, PoorAdmin -10; 0xbf82ad, against `Random(100)`) and gets a battle star. The `.sac` saves
   `Ship<i>Commander` (0xdd472b) and its load looks it up with
-  `PlayerNation.GetOfficerWithId` (0xdda984), for both sides; it has no division commander, so a resumed battle
+  `PlayerNation.GetOfficerWithId` (0xdda984), for both sides (the mod's live battles since 0.8.1 also in the battle's
+  other nations' lists: below); it has no division commander, so a resumed battle
   (every live battle) has none. After a battle `TransferCampaignShipDamage` 0xd55dd8 gives battle stars; a sunk
   ship's commander is captured (20 %), saved by luck or his specials, or goes down with her (`Fate`; a MusicLover's
   band first gives PlayerNation prestige and fleet morale).
@@ -1477,6 +1478,36 @@ Static reading of 1.01.44 and live runs of 2026-11-01 on 0.7.1 (MODLOG
   without a commander loses crew quality 1 in 5); the raider checks; `ScrapShip` (unassigns). The strategic ship sheet
   (`TdlgShipStatus.ExecuteShipStatusStrategic`) shows "<officer> commanding" for a ship with a commander unless it is
   called with `Enemy`.
+- **A ship without a commander** (static reading of 1.01.44 and live runs of 2026-11-03 on 0.8.1-dev; MODLOG
+  [the crew quality of a joined nation's ships without a commander](../MODLOG.md#fix-2026-11-03-a-joined-nations-ships-without-a-commander-lose-crew-quality-as-the-hosts-v081-dev)).
+  - When and whom: `DoStrategicTurn` -> `ReduceTimeLimits` (0xce1dcf) -> `AdvanceShipConstruction` (0xc7c536, once a
+    month) loops over the nations 0 to 8 and each one's `ShipList` (+0x109): a ship in play (+0x41) and
+    `IsOperational` (`Status` +0xac not 7 Interned or 9 Museum, `RepairTime` +0x25 = 0) gets `AdjustCrewQuality(aShip,
+    aNation)` (0xcd94bb; its only caller); a ship being rebuilt (`RepairTime` > 0 with `Rebuild`) loses one or two
+    there instead. Submarines are another list; a ship commissioned in the month is not in play yet at that point.
+  - The routine (Self = frmBuildCamp, EBX = aShip, ESI = aNation, EDI = Self): first the training by `Status` and place
+    (`TMapArea.IsHomeArea(aNation)`; statuses 0 Active and 10 WorkingUp: at home +6 below -10, +4 below -5, +3 below -2,
+    +2 below 2, +1 below 14; elsewhere +3 below -4, +2 below 2, +1 below 13; 1, 2, 3 and 4 their own; 5 to 9 none).
+    Then 0xcb2a7e: `cmp dword ptr [ebx+Commander],0; jne <the commander's part>; cmp esi,[edi+PlayerNation]; jne
+    0xcb2c7f; mov eax,5; call Random; dec eax; jne 0xcb2c7f; dec dword ptr [ebx+CrewQuality]` (+0xcc, +0x3204, +0x1d):
+    a ship without a commander loses one crew quality when `Random(5)` = 1, only when aNation is PlayerNation; no
+    message, no bound at that point and no `IsCommandedShip` test (destroyers, corvettes and every type that never gets a
+    commander lose it too). Then the working up (status 10 at -2 or more: Active; PlayerNation's texts only), the
+    nation's rules (PoorEducation: one less 40 % above -5; GovernmentType 5: one less 30 % above 5; neither
+    PoorEducation, GovernmentType 3 and SurpriseAttack: one more 60 % below 5), the commander's ability once more (one
+    less 1 in Ability+7 below 0, one more 1 in 7-Ability), the bounds (below -25: -25; above 20: one less 40 %, 60 %
+    with PoorEducation; above 25: one less) and the late years (after 1954 and 1969).
+  - So in single player each operational ship of the player without a commander loses one crew quality 1 in 5 a month
+    (on top of her training: an Active ship at home rises one a month to 14, then stays between 13 and 14), the
+    computer's ships never (they never have a commander, and the test is the player's). Live (four real months on the
+    slot 1 fixture, the month's training step one short for the active ships without a commander): the host's 13 of 94,
+    a joined nation's with its own corps 0 of 56 on 0.8.0 (0.8.1: 22 of 93 and 11 of 56); `ofcrew <n> <ship> 200 15`
+    (crew quality 15 before each run, where training and these nations' rules change nothing): the host's ship 44 and a
+    joined nation's 0 of 200 with the game's own test, the joined nation's 39 with 0.8.1's rule.
+  - Nothing else in the campaign penalizes a missing commander for PlayerNation only (a scan of every test of
+    `Commander` +0xcc against nil in a routine reading PlayerNation: the raider sinkings, any nation's commander only;
+    the battle's damage transfer; the ship list, `AssignOfficer`, *Send ashore*). A division without a commander gains
+    no commander's experience (`TCampaignDivision.AdjustExperience`), with no penalty.
 - **Joined players (0.7.1, live).** A joined player's month carries the host's `.off`, so on the player's PC the host's
   officers load into nation 0's list and command the host's ships and areas there; the player's own list is empty (the
   *Officers* tab shows nothing) and its ships have no commanders. Ids a joined player's turn sends for its ships are
@@ -1541,6 +1572,55 @@ Static reading of 1.01.44 and live runs of 2026-11-01 on 0.7.1 (MODLOG
     have been dismissed from the Navy!", then 0xcdebd8 shows the game's summary `TfrmSummary` modally: the campaign is
     over); fleet morale (+0x19c) at -3/-4 has its own dismissal. Live: the default run's host was dismissed in 1904/10
     (the run stopped at the summary); the runner now keeps the host's Prestige at 20 or more (`keep_host_prestige`).
+- **Found while building 0.8.1** (live battles with both sides' commanders; static reading of 1.01.44 on 2026-11-03,
+  proven live the same day unless marked; MODLOG
+  [live battles with both sides' commanders](../MODLOG.md#fix-2026-11-03-live-battles-with-both-sides-commanders-v081-dev)):
+  - Where a commander acts in the battle: the readers of `TFightingShip.Commander` (+0xac1) and the callers of
+    `TFightingShip.HasCommanderWithSpecialAbility` 0xe4ad44 and `TDivision.HasCommanderWithSpecialAbility` 0xe55364
+    (the division's `Commander`, else its flagship's: a resumed battle has no division commanders, so its flagships'
+    count): hit chance, rate of fire, `HandleHit`, damage control, fire spread, torpedo mounts and runs, missile hits,
+    CAP and landings, the minute's movement (`tmrMoveIntervalTimer` 0xdb1816: a division's PoorAdmin, PoorShiphandler
+    and Speed lower a distance term by 100, 50 and 30), the fire phase, the closest-enemy distance, `DetachShip` and the
+    emergency action. All of it is the minute's simulation, which both PCs run alike once they resolve the same
+    commanders.
+  - `GetOfficerWithId(Self=EAX, anId=EDX)` 0xc690ec is pure (Self's `OfficerList` by `Id`, nil for -1) and has four
+    call sites: `ConnectOfficersToShips` (ships, areas), `TCampaignDivision.LoadMe` and the battle save's ship reader
+    (0xdda2b4; the call 0xdda984, the only one followed by `mov edx,[ebp-0x24]; mov [edx+0xac1],eax`). That reader
+    reads `Ship<i>Nation` into `Tship.Nation` (+0x14, a role code: 0 PlayerNation, 1 the battle's enemy [0xf4c5dc], 2
+    and 3 the allies [0xf4c5e0]/[0xf4c5e4]; 0xbdb6bc maps it to the nation) before `Ship<i>Commander`. The resume runs
+    inside `LoadBuildCampaign` (`LoadScenarioInProgress`), after PlayerNation's `ConnectOfficersToShips`: a list put into
+    its nation there is found by a lookup that falls back to it (live: 15 of the joined nation's commanders found on
+    both PCs).
+  - On the host a joined nation's ships carry their commanders into the host's own battles against it (the setup's
+    copy at 0xbf282f/0xbf6f98 after `HostOfficersToMemory`), also when the computer fights the nation's side; until
+    0.8.1 the live battle's resume dropped them.
+  - The battle's end (both PCs: 0xdec0e0 from the end routine at 0xdc41fc) gives each division's `Commander` a star
+    (and `AnOfficerToRetire`, below) and calls `TransferCampaignShipDamage(aShip, LossRisk)` for every ship of both
+    sides: `FindCShipWithId(nation of Tship.Nation, CShipRefId)`; "In action. " (`GetActionString`: damaged, fired,
+    shot down aircraft or fired torpedoes) gives the campaign ship +1 battle and `FS.Commander.BattleStars` +1, and an
+    officer with `Ability` < 0 becomes `TfrmBuildCamp.AnOfficerToRetire` (+0xa78) when `Random(100)` < 10 - Ability. A
+    sunk ship's commander: `Random(100)` < 20 POW (Status 3, the ship's commander nil); else `Random(100)` < 10, Lucky
+    (6) or LooseCannon (15) and `Random(100)` < 50: " is picked up by a fishing boat and returns a week after the
+    battle." (alive; `TfrmMain.MessageLog`); Sportsman (12) and `Random(100)` < 50: " survives after rowing a lifeboat
+    for two weeks."; a MusicLover (13) whose ship's damage list has "rogressive flooding": **PlayerNation**'s Prestige +1
+    and FleetMorale +1 and a `ShowPicMessage` "Band.jpg" ("... Your prestige increases and fleet morale gets a
+    boost!"); then " Went down with <ship>" (or the binnacle text) and Status 1. No nation test anywhere: a commander
+    of another nation gets stars and fates on the PC that runs the aftermath, and its band rewards PlayerNation.
+  - `DoStrategicTurn` (0xce1ad0..0xce1b9c) turns `AnOfficerToRetire` into "Post battle analysis shows that <officer>
+    made some rather questionable tactical decisions in the recent battle. ... Do you want to cashier ...?" (Yes:
+    Status 2, Fate "Dismissed after poor showing in battle.", `PlayerNation.RemoveOfficerFromShip`). Live (2026-11-03):
+    after a test battle the host's guard kept a joined nation's officer from being that officer.
+  - In the battle: `HandleBridgeHit` kills the commander (" Killed by bridge hit on <ship>", Status 1, pointer nil);
+    EOTP's survivor pickup of a sunk ship (0xdb0dfd..0xdb100d): if she has a commander, `Random(100)` < 30 (or Lucky and
+    `Random(100)` < 70): a Japanese officer after 1930 commits suicide 40 % ("Committed suicide as <ship> went down."),
+    else "<rescuer> has picked up <officer> from <ship>": his `BattleStars` +1 and the sunk ship's commander nil (alive;
+    the aftermath has no fate for him). All of it is simulation with shared draws (live: equal per-minute hashes with
+    the commanders in them).
+  - `TFightingShip.CheckSunk`: `Sinking` (+0xb35) > 0 counts down each call (twice for type 0xc); at 0 the ship sinks,
+    below 20 also 1 in 20 at once. The battle's debug *Sink* (`TfrmMain.Sink1Click`, the ship tree's selection) sets
+    `CurrentFloatPoints` (+0xb0a) 0 and `Sinking` 10. A sunk ship leaves the battle's all-ships list and her division's
+    ship list in the minute she sinks (live: 47 ships, 31 of side 1, then 45 and 29 after two sinkings; the state hash's
+    ship count drops); the battle's end still transfers her damage (her commander's fate: above).
 
 ## Tactical battles
 The battle facts, gathered since the battle investigation of 2026-10-14; the later findings carry their dates.
@@ -2181,8 +2261,10 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     refit over), `RepairTime` countdowns, `TimeToRefit`, `InPlay`, `ObsoleteDate`, and the log entries
     (`LogEntry<i>`, `NumberOfLogEntries`) and `BattleStars` of the ships in the host's battle. A battle fought in a
     joined player's battle slot changes only `CrewQuality`, `BattleStars`, `RepairTime`, `LogEntry<i>` and
-    `NumberOfLogEntries` of the ships that fought (6 to 22 a battle; sunk ships leave the list); every other field of
-    the result equals the save it was built from (no change from the slot's load and save).
+    `NumberOfLogEntries` of the ships that fought (6 to 22 a battle; a ship it sank also its `Fate`, `Reinforcement`
+    and `CommanderId`, and it stays listed with `RepairTime` 100: corrected 2026-11-03, this said sunk ships leave the
+    list; the next bullets); every other field of the result equals the save it was built from (no change from the
+    slot's load and save).
   - *The bounds of `CrewQuality` and a ship's log (static, 2026-11-02, for 0.8.0's merge rules;
     [MODLOG](../MODLOG.md#feature-2026-11-02-simultaneous-battles-v080-dev)).* `CrewQuality` (`TCampaignShip` +0x1d,
     an Integer) is negative on many ships (the 1900 fixture: -12 to 20). The month's `TfrmBuildCamp.AdjustCrewQuality`
@@ -2191,6 +2273,47 @@ The battle facts, gathered since the battle investigation of 2026-10-14; the lat
     ship's log is `NumberOfLogEntries` and `LogEntry0..n-1` in the save, appended to only: each record (the laying
     down, a battle: "August 1900 Took part in Battle of ...", "In action.", the damage, the hits) ends with an empty
     entry, so a battle's new entries are the indices from the count the battle started from on.
+  - *A lost ship, a battle's losses and its points (static, 2026-11-03, for 0.8.1's merge of a ship sunk twice;
+    [MODLOG](../MODLOG.md#fix-2026-11-03-a-computer-ship-sunk-in-the-hosts-battle-and-in-a-joined-players-battle-of-the-same-month-is-counted-once-v081-dev)).*
+    - A lost ship stays in its nation's `ShipList` (`TBuilderNation.SaveMe` writes every ship, 0xc561b2..0xc5621b): the
+      "Ships sunk or scrapped" list is the ships with `RepairTime` (+0x25) >= 100 (`DisplayNationShips` 0xca657d,
+      0xca658d), the others' lists those below. A sinking sets 100: the battle's end (`TransferCampaignShipDamage`
+      0xd55dd8, for a `TFightingShip` with `Sunk` +0xa9f: `Fate` +0x65 := "Sunk in battle <name> with <adjective>
+      ships." / "Sunk in duel with ..." / "Sunk in raider battle." 0xd56044..0xd5609b, `Reinforcement` +0x69 := the
+      date, `RepairTime` := 100 0xd560b9, the commander's fate, `Commander` nil, `RemoveShipFromCampaignDivision`),
+      `SinkShip` 0xd45d60 (`RepairTime` 100, `Status` 8; the month's raider, submarine, mine and foreign-station
+      sinkings), `QuickResolveRaiderBattle` 0xd0b71c ("... Sunk in duel with ..."), the AI battles' sinkings 0xd31fe2
+      ("Sunk in combat with <nation> forces."); a scrapping or a museum ship sets 101 (`ScrapShip` 0xca094f, `Fate`
+      "Scrapped"; `CheckMuseumShip` 0xd01ade). Seen in saves: "Sunk in battle  off Western France with German ships."
+      with `RepairTime=100` kept month after month.
+    - The losses counters (`TBuilderNation` +0xbbca..+0xbbf6, `[Nation<n>Losses]` BBLost ... SSLost): the battle's end
+      `ShowResultScreen` (0xdc4154, after `TransferCampaignShipDamage` through 0xdec0e0) counts each ship whose
+      `GetDamageState` is 4 (sinking or sunk) for its own nation by type (0xdc4644 -> 0xdc40b8: BB `BBLost`, BC `BCLost`, B
+      `BLost`, CA `CALost`, CL `CLLost`, CV `CVLost`, CVL `CVLLost`, DD `DDLost`, K/KE `MSLost`, LT `LTLost`; AMC, AV, TR,
+      MTB none there), the merchants (AMC, AV, TR) of the two main sides into `AUXLost` and their submarines into
+      `SSLost` (0xdc4988..0xdc49f4); `AddShipToTotalLosses` (0xd0ae10; the month's sinkings, a raider scuttled after a
+      raider battle) by its own table (TR `AUXLost`, LT and AMC/AV none). Each battle counts its own: a ship two battles
+      sink is counted by both.
+    - A battle's points: `ShowResultScreen` sums `TFightingShip.GetShipDamagePointValue` (0xe442b8) per side
+      (0xdc464b..0xdc465f): the lost points of a ship's damage, `GetShipOriginalPointValue` - `GetShipCurrentPointValue`,
+      and for a sinking or sunk one 4 x `GetShipOriginalPointValue` (0xe44318), x2 for an HVU (+0xd71), /2 when obsolete
+      (+0xe0: the generator sets it from `TCampaignShip.IsObsolete`, 0xbf6fb7), 0 for a ship scuttled as a blockship and
+      for MTB. `GetShipOriginalPointValue` (0xe3f720) is (`GetShipFixedValue` (by type and year: 2000 BB/BC, ...) +
+      displacement) / 2 with modifiers by type, speed, TPS and design. The side's total VP0/VP1 (0xdc582e..0xdc584f) =
+      the other side's ships' points + survivors picked up + the surviving merchants' bonus + objectives - aircraft
+      losses; `HandleBattleAftermath(VP0, VP1, level)` adds `GetLogAdjustedVP` of each to nation 0's VP and to EnemyVP
+      (0xcc0916..0xcc0938). `GetLogAdjustedVP` (0xcc07d8) = 0 for v <= 0, else Round(0.8 x (Round(3 x Sqrt(v)) + v div
+      15)) (the FPU's Round, to even; 0x837dfc is Sqrt, 0x837e0c Round). The campaign's own estimate of a sunk ship's
+      points, `TCampaignShip.GetApproxVP` (0xd583fc): 2 x `Displacement` for types 0..4 and 9..10 (BB, BC, B, CA, CL, DD,
+      KE), else `Displacement`; `QuickResolveRaiderBattle` adds `GetLogAdjustedVP(GetApproxVP)` per sunk ship.
+    - No capture or surrender in the career's tactical battles (the texts "is captured", "Boarded and scuttled by",
+      "Scuttled on capture of" belong to `TfrmCampaign`, the operational campaign mode, and to officers). After a raider
+      battle `DoAfterRaiderBattle` (0xcd1c78, from `HandleBattleAftermath` 0xcc0e61) may send the damaged raider home,
+      intern it ("... is forced to seek internment in neutral port ...", `Status` 7) or scuttle it ("... is forced to
+      scuttle at a neutral shore ...": `SinkShip`, `Fate` "Scuttled after battle damage", `AddShipToTotalLosses`; no
+      points).
+    - The battle screen's debug Sink (`TfrmMain.Sink1Click` 0xdea050): the selected ship's `CurrentFloatPoints` (+0xb0a)
+      := 0 and `Sinking` (+0xb35) := 10; the battle then sinks it by its own rules (0.8.1's TEST `ls sink`).
   - *Raider vs patrol battles (static 2026-10-23; 0.7.0 static and live 2026-10-26).* `CheckForBattles2` calls
     `CheckRaiderVsPatrols` 0xcce6bc at two places, each after `Random(100) < 30` (0xcecb7e after the invasion check;
     0xcecfbc in the `GetRandomEnemy` passes after a `CheckAttackLocation` that found nothing); a True ends the search

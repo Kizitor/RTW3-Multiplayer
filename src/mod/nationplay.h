@@ -46,6 +46,10 @@ bool HostTakeOfficers(const Bundle& sub, int K, std::string& why);
 // simultaneous battles): the [Officers] lines its package carried (HostPutOfficers' `put`): the result is merged per
 // officer id into the record (saveio::MergeOfficers: the host's month since the send stays), else it replaces it.
 bool HostTakeBattleOfficers(const Bundle& res, int K, const std::vector<std::string>* sent = nullptr);
+// 0.8.1 (a live battle between two players with both sides' commanders): the second player's nation K's officers after
+// the battle (the result's lsoff<K>.ini, from the first player's PC) merged into K's record against `sent` (what the
+// package carried, `of2`), only what a battle changes (saveio::BattleOnlyOfficers). False: none or rejected.
+bool HostTakeBattleOfficers2(const Bundle& res, int K, const std::vector<std::string>& sent);
 // The package's .off [Officers] := K's record (own = false or no record: OfficerNo=0), its MapData's area commanders :=
 // K's (-1 elsewhere). Returns true if K has a record (false: the player's PC makes the corps, `offgen`). put: the
 // [Officers] lines the package got (own only; else left empty).

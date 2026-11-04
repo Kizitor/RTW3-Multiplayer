@@ -1,10 +1,11 @@
 # Architecture
 
-How RTW3 Multiplayer works in the current version (0.8.0, protocol 3, live-battle engine level 18, battle generator
-level [`gen`](#network-protocol) 5) on Rule the Waves 3 1.01.44. This is the developer view; players read the
-[README](../README.md). The history of each part, with the measurements and the dead ends, is in
-[MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game facts (calling convention, objects,
-offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing is in [TESTING.md](TESTING.md).
+How RTW3 Multiplayer works in the current version (0.8.1, protocol 3, live-battle engine level 18 with the per-battle
+capability [`lsof`](#both-sides-commanders-081), battle generator level [`gen`](#network-protocol) 5) on Rule the
+Waves 3 1.01.44. This is the developer view; players read the [README](../README.md). The history of each part, with
+the measurements and the dead ends, is in [MODLOG.md](../MODLOG.md) (linked per section); the reverse-engineered game
+facts (calling convention, objects, offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testing
+is in [TESTING.md](TESTING.md).
 
 ## Contents
 - [Overview](#overview)
@@ -28,6 +29,7 @@ offsets, battle internals) are in [GAME-INTERNALS.md](GAME-INTERNALS.md); testin
 - [Simultaneous battles (0.8.0)](#simultaneous-battles-080)
 - [Each joined nation's relations (relations v2)](#each-joined-nations-relations-relations-v2)
 - [Live battles between players (lockstep)](#live-battles-between-players-lockstep)
+  - [Both sides' commanders (0.8.1)](#both-sides-commanders-081)
 - [Test bridge](#test-bridge)
 - [Versions and protocol](#versions-and-protocol)
 
@@ -71,10 +73,10 @@ RTW3.exe (Delphi/VCL, Steam DRM stub)
 | `src/mod/delphi.cpp`, `delphi.h` | Delphi runtime interop: VMT scan, method and field lookup by name, `dl::Call`, `ConstUStr`/`ReadUStr`, byte patterns. |
 | `src/mod/game.cpp`, `game.h` | Game bindings and all campaign hooks; callbacks into the session (`hookcb::*`). |
 | `src/mod/session.cpp`, `session.h` | The multiplayer session (host and client). |
-| `src/mod/saveio.cpp`, `saveio.h` | `IniDoc`, `Bundle`, month packages, submissions, the merge, `MakeNationPlayer`, `ExtractBattleResult`/`ApplyBattleResult`, the `.off`'s campaign divisions (0.6.1). |
+| `src/mod/saveio.cpp`, `saveio.h` | `IniDoc`, `Bundle`, month packages, submissions, the merge, `MakeNationPlayer`, `ExtractBattleResult`/`ApplyBattleResult`, the `.off`'s campaign divisions (0.6.1); 0.8.1: a ship lost in the host's month and in a battle counted once (`LossTwice`, `BattlePointsCut`, `LogAdjustedVP`), the officers a live battle gives back (`BattleOnlyOfficers`). |
 | `src/mod/net.cpp`, `net.h` | TCP transport, message types, LAN discovery. |
 | `src/mod/ui.cpp`, `ui.h` | The Multiplayer window, the title-screen button, the Claim land window, `config.ini`. |
-| `src/mod/lockstep.cpp`, `lockstep.h` | Live battles: the battle engine bindings, the deterministic RNG, the minute protocol. The fixes of the game's battle AI in every battle (installed at the mod's start): the destroyer stance routine's second ask (0.7.2), the divisions without ships in the battle AI's loops and 0.7.0's stance guard (0.7.3). |
+| `src/mod/lockstep.cpp`, `lockstep.h` | Live battles: the battle engine bindings, the deterministic RNG, the minute protocol; 0.8.1: both sides' commanders (the other nations' officer lists in the start, the commanders in the state hash). The fixes of the game's battle AI in every battle (installed at the mod's start): the destroyer stance routine's second ask (0.7.2), the divisions without ships in the battle AI's loops and 0.7.0's stance guard (0.7.3). |
 | `src/mod/x87.cpp`, `x87.h`, `softmath.h` | Live battles (engine level 16): the hooks of the game's 11 x87 transcendental routines and their software versions (fdlibm's algorithms in SSE2 doubles, with the x87's own 66-bit pi reduction, out-of-range and special-value rules and the game's Exp rounding, within 1 ulp of a double of the CPU's results), the same bits on every CPU; the CPU vendor. |
 | `src/mod/datafiles.cpp`, `datafiles.h` | Live battles (engine level 16): the hash of the game's `Data` folder (but `Data\Graphics` and, since level 18, the game's temporary files `tmp*`), computed in a background thread when a session starts, and the list of files a start compares. |
 | `src/mod/nationplay.cpp`, `nationplay.h` | What the game does for its player only, for joined players' nations: intelligence, the Turn's trade protection and foreign stations questions, the month's consequences ([below](#per-player-intelligence-trade-protection-and-foreign-stations)); the host's store of their campaign divisions (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
@@ -82,7 +84,7 @@ RTW3.exe (Delphi/VCL, Steam DRM stub)
 | `src/mod/warfx.cpp`, `warfx.h` | The player's war effects for joined nations on the host (0.6.0, B5): blockades (their points, flags, effects and messages), war weariness, the build rules' war tests, and raiders, submarines and the trade war (a frame in K's view in DoStrategicTurn) for each joined nation at war; the computer's ships laid down (0.7.2); `CheckPatrols`' part for a computer nation in its war player's view (0.7.3). |
 | `src/mod/invasion.cpp`, `invasion.h` | Invasions of joined nations (0.7.0): the host's routines that must not see their invasions (`CheckRebellionAndInvasions`, its rebellion part, `DoPossessionBattle` from the host's invasion check, `DoPeace` through game.cpp), a nation's month resolution in its view, its plan (`kinv`), its invasions in its battle slot and back, the computer's fleets (`GetMostImportantArea`); 0.7.2: the possession details' "Set invasion target" on a joined player's PC by the nation's own wars (`TdlgPossessionDetailsNew.FormShow`). |
 | `src/mod/bridge.cpp` | The test bridge. |
-| `src/mod/officers.cpp`, `officers.h` | Each joined nation's own officer corps (0.8.0): a nation's list loaded into and read from memory with the game's own loader and writer, the hook of `ConnectOfficersToShips` that trades the lists of nation 0 and K at a joined player's month, the new campaign's corps, the Turn's commander question and assignments, the free promotion, the host's guards (`AdjustCrewQuality`'s messages, the ship sheet) ([below](#each-joined-players-officers-080)). |
+| `src/mod/officers.cpp`, `officers.h` | Each joined nation's own officer corps (0.8.0): a nation's list loaded into and read from memory with the game's own loader and writer, the hook of `ConnectOfficersToShips` that trades the lists of nation 0 and K at a joined player's month, the new campaign's corps, the Turn's commander question and assignments, the free promotion, the host's guards (`AdjustCrewQuality`'s messages, the ship sheet) ([below](#each-joined-players-officers-080)). 0.8.1: the game's rule for its player's ships without a commander applied to the joined nations ([below](#each-joined-players-officers-080)), the other nations' lists in a live battle's loads and the battle aftermath's guard ([both sides' commanders](#both-sides-commanders-081)). |
 | `src/mod/poc_battle.cpp`, `poc_battle.h` | The `poc*` research commands of the battle investigation (inactive unless used). |
 | `third_party/minhook/` | MinHook (BSD 2-Clause); `build.bat` compiles its core (`buffer.c`, `hook.c`, `trampoline.c`) with the 32-bit disassembler `hde32.c`. |
 | `build.bat` | Builds both DLLs into `dist\` with the Visual Studio C++ x86 tools (`/Zc:threadSafeInit-`, `/PDBALTPATH`). |
@@ -170,8 +172,11 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | `GetPatrolRequirement` | Joined player's PC: the budget panel's trade protection requirement is the player's nation's, against its own enemies (0.4.1). |
 | `CheckShipsOnForeignStations` | Host: after it, the player's part of it and of `CheckPatrols` for each joined player's nation (0.4.1). |
 | `TfrmBuildCamp.LayDownAIShip` | 0.7.2, every PC: records each ship a computer nation lays down with its cause and frame (log `aibuild:`, bridge `aibuilds`; [B5 (c)](#each-joined-nations-relations-relations-v2)); the original runs unchanged. |
-| `TBuilderNation.ConnectOfficersToShips` | 0.8.0, a joined player's own month (`game::LoadCampaign(77, K)` with a host's `offs`): the lists of nation 0 and K trade places and the game's routine runs for K with PlayerNation = K (its ships and the map areas), then for nation 0; elsewhere the original ([below](#each-joined-players-officers-080)). |
-| `TfrmBuildCamp.AdjustCrewQuality` | 0.8.0, host: for a ship of a nation other than the host's, the game's picture messages are captured (no box, no line in the host's turn report) and go to that nation's player with the month. |
+| `TBuilderNation.ConnectOfficersToShips` | 0.8.0, a joined player's own month (`game::LoadCampaign(77, K)` with a host's `offs`): the lists of nation 0 and K trade places and the game's routine runs for K with PlayerNation = K (its ships and the map areas), then for nation 0; elsewhere the original ([below](#each-joined-players-officers-080)). 0.8.1, a live battle's load with both sides' commanders (both PCs): after PlayerNation's own connection, each other nation's list that the start carried goes into that nation's list and its ships are connected ([both sides' commanders](#both-sides-commanders-081)). |
+| `TBuilderNation.GetOfficerWithId` (only the battle save's ship reader's call, told apart by its return address) | 0.8.1, during a live battle's load with both sides' commanders: an officer id that PlayerNation doesn't hold is looked up in the battle's other lists; elsewhere the original ([both sides' commanders](#both-sides-commanders-081)). |
+| `TfrmBuildCamp.AdjustCrewQuality` | 0.8.0, host: for a ship of a nation other than the host's, the game's picture messages are captured (no box, no line in the host's turn report) and go to that nation's player with the month. 0.8.1, host: a second hook at the routine's test for its player's ships without a commander (found by its code): a joined nation's ship that the rule applies to gets the game's roll there (one crew quality less when `Random(5)` = 1) and goes on after the rule; any other ship takes the game's own test ([below](#each-joined-players-officers-080)). |
+| `TfrmBuildCamp.TransferCampaignShipDamage` | 0.8.1, every PC, every battle's end, for a ship whose commander is not PlayerNation's: a band's prestige and fleet morale go to the officer's own nation, its picture message shows only on his player's PC (on the host: the text goes to that nation's player with the month), and he never becomes the officer `DoStrategicTurn` offers to cashier ([both sides' commanders](#both-sides-commanders-081)). |
+| `TFightingShip.GetShipDamagePointValue` | 0.8.1, in battle-slot mode (a joined player's battle): the points of each ship sunk in the battle, kept with `HandleBattleAftermath`'s raw VP0/VP1 for the result's `deltas` (`sunk`, `vp0`, `vp1`; [simultaneous battles](#simultaneous-battles-080)). |
 | `TdlgShipStatus.ExecuteShipStatusStrategic` | 0.8.0: a ship that is not PlayerNation's shows no commander on the ship sheet (its `Commander` nil while the sheet is filled and shown; put back afterwards and before any save). |
 
 The live battles add their own hooks (`Random32Proc`, the simulation and display routines, and since engine level 16
@@ -260,7 +265,9 @@ the game's 11 x87 transcendental routines in `x87.cpp`) with the first live batt
    month into a scratch slot, writes the joined nations' officers from its memory into their records and sends the
    players their battles from it, each with its nation's own officers; they fight them while the host's month, its own
    battle included, goes on, and their results are held ([simultaneous battles](#simultaneous-battles-080)). The
-   month's own changes to a joined nation's officers (a commander killed or captured) happen in the host's memory.
+   month's own changes to a joined nation's officers (a commander killed or captured) happen in the host's memory;
+   since 0.8.1 the game's crew quality rule for its player's ships without a commander applies to the ships of a
+   joined nation with its own corps too ([below](#each-joined-players-officers-080)).
 7. **After `DoEndOfTurn`.** The joined nations' officers go from the host's memory into their records. If battles were
    deferred or results held, the battle phase runs (the held results merged first, their officers per officer id into
    the records with the month's changes kept; [below](#joined-players-battles-against-ai-nations-the-battle-phase)).
@@ -646,9 +653,12 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
   ships; in the battle: ok side0=a/b side1=c/d ..." when it is fought; host log "officers of nation K: N in its battle
   (...)" at the send, "officers of nation K: N after its battle merged into the record (M): <what each rule did>" at
   the merge.
-- **Live battles** are unchanged and deterministic (engine 18): both PCs resume A's files, whose `.sac` looks every
-  ship's commander up in A's nation 0 (`PlayerNation.GetOfficerWithId`): host vs K, the host's commanders only; K1 vs
-  K2, K1's only. A joined nation's ship sunk in a live battle keeps her commander active (not killed or captured).
+- **Live battles** (until 0.8.0, and since 0.8.1 whenever a PC of the battle, or the host of a battle between two
+  players, is older): both PCs resume A's files, whose `.sac` looks every ship's commander up in A's nation 0
+  (`PlayerNation.GetOfficerWithId`): host vs K, the host's commanders only; K1 vs K2, K1's only. A joined nation's
+  ship sunk in such a battle keeps her commander active (not killed or captured). Since 0.8.1, between PCs that
+  announce `lsof`, both sides' commanders fight, get their stars and fates and reach their records
+  ([below](#both-sides-commanders-081)).
 - **Copy game:** the copy of slot 77 holds K's corps; the transform clears every other nation's ships' commanders
   (since 0.8.0 the other joined nations' too: the copy has only the player's officers).
 - **Host guards.** `AdjustCrewQuality` (any nation's commanded ships, from `AdvanceShipConstruction`) shows picture
@@ -657,7 +667,29 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
   player with the month ("* Officers: The crew of ..."). The strategic ship sheet
   (`TdlgShipStatus.ExecuteShipStatusStrategic`) shows "<officer> commanding" for a ship with a commander when not
   called with `Enemy`: a ship that is not PlayerNation's shows none (its pointer is nil while the sheet is filled and
-  shown, put back after it and before any save meanwhile).
+  shown, put back after it and before any save meanwhile). Since 0.8.1 a battle's end has a guard of its own on every
+  PC (a band's prestige and morale, the cashier question; [both sides' commanders](#both-sides-commanders-081)),
+  which also covers the host's battles against K that the computer fights for K's side.
+- **Ships without a commander (0.8.1).** The game's month lowers the crew quality of PlayerNation's operational ships
+  without a commander (`AdjustCrewQuality`: one less when `Random(5)` = 1, no message; the test is `aNation =
+  PlayerNation`, [GAME-INTERNALS](GAME-INTERNALS.md#officers)), so up to 0.8.0 a joined nation's escaped it (MODLOG
+  [the crew quality of a joined nation's ships without a commander](../MODLOG.md#fix-2026-11-03-a-joined-nations-ships-without-a-commander-lose-crew-quality-as-the-hosts-v081-dev)).
+  The host applies it where the game does, in the host's month (`AdvanceShipConstruction`, once a month, the only
+  caller; K's PC runs no month): a hook at the routine's PlayerNation test (`officers.cpp`, found by its code: the test,
+  the roll and the decrement with their three exits checked) gives K's ship the same roll with the game's `Random`, at
+  the same place (after the training, before the working up, the nation's rules and the bounds), and goes on after the
+  rule; any other ship takes the game's test (the host's: the game's own roll; the computer's: none). It applies to K
+  when (session.cpp `UncommandedRuleFor`) K is a joined nation, its player's mod keeps the nation's own officers (the
+  connected player's hello `off`; while it is away, what its last player announced: `offRules` in the session file,
+  noted with each month sent to it, dropped when the nation goes to the computer), and its corps is in the host's memory
+  (`LoadIntoNation` since the last load: its ships' commanders connected). A nation without a corps is left alone: an
+  older mod's player has no officers at all (all its ships would count as without a commander), and a nation whose
+  record does not exist yet (the month its PC forms the corps) has none on the host. The crew quality goes into the
+  host's save and K's month package; K's turn carries it back with K's own changes (the officer events), and a battle
+  fought during the month adds its change to the host's value (0.8.0's merge). Nothing is shown on any screen (as in
+  the game); the host's log has one line a month ("officers: the month's crew quality of the joined nations' ships
+  without a commander (...): nation K: N ships, M lost one; nation J: N ships, not applied (no corps of its own)").
+  Protocol 3 and the live-battle engine 18 are unchanged (the host's month only).
 - **Legacy fleet:** the first month's corps is formed before the manual build, so the game's Continue assigns K's own
   officers to the hand-built ships (the skip of `AssignOfficersToUncommandedShips` applies only with an older host).
 - **Rejoin:** the month is sent again with the record (changes not yet merged are lost, like other orders); the month's
@@ -666,14 +698,20 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
   ignored by older peers). A 0.7.1 player of a 0.8.0 host gets an empty list (no longer the host's officers): its
   nation has no officers, as before, and the host keeps its record and its ships' commander ids. A 0.8.0 player of a
   0.7.1 host keeps 0.7.1's behaviour (the host's officers in nation 0, no question, no corps). Existing campaigns: the
-  player's corps is formed in the first month after both sides updated.
+  player's corps is formed in the first month after both sides updated. Ships without a commander (0.8.1, the host's
+  month only): a 0.8.1 host applies the rule to a 0.8.0 player's nation too (hello `off`; nothing changes on its PC),
+  never to an older player's (no `off`: no officers, its ships keep their crew quality); a 0.8.0 host applies it to no
+  joined nation.
 - **What differs from single player:** officer events and the officer routine run at the start of the month on the
   player's PC (the game's at the Turn's end), their effects on the nation's own fields reach the host with the turn;
   the host's month can kill or capture K's commanders, but not run K's officer routine; division commanders are lost
   when a battle is resumed (the game's `.sac` keeps none); the officer event cooldowns (`UsedOfficerEvents`) live in
-  the player's game, as in the game (not saved).
+  the player's game, as in the game (not saved). A ship commissioned in the host's month gets no commander there even
+  with the player's *Yes To All* (the game assigns one at commissioning for index 0 only): the Turn's assignments give
+  her one at the player's next Submit, before the month that first trains her.
 - Bridge: `officers`, `ofstore <K>`, `ofstate`, `ofget`, `ofship`, `ofpromo`, `ofgen`, `ofassign`, `ofask`, `ofmonth`,
-  TEST `ofquiet`, `ofkill`, `ofset`, `ofcrew`; `ls commanders` ([TESTING](TESTING.md#bridge-command-reference)).
+  TEST `ofquiet`, `ofkill`, `ofset`, `ofcrew`, `ofuncmd` (0.8.1); `ls commanders`
+  ([TESTING](TESTING.md#bridge-command-reference)).
 
 ## Network protocol
 - **Transport:** TCP; the host listens on the port (default 47624), clients connect. One background thread does all
@@ -683,18 +721,26 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
   `RTW3MP!<port>|<host name>|<host nation>|<date>|<players>`.
 - **Payloads:** `KV` text (`key=value` lines), or a header and a body (`PackHB`: a 4-byte header length, a `KV`
   header, then binary data such as a `Bundle` of files).
-- **Handshake:** the client's `MSG_HELLO` carries `proto`, `mod`, `build`, `name`, `pw`, `battles` (Fight my battles),
-  `ls` (live battles possible), since relations v2 `rel` (the player's relation routines run on that PC), since 0.6.0
-  `gen` (1: the player's battle generator's requests replayed; 2: also surprise attacks, kind 2, and the view's
-  takeovers; 3, since 0.7.0: also raider checks; 4: also invasions: its plan, its invasion battles, landings; 5, since
-  0.7.2: the search goes on after an encounter without a battle, [below](#joined-players-battles-against-ai-nations-the-battle-phase)), since 0.6.1 `div` (1: the PC loads its nation's own campaign divisions and sends them with its turn,
-  [above](#each-joined-players-campaign-divisions-061); the host logs it as `campaign divisions <d>`) and since 0.8.0
-  `simb` (1: the PC takes its battles during the host's month, [below](#simultaneous-battles-080); the host logs it as
+- **Handshake:** the client's `MSG_HELLO` carries `proto`, `mod`, `build`, `name`, `pw`, `battles` (Fight my
+  battles), `ls` (live battles possible), since relations v2 `rel` (the player's relation routines run on that PC),
+  since 0.6.0 `gen` (1: the player's battle generator's requests replayed; 2: also surprise attacks, kind 2, and the
+  view's takeovers; 3, since 0.7.0: also raider checks; 4: also invasions: its plan, its invasion battles, landings;
+  5, since 0.7.2: the search goes on after an encounter without a battle,
+  [below](#joined-players-battles-against-ai-nations-the-battle-phase)), since 0.6.1 `div` (1: the PC loads its
+  nation's own campaign divisions and sends them with its turn, [above](#each-joined-players-campaign-divisions-061);
+  the host logs it as `campaign divisions <d>`) and since 0.8.0 `simb` (1: the PC takes its battles during the host's
+  month, [below](#simultaneous-battles-080); the host logs it as
   `battles during the host's month <s> (this host: <h>)`) and `off` (1: the PC plays its nation's own officers,
-  [above](#each-joined-players-officers-080); the host logs it as `officers <o>`). The host answers
-  `MSG_WELCOME` (the final name; since 0.6.0 `gen`: the host's battle requests, 1 = it merges a declined battle's
-  result, 2 = it also takes surprise attacks and takeovers, 3 = raider checks and their news, 0.7.0; 4 = the invasions of joined nations, 0.7.0; 5 = a result of several encounters, `enc`, each one's points to its own opponent, 0.7.2; since 0.8.0 `simb` = 1: it sends a `simb` player's battles during its month) or `MSG_REJECT` with the reason:
-  "protocol mismatch (host mod X)", "different game version than the host" or "wrong password".
+  [above](#each-joined-players-officers-080); the host logs it as `officers <o>`), since 0.8.1 `lsof` (1: the PC's
+  live battles carry both sides' commanders, [below](#both-sides-commanders-081); the host logs
+  `<name>: both sides' commanders in live battles <l> (this host: <h>)`). The host answers `MSG_WELCOME` (the final
+  name; since 0.6.0 `gen`: the host's battle requests, 1 = it merges a declined battle's result, 2 = it also takes
+  surprise attacks and takeovers, 3 = raider checks and their news, 0.7.0; 4 = the invasions of joined nations,
+  0.7.0; 5 = a result of several encounters, `enc`, each one's points to its own opponent, 0.7.2; since 0.8.0
+  `simb` = 1: it sends a `simb` player's battles during its month; since 0.8.1 `lsof` = 1: its live battles carry
+  both sides' commanders, logged by the player as
+  `joined <host>: both sides' commanders in live battles: the host <h>, this PC <l>`) or `MSG_REJECT` with the
+  reason: "protocol mismatch (host mod X)", "different game version than the host" or "wrong password".
 
 | Message | Direction | Content |
 |---|---|---|
@@ -710,8 +756,8 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
 | `MSG_DIPLO` | client -> host | A diplomacy request (war, ally, peace, leave, cancel, claim). |
 | `MSG_EVENT` | client -> host | The result of the player's random event (relation changes, own fields), or (0.4.1, `intel=1`) of its monthly spying check, or (0.8.0, `event=-2`, `caption=Officers`) of an officer event of the month's officer routine. |
 | `MSG_RELATIONS` (40) | client -> host | Relations v2: what the player's relation routines changed for its nation this month (pairs before/after, alliances, per-relation state, other nations' budget changes, VP, war counter); B4: the peace with the computer's nations (`peace`, `pcode`, `pevent`, `pargs`, `paccepted`, `pwinner`, `penemies`, `pland`, `pships`, `ptaken`, `pdelta`, `plost`, `ptreaty`; 0.5.0: `self`, the nation's own BudgetModifier/Prestige/BaseResources/UnrestLevel changes; 0.6.0: `ally`, `allyvp`, `afunds`, `aships`, `lend`, the allies' war help; `bwar`, `bships`, the ship seizures of a war), also alone for a proposal (`kind=peace`; `test=1` from `peacetest`). 0.6.0 (to a `gen=2` host): `ksa` (the surprise attacks "a,b;") and `sland` (the takeovers of unowned possessions, pland's layout). |
-| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. 0.6.1: the battle's `divs=1` (the slot's `.off` holds the nation's own campaign divisions). 0.7.1: the result's `noforce` (the game's no-force rule gave the outcome: 0 the player's nation had no ships there that could fight, sent as `declined`; 1 the enemy had none, sent as `avoided`) and a `nobattle`'s reason in `why` for every kind (a battle setup without a side's force); older hosts ignore both. 0.7.2 (to a welcome `gen` 5 host): the result's `enc`, the request's encounters in order (`attempt:kind:opponent:dVP_K:dVP_J:area;...`, kind `avoided`, `declined`, `noforce0`, `noforce1`, `points` or `fought`), its `cand` the last one's attempt. 0.8.0: the battle's `early=1` (sent during the host's month: its result is merged when the month is over; the player's notice says so; older PCs ignore it), and to a player with hello `off` its `offs=1` (the slot's `.off` holds the nation's own officers, its map data the nation's area commands; the result then carries `officers.ini`, the battle slot's officers after the battle). |
-| `MSG_LOCKSTEP` | both (the host relays between two clients) | Live battle traffic. |
+| `MSG_BATTLE`, `MSG_BATTLE_RESULT`, `MSG_BATTLE_CANCEL` | host -> client, client -> host, host -> client | A battle to fight, its result (`fought`, since 0.4.1 `avoided` when the enemy declined it, or why there was none), a battle the host resolved without the player. 0.6.0: the battle's `kind` (2: a surprise attack, played with CheckSurpriseAttack), `att`, `att0..` (the player's generator's attempts or the surprise attack's pairs) and `dc` (the nation's decline counts "own:enemy"); the result's `cand`, `area`, `dc` and `declined` with the slot's result; a kind 2 `nobattle` has its reason in `why`. 0.6.1: the battle's `divs=1` (the slot's `.off` holds the nation's own campaign divisions). 0.7.1: the result's `noforce` (the game's no-force rule gave the outcome: 0 the player's nation had no ships there that could fight, sent as `declined`; 1 the enemy had none, sent as `avoided`) and a `nobattle`'s reason in `why` for every kind (a battle setup without a side's force); older hosts ignore both. 0.7.2 (to a welcome `gen` 5 host): the result's `enc`, the request's encounters in order (`attempt:kind:opponent:dVP_K:dVP_J:area;...`, kind `avoided`, `declined`, `noforce0`, `noforce1`, `points` or `fought`), its `cand` the last one's attempt. 0.8.0: the battle's `early=1` (sent during the host's month: its result is merged when the month is over; the player's notice says so; older PCs ignore it), and to a player with hello `off` its `offs=1` (the slot's `.off` holds the nation's own officers, its map data the nation's area commands; the result then carries `officers.ini`, the battle slot's officers after the battle). 0.8.1: a battle between two players whose PCs and host announce `lsof`: the battle's `of2=<the second player's nation>` and the file `rtw3mp_lsoff<N>.ini` (that nation's record), the result's `of2` and `lsoff<N>.ini` (its officers after the battle) ([both sides' commanders](#both-sides-commanders-081)); and a fought battle's result carries the battle's own points in its `deltas` (`vp0`, `vp1`: `HandleBattleAftermath`'s raw VP0/VP1; `sunk`: `id:side:points,...` of each ship sunk in it), for the merge of a ship lost twice ([simultaneous battles](#simultaneous-battles-080)); older hosts ignore them. |
+| `MSG_LOCKSTEP` | both (the host relays between two clients) | Live battle traffic. 0.8.1: the start's `of2=1`, `ofn` and its `rtw3mp_lsoff<N>.ini` files, the ready's `of2`/`ofl`, the relayed `rejoin`'s `lsof=1` ([both sides' commanders](#both-sides-commanders-081)); sent only to PCs that announce `lsof`. |
 | `MSG_LEGACY` (41) | client -> host | 0.7.0: the player's legacy build started (`state=start`, `info`: the budget figures) or ended (`state=done`, `ships`, `funds`, `forced=1` when a forced submit ended it); notices only (the fleet comes with the turn). Older hosts ignore it. |
 | `MSG_PING`, `MSG_PONG`, `MSG_BYE` | both | Keep-alive and round-trip time; leaving. |
 
@@ -968,11 +1014,14 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   too; a 0.7.0 or 0.7.1 player's button still follows the host's wars, and a 0.7.2 host refuses such a target with
   its chat line (and drops one an older host had taken before the next month uses it).
 - **The merge (host):** `ApplyBattleResult` applies only what the battle changed, field by field, for the two
-  nations and AI nations; ships missing from the result were sunk; the player's intel fields are never taken;
-  nothing changes unless everything applies. Since 0.8.0 a field the host's save changed since the battle was sent
-  follows the rules of [simultaneous battles](#simultaneous-battles-080) (the month's training plus the battle's
-  change, the logs one after the other, ...). A battle between two players' nations also counts for their war score
-  (`CreditWarScore`, since 0.3.1): the host's battle hooks never see a battle fought on a player's PC.
+  nations and AI nations; a ship the battle sank stays in its nation's list as the game keeps every lost ship
+  (`RepairTime` 100, its `Fate`: the result carries it so; one missing from the result is removed); the player's intel
+  fields are never taken; nothing changes unless everything applies. Since 0.8.0 a field the host's save changed since
+  the battle was sent follows the rules of [simultaneous battles](#simultaneous-battles-080) (the month's training plus
+  the battle's change, the logs one after the other, ...); since 0.8.1 a ship the host's month lost since the send is
+  kept as the host has it and, lost in the battle too, counted once (its loss and its points not again; the same
+  section). A battle between two players' nations also counts for their war score (`CreditWarScore`, since
+  0.3.1): the host's battle hooks never see a battle fought on a player's PC.
 - Details: [investigation](../MODLOG.md#investigation-2026-10-14-tactical-battles-joined-players-vs-ai-live-lockstep-pvp-v030),
   [feature](../MODLOG.md#feature-2026-10-15-joined-players-fight-their-battles-against-ai-nations-on-their-own-pc-v030),
   [tests](../MODLOG.md#testing-2026-10-15-joined-players-battles-vs-ai-v030).
@@ -1038,13 +1087,47 @@ auto-run in the investigation, the whole battle of a person).
   log the battle did more to than append keeps the battle's entries; `RepairTime` the larger; any other field the
   battle's value (as before; counted in the log). `Used` stays the host's for a battle fought during the month (as
   for a raider battle: the month's raider sinkings came after its state). A ship gone from the host's save since the
-  send (a raider sinking, a battle the game resolved, the host's own battle) stays gone and the battle's changes to it
-  are dropped (sunk in both: in the losses of both, accepted); a ship new in the host's save stays; `Losses`, VP,
-  prestige and morale go by the battle's deltas (as before). The rules hold for battles of the phase too (two
-  players' battles against the same enemy's ships). The host logs what they did for each merge: `battle N: the host's
-  save changed since the send (a battle fought during the host's month): the host's value + the battle's change:
+  send (no longer in its nation's list: handed over in a peace, ...) stays gone and the battle's changes to it are
+  dropped; a ship new in the host's save stays; `Losses`, VP, prestige and morale go by the battle's deltas (as
+  before), except for the ships lost twice (next bullet). The rules hold for battles of the phase too (two players'
+  battles against the same enemy's ships). The host logs what they did for each merge: `battle N: the host's save
+  changed since the send (a battle fought during the host's month): the host's value + the battle's change:
   CrewQuality 12 ship(s); ...`. An enemy that fights the host and a player at full strength in one month is accepted
   (a computer fleet can fight the player and a battle of the computer's in one single-player month).
+- **A ship sunk twice is counted once** (0.8.1, [fix](../MODLOG.md#fix-2026-11-03-a-computer-ship-sunk-in-the-hosts-battle-and-in-a-joined-players-battle-of-the-same-month-is-counted-once-v081-dev)).
+  A computer nation at war with the host's and a joined player's nation can lose the same ship in the host's battle
+  and in the player's battle fought during the month: both start from the month's state. The game keeps every lost
+  ship in its nation's list (`RepairTime` 100 for a sinking, 101 for a scrapped ship, its `Fate`; the "Ships sunk or
+  scrapped" list is `RepairTime` >= 100), so before 0.8.1 such a ship was merged by the field rules: the player's
+  battle's `Fate` over the host's, both battles' log entries, stars and training added, its losses counter of its type
+  (+1 in each battle's `[Nation<n>Losses]`) and its points (in the player's VP and in the war score) counted again
+  (GAME-INTERNALS). Since 0.8.1 a ship the host's save lost since the send (`RepairTime` from below 100 to 100 or
+  more: the host's battle, a raider, a submarine, a mine, an AI battle, a scrapping) stays as the host has it; none of
+  the battle's changes to it are taken. The host's month keeps the sinking (merged first into the month: the host's
+  battle's effects are all over the host's game, its VP, prestige, messages and officers; the player's result is a
+  diff that can drop one ship): when the battle lost the ship too (or one gone from the host's save), the merge takes
+  out the battle's loss of it (its nation's counter of its type, as `ShowResultScreen` and `AddShipToTotalLosses`
+  count it: BB `BBLost` ... KE `MSLost`, TR/AMC/AV `AUXLost`; only while the battle's delta of that counter has one)
+  and the battle's points for it, off the side that gained them (J's ship: K's `dVP_K`; K's ship: J's `dVP_J`). The
+  points as the game counted them in that battle: a 0.8.1 player's PC sends the battle's raw points in the result's
+  `deltas` (`vp0`/`vp1`, `HandleBattleAftermath`'s VP0/VP1 before `GetLogAdjustedVP`; `sunk` = "id:side:points,..." =
+  `GetShipDamagePointValue` of each ship sunk in it, hooked on the player's PC in the battle slot), and the host takes
+  `GetLogAdjustedVP(VP0) - GetLogAdjustedVP(VP0 - points)`; for a 0.8.0 player's result (no per-ship points) it
+  estimates the ship's points with the game's own `GetApproxVP` (2 x displacement for BB, BC, B, CA, CL, DD, KE, else
+  the displacement; the value `QuickResolveRaiderBattle` gives a sunk ship) against the raw total that gives the
+  battle's points (after encounters: the fought one's, `bVP_K`/`bVP_J`), only for a ship of K or J that the battle's
+  `Fate` says was sunk in it; a raider battle auto-resolved takes `GetLogAdjustedVP(GetApproxVP)` of each ship, as the
+  game. The war score (`CreditWarScore`) gets the same points; prestige and morale (the battle's victory level, drawn at
+  random) stay the battle's. Logs: `battle N: nation J's CA Zara (ship 301) was lost in the host's month (<its Fate>)
+  and in the battle (<the battle's>): counted once: the host's ship kept, CALost -1, 27000 raw points of nation K` and
+  `battle N: points taken off for them: nation K 1647, nation J 0 (the player's PC's per-ship points, raw VP
+  40000/0)`; the battle phase's chat line ends "... was fought by Captain (Italy's CA Zara was already sunk in the
+  host's battle: not counted twice, 1647 VP fewer for Germany)." ("sunk in Bot's battle" when another player's battle
+  merged before sank it, "lost in the host's month (<Fate>)" for another loss). A ship the host's month lost that the
+  battle only damaged keeps the month's state (its damage's points stay: a battle before the host's could have
+  damaged it). Versions: the merge runs on the host (a 0.8.1 host; results held during the month come from 0.8.0 and
+  later players); a 0.8.1 player's `vp0`/`vp1`/`sunk` are ignored by a 0.8.0 host; protocol 3 and the live-battle
+  engine 18 unchanged.
 - **The nations' officers** (0.8.0 integration with [each joined player's officers](#each-joined-players-officers-080)).
   A package from the snapshot or from the month's start carries the nation's own officers as a package of the battle
   phase does (`HostPutOfficers`: the `.off`'s `[Officers]` = K's record, K's area commands in the map data, header
@@ -1092,8 +1175,11 @@ auto-run in the investigation, the whole battle of a person).
   `RTW3MP\simul_test\`; since the 0.8.0 integration also each officers' merge, `<id>_off{sent,host,result,merged}.ini`),
   TEST `battles simulhold <s>` (the battle phase waits up to <s> s for the battles of the month: their results held),
   `battles list` (`:early`, `:held`, `:kept`); TEST `ofkill <K> <ship> 0 armmonth` (a commander's death when the host's
-  `DoStrategicTurn` starts: after the battles went out); the offline test of the merge rules `tools\merge_test.bat`
-  (the ships' and the officers') and the suite's `battle_simul` (TESTING.md).
+  `DoStrategicTurn` starts: after the battles went out); 0.8.1: `ls cships` (the battle's ships on that PC with their
+  campaign ids), TEST `ls sink <id>` (the battle screen's own Sink on that ship) and TEST `battles sinkmonth <J>
+  <id>|result` (host: that ship of J, or the first one a result held this month lost, lost in the host's month by the
+  game's `SinkShip` and `AddShipToTotalLosses`); the offline test of the merge rules `tools\merge_test.bat`
+  (the ships', the ships lost twice and the officers') and the suite's `battle_simul` (TESTING.md).
 
 ## Each joined nation's relations (relations v2)
 The game runs every nation but nation 0 by its AI rules
@@ -1466,7 +1552,9 @@ decided later). Done so far:
   `MSG_LOCKSTEP` by battle id). B is side 1. A host battle against a player who doesn't fight battles, or whose PC
   can't play live battles, is fought by the host against the AI as in single player.
 - **Start.** A holds the battle at minute 0 and saves it (the game's battle save and the campaign with the battle in
-  progress), sends the files, the RNG seed, the game speed, the battle-relevant preferences and its x87 control word.
+  progress), sends the files, the RNG seed, the game speed, the battle-relevant preferences and its x87 control word
+  (since 0.8.1, to a B that announced `lsof`, also the other nations' officer lists:
+  [both sides' commanders](#both-sides-commanders-081)).
   Both PCs load the battle through the game's own resume path with the seeded RNG and compare a hash before minute 1.
   Since engine level 15 the preferences sent are only the 14 the load and the simulation use (GAME-INTERNALS, "Two
   PCs"): B swaps A's into its preferences record before every load of the battle (start, resync, rejoin) and gets its
@@ -1898,6 +1986,63 @@ decided later). Done so far:
   [dawn and dusk](../MODLOG.md#fix-2026-10-17-dawn-and-dusk-desyncs-lightstate-engine-level-14-v060),
   and the battle facts in [GAME-INTERNALS.md](GAME-INTERNALS.md#tactical-battles).
 
+### Both sides' commanders (0.8.1)
+Both PCs resume A's snapshot, and the battle save's commander lookup (`PlayerNation.GetOfficerWithId`) knows only A's
+nation 0: up to 0.8.0 the second player's ships fought without their commanders, which won no stars and survived any
+sinking ([GAME-INTERNALS](GAME-INTERNALS.md#officers), "Found while building 0.8.1"). Since 0.8.1 the battle carries the
+other nations' officer lists, a per-battle capability between PCs that announce it; **engine level 18 and protocol 3
+stay**, and a battle with any 0.6.1-0.8.0 PC is the 0.8.0 battle (MODLOG
+[live battles with both sides' commanders](../MODLOG.md#fix-2026-11-03-live-battles-with-both-sides-commanders-v081-dev)).
+- **Who uses it.** Hello and welcome `lsof=1` (`LiveOfficers()`: live battles on, the engine, the lookup found and
+  hooked). A tells its start which (`StartInfo.peerOfficers`): the host for its own battle when the player's hello had
+  `lsof`; for a battle between two joined players the first player's PC when the host's battle message had `of2` (the
+  host sends it only when it and both players' PCs announce `lsof`); a rejoin carries the returning player's (the host's
+  relayed `rejoin` gets `lsof=1`).
+- **The start** (`StartTransfer`, also every resync and rejoin): `of2=1`, `ofn=<nations>` and one bundle file
+  `rtw3mp_lsoff<N>.ini` per nation N (`[Officers]` and the game's eleven keys, the game's writer on N's list in A's
+  memory): the opponent's nation when it has officers (also when none of them commands a ship of the battle: every load
+  then keeps its list, so its sunk ships' commanders get their fates and the result can carry it), the other nations,
+  not PlayerNation, whose officers command the battle's ships at the snapshot, and every nation an earlier start of
+  the battle carried (`ofc::BattleLists`). B takes the files out of the bundle (never written into its slot) and keeps
+  them for its loads.
+- **Both loads** (`LoadSnapshot`): `ofc::SetBattleLists` before the load; the `ConnectOfficersToShips` hook loads each
+  list into its nation's (empty) list right after PlayerNation's own connection, with the game's loader, and connects
+  that nation's ships (`LoadIntoNation`, so the host's `HostOfficersToMemory` skips the nation and
+  `HostOfficersFromMemory` writes its list back with the battle's results); the hook of `GetOfficerWithId`, active only
+  while such a load runs and only for the battle save reader's call (its return address, found by its pattern), looks
+  an id PlayerNation doesn't hold up in those lists (ids are unique: a joined nation's come from IDNo + 20000 K). Both
+  PCs log "both sides' commanders: the officer lists of nations N loaded (...); the battle save's lookup found C
+  commanders in them". B's `ready` echoes `of2=1` and `ofl=<nation>:<officers>/<ships>/<found>`; a PC that missed a list
+  answers `of2=0` and A turns the mode off for the rest of the battle (the READY mismatch resyncs without it).
+- **Determinism.** Both PCs load the same text before the same lookup; with `of2` every ship's commander (`Id`,
+  `Ability`, `Special1/2`, `Status`) is part of the state hash's `all` (the hash line's `cmd=`; without `of2` the hash
+  is level 18's). In the battle the commanders act on both PCs alike (abilities, bridge hits, a sunk ship's commander
+  picked up: GAME-INTERNALS).
+- **The results.** The campaign takes the battle from A: the game's aftermath there gives the other side's commanders
+  their stars and the sunk ships' commanders their fates. Host vs K: in the host's memory, into K's record by
+  `HostOfficersFromMemory` (after `DoEndOfTurn`, or a save of the host's slot) and to K's PC with the next month (a
+  test battle outside a month stays in memory: the player's next turn replaces it). K1 vs K2: the host's battle
+  message carries K2's record (`of2=<K2>`, `rtw3mp_lsoff<K2>.ini`, kept as the request's `sentOff2`); K1's PC keeps
+  K2's ships' commander ids over `MakeNationPlayer` and loads K2's list into its battle slot (the battle's setup gives
+  K2's ships their commanders); the result carries K2's list after the battle (`lsoff<K2>.ini`, header `of2`), merged
+  into K2's record against `sentOff2` with only what a battle changes (`saveio::BattleOnlyOfficers`: stars up by at
+  most 2, Active to Dead or POW with the fate; nothing added or dropped), then `HostFixShipCommanders(K2)`.
+- **The aftermath's guard** (every battle, `TransferCampaignShipDamage` hook, only for a ship whose commander is not
+  PlayerNation's, so single player and the 0.8.0 battles are unchanged): a MusicLover's band gives its prestige and
+  fleet morale to the officer's own nation, its picture message shows only on the PC whose player commands that nation
+  (B: its nation in A's campaign, `lockstep::ViewerNation`; on the host the text goes to that nation's player with the
+  month, "* Officers: ..."), and the officer never becomes the one `DoStrategicTurn` offers to cashier. This also
+  covers the host's battles against a joined nation fought by the computer (since 0.8.0 the nation's ships have their
+  commanders there).
+- **Limits.** A battle resumed from the host's save after its game restarted loads before the records: from then on
+  the joined side fights without commanders, as in 0.8.0. The other side's survivors' lines ("... is picked up by a
+  fishing boat ...") appear in A's battle message log, as the game's own lines. Only A's player is asked to cashier an
+  officer of a poor showing (the guard keeps the other side's officers from the question). K1 vs K2: a band of K2's
+  officer raises K2's prestige and fleet morale in K1's battle slot only (the result carries the prestige and morale
+  of the slot's nation 0 alone, `dPrestige_K`/`dMorale_K`).
+- Bridge: `ls commanders` (owners, mode, `cand1`, `cship <id>`), TEST `ls testsink`
+  ([TESTING](TESTING.md#bridge-command-reference)).
+
 ## Test bridge
 - A line-based command socket on 127.0.0.1, only when `RTW3MP_BRIDGE_PORT` is set when the game starts; with
   `RTW3MP_BRIDGE_TOKEN` the first line must be the token.
@@ -1906,21 +2051,25 @@ decided later). Done so far:
 - The command reference, the runner and the scenario catalog are in [TESTING.md](TESTING.md).
 
 ## Versions and protocol
-- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.8.0
+- `MP_MOD_VERSION` and `MP_PROTOCOL` in `src/mod/common.h`; both are in the log's first line (`RTW3MP 0.8.1
   starting (protocol 3)`).
 - The host refuses a client with another protocol or another game build. Protocol history: 1 = 0.1.0, 2 =
-  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3 and 0.8.0 (relations v2,
-  0.6.0, 0.6.1 and 0.7.0 keep 3: their new keys are ignored by older peers; 0.7.0's features go by the hello's and the
-  welcome's `gen` and the month's `legacy`, see [Network protocol](#network-protocol); 0.7.1 adds only the battle
-  result's optional `noforce`; 0.7.2 raises the hello's and the welcome's `gen` to 5 and adds the battle result's
-  optional `enc`, sent only to a `gen` 5 host; 0.7.3 changes no message; 0.8.0 keeps 3: the hello's and the welcome's
-  `simb`, the hello's `off`, the battle's `early`, the headers' `offs`/`offgen`, the turn's and the result's
-  `officers.ini`, and the officer event's `event=-2`, sent only to a host whose month had `offs`).
-  Within a protocol, versions can play together, but features may need both
-  sides (see [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is not checked; the notices about
-  another live-battle level quote it.
+  0.2.0-0.2.8, 3 = 0.3.0-0.3.3, 0.4.0, 0.4.1, 0.5.0, 0.6.0, 0.6.1, 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.8.0 and 0.8.1
+  (relations v2, 0.6.0, 0.6.1 and 0.7.0 keep 3: their new keys are ignored by older peers; 0.7.0's features go by the
+  hello's and the welcome's `gen` and the month's `legacy`, see [Network protocol](#network-protocol); 0.7.1 adds
+  only the battle result's optional `noforce`; 0.7.2 raises the hello's and the welcome's `gen` to 5 and adds the
+  battle result's optional `enc`, sent only to a `gen` 5 host; 0.7.3 changes no message; 0.8.0 keeps 3: the hello's
+  and the welcome's `simb`, the hello's `off`, the battle's `early`, the headers' `offs`/`offgen`, the turn's and the
+  result's `officers.ini`, and the officer event's `event=-2`, sent only to a host whose month had `offs`; 0.8.1
+  keeps 3: the hello's and the welcome's `lsof`, the battle's and the result's `of2` with their officer files, the
+  live start's `of2`/`ofn` with its files, the ready's `of2`/`ofl` and the relayed rejoin's `lsof`, sent only to
+  peers that announce `lsof`, and the battle result's `deltas` keys `vp0`, `vp1` and `sunk`, which older hosts
+  ignore). Within a protocol, versions can play together, but features may need both sides (see
+  [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is not checked; the notices about another
+  live-battle level quote it.
 - Live battles have their own version, the live-battle engine level `MP_LS_LEVEL` (`src/mod/common.h`): 1 = 0.3.0 to
-  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1 and 0.7.0 to 0.8.0. Levels 2 to 13 were development levels
+  0.3.3, 14 = 0.4.0, 17 = 0.4.1, 0.5.0 and 0.6.0, 18 = 0.6.1 and 0.7.0 to 0.8.1 (0.8.1's both sides' commanders are a
+  per-battle capability, `lsof`, not a level). Levels 2 to 13 were development levels
   of 0.4.0 (the live-battle limits branch, whose MODLOG entries say "v0.4.0", "v0.5.0" and "v0.6.0" after the release
   plan of 2026-10-16, but it shipped as one version, 0.4.0), and levels 15 and 16 were rounds of 0.4.1's two-PC fixes;
   none of them was released. A client announces its level in its hello (`ls=<level>`), and the host pairs a live battle
@@ -1994,6 +2143,14 @@ decided later). Done so far:
   an older host (or either side with `RTW3MP_SIMUL=0`) fight their battles after the host's month as before
   ([above](#simultaneous-battles-080)). Each joined player's officers ([above](#each-joined-players-officers-080)) go
   by the hello's `off`, the month's `offs`/`offgen`, the battle's `offs` and the turn's and result's `officers.ini`,
-  which older peers ignore; a live battle still looks every commander up in A's nation 0 on both PCs.
+  which older peers ignore; a live battle still looks every commander up in A's nation 0 on both PCs. 0.8.1 keeps
+  level 18 and protocol 3: both sides' commanders in live battles ([above](#both-sides-commanders-081)) are a
+  per-battle capability, the hello's and the welcome's `lsof`; A puts the lists into a start (`of2`) only for a B
+  that announced it, and the host puts the second player's record into a battle between two players (`of2`) only when
+  it and both players' PCs announce it, so a battle with any 0.6.1-0.8.0 PC (A, B or that host) is 0.8.0's battle on
+  both PCs: the first player's commanders only, no new key on the wire, the same state hash. Its other two fixes
+  change no live-battle path: a ship lost twice counted once is the host's merge (the result's `deltas` keys
+  `vp0`/`vp1`/`sunk`, which older hosts ignore: a 0.8.0 host merges as before), and the rule for a joined nation's
+  ships without a commander is the host's month only.
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

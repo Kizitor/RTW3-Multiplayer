@@ -3347,6 +3347,18 @@ def treaty_lines(txt, winner, loser):
     return [m for m in re.findall(TREATY_RE, txt) if int(m[0]) == winner and int(m[1]) == loser]
 
 
+def treaty_moves(moved, gained, owner_of):
+    """g) of `treaty` (its processed month): the loser's possessions the winner gained (the treaty's), those the game's
+    own rebellion of that month took (the owner 'Neutral' now: "The rebels in <possession> have won several engagements,
+    and the <adjective> government has been forced to abandon the territory.") and any other loss ({name: its owner}).
+    moved: the loser's lost possessions, gained: the winner's new ones, owner_of(name): its owner in the host's MapData
+    after the month."""
+    treaty = set(moved) & set(gained)
+    rest = set(moved) - treaty
+    rebel = {x for x in rest if owner_of(x) == 'Neutral'}
+    return treaty, rebel, {x: owner_of(x) for x in sorted(rest - rebel)}
+
+
 def nation_view(nations):
     """Host values a treaty changes: possessions, ships, funds, Prestige, BaseResources of some nations."""
     nt = nation_table()
@@ -3671,15 +3683,23 @@ def scenario_treaty(ctx):
           r12['war'] == '0' and r and r['relation'] == 'Peace' and r['pending'] == '' and r['claim'] == '0:0:0',
           f'{r12} | {r}')
     moved, gained = set(bv[2]['poss']) - set(av[2]['poss']), set(av[1]['poss']) - set(bv[1]['poss'])
-    check(f'g) host: the claimed possessions {claims_g} moved from 2 to 1 (possessions 1/2), nothing else',
-          moved == gained == set(claims_g) and len(av[1]['poss']) == len(bv[1]['poss']) + len(claims_g) and
-          len(av[2]['poss']) == len(bv[2]['poss']) - len(claims_g), f'moved {sorted(moved)}, gained {sorted(gained)}')
+    own = {f.get('Name'): f.get('Owner') for k, f in poss_fields(HOST_SLOT).items() if k != '[General]'}
+    tmoved, rebel, other = treaty_moves(moved, gained, own.get)
+    if rebel:
+        log(f'  SKIP-note g) nation 2 also lost {sorted(rebel)} in the treaty month to the game\'s own rebellion (the '
+            f'owner Neutral now; the turn messages: "The rebels in <possession> have won several engagements ..."): '
+            f'not the treaty\'s')
+    check(f'g) host: the claimed possessions {claims_g} moved from 2 to 1 (possessions 1/2), nothing else (but a '
+          f'possession the game\'s rebellion takes that month: owner Neutral)',
+          tmoved == gained == set(claims_g) and not other and len(av[1]['poss']) == len(bv[1]['poss']) + len(claims_g)
+          and len(av[2]['poss']) == len(bv[2]['poss']) - len(claims_g) - len(rebel),
+          f'moved {sorted(moved)}, gained {sorted(gained)}, to a rebellion {sorted(rebel)}, elsewhere {other}')
     ca1, ca2 = pnames(poss_list(C, 'possessions 1')), pnames(poss_list(C, 'possessions 2'))
     check('g) client (its new month): possessions 1/2 as on the host', ca1 == av[1]['poss'] and ca2 == av[2]['poss']
           and set(ca1) - set(cb1) == set(claims_g), f'client gained {sorted(set(ca1) - set(cb1))}, lost '
                                                     f'{sorted(set(cb2) - set(ca2))}')
     head = f'Peace treaty between {n1} and {n2}: {n1} wins a major victory.'
-    ceded = [f'{x} is ceded from {n2} to {n1}.' for x in sorted(moved)] or [f'{n2} cedes no possessions']
+    ceded = [f'{x} is ceded from {n2} to {n1}.' for x in sorted(tmoved)] or [f'{n2} cedes no possessions']
     repar = [f'{n2} pays reparations (base resources -{res}).'] if res else []
     end_re = rf'Peace: ({re.escape(n1)}|{re.escape(n2)}) and ({re.escape(n1)}|{re.escape(n2)}) have ended their war ' \
              rf'\({re.escape(n1)} victorious\)\.'
@@ -5575,9 +5595,17 @@ def battle_search_month(ctx, tag, tr, K, J, area, J2, area2, sw, plan, nt):
     d0k, d0j = e0
     sp = log_lines(seg, r'StartPlayerBattle \d+ attacks \d+ in ')
     tsw = 'the computer declined 1x' if tag == 'g' else 'fought 1x'
+    # (h: the switch answers the computer's decision only where the game asks it, AIDeclinesBattle with Implement True:
+    # a possession's or a home area's battle; another attempt 0 asks none, "fought 0x", and the player's decline in its
+    # preview is the same encounter: the 0.8.1 release candidate's --stress run, reg-081)
+    asked_none = tag == 'h' and bool(sp) and 'declined 0x, fought 0x' in sp[0]
+    if asked_none:
+        log(f'  note {tag}) request {bid}, attempt 0: the game asked the computer no decision (no possession or home '
+            f'area battle): the switch did not need to act; the player declined in the preview')
     check(f'{tag}) request {bid}, attempt 0: {want} against nation {J} in {area} (VP {d0k:+d}/{d0j:+d}), the switch '
-          f'acted ("{tsw}"), no battle; the search went on (client "... no battle; the search goes on, as single '
-          f'player")', sp and tsw in sp[0] and (d0k > 0 if tag == 'g' else True),
+          f'acted ("{tsw}"{"" if tag == "g" else "; or the game asked the computer no decision: fought 0x"}), no battle; '
+          f'the search went on (client "... no battle; the search goes on, as single player")',
+          sp and (tsw in sp[0] or asked_none) and (d0k > 0 if tag == 'g' else True),
           dict(start=[x.split('] ', 1)[-1][:200] for x in sp[:2]]))
     fm = re.search(rf'\] battle {bid}: fighting nation {K} vs (\d+) in (.*?) \(slot ', seg)
     if not fm or o != 'fought':
@@ -6521,10 +6549,18 @@ def scenario_battle_invasion(ctx):
         if btn_state(r) != 'enabled' or r['target'] == n:
             break
     ui_t = next((n for n, r in tries if r['target'] == n), None)
+    # (the game's own range check refuses a possession beyond nation K's invasion range, its box "Possession is beyond
+    # your invasion range! ...": when every free possession of J is (InvasionPossible 0; J the USA in the 0.8.1 release
+    # candidate's --stress run, reg-081) only the button is checked, a SKIP-note)
+    out_all = bool(cands) and all(rng[n] is not None and rng[n] <= 0 for n in cands)
+    by_range = bool(tries) and all(any('beyond your invasion range' in b for b in r['boxes']) for _, r in tries)
+    if not ui_t and out_all and by_range:
+        log(f'  SKIP-note u1) every free possession of J (nation {J}) is beyond nation {K}\'s invasion range '
+            f'(InvasionPossible {rng}): the game\'s own range check refused each one pressed; the button checked only')
     check(f'u1) client: J\'s possession (nation {J}: at war with nation {K}, at peace with the host) through the game\'s '
           f'dialog: "Set invasion target" enabled, pressed: the form\'s InvasionTarget is it (the game\'s checks: '
-          f'value, invaded, blockade, invasion range: InvasionPossible {rng})', ui_t and
-          all(btn_state(r) == 'enabled' for _, r in tries),
+          f'value, invaded, blockade, invasion range: InvasionPossible {rng}; every one beyond the range: the game\'s '
+          f'range box)', (ui_t or (out_all and by_range)) and all(btn_state(r) == 'enabled' for _, r in tries),
           [(n, btn_state(r), r['mod'], r['clicked'], r['boxes'], r['target']) for n, r in tries])
     if ui_t:
         t, rp = ui_t, 'ok (the game\'s dialog)'
@@ -7195,7 +7231,10 @@ def simul_expected(sent, host, res, keep_used):
     the battle and the host's save since the send changed): sent = the ship as the battle was sent, host = in the host's
     save before the merge, res = in the result ({field: value} each); keep_used: a battle fought during the host's
     month (its Used marks stay the host's). Returns ({field: value}, [the rules that applied: 'CrewQuality',
-    'BattleStars', 'RepairTime', 'log', 'other <field>'])."""
+    'BattleStars', 'RepairTime', 'log', 'other <field>']). 0.8.1 (fix-sunktwice): a ship the host's save lost since
+    the send (RepairTime >= 100: sunk, scrapped) stays as the host has it: ({}, ['lost in the month'])."""
+    if not ship_lost(sent) and ship_lost(host):
+        return {}, ['lost in the month']
     out, rules = {}, []
     for k, v in res.items():
         # (never the ships' commanders, 0.8.0: a battle assigns none; the officers' merge clears the dead and captured)
@@ -7234,6 +7273,127 @@ def simul_expected(sent, host, res, keep_used):
     return out, rules
 
 
+# 0.8.1 (fix-sunktwice): a ship sunk in the host's month and in a player's battle of the month is counted once (the
+# merge keeps the host's ship and takes the battle's loss and points of it out): the game's formulas, as saveio's.
+SIMUL_LOSS = {'BB': 'BBLost', 'BC': 'BCLost', 'B': 'BLost', 'CA': 'CALost', 'CL': 'CLLost', 'CV': 'CVLost',
+              'CVL': 'CVLLost', 'DD': 'DDLost', 'KE': 'MSLost', 'MS': 'MSLost', 'LT': 'LTLost', 'SS': 'SSLost',
+              'TR': 'AUXLost', 'AMC': 'AUXLost', 'AV': 'AUXLost'}
+
+
+def ship_lost(f):
+    """A ship the game counts lost (sunk, scrapped: its "Ships sunk or scrapped" list): RepairTime >= 100."""
+    v = (f or {}).get('RepairTime') or '0'
+    return v.lstrip('-').isdigit() and int(v) >= 100
+
+
+def log_adjusted_vp(v):
+    """The game's GetLogAdjustedVP (saveio::LogAdjustedVP): Round(0.8 x (Round(3 x sqrt v) + v div 15)), 0 for v <= 0
+    (Round to even, as the FPU's and Python's round)."""
+    return 0 if v <= 0 else round((round(math.sqrt(v) * 3) + v // 15) * 0.8)
+
+
+def approx_ship_vp(t, disp):
+    """The game's TCampaignShip.GetApproxVP (saveio::ApproxShipVP)."""
+    return 2 * disp if t in ('BB', 'BC', 'B', 'CA', 'CL', 'DD', 'KE', 'MS') else disp
+
+
+def battle_points_cut(battle, raw0, raw, quick=False, each=()):
+    """saveio::BattlePointsCut: the points off a battle's `battle` points for ships worth `raw` raw points."""
+    if quick:
+        cut = sum(log_adjusted_vp(e) for e in each)
+    elif raw > 0:
+        total = raw0
+        if total < 0:
+            if battle <= 0:
+                return 0
+            lo, hi = 1, 1
+            while log_adjusted_vp(hi) < battle and hi < (1 << 40):
+                hi *= 2
+            while lo < hi:
+                mid = (lo + hi) // 2
+                lo, hi = (lo, mid) if log_adjusted_vp(mid) >= battle else (mid + 1, hi)
+            total = lo
+        cut = log_adjusted_vp(total) - log_adjusted_vp(max(0, total - raw))
+    else:
+        cut = 0
+    return min(max(0, battle), max(0, cut))
+
+
+def simul_twice(f, K, J):
+    """0.8.1 (fix-sunktwice): what saveio::ApplyBattleResult does with the ships of a merge (its kept files: sent, host,
+    result with its [deltas], merged) that the host's save lost (or no longer has) since the send and the battle lost
+    too. Returns dict(twice=[dict(nation, id, name, type, side, points, estimated, counter, host_fate)], losses={(n,
+    counter): the merged value expected}, cut=(cutK, cutJ), vp={K: .., J: ..} expected, bad=[the merged save's
+    differences: those ships not as the host had them, a losses counter, a VP])."""
+    d = (f['result'].get('deltas') or {})
+    measured = 'vp0' in d and 'vp1' in d
+    pts = {}
+    for e in (d.get('sunk') or '').split(','):
+        p = e.split(':')
+        if len(p) == 3 and p[0]:
+            pts[p[0]] = (0 if p[1] == '0' else 1, int(p[2]))
+    twice, bad = [], []
+    for sec in f['result']:
+        mm = re.match(r'^Nation(\d+)Ships$', sec)
+        if not mm:
+            continue
+        n = int(mm[1])
+        sent, host, res = (ships_by_id(f['sent'].get(sec)), ships_by_id(f['host'].get(sec)),
+                           ships_by_id(f['result'][sec]))
+        merged = ships_by_id(f['merged'].get(sec))
+        for sid, s in sent.items():
+            h, r = host.get(sid), res.get(sid)
+            if ship_lost(s) or not (h is None or ship_lost(h)) or not (r is None or ship_lost(r)):
+                continue
+            if h is not None and merged.get(sid) != h:
+                bad.append((sec, sid, 'lost in the host\'s month: not as the host had it'))
+            if h is None and sid in merged:
+                bad.append((sec, sid, 'gone from the host\'s save: back after the merge'))
+            t = dict(nation=n, id=sid, name=s.get('Name'), type=s.get('ShipType'), side=0 if n == K else 1 if n == J
+                     else -1, points=0, estimated=False, counter='', host_fate=(h or {}).get('Fate', ''))
+            if sid in pts:
+                t['side'], t['points'] = pts[sid]
+            elif not measured and t['side'] >= 0 and 'Sunk in ' in ((r or {}).get('Fate') or ''):
+                t['points'], t['estimated'] = approx_ship_vp(t['type'], int(s.get('Displacement') or 0)), True
+            twice.append(t)
+    losses = {}
+    for sec, rsec in f['result'].items():
+        mm = re.match(r'^Nation(\d+)Losses$', sec)
+        if not mm:
+            continue
+        n = int(mm[1])
+        delta = {k: int(v or 0) - int((f['sent'].get(sec) or {}).get(k) or 0) for k, v in rsec.items()}
+        for t in twice:
+            c = SIMUL_LOSS.get(t['type'])
+            if t['nation'] == n and c and delta.get(c, 0) > 0:
+                delta[c] -= 1
+                t['counter'] = c
+        for k, dv in delta.items():
+            want = int((f['host'].get(sec) or {}).get(k) or 0) + dv
+            losses[(n, k)] = want
+            got = (f['merged'].get(sec) or {}).get(k)
+            if got is not None and int(got) != want:
+                bad.append((sec, k, f'{got} != {want}'))
+    raw, each = [0, 0], [[], []]
+    for t in twice:
+        if t['side'] >= 0 and t['points'] > 0:
+            raw[1 - t['side']] += t['points']
+            each[1 - t['side']].append(t['points'])
+    dK, dJ = int(d.get('dVP_K') or 0), int(d.get('dVP_J') or 0)
+    bK, bJ = int(d.get('bVP_K', dK)), int(d.get('bVP_J', dJ))
+    quick = d.get('bQuick') == '1'
+    cut = (battle_points_cut(min(dK, bK), int(d['vp0']) if measured else -1, raw[0], quick, each[0]),
+           battle_points_cut(min(dJ, bJ), int(d['vp1']) if measured else -1, raw[1], quick, each[1])) if twice else (0, 0)
+    vp = {}
+    for n, dv, c in ((K, dK, cut[0]), (J, dJ, cut[1])):
+        want = int((f['host'].get(f'Nation{n}') or {}).get('VP') or 0) + dv - c
+        vp[n] = want
+        got = (f['merged'].get(f'Nation{n}') or {}).get('VP')
+        if got is not None and int(got) != want:
+            bad.append((f'Nation{n}', 'VP', f'{got} != {want}'))
+    return dict(twice=twice, losses=losses, cut=cut, vp=vp, bad=bad)
+
+
 def simul_kept(bid):
     """The files `battles simulkeep 1` kept of battle bid's merge: dict(sent, host, result, merged) parsed, or None."""
     out = {k: read_save(os.path.join(SIMUL_KEEP, f'{bid}_{k}.{e}'))
@@ -7244,9 +7404,9 @@ def simul_kept(bid):
 def simul_merge_check(f, early):
     """e) one merge against its kept files: in every ships section of the result, each ship as the host had it with
     simul_expected's fields set (nothing else changed); a ship sunk in the battle gone, one gone from the host's save
-    since the send still gone, one new there as it was. Returns dict(ships, changed, sunk, gone, new, rules={rule:
-    ships}, bad=[...])."""
-    res = dict(ships=0, changed=0, sunk=0, gone=0, new=0, rules={}, bad=[])
+    since the send still gone, one new there as it was; 0.8.1: one the host's save lost since the send as the host had
+    it (`lost`). Returns dict(ships, changed, sunk, gone, new, lost, rules={rule: ships}, bad=[...])."""
+    res = dict(ships=0, changed=0, sunk=0, gone=0, new=0, lost=0, rules={}, bad=[])
     for sec, rsec in f['result'].items():
         if not re.match(r'^Nation\d+Ships$', sec):
             continue
@@ -7260,6 +7420,11 @@ def simul_merge_check(f, early):
                     res['bad'].append((sec, sid, 'a ship new since the send changed'))
                 continue
             res['ships'] += 1
+            if not ship_lost(sent[sid]) and ship_lost(hs):  # 0.8.1: lost in the host's month: as the host had it
+                res['lost'] += 1
+                if ms != hs:
+                    res['bad'].append((sec, sid, 'lost in the host\'s month since the send, changed by the merge'))
+                continue
             if sid not in result:
                 res['sunk'] += 1
                 if ms is not None:
@@ -7297,7 +7462,7 @@ def simul_merge_changes(f):
         n = int(mm[1])
         sent, host, result = ships_by_id(f['sent'].get(sec)), ships_by_id(f['host'].get(sec)), ships_by_id(rsec)
         for sid, s in sent.items():
-            if sid not in host:
+            if sid not in host or (not ship_lost(s) and ship_lost(host[sid])):  # (0.8.1: lost in the month: kept)
                 continue
             if sid not in result:
                 sunk.add((n, sid))
@@ -7517,6 +7682,173 @@ def simul_officer_puts(text):
     return out
 
 
+def cships(port):
+    """`ls cships`: the battle's ships on this PC: [(side, campaign ship id, sunk, name)], or None (no battle)."""
+    r = scmd(port, 'ls cships', 20)
+    if not r.startswith('ok '):
+        return None
+    out = []
+    for e in r.split(' ships=', 1)[-1].split(';'):
+        p = e.split(':', 3)
+        if len(p) == 4 and p[1].lstrip('-').isdigit():
+            out.append((int(p[0]), p[1], p[2] == '1', p[3]))
+    return out
+
+
+SINK_PICK = ('CA', 'B', 'BB', 'BC', 'CL', 'CVL', 'CV', 'DD', 'KE')  # (the ship to sink twice: a big one first)
+TWICE_RE = (r"\] battle (\d+): nation (\d+)'s (\S+) (.*) \(ship (\d+)\) was lost in the host's month \((.*)\) and in the "
+            r"battle \((.*)\): counted once: the host's ship kept, (.*?)\r?$")
+TWICE_CUT_RE = r"\] battle (\d+): points taken off for them: nation (\d+) (\d+), nation (\d+) (\d+) \((.*)\)\r?$"
+
+
+def simul_sunk_twice(ctx, K, J, set_war):
+    """0.8.1 (fix-sunktwice), battle_simul S: a computer ship sunk in the host's month and in Captain's battle of the
+    same month, the known issue of 0.8.0 (a computer nation at war with the host's and a joined player's nation). The
+    host at war with J too; Captain's battle against J: an injected request of the player's generator (`battles
+    injectgen K J x6`, the computer fighting: client TEST `battles testdecline 0 6`), sent during the host's month.
+    Once Captain's battle screen is open for a battle sent during the host's month, the runner takes J's first ship in
+    it (`ls cships`) and sinks it there with the battle screen's own Sink (TEST `ls sink`: the battle sinks it by the
+    game's rules, its loss, points and fate); if the host's own battle has that ship too it is sunk there the same way
+    (both battles), else the host's month loses, at the battle phase's start, before its save, the first ship of J the
+    held result lost (TEST `battles sinkmonth J result`: the game's SinkShip and AddShipToTotalLosses, as the month's
+    own sinkings lose a ship): that ship or one Captain's battle sank by itself before it; the checks follow the ship
+    the host's month lost. The merge's kept files (simul_twice): the ship as
+    the host's month left it, J's losses counter of its type counted once, Captain's nation's points less the battle's
+    own points of it (Captain's 0.8.1 PC's per-ship points: GetLogAdjustedVP(VP0) - GetLogAdjustedVP(VP0 - its)), the
+    war score credited the same; the host's log lines, the chat's note. Up to three months for such a battle.
+    Returns True when the case was seen."""
+    save = read_save(save_path(HOST_SLOT)) or {}
+    jids = set(ships_by_id(save.get(f'Nation{J}Ships')))
+    nt = nation_table()
+    nK, nJ = nt.get(K, {}).get('name', str(K)), nt.get(J, {}).get('name', str(J))
+    hostwar = rel(0, J).get('war') == '1'
+    if not hostwar:
+        set_war(0, J)
+        log('  S: the host at war with', nJ, cmd(H, 'armstreaty war 1'))
+    seen = False
+    try:
+        for tryno in (1, 2, 3):
+            st = {'cm': log_mark(C), 'hm': log_mark(H)}
+            log('  S:', cmd(C, 'battles testdecline 0 6'), cmd(H, f'battles injectgen {K} {J} x6'),
+                cmd(H, f'battles sinkmonth {J} result'))
+
+            def cap_open():  # (Captain's battle screen against J, a battle sent during the host's month)
+                hl = log_since(H, st['hm'])
+                for mm in re.finditer(rf'\] battle (\d+): fighting nation {K} vs {J} ', log_since(C, st['cm'])):
+                    if re.search(rf'\] battle {mm[1]} sent to {CLIENT_NAME} \(\d+ bytes\), during the host\'s month', hl):
+                        st['bid'] = int(mm[1])
+                        return True
+                return False
+
+            def sink_both():
+                time.sleep(2)
+                ships = cships(C) or []
+                mine = [(sid, nm) for side, sid, sunk, nm in ships if side == 1 and sid in jids and not sunk]
+                if not mine:
+                    return f'no ship of nation {J} in Captain\'s battle: {ships[:6]}'
+                rank = {t: i for i, t in enumerate(SINK_PICK)}
+                types = {sid: f.get('ShipType') for sid, f in ships_by_id(save.get(f'Nation{J}Ships')).items()}
+                mine.sort(key=lambda x: rank.get(types.get(x[0]), 99))
+                x = st['x'] = mine[0][0]
+                hl = log_since(H, st['hm'])
+                host_open = re.search(rf'DoBattle\(opponent {J}\) -> 1, battle screen open', hl) and \
+                    "the host's month: DoStrategicTurn runs" not in hl
+                hs = cships(H) if host_open else None
+                if hs and any(sid == x and not sunk for side, sid, sunk, nm in hs):
+                    st['both'] = cmd(H, f'ls sink {x}')
+                    if st['both'].startswith('ok'):
+                        cmd(H, 'battles sinkmonth off')
+                st['csink'] = cmd(C, f'ls sink {x}')
+                return dict(ship=(x, mine[0][1], types.get(x)), captain=st['csink'], host=st.get('both', 'its month'))
+            m = simul_month(ctx, f'simul S{"abc"[tryno - 1] if tryno > 1 else ""}',
+                            actions=[('a ship of J sunk in Captain\'s battle and in the host\'s month', cap_open,
+                                      sink_both)])
+            bid, x = st.get('bid'), st.get('x')
+            if bid is None or x is None or not str(st.get('csink', '')).startswith('ok'):
+                log(f'  S: no battle screen of Captain against nation {J} sent during the host\'s month with a ship of '
+                    f'it to sink this month ({m["actions"]}): once more' if tryno < 3 else
+                    '  SKIP-note S: no such battle in three months')
+                cmd(H, 'battles sinkmonth off')
+                continue
+            seen = True
+            hlog, clog = m['hlog'], m['clog']
+            f = simul_kept(bid)
+            keep = os.environ.get('RTW3MP_TEST_KEEP_DIR')  # (a copy of the merge's kept files, e.g. for an offline merge)
+            if keep and f is not None:
+                os.makedirs(keep, exist_ok=True)
+                for k, e in (('sent', 'bcs'), ('host', 'bcs'), ('result', 'ini'), ('merged', 'bcs')):
+                    shutil.copy2(os.path.join(SIMUL_KEEP, f'{bid}_{k}.{e}'), os.path.join(keep, f'S_{bid}_{k}.{e}'))
+            tw = simul_twice(f, K, J) if f else None
+            sm = re.search(rf'TEST: sinkmonth: nation {J}\'s ship (\d+) lost in the host\'s month \((.*?)\): (.*)$',
+                           hlog, re.M)
+            both = st.get('both', '').startswith('ok')
+            via = 'both battles' if both else \
+                f'the host\'s month (TEST sinkmonth: {sm[3][:40] if sm else "not seen"})'
+            # the ship lost twice: x, or (sinkmonth) the first ship of J the held result lost, which can be one
+            # Captain's battle sank by itself before x (b2: two destroyers sunk on auto-run, then x with `ls sink`)
+            y = x if both or not sm else sm[1]
+            mine = [t for t in (tw or {}).get('twice', []) if t['id'] == y]
+            pts = re.search(rf"\] battle {bid}: the battle's own points: raw VP (\d+)/(\d+); ships sunk in it \(id:side:"
+                            rf"points\): (.*)$", clog, re.M)
+            check(f'S a) nation {J}\'s ship {y} sunk in Captain\'s battle {bid} (TEST `ls sink {x}`: {st.get("csink")}) '
+                  f'and in the host\'s month ({via}): lost in the result and in the host\'s save the battle was merged '
+                  f'into; the result carried the battle\'s own points of Captain\'s PC (raw VP, the ship\'s points)',
+                  f is not None and len(mine) == 1 and ship_lost(ships_by_id(f['host'].get(f'Nation{J}Ships')).get(y))
+                  and ship_lost(ships_by_id(f['result'].get(f'Nation{J}Ships')).get(y)) and pts is not None and
+                  re.search(rf'(^|,){y}:1:\d+', pts[3]) and not mine[0]['estimated'] and mine[0]['points'] > 0,
+                  dict(kept=f is not None, twice=mine, all=[(t['id'], t['type'], t['points']) for t in
+                                                            (tw or {}).get('twice', [])],
+                       points=pts[0][-160:] if pts else None, sinkmonth=sm[0][-120:] if sm else None))
+            if not f or not mine:
+                continue
+            t = mine[0]
+            check(f'S b) the merge counted it once: the ship as the host\'s month left it (its Fate "{t["host_fate"][:50]}"),'
+                  f' J\'s {t["counter"] or "(no)"} counter +1 once (the host\'s), every losses counter and both VP as '
+                  f'saveio\'s rules give (simul_twice: Captain\'s nation {tw["vp"][K]} = the host\'s + the battle\'s less '
+                  f'{tw["cut"][0]})', not tw['bad'] and t['counter'] and tw['cut'][0] > 0, dict(bad=tw['bad'][:4],
+                                                                                         cut=tw['cut'], twice=mine))
+            tl = [mm for mm in re.finditer(TWICE_RE, hlog, re.M) if int(mm[1]) == bid and mm[5] == y]
+            cl = [mm for mm in re.finditer(TWICE_CUT_RE, hlog, re.M) if int(mm[1]) == bid]
+            check(f'S c) the host\'s log: "battle {bid}: nation {J}\'s ... (ship {y}) was lost in the host\'s month (...) '
+                  f'and in the battle (...): counted once: the host\'s ship kept, {t["counter"]} -1, N raw points of nation '
+                  f'{K}" and "points taken off for them: nation {K} {tw["cut"][0]}, ..."',
+                  tl and f'{t["counter"]} -1' in tl[0][8] and cl and int(cl[0][3]) == tw['cut'][0] and
+                  int(cl[0][2]) == K, dict(lines=[mm[0][-200:] for mm in tl + cl]))
+            d = f['result'].get('deltas') or {}
+            hl_ = hlog.splitlines()
+            at = next((i for i, ln in enumerate(hl_) if f'] battle {bid} applied: ' in ln), None)
+            ws = [mm for ln in (hl_[at:at + 12] if at is not None else [])
+                  for mm in [re.search(r'\] war score (\d+)-(\d+): \+(\d+)/\+(\d+) from a battle fought on a player\'s '
+                                       r'PC', ln)] if mm and {int(mm[1]), int(mm[2])} == {K, J}]
+            want = max(0, int(d.get('dVP_K') or 0) - tw['cut'][0])
+            if ws:
+                a, b_ = int(ws[0][3]), int(ws[0][4])
+                check(f'S d) the war score {K}-{J}: Captain\'s nation credited the battle\'s points less the ship\'s '
+                      f'({want})', (a if K < J else b_) == want, ws[0][0])
+            else:
+                log(f'  SKIP-note S d): no war score line of {K}-{J} after battle {bid} (not a ledger pair this month)')
+            hc = chat(ctx.hp)
+            note = re.search(rf"was fought by {CLIENT_NAME} \(.*?'s \S+ .*?(?: was already (?:sunk in the host's battle|"
+                             rf"lost in the host's month \(.*?\))| were already lost): not counted twice, {tw['cut'][0]} "
+                             rf"VP fewer for [^)]*\)\.", hc)
+            check(f'S e) the chat: "... was fought by {CLIENT_NAME} ({nJ}\'s <type> <name> was already sunk in the host\'s '
+                  f'battle: not counted twice, {tw["cut"][0]} VP fewer for {nK})."', note is not None,
+                  note[0] if note else [ln for ln in hc.splitlines() if 'was fought by' in ln][-3:])
+            res = simul_merges('S', m, [bid])
+            check('S f) every ship of the result merged by the rules (the ship lost in the host\'s month as the host had '
+                  'it)', res and all(not r['bad'] for r in res.values()) and any(r['lost'] for r in res.values()),
+                  {b: (r['lost'], r['bad'][:3]) for b, r in res.items()})
+            break
+    finally:
+        cmd(H, 'battles sinkmonth off')
+        cmd(C, 'battles testdecline 0 0')
+        if not hostwar:
+            set_war(0, J, 5)
+            if not any(rel(0, j).get('war') == '1' for j in range(1, 9)):
+                log('  S: the host at peace again: its war counter 0, as a peace sets it:', cmd(H, 'armstreaty war 0'))
+    return seen
+
+
 def scenario_battle_simul(ctx):
     """0.8.0: simultaneous battles. A third copy joins as "Bot" (nation 2); nations 1 and 2 under the player's rules at
     war with computer nations J1, J2 (`settension` on every copy), the host with J0 in M1 (a battle of its own), each
@@ -7625,6 +7957,9 @@ def scenario_battle_simul(ctx):
             time.sleep(0.2)
         return (mk.get('text') or 'no marker').replace('\r\n', ' | ')
     try:
+        if os.environ.get('RTW3MP_TEST_SIMUL_PART') == 'S':  # (development: the 0.8.1 part S alone after the setup)
+            simul_sunk_twice(ctx, K, picks[K], set_war)
+            return
         # ---- M1: the main case, up to twice for a month with the host's own battle
         ofb = {}  # 0.8.0 integration (officers): the month's TEST kill on the host, the star in Captain's battle
 
@@ -8013,6 +8348,10 @@ def scenario_battle_simul(ctx):
             log('  SKIP-note M6-M8: the host\'s battle was against nation 1 every month: no request went out after its '
                 'battle search')
         ls_peace01(ctx)
+
+        # ---- S (0.8.1, fix-sunktwice): a computer ship sunk in the host's month and in Captain's battle of the same
+        # month: counted once (the host's month keeps it; the battle's loss and points of it are taken out)
+        simul_sunk_twice(ctx, K, picks[K], set_war)
 
         # ---- R: the host's game restarted during a month whose battles were fought during it: M1's marker put back
         # into slot 151 (as the stopped game leaves it there) and a new session of the host (`leave`, `host`): the
@@ -9875,6 +10214,13 @@ def scenario_player_copy(ctx):
         ends = {j: cmd(C, f'settension 0 {j} 5') for j in fx['at_war']}
         log(f'  NOTE f) {me} is at war with {fx["at_war"]} in the copy: peace there before its month (`settension 0 j '
             f'5`, a throwaway copy; a battle would stop the month): {ends}')
+        # (a raw `settension` peace leaves the game's war counter above 0 with no enemy: the copy's CheckForWar then
+        # takes GetRandomEnemy's nil in its "... has entered the war against ... on our side!" path, "Error in
+        # CheckForWar procedure! Access violation ... Read of address 00000004" (the 0.8.1 release candidate's default
+        # run: after ai_war's war 1-3, slot 78 War 3 -> 4 at peace; battle_simul's b5 2026-11-02); DoPeace and the mod's
+        # own peace set it to 0)
+        if not any('war=1' in cmd(C, f'rel 0 {j}').split() for j in range(1, 9)):
+            log(f'  f) the copy at peace again: its war counter 0, as a peace sets it: {cmd(C, "armstreaty war 0")}')
     sp = single_player_month(ctx, 78)
     ctx.months.append(('player_copy (slot 78 alone)', '/'.join(sp['d0'] or ()), '/'.join(sp['d1'] or ()), sp['dt']))
     log(f'  single-player month on slot 78: {sp["d0"]} -> {sp["d1"]} in {sp["dt"]:.0f} s; {len(sp["answered"])} '
@@ -11517,6 +11863,10 @@ def ss_fleet(port, n, limit=600):
 
 OF_START_RE = (r"Officers of the joined players: ok; their month \(the pool, the auto-assignment\): ok; the Turn's "
                r"question: ok; the free promotion: ok")
+# 0.8.1: AdjustCrewQuality's rule for its player's ships without a commander, for the joined nations with their corps
+OF_UNCMD_START_RE = (r"Officers: the game's rule for its player's ships without a commander \(AdjustCrewQuality: 1 in 5 "
+                     r"a month loses one crew quality\) for the joined nations with their own corps: ok")
+OF_UNCMD_MONTH_RE = r"officers: the month's crew quality of the joined nations' ships without a commander"
 
 
 def of_kv(r):
@@ -11663,6 +12013,120 @@ def of_fit_ships(port, slot, K):
     return out
 
 
+def of_crew_ship(n, commanded):
+    """Nation n's first ship on the host that the month's crew training takes, active (`ofship`: status=0 op=1: in play,
+    not under repair), with or without a commander in memory: her `ofship` reply as a dict ({} none)."""
+    for i in range(400):
+        r = ctl.cmd(H, f'ofship {n} {i}')
+        if not r.startswith('ok'):
+            break
+        s = of_kv(r)
+        if s.get('status') == '0' and s.get('op') == '1' and (s.get('id', '-1') != '-1') == commanded:
+            return s
+    return {}
+
+
+def of_crew_runs(n, ship, runs=200, crew=15):
+    """The game's AdjustCrewQuality on the host's nation n's ship `runs` times through the mod's hooks (TEST `ofcrew`),
+    her crew quality set to `crew` before each run: {down, same, up, other, now} of the runs' outcomes ({} none)."""
+    hm = log_mark(H)
+    cmd(H, f'ofcrew {n} {ship} {runs} {crew}')
+    got = wait_until(lambda: log_lines(log_since(H, hm), rf"TEST: officers: AdjustCrewQuality on nation {n}'s ship "
+                                                         rf"{ship}, {runs} time"), lambda v: v, 90)
+    m = re.search(r'-> ok crew=-?\d+ runs=\d+ down=(\d+) same=(\d+) up=(\d+) other=(\d+) now=(-?\d+)', got[0]) if got else None
+    return dict(zip(('down', 'same', 'up', 'other', 'now'), (int(x) for x in m.groups()))) if m else {}
+
+
+def of_neutral(n, slot=HOST_SLOT):
+    """Nation n's government and education leave AdjustCrewQuality's nation rules out at crew quality 15 (not
+    PoorEducation, GovernmentType not 5, not 3 with SurpriseAttack; the slot's [Nation<n>])."""
+    s = (read_save(save_path(slot)) or {}).get(f'Nation{n}', {})
+    g = s.get('GovernmentType')
+    return s.get('PoorEducation') == '0' and g not in (None, '5') and not (g == '3' and s.get('SurpriseAttack') == '1')
+
+
+def of_uncommanded(K):
+    """j) 0.8.1 (scenario_officers): AdjustCrewQuality's rule for its player's ships without a commander (one crew quality
+    less when Random(5) = 1; the game tests aNation = PlayerNation) on the host for nation K, whose player keeps its own
+    corps, as for the host's own ships; not for a commanded ship, the stand-in's nation without a corps or nation K taken
+    as an older mod's player's (TEST `ofuncmd old`); without the rule (TEST `ofuncmd off`: the game's own test, as 0.8.0)
+    nation K's ship never loses any. Each probe runs the game's routine 200 times on an active ship (`ofcrew <n> <ship>
+    200 15`: her crew quality 15 before each run, where the training by status and place, the bounds and the nation rules
+    of these nations change nothing in 1900); then the months' log lines and the ships put back."""
+    start = [x.split('] ', 1)[-1] for x in log_lines(log_since(H), OF_UNCMD_START_RE)]
+    check('j) the host log: "Officers: the game\'s rule for its player\'s ships without a commander (AdjustCrewQuality: 1 '
+          'in 5 a month loses one crew quality) for the joined nations with their own corps: ok (...)"', start, start[:1])
+    months = [x.split('] ', 1)[-1] for x in log_lines(log_since(H), OF_UNCMD_MONTH_RE)]
+    km = [re.search(rf' nation {K}: (\d+) ships, (\d+) lost one;', x) for x in months]
+    km = [(int(m[1]), int(m[2])) for m in km if m]
+    sbad = [x for x in months if re.search(rf' nation {STANDIN}: \d+ ships, \d+ lost one;', x)]
+    check(f'j) the host\'s months gave nation {K}\'s active ships without a commander the rule ("officers: the month\'s '
+          f'crew quality of the joined nations\' ships without a commander (...): nation {K}: N ships, M lost one;"), '
+          f'never the stand-in\'s nation {STANDIN} (no corps: "not applied")', km and all(0 <= b <= a for a, b in km)
+          and not sbad, dict(months=months[-3:], nation=km, standin=sbad[:1]))
+    nat = dict(host=0, free=K, cmd=K, standin=STANDIN)
+    ships = {w: of_crew_ship(n, w == 'cmd') for w, n in nat.items()}
+    neutral = {n: of_neutral(n) for n in (0, K, STANDIN)}
+    log(f'  j) ships: {ships}; nations without the nation rules: {neutral}')
+    if not check(f'j) the probes\' ships: an active ship without a commander of the host\'s nation, of nation {K} and of '
+                 f'the stand-in\'s nation {STANDIN}, a commanded one of nation {K} (`ofship`: status=0 op=1); their nations '
+                 f'without the nation rules at crew quality 15', all(ships.values()) and all(neutral.values()),
+                 dict(ships=ships, neutral=neutral)):
+        return
+    orig = {w: (s['ship'], s['crew']) for w, s in ships.items()}
+    oid = ships['cmd']['id']
+    kept = {}
+    for fld in ('Ability', 'Special1', 'Special2'):  # (her commander's part: only 1 in 7 one more)
+        m = re.search(rf'{fld}=(-?\d+)->', cmd(H, f'ofset {K} {oid} {fld} 0'))
+        kept[fld] = m[1] if m else None
+    R = {}
+    try:
+        cmd(H, 'ofuncmd reset')
+        cmd(H, 'ofuncmd off')
+        R['off_free'] = of_crew_runs(K, orig['free'][0])
+        R['off_host'] = of_crew_runs(0, orig['host'][0])
+        cmd(H, 'ofuncmd on')
+        R['host'] = of_crew_runs(0, orig['host'][0])
+        R['free'] = of_crew_runs(K, orig['free'][0])
+        R['cmd'] = of_crew_runs(K, orig['cmd'][0])
+        R['standin'] = of_crew_runs(STANDIN, orig['standin'][0])
+        cmd(H, f'ofuncmd old {K} 1')
+        R['old'] = of_crew_runs(K, orig['free'][0])
+    finally:
+        cmd(H, f'ofuncmd old {K} 0')
+        cmd(H, 'ofuncmd on')
+        for fld, v in kept.items():
+            if v is not None:
+                cmd(H, f'ofset {K} {oid} {fld} {v}')
+        for w, (i, c) in orig.items():
+            cmd(H, f'ofcrew {nat[w]} {i} 0 {c}')
+    info = of_kv(cmd(H, 'ofuncmd'))
+    log(f'  j) outcomes of 200 runs at crew quality 15 (down = one less): {R}; {info}')
+    lost = lambda r: r and r['up'] == r['other'] == 0 and 15 <= r['down'] <= 70  # (1 in 5: 40 of 200)
+    none = lambda r: r and r['same'] == 200
+    check(f'j) before (TEST `ofuncmd off`: the game\'s own test, as 0.8.0): nation {K}\'s active ship without a commander '
+          f'keeps her crew quality in all 200 runs, the host\'s in the same state loses one in about 1 of 5 (15..70)',
+          none(R.get('off_free')) and lost(R.get('off_host')), dict(nation=R.get('off_free'), host=R.get('off_host')))
+    check(f'j) the rule: nation {K}\'s active ship without a commander loses one crew quality as the host\'s does (each '
+          f'15..70 of 200, never more, never a gain; `ofuncmd` n{K}=200/<down>/.. rolled with the game\'s Random, the host\'s '
+          f'200 sent on to the game\'s own roll)', lost(R.get('free')) and lost(R.get('host')) and
+          info.get(f'n{K}', '').startswith(f'200/{R["free"]["down"]}/') and info.get('own') == '200',
+          dict(nation=R.get('free'), host=R.get('host'), info=info))
+    check(f'j) nation {K}\'s commanded ship (her commander made Ability 0 without specials for the probe) never loses one '
+          f'(her commander\'s part: one more 1 in 7)', R.get('cmd') and R['cmd']['down'] == R['cmd']['other'] == 0 and
+          5 <= R['cmd']['up'] <= 70, R.get('cmd'))
+    check(f'j) not applied: the stand-in\'s nation {STANDIN} (reserved, no corps of its own) and nation {K} taken as an '
+          f'older mod\'s player\'s (TEST `ofuncmd old {K} 1`: hello without `off`, no officers at all) keep their crew '
+          f'quality in all 200 runs (`ofuncmd` n{STANDIN}=0/0/200, n{K}: 200 not applied)',
+          none(R.get('standin')) and none(R.get('old')) and info.get(f'n{STANDIN}') == '0/0/200' and
+          info.get(f'n{K}', '').endswith('/200'), dict(standin=R.get('standin'), old=R.get('old'), info=info))
+    back = wait_until(lambda: {w: of_kv(ctl.cmd(H, f'ofship {nat[w]} {i}')).get('crew') for w, (i, c) in orig.items()},
+                      lambda v: all(v[w] == orig[w][1] for w in orig), 10)
+    check('j) the probes\' ships have their crew quality back and the commander his ability and specials',
+          all(back[w] == orig[w][1] for w in orig) and all(v is not None for v in kept.values()),
+          dict(back=back, before={w: c for w, (i, c) in orig.items()}, kept=kept))
+
+
 def scenario_officers(ctx):
     """0.8.0: each joined player's nation has its own officer corps, as the game's player has in single player. a) both
     copies resolved the officers' parts and the client announced them (hello `off`); b) the first month formed the
@@ -11676,7 +12140,8 @@ def scenario_officers(ctx):
     (its dialog answered) reaches the host as the month's event; f) six save/reload cycles on the host and three on the
     client keep the counts, ids unique; the player's Copy game holds its corps only; g) a commander killed in the host's
     month (TEST `ofkill ... arm`) is dead or captured in the record and on the player's PC; h) a rejoin gets the record
-    back, no second officer routine; i) a third month: counts and ids. The monthly officer routine runs (`ofquiet 0`)."""
+    back, no second officer routine; i) a third month: counts and ids; j) 0.8.1: the nation's ships without a commander
+    lose crew quality as the host's (of_uncommanded). The monthly officer routine runs (`ofquiet 0`)."""
     K = 1
     # a) startup
     ls = {who: [x.split('] ', 1)[-1] for x in log_lines(log_since(p), r"Officers of the joined players: ")][:1]
@@ -11686,6 +12151,16 @@ def scenario_officers(ctx):
     hello = [x.split('] ', 1)[-1] for x in log_lines(log_since(H), r'Captain: mod .*, officers \d')]
     check('a) the client announced its own officers (hello `off`): the host log "Captain: mod ..., officers 1"',
           hello and hello[-1].endswith('officers 1'), hello[-1:])
+    # 0.8.1: live battles with both sides' commanders (officers.cpp: the battle save's lookup and the aftermath's guard)
+    lso = {who: [x.split('] ', 1)[-1] for x in log_lines(log_since(p), r"Officers of the joined players: ")][:1]
+           for who, p in (('host', H), ('client', C))}
+    lsh = [x.split('] ', 1)[-1] for x in log_lines(log_since(H), r"Captain: both sides' commanders in live battles \d")]
+    check('a) 0.8.1: both copies can carry both sides\' commanders in live battles ("... live battles with both sides\' '
+          'commanders: ok (the battle save\'s lookup rva ...); the battle aftermath\'s guard: ok"), the client announced '
+          'it (hello `lsof`: the host log "Captain: both sides\' commanders in live battles 1 (this host: 1)")',
+          all(v and "live battles with both sides' commanders: ok" in v[0] and "the battle aftermath's guard: ok" in v[0]
+              for v in lso.values()) and lsh and lsh[-1].endswith('in live battles 1 (this host: 1)'),
+          dict(lines={k: (v[0][-160:] if v else None) for k, v in lso.items()}, hello=lsh[-1:]))
     if not check('a) the joined player\'s officers are active on its PC (`ofstate` active=1, month=1)',
                  of_kv(cmd(C, 'ofstate')).get('active') == '1', cmd(C, 'ofstate')):
         return
@@ -11946,6 +12421,8 @@ def scenario_officers(ctx):
                                       r'into the record)'), bl[:2])
     else:
         log('  NOTE: no battle of the nation was fought in this run (the `battles` scenario checks them)')
+    # j) 0.8.1: the crew quality of the nation's ships without a commander, as the game's player's
+    of_uncommanded(K)
     log(f'  quiet again for the other scenarios: {cmd(C, "ofquiet 1")}')
 
 
@@ -14195,6 +14672,227 @@ def ls_end_refused_check(tag, A=H, B=C):
                  f'{ls_lines(A, ma, "can.t end yet")[:1]} | A st={a.get("st")} end={a.get("end")}, B st={b.get("st")}')
 
 
+# ---------------------------------------------------------------- both sides' commanders in live battles (0.8.1)
+# A live battle resumes A's snapshot on both PCs; up to 0.8.0 the battle save's commander lookup searched the first
+# player's nation alone, so the second player's ships fought without their commanders. Since 0.8.1, between PCs (and, for
+# a battle between two players, a host) that announce `lsof`, A's start carries the other nations' officer lists (`of2`),
+# both PCs load them before that lookup and every ship's commander is in the state hash (`cmd=`); engine level 18 stays.
+
+LSCMD_ON_RE = r"lockstep: both sides' commanders: on, the officer lists of nations (\S+) sent"
+LSCMD_LOAD_RE = (r"lockstep: both sides' commanders: the officer lists of nations (\S+) loaded \(nation:officers/ships "
+                 r"commanded: (\S+)\); the battle save's lookup found (\d+) commanders in them")
+LSCMD_TOOK_RE = r"lockstep: both sides' commanders: \S+'s PC (loaded|did NOT load) the officer lists"
+
+
+def lscmd(port, *args):
+    """`ls commanders [cship <campaign ship id>]`: side0/side1 (commanded/ships), ids0/ids1, own0/own1 (<owner
+    nation>x<n>), of2, ofn, loaded, found, peer, refused, viewer, first1 (<index>:<officer id>:<campaign ship id>: side
+    1's first ship afloat commanded by another nation's officer), ship (<campaign ship id>:<side>:<sunk>:<officer id>,
+    sunk ships too)."""
+    return kvs(scmd(port, ' '.join(('ls', 'commanders') + tuple(str(a) for a in args)), 30))
+
+
+def lscmd_announced(*names):
+    """Both sides' commanders expected in these players' live battles: the host's hello line of each says that the
+    player's PC and the host carry them (`<name>: both sides' commanders in live battles 1 (this host: 1)`)."""
+    hl = log_since(H, 0)
+    return all(log_lines(hl, rf"\] {re.escape(n)}: both sides' commanders in live battles 1 \(this host: 1\)")[-1:]
+               for n in names)
+
+
+def of_record_rows(K, port_slot=HOST_SLOT):
+    """The host's record of nation K's officers (rtw3mp_nations.ini [Nation<K>Officers]): {id: fields}."""
+    d = read_save(os.path.join(slot_dir(port_slot), 'rtw3mp_nations.ini')) or {}
+    sec = d.get(f'Nation{K}Officers') or {}
+    rows = {}
+    for k, v in sec.items():
+        m = re.match(r'^Officer(\d+)([A-Za-z0-9]+)$', k)
+        if m:
+            rows.setdefault(int(m[1]), {})[m[2]] = v
+    return {r.get('Id'): r for r in rows.values() if r.get('Id')}
+
+
+def lscmd_in_battle(A, nation):
+    """0.8.1: nation's ships with a commander in the host's campaign (slot 1's [Nation<n>Ships] CommanderId) and those of
+    them in A's battle (`ls commanders cship <id>`: <id>:<side>:<sunk>:<officer id>, or <id>:-:-:- when not in it):
+    (the commanded ships' ids, {id: `ship` of the reply} of those in the battle)."""
+    ships = ships_by_id((read_save(save_path(HOST_SLOT)) or {}).get(f'Nation{nation}Ships'))
+    ids = [i for i, f in ships.items() if (f.get('CommanderId') or '-1').isdigit() and int(f['CommanderId']) > 0]
+    inb = {}
+    for i in ids:
+        s = lscmd(A, 'cship', i).get('ship', '')
+        if s.split(':')[1:2] not in ([], ['-'], ['']):
+            inb[i] = s
+    return ids, inb
+
+
+def lscmd_c1(start):
+    """Side 1's commanded ships at the start (A's reply of lscmd_start), or None."""
+    if not start:
+        return None
+    try:
+        return int((start[0].get('side1') or '0/0').split('/')[0])
+    except (ValueError, AttributeError, IndexError):
+        return None
+
+
+def lscmd_start(tag, A, B, nation, want, ma=0, mb=0):
+    """At a live battle's load (both copies at the loaded boundary): `ls commanders` the same on both copies (the
+    commanders of each side, the lists loaded, the commanders found); with `want` (both PCs announce `lsof`) of2=1 on
+    both and, when `nation` commands ships in A's campaign, side 1 commanded by its officers (a SKIP-note instead when
+    none of its commanded ships is in the battle: e.g. a battle of destroyers, which never have a commander); without it
+    0.8.0's: of2=0, side 1 without commanders. ma/mb: log marks before the battle's start. Returns (A's reply, B's
+    reply)."""
+    a, b = lscmd(A), lscmd(B)
+    keys = ('side0', 'side1', 'ids0', 'ids1', 'own0', 'own1', 'of2', 'ofn', 'loaded', 'found')
+    same = bool(a) and all(a.get(k) == b.get(k) for k in keys)
+    c1 = int((a.get('side1') or '0/0').split('/')[0])
+    corps = of_nations(scmd(A, 'officers')).get(nation, (0, 0, 0, 0, 0, 0))
+    log(f'  {tag}: commanders: A {dict((k, a.get(k)) for k in keys + ("first1",))}; B '
+        f'{dict((k, b.get(k)) for k in keys)}; nation {nation} on A: {corps}')
+    if want:
+        on = ls_lines(A, ma, LSCMD_ON_RE)[-1:] + ls_lines(B, mb, LSCMD_LOAD_RE)[-1:]
+        ids, inb = None, None
+        if c1 == 0 and corps[3] > 0:  # (are any of the nation's commanded ships in this battle at all?)
+            ids, inb = lscmd_in_battle(A, nation)
+            log(f'  {tag}: side 1 without commanders: nation {nation}\'s ships with a commander in the host\'s campaign '
+                f'{len(ids)}, of them in this battle {len(inb)} {inb}')
+            if ids and not inb:
+                log(f'  SKIP-note {tag}: side 1 holds none of nation {nation}\'s {len(ids)} commanded ships (its ships in '
+                    f'this battle are of types without a commander): its commanders are not in this battle')
+        check(f'{tag}: both sides\' commanders (0.8.1, `lsof` on both PCs): `ls commanders` equal on both copies (the '
+              f'commanders of each side, the officer lists loaded, the commanders found), of2=1; side 1 commanded by '
+              f'nation {nation}\'s officers (own1 {nation}xN) when the nation commands ships ({corps[3]} in A\'s campaign) '
+              f'and any of them is in the battle; A "both sides\' commanders: on, the officer lists of nations ... sent", '
+              f'B "... loaded ...; the battle save\'s lookup found N commanders"', same and a.get('of2') == '1' and
+              len(on) == 2 and (corps[3] == 0 or (c1 > 0 and f'{nation}x' in a.get('own1', '')) or
+                                (bool(ids) and not inb)),
+              dict(side1=a.get('side1'), own1=a.get('own1'), of2=(a.get('of2'), b.get('of2')),
+                   loaded=(a.get('loaded'), b.get('loaded')), found=(a.get('found'), b.get('found')), lines=on,
+                   commanded_in_battle=None if inb is None else (len(ids), len(inb))))
+    else:
+        check(f'{tag}: a PC without both sides\' commanders (an older mod): 0.8.0\'s battle on both copies (of2=0, side 1 '
+              f'without commanders, `ls commanders` equal)', same and a.get('of2') == '0' and c1 == 0,
+              dict(side1=a.get('side1'), of2=(a.get('of2'), b.get('of2'))))
+    return a, b
+
+
+def lscmd_sink(tag, A, B, nation, n=2):
+    """TEST `ls testsink` (deferred actions of B, the second player: the game's debug Sink on both copies at the next
+    release) on side 1's first n ships commanded by another nation's officers (`nation`'s). Returns a list of
+    dict(idx, oid, cship, before, ships1: side 1's ships in the battle's list then)."""
+    a = lscmd(A)
+    ships1 = int((a.get('side1') or '0/0').split('/')[1])
+    out = []
+    for c in (a.get('cand1') or '-').split(','):
+        try:
+            idx, oid, cship = (int(x) for x in c.split(':'))
+        except ValueError:
+            continue
+        before = of_get(A, nation, oid)
+        r = scmd(B, f'ls testsink {idx}')
+        out.append(dict(idx=idx, oid=oid, cship=cship, before=before, r=r, ships1=ships1))
+        if len(out) >= n:
+            break
+    log(f'  {tag}: TEST sinking of side 1\'s ships (nation {nation}; side 1 has {ships1} ships): '
+        + ('; '.join(f'{s["idx"]} (campaign ship {s["cship"]}, officer {s["oid"]} {s["before"]}): {s["r"]}' for s in out)
+           or f'none to sink ({a.get("cand1")})'))
+    return out
+
+
+def lscmd_sunk(tag, A, B, sinks, ma, mb):
+    """The ships of lscmd_sink sank on both copies: the deferred actions carried out on both ("TEST: deferred sinking of
+    ... carried out"), the ships gone from the battle's lists on both (a sunk ship leaves the ship list and its
+    division: `ls commanders cship <id>` -> `<id>:-:-:-`, or listed sunk), side 1's ship count down by at least as many
+    on both."""
+    if not sinks:
+        return None
+    got = []
+    for s in sinks:
+        sa, sb = lscmd(A, 'cship', s['cship']).get('ship', ''), lscmd(B, 'cship', s['cship']).get('ship', '')
+        got.append((s['cship'], sa, sb))
+    na, nb = (int((lscmd(p).get('side1') or '0/0').split('/')[1]) for p in (A, B))
+    la = ls_lines(A, ma, r'lockstep: TEST: deferred sinking of .* carried out')
+    lb = ls_lines(B, mb, r'lockstep: TEST: deferred sinking of .* carried out')
+    gone = all(sa == sb and (sa.endswith(':-:-:-') or sa.split(':')[2:3] == ['1']) for _, sa, sb in got)
+    return check(f'{tag}: side 1\'s ships {[s["cship"] for s in sinks]} (commanded by officers '
+                 f'{[s["oid"] for s in sinks]}) sank on both copies by the TEST sinking (carried out on both at the same '
+                 f'release; gone from the battle\'s lists on both, `ls commanders cship <id>`; side 1\'s ships '
+                 f'{sinks[0]["ships1"]} -> {na}/{nb})', len(la) == len(lb) == len(sinks) and gone and na == nb and
+                 na <= sinks[0]['ships1'] - len(sinks), dict(ships=got, side1=(sinks[0]['ships1'], na, nb),
+                                                             lines=(len(la), len(lb))))
+
+
+FATES = []  # 0.8.1: (scenario, officer, fate) of every sunk ship's commander of the second side (the report's counts)
+
+
+def lscmd_fate(tag, sinks, afters, where):
+    """The sunk ships' commanders after the battle (`afters`: {officer id: his fields} in `where`): each one's fate is
+    the game's for a sunk ship's commander: dead (Status 1, Fate "... Went down with ..."), captured (3, " POW after
+    sinking of ..."), or rescued (0: the game's 10 %, his specials, or picked up by another ship during the battle);
+    his battle stars not fewer."""
+    if not sinks:
+        return None
+    res = []
+    for s in sinks:
+        after = afters.get(str(s['oid'])) or {}
+        st = after.get('Status', after.get('status'))
+        stars0 = int(s['before'].get('stars', '0') or 0)
+        stars1 = int(after.get('BattleStars', after.get('stars', '-1')) or -1)
+        fate = {'1': 'killed', '3': 'captured', '0': 'rescued'}.get(st, f'? ({st})')
+        FATES.append((_scenario[0], s['oid'], fate))
+        res.append(dict(oid=s['oid'], fate=fate, stars=(stars0, stars1), Fate=after.get('Fate'),
+                        ok=st in ('0', '1', '3') and stars1 >= stars0))
+    return check(f'{tag}: the sunk ships\' commanders (the second side\'s) have the game\'s fates in {where}: '
+                 f'{[(r["oid"], r["fate"]) for r in res]} (killed, captured, or rescued by the game\'s chance); battle '
+                 f'stars not fewer', all(r['ok'] for r in res), res)
+
+
+def lscmd_stars(tag, before, after, nation, commanded=None):
+    """The second side's battle stars reached its record (`before`/`after`: of_record_rows). commanded: side 1's
+    commanded ships at the battle's start (lscmd_c1); 0: none of the side's commanders fought, no star to win (a
+    SKIP-note)."""
+    s0 = sum(int(r.get('BattleStars', 0) or 0) for r in before.values())
+    s1 = sum(int(r.get('BattleStars', 0) or 0) for r in after.values())
+    dead = [i for i, r in after.items() if r.get('Status') in ('1', '3') and before.get(i, {}).get('Status') == '0']
+    if commanded == 0:
+        log(f'  SKIP-note {tag}: no commander of the second side (nation {nation}) in the battle: no battle star to win '
+            f'(the record\'s stars {s0} -> {s1}; dead or captured since: {dead})')
+        return None
+    return check(f'{tag}: the second side\'s commanders\' battle stars reached nation {nation}\'s record (the host\'s '
+                 f'rtw3mp_nations.ini: {s0} -> {s1}); dead or captured since: {dead}', s1 > s0,
+                 dict(stars=(s0, s1), officers=(len(before), len(after)), dead=dead))
+
+
+class LsCmdProbe:
+    """0.8.1: both sides' commanders in a month's live battle (ls_month's live_hook; chains another hook). 'load': the
+    start check (lscmd_start) and the TEST sinking of side 1's first commanded ship; 'minutes': the sinking seen on
+    both copies. The record's checks follow the month (lscmd_fate, lscmd_stars). nation None: side 1's nation is B's
+    (the client's 1, the third copy's STANDIN)."""
+
+    def __init__(self, tag, nation, names, chain=None, a_ports=None):
+        self.tag, self.nation, self.names, self.chain, self.a_ports = tag, nation, names, chain, a_ports
+        self.want, self.sink, self.start, self.sunk, self.marks = None, None, None, None, None
+
+    def hook(self, what, rec, A, B, r):
+        if self.chain:
+            self.chain(what, rec, A, B, r)
+        if self.a_ports and A not in self.a_ports:
+            return
+        if what == 'load' and self.start is None:
+            if self.nation is None:
+                self.nation = 1 if B == C else STANDIN
+            self.want = lscmd_announced(*self.names)
+            self.marks = (log_mark(A), log_mark(B))
+            self.start = lscmd_start(f'{self.tag} start', A, B, self.nation, self.want, rec['marks'][A],
+                                     rec['marks'][B])
+            if self.want:
+                self.sink = lscmd_sink(f'{self.tag} sink', A, B, self.nation)
+        elif what == 'minutes' and self.sink and self.sunk is None:
+            ls_run_total(A, B, 3, A)  # (the sinking: within two minutes of the release that carried it)
+            self.sunk = lscmd_sunk(f'{self.tag} sink', A, B, self.sink, *self.marks)
+
+
 def scenario_lockstep(ctx):
     """Live player-vs-player battles (lockstep), the host against the joined player, two copies (short; from the research
     driver ls_live.py). a) both copies offer live battles, the host lists Captain(1,b,ls); the client changes its plans
@@ -14228,12 +14926,18 @@ def scenario_lockstep(ctx):
     def battle():
         s = ls_start_test(ctx, 'lockstep')
         ls_start_checks('b)', s)
+        # 0.8.1: both sides' commanders at the start, identical on both copies; a ship of side 1 sunk (TEST)
+        want = lscmd_announced(CLIENT_NAME)
+        lscmd_start('b) commanders', H, C, 1, want, s['hm'], s['cm'])
+        sm = (log_mark(H), log_mark(C))
+        sink = lscmd_sink('b) commanders', H, C, 1) if want else None
         scmd(H, 'ls speed 3')
         ra, rb = ls_run_total(H, C, 3, H), ls_run_total(H, C, 2, C)
         hc = ls_compare(H, s['hm'], C, s['cm'], 'runs')
         check(f'c) runs asked by the host ({ra} minutes) and by the client ({rb}) at speed 3: every minute\'s state hash '
               f'is equal on both copies (>= 5 minutes), no DESYNC', hc['minutes'] >= 5 and not hc['differ']
               and not ls_lines(H, s['hm'], 'DESYNC'), hc)
+        lscmd_sunk('c) commanders', H, C, sink, *sm)
         ls_orders_check('d)')
         ls_detach_check('d) detach')
         ls_guard_check('d) guard')
@@ -14250,6 +14954,9 @@ def scenario_lockstep(ctx):
               'DoStrategicTurn skipped", the date unchanged); battle slot mode off afterwards',
               closed and hn.get('slotMode') == '0' and hst.get('date') == date0
               and 'battle slot: DoStrategicTurn skipped' in hl, f'{hn} date {date0} -> {hst.get("date")}')
+        if sink:  # (a test battle outside a month: its results stay in the host's memory; the next turn's list replaces it)
+            lscmd_fate('h) commanders', sink, {str(s['oid']): of_get(H, 1, s['oid']) for s in sink},
+                       'the host\'s memory after the battle')
 
     ls_case(ctx, 'lockstep: a live test battle', battle)
     ls_quiet(ctx)
@@ -15226,7 +15933,11 @@ def scenario_lockstep_pvp(ctx):
                 cmd(H, f'settension 1 {J} 50')
             ibid, _ = inject(1, J, area)
         ws0, wm = warvp(1, STANDIN), log_mark(H)  # f) the war score of 1-2 before the month
-        rec = ls_month(ctx, f'lockstep_pvp M{attempt}', modes=[mode], k2=True, live_hook=pvpd['hook'])
+        # 0.8.1: both sides' commanders (side 1's nation is the defender's: B's)
+        probe = LsCmdProbe(f'b) M{attempt} commanders', None, (CLIENT_NAME, K2_NAME), chain=pvpd['hook'],
+                           a_ports=(C, K2))
+        ofs0 = {n: of_record_rows(n) for n in (1, STANDIN)}
+        rec = ls_month(ctx, f'lockstep_pvp M{attempt}', modes=[mode], k2=True, live_hook=probe.hook)
         hlog = log_since(H, hm)
         lives = [b for b in rec['live'] if b['A'] in (C, K2)]
         applied = {int(x) for x in re.findall(r'battle (\d+) applied: ', hlog)}
@@ -15236,6 +15947,8 @@ def scenario_lockstep_pvp(ctx):
             ws = dict(before=ws0, after=warvp(1, STANDIN), war=rel(1, STANDIN).get('war'))
             ws['log'] = log_since(H, wm)  # the month, and a restart of the score by the read after it
             done = (rec, lives, hm, pbid, ibid, ws)
+            if probe.want and probe.start:
+                pvp_lscmd_checks(probe, ofs0, hlog)
             break
     check(f'b) a live battle between nations 1 and 2 fought within 3 months (`battles injectpvp 1 2 {PVP_AREA}`; '
           f'attempts: month, inject, live battles, merged ids, resolved by the game)', done, attempts)
@@ -15252,6 +15965,28 @@ def scenario_lockstep_pvp(ctx):
           and r2 and r2['player'] == K2_NAME, f'{rel(1, 2)} {hs.get("players")} {r2}')
     ls_after_checks(ctx, 'd)')
     ls_log_scan('e)', marks0)
+
+
+def pvp_lscmd_checks(probe, ofs0, hlog):
+    """0.8.1: a month whose live battle between two players had both sides' commanders: the package carried the second
+    player's nation's officers to the first player's PC and its result brought them back into the nation's record (only
+    what a battle changes), with the sunk ship's commander's fate and the side's battle stars."""
+    n = probe.nation
+    ofs1 = of_record_rows(n)
+    sent = log_lines(hlog, rf"battle \d+: both sides' commanders: nation {n}'s \d+ officers go with it")
+    merged = log_lines(hlog, rf"officers of nation {n}: \d+ after the live battle \(the other player's PC\) merged into "
+                             rf"the record")
+    # the same officers went and came back (the battle slot adds and drops none of another nation's)
+    ms = {int(re.search(r"nation \d+'s (\d+) officers", x)[1]) for x in sent}
+    mb = {int(re.search(r'nation \d+: (\d+) after', x)[1]) for x in merged}
+    check(f'{probe.tag}: the package carried nation {n}\'s officers to the first player\'s PC ("battle N: both sides\' '
+          f'commanders: nation {n}\'s M officers go with it"), its result brought the same M back into the record '
+          f'("officers of nation {n}: M after the live battle (the other player\'s PC) merged into the record ...")',
+          sent and merged and len(ms) == 1 and ms == mb,
+          dict(sent=[x.split('] ', 1)[-1] for x in sent[:2]], merged=[x.split('] ', 1)[-1] for x in merged[:1]]))
+    lscmd_stars(probe.tag, ofs0.get(n, {}), ofs1, n, lscmd_c1(probe.start))
+    if probe.sink:
+        lscmd_fate(probe.tag, probe.sink, ofs1, f'nation {n}\'s record after the month')
 
 
 def pvp_checks(ctx, stress, rec, lives, hm, pbid, ibid, ws):
@@ -15768,7 +16503,9 @@ def scenario_lockstep_month(ctx):
         cmd(C, f'nfield 1 ResearchPct {plan}')
         before = dict(vp=vpinfo(H) and vpinfo(H)['raw'])
         d_before = gen_date(HOST_SLOT)
-        rec = ls_month(ctx, f'lockstep_month M{attempt}', modes=[modes[k]])
+        probe = LsCmdProbe(f'battle {len(fought) + 1} ({modes[k]}) commanders', 1, (CLIENT_NAME,))  # 0.8.1
+        ofs0 = of_record_rows(1)
+        rec = ls_month(ctx, f'lockstep_month M{attempt}', modes=[modes[k]], live_hook=probe.hook)
         kind = ls_host_battle(rec)
         hb = [b for b in rec['live'] if b['A'] == H]
         hl = log_since(H, rec['hmark'])
@@ -15781,6 +16518,16 @@ def scenario_lockstep_month(ctx):
             tag = f'battle {len(fought) + 1} ({modes[k]})'
             n0 = len(results)
             host_battle_checks(ctx, tag, rec, hb[0], plan, before)
+            if probe.want and probe.start:  # 0.8.1: the second side's officers after the month (the host's record)
+                ofs1 = of_record_rows(1)
+                lscmd_stars(f'{tag} commanders', ofs0, ofs1, 1, lscmd_c1(probe.start))
+                if probe.sink:
+                    lscmd_fate(f'{tag} commanders', probe.sink, ofs1, 'nation 1\'s record after the month')
+                    cg = {str(s['oid']): of_get(C, 1, s['oid']) for s in probe.sink}
+                    rr = {i: (ofs1.get(i, {}).get('Status'), ofs1.get(i, {}).get('BattleStars')) for i in cg}
+                    check(f'{tag} commanders: the client\'s new month has them as the record does (status, stars: '
+                          f'{rr})', all((g.get('status'), g.get('stars')) == rr[i] for i, g in cg.items()),
+                          dict(client={i: (g.get('status'), g.get('stars')) for i, g in cg.items()}, record=rr))
             d_after = gen_date(HOST_SLOT)
             rl = [x.split('] ', 1)[-1] for x in log_lines(hl, r'lockstep: campaign date (recorded: |\S+ kept from)')]
             dl = log_lines(hl, r'lockstep: the month runs: (the recorded campaign date is dropped|campaign date \S+ put '
@@ -16630,6 +17377,8 @@ def twopc_test_battle(ctx, st):
         s = ls_start_test(ctx, 'twopc')
         st['battles'] += 1
         twopc_load_checks(ctx, st, 'b) test battle, the start', s['hm'], s['cm'], s['ready'])
+        # 0.8.1: both sides' commanders, identical on both PCs also under two-PC conditions
+        lscmd_start('b) test battle, the start: commanders', H, C, 1, lscmd_announced(CLIENT_NAME), s['hm'], s['cm'])
         ls_all_ai(H, C)
         scmd(H, 'ls speed 3')
         n = 10 if full else 6
@@ -16667,6 +17416,8 @@ def twopc_live_hook(ctx, st, hk, what, rec, A, B, r):
             hk['load'] = True
             st['battles'] += 1
             twopc_load_checks(ctx, st, f'{hk["tag"]}, the start', rec['marks'][A], rec['marks'][B], r.get('ready'))
+            lscmd_start(f'{hk["tag"]}, the start: commanders', A, B, 1, lscmd_announced(CLIENT_NAME), rec['marks'][A],
+                        rec['marks'][B])  # 0.8.1
         elif what == 'minutes':
             hk['minutes'] = True
             full = st['variant'] == 'full'
@@ -23167,7 +23918,8 @@ SCENARIOS = [  # name, months processed, what it guards, function
                     'the pool) and the Turn\'s commander question (No goes back, Yes assigns) kept by the host (its '
                     'record, its memory and save) and back each month; the host\'s guards (crew training messages to '
                     'the player, GoodAdmin maintenance); a forced officer event; six host and three client save/reload '
-                    'cycles; the player\'s Copy game; a commander killed in the host\'s month; a rejoin; ids distinct',
+                    'cycles; the player\'s Copy game; a commander killed in the host\'s month; a rejoin; ids distinct; '
+                    '0.8.1: its ships without a commander lose crew quality as the host\'s (not a nation without a corps)',
      scenario_officers),
     ('ship_status', 4, '0.7.1: a joined player\'s ship statuses (Trade protection, Raider, Reserve, Mothballed, Foreign '
                        'station) set through the game\'s own popup menu stay over the host\'s months, also in a war '
@@ -23946,6 +24698,12 @@ def summary(names, open_s, ctx, saves_ok, left, ev_left=(), copies_left=(), batt
         print('  live battle cases (checks passed/checks, seconds, note):')
         for case, n_ok, n, secs, note in LS_MATRIX:
             print(f'    {case:<52} {n_ok:>2}/{n:<2} {"PASS" if n_ok == n else "FAIL"} {secs:>5} s  {note[:90]}')
+    if FATES:  # 0.8.1: the second side's sunk ships' commanders
+        cnt = {}
+        for _, _, fate in FATES:
+            cnt[fate] = cnt.get(fate, 0) + 1
+        print(f'  the second side\'s sunk ships\' commanders (TEST sinkings): {cnt} '
+              f'{[(sc, oid, f) for sc, oid, f in FATES]}')
     if KEPT_LOGS:
         print('  logs of copies started again:', ', '.join(os.path.basename(p) for p in KEPT_LOGS))
     for ev in LOADING_STUCK:
