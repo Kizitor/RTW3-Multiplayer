@@ -8,7 +8,8 @@ in order, then both copies are closed and the save slots restored.
 Requires Steam running, the mod installed in the game folder (env RTW3_DIR, see rtw3ctl.py) and a campaign in
 save slot 1 that is past its setup steps (the host plays nation 0). Refuses to start while RTW3.exe runs.
 `lockstep_air` also uses the 1935 test campaign in save slot 9 (skipped without it; the slot is backed up and restored
-like slot 1); `air_units` copies it into the throwaway slot 49 (which must not exist before the run; deleted after it).
+like slot 1); `air_units` copies it into the throwaway slot 49 and `aircraft` (0.9.0) into slot 45 (which must not exist
+before the run; deleted after it).
 Host bridge 47701, client bridge 47702 (client save slot 77); nation 2 is reserved for a stand-in player "Bot".
 The client runs with RTW3MP_EVENT_CHANCE=0 (no random events unless a test asks for one); the client's event
 cooldown files (events_*.ini in the RTW3MP data folder) are deleted before and after the run.
@@ -624,6 +625,10 @@ def answer_dialogs(pid, who):
     for top in top_windows(pid):  # other forms with a "Not now" button (e.g. a design ready for construction)
         k = e2e_test.class_name(top)
         if k == 'TMessageForm' or k.startswith('Tdlg') or k in ('TfrmBuildCamp', 'RTW3MP_Window'):
+            continue
+        if k == 'TfrmAircraftTypes' and AC_PICK['on'] and u.IsWindowVisible(top) and \
+                e2e_test.window_text(top) == AC_PROTO_CAPTION:  # (aircraft d: the month's prototype choice)
+            ac_answer_prototype(pid, who, top)
             continue
         # the aircraft types screen as the month's question (1935, after a private venture aircraft was bought: "Do you
         # want to continue development of the aircraft type at the top of the list for 640?", Save to file/No/OK): No
@@ -1645,16 +1650,32 @@ def force_event(ctx, idx, probe=False, timeout=25):
 
 def planned_months(names):
     """Months the selected scenarios process (doctrine, research and events process their own if no later scenario
-    does). `air_units`' months are another campaign's (OWN_CAMPAIGN): no other scenario shares them."""
+    does; research also when the next one changes nation 1's research first, RESEARCH_NOT_SHARED). `air_units`' and
+    `aircraft`'s months are another campaign's (OWN_CAMPAIGN): no other scenario shares them."""
     n = sum(s[1] for s in SCENARIOS if s[0] in names and s[0] not in OWN_CAMPAIGN)
     if 'doctrine' in names and 'design_study' not in names:
         n += 2
-    order = [s[0] for s in SCENARIOS]
-    if 'research' in names and planned_months([x for x in names if order.index(x) > order.index('research')]) == 0:
+    if 'research' in names and research_own_month(names):
         n += 1
     if 'events' in names and n == 0:
         n += 2
     return n
+
+
+# 0.9.0 integration: scenarios whose first month carries a turn with another research % for nation 1 than the one
+# `research` sets up (unsubmit: its re-submitted orders), so research's checks after the next month need a month of its
+# own before them
+RESEARCH_NOT_SHARED = ('unsubmit',)
+
+
+def research_own_month(names):
+    """`research` processes a month of its own: no later scenario processes one, or the first later scenario with months
+    of its own is one of RESEARCH_NOT_SHARED."""
+    order = [s[0] for s in SCENARIOS]
+    later = [s for s in SCENARIOS if s[0] in names and order.index(s[0]) > order.index('research')]
+    if planned_months([s[0] for s in later]) == 0:
+        return True
+    return next((s[0] for s in later if s[1] > 0 and s[0] not in OWN_CAMPAIGN), None) in RESEARCH_NOT_SHARED
 
 
 def months_through(names, last):
@@ -2247,6 +2268,33 @@ def research_lines(port, mark):
     return [x.split('] ', 1)[-1] for x in log_lines(log_since(port, mark), RESEARCH_LINE)]
 
 
+# 0.8.2 (fix-research): TEST `resforce <nation> [area|-1] [as]` (the nation's research in that copy: a joined nation's on
+# its player's PC before its turn, the host's own on the host): its next monthly research completes the tech of the
+# reply (its research points twice the tech's cost), preferably one no other copy's player can see completed this month
+# (`others=1`: the host's nation, or for the host's own the joined players' nations, know it or research another of the
+# area's techs); `as`: it is also asked the air/sea rescue question.
+RESFORCE_RE = re.compile(r'^ok area=(\d+) level=(\d+) tech=(.*?) areaName=(.*?) picture=(\S*) effect=(.*?) year=(-?\d+) '
+                         r'cost=(\d+) points=(-?\d+)->(\d+) others=([01])(?: as=1 \(tech 1717: (\w+)[^)]*\))?$')
+RES_QUESTION = 'Do you want to institute an air/sea rescue service?'
+
+
+def resforce_parse(reply):
+    m = RESFORCE_RE.match(reply or '')
+    if not m:
+        return dict(ok=False, reply=reply)
+    return dict(ok=True, reply=reply, area=int(m[1]), level=int(m[2]), tech=m[3], areaName=m[4], picture=m[5],
+                effect=m[6], others=m[11] == '1', as_=None if m[12] is None else m[12] == 'yes')
+
+
+def research_news(seen, who, rf):
+    """f): the game's research result dialog ("<caption>, <tech>  <effect>", box_text) and turn report line ("Research
+    breakthrough: <area>, <tech>, <effect>") of resforce's tech among (who, class, text) dialogs."""
+    cap = f'Research breakthrough: {rf["areaName"]}, {rf["tech"]}'
+    dlg = [t for w, k, t in seen if w == who and k == 'TdlgPictureMessage' and t.startswith(cap) and rf['effect'] in t]
+    rep = [t for w, k, t in seen if w == who and k == 'TdlgCampTurnRep' and f'{cap}, {rf["effect"]}' in t.split(' | ')]
+    return dlg, rep
+
+
 def scenario_research(ctx):
     """0.2.8: the strategic screen's Research button opens TfrmResearch for BuilderNations[0]; on a joined player's PC
     that is the host's nation, so the player saw and edited the host's research budget and priorities (0.2.0 report).
@@ -2256,7 +2304,16 @@ def scenario_research(ctx):
     later scenario processes any): the host has the client's values for nation 1 and its own for nation 0, the client
     still shows them; e) (ebfca72) host `researchrun 1 100`: the game's DoResearch with its AI research choices (5 % a
     month a full re-roll) keeps the joined nation's priorities (the hook's "kept" line); control `researchrun 8 100` on
-    an AI nation (recorded, not protected)."""
+    an AI nation (recorded, not protected). f) 0.8.2 (fix-research): a joined nation's research month runs as its
+    player's on the host (in its view, research.cpp) and its research messages reach its player's PC: TEST `resforce`
+    makes nation 1's (on the client: its turn carries the nation's research) and the host's nation 0's research of the
+    month complete a tech each (preferably one no other copy's player can see completed this month: the other side's
+    nation knows it or researches another of the area's techs) and gives nation 1 the tech that asks the air/sea rescue
+    question; after the month the client showed the game's "Research breakthrough" dialog of nation 1's tech (caption,
+    tech, effect, picture) and its turn report has the game's line, the host showed nothing of it; the host's own
+    breakthrough showed on the host as in single player and nowhere on the client; the question was asked on the client
+    (first answer: Yes) and not on the host, nation 1's AirSeaRescue 1 there, and after the next month (when the run
+    processes one) on the host (the turn's merge)."""
     t0, cp, hp = time.time(), ctx.cp, ctx.hp
     rc0, rc1, rh0, rh1 = research(C, 0), research(C, 1), research(H, 0), research(H, 1)
     log(f'  research before: client 0 {fmt_research(rc0)} | client 1 {fmt_research(rc1)} | host 0 {fmt_research(rh0)} '
@@ -2384,7 +2441,82 @@ def scenario_research(ctx):
     log(f'  research set up in {time.time() - t0:.0f} s: client nation 1 {fmt_research(want)}, host nation 0 '
         f'{fmt_research(hwant)}; checked after the next processed month')
 
+    # f) 0.8.2: the joined nation's research month as its player's (checked after the month). Nation 1's research is
+    # forced on the client (its turn carries the nation's research to the host: the merge takes [Nation1] from it), the
+    # host's own on the host.
+    t_f, cm_f = time.time(), log_mark(C)
+    rf1, rf0 = resforce_parse(cmd(C, 'resforce 1 -1 as')), resforce_parse(cmd(H, 'resforce 0'))
+    log(f'  f) resforce 1 (client): {rf1["reply"]}; resforce 0 (host): {rf0["reply"]}')
+    check('f) setup: TEST `resforce 1 -1 as` (client) and `resforce 0` (host): nation 1 and the host\'s nation 0 each '
+          'complete a tech in the next month (research points above its cost), nation 1 has the tech that asks the '
+          'air/sea rescue question (not asked yet)', rf1['ok'] and rf0['ok'] and rf1['as_'] is True,
+          (rf1['reply'], rf0['reply']))
+
     st = dict(n=0, need=1)
+
+    def research_f(label, hlog):
+        """f) after the month (see the docstring)."""
+        if not (rf1['ok'] and rf0['ok']):
+            return
+        clog = log_since(C, cm_f)
+        seen = [(w, k, t) for (ts, w, k, t) in BOX_SEEN if ts >= t_f]
+        ans = [(w, c) for (ts, w, c) in ANSWERED if ts >= t_f]
+        run = [x.split('] ', 1)[-1] for x in log_lines(hlog, r"research: nation 1's month as its player's")]
+        log(f'  f) host: {run[-1][:600] if run else "no research month of nation 1 as its player\'s"}')
+        check(f'f) month ({label}): the host ran nation 1\'s research as its player\'s (in its view, no game exception) '
+              f'and recorded its breakthrough "{rf1["tech"]}" ({rf1["areaName"]}) for its player',
+              bool(run) and rf1['tech'] in run[-1] and 'A GAME EXCEPTION' not in run[-1], run[-1:])
+        cd, cr = research_news(seen, 'client', rf1)
+        shown = log_lines(clog, r"research: research result 'Research breakthrough: " + re.escape(rf1['areaName']) +
+                          r"' '" + re.escape(rf1['tech']) + r"'")
+        check(f'f) month ({label}): the client showed the game\'s "Research breakthrough" dialog of nation 1\'s tech '
+              f'(caption "Research breakthrough: {rf1["areaName"]}", "{rf1["tech"]}", its effect; picture '
+              f'{rf1["picture"]}) and its turn report has the game\'s line', bool(cd) and bool(cr) and bool(shown) and
+              rf1['picture'] in shown[0], dict(dialog=cd[:1], report=[r[:300] for r in cr[:1]], log=shown[:1]))
+        hd, hr = research_news(seen, 'host', rf1)
+        hany = [t[:200] for w, k, t in seen if w == 'host' and rf1['tech'] in t]
+        if rf1['others']:
+            check(f'f) month ({label}): the host showed nothing of nation 1\'s research (no dialog or turn report line '
+                  f'with "{rf1["tech"]}", a tech the host\'s nation could not complete this month)',
+                  not hd and not hr and not hany, dict(dialog=hd[:1], report=[r[:300] for r in hr[:1]], any=hany[:2]))
+        else:
+            log(f'  SKIP-note f): nation 1\'s tech "{rf1["tech"]}" is one the host\'s nation could complete too this month '
+                f'(resforce found no other): the host\'s screen is not checked for it (host: {hany[:2]})')
+        h0d, h0r = research_news(seen, 'host', rf0)
+        c0d, c0r = research_news(seen, 'client', rf0)
+        cany = [t[:200] for w, k, t in seen if w == 'client' and rf0['tech'] in t]
+        check(f'f) month ({label}): the host\'s own breakthrough "{rf0["tech"]}" ({rf0["areaName"]}) showed on the host '
+              f'as in single player (dialog and turn report line)' +
+              (' and nowhere on the client' if rf0['others'] else ''),
+              bool(h0d) and bool(h0r) and (not rf0['others'] or (not c0d and not c0r and not cany)),
+              dict(host=(h0d[:1], [r[:200] for r in h0r[:1]]), client=(c0d[:1], c0r[:1], cany[:2])))
+        if not rf0['others']:
+            log(f'  SKIP-note f): the host\'s tech "{rf0["tech"]}" is one nation 1 could complete too this month: the '
+                f'client\'s screen is not checked for it (client: {cany[:2]})')
+        q = log_lines(clog, r"research: question '" + re.escape(RES_QUESTION))
+        hq = [c for w, c in ans if w == 'host' and 'pilots' in c]
+        cq = [c for w, c in ans if w == 'client' and 'TdlgEventAnswer' in c and 'pilots' in c]
+        cflag = value(cmd(C, 'nflag 1 AirSeaRescue'))
+        check(f'f) month ({label}): nation 1\'s air/sea rescue question (the game\'s, from its research month) went to its '
+              f'player: asked on the client (first answer "Yes, the lives of our pilots are important!"), nation 1\'s '
+              f'AirSeaRescue 1 there; not asked on the host', bool(run) and 'goes to its player' in run[-1] and bool(q)
+              and 'answered 1 (AirSeaRescue := 1)' in q[-1] and cflag == '1' and bool(cq) and not hq,
+              dict(client=q[-1:], answered=cq[:1], flag=cflag, host=hq[:1]))
+        if ctx.months_planned - len(ctx.months) >= 1:  # (a later month of this run: the answer's merge)
+            def research_f7(ctx, label2):
+                outer, _scenario[0] = _scenario[0], 'research'
+                try:
+                    ctx.month_hooks.remove(research_f7)
+                    research_f7.state['n'] = 1
+                    hf = value(cmd(H, 'nflag 1 AirSeaRescue'))
+                    check(f'f) month ({label2}): the player\'s answer reached the host with its turn: nation 1\'s '
+                          f'AirSeaRescue 1 on the host', hf == '1', f'host nflag 1 AirSeaRescue -> {hf}')
+                finally:
+                    _scenario[0] = outer
+            research_f7.scenario, research_f7.state = 'research', dict(n=0, need=1)
+            ctx.month_hooks.append(research_f7)
+        else:
+            log('  SKIP-note f): no later processed month in this run: the answer\'s merge on the host is not checked')
 
     def hook(ctx, label):
         outer, _scenario[0] = _scenario[0], 'research'
@@ -2448,14 +2580,14 @@ def scenario_research(ctx):
                   f'reply {ctl_["reply"]}; before {fmt_research(ctl_["before"])}; after {fmt_research(ctl_["after"])}')
             if hb is not None:  # the host's nation 0 back to its own value (affects nothing checked later)
                 log(f'  host nation 0 research % back to {rh0["pct"]}:', cmd(H, f'nfield 0 ResearchPct {rh0["pct"]}'))
+            research_f(label, hlog)
         finally:
             _scenario[0] = outer
 
     hook.scenario, hook.state = 'research', st
     ctx.month_hooks.append(hook)
-    order = [s[0] for s in SCENARIOS]
-    if planned_months([n for n in ctx.selected if order.index(n) > order.index('research')]) == 0:
-        run_month(ctx, 'research')  # no later month to share
+    if research_own_month(ctx.selected):  # no later month to share, or the next one changes nation 1's research first
+        run_month(ctx, 'research')
 
 
 def doctrine(port, nation):
@@ -2960,6 +3092,9 @@ class RemoteBuf:
 # from the game's RTTI, 1.01.44). The form's VMT is checked first (TMessageForm, RVA 0x1d5a80).
 MSGFORM_VMT_RVA, MSGFORM_MESSAGE, CONTROL_FTEXT = 0xa05a80 - 0x830000, 0x438, 0x18c
 PICMSG_VMT_RVA, PICMSG_MESSAGE = 0xadab44 - 0x830000, 0x43c  # TdlgPictureMessage.lbMessage: TLabel (RTTI, 1.01.44)
+# 0.8.2: a research result (TdlgPictureMessage.ShowResearchResult: lbMessage empty) shows lbResearchCaption ("Research
+# breakthrough: <area>") and lbResearchEffect ("<tech>\r\r<effect>"); box_text gives "<caption>, <tech>  <effect>"
+PICMSG_RESEARCH_CAPTION, PICMSG_RESEARCH_EFFECT = 0x448, 0x444
 _BOX_LABEL = {'TMessageForm': (MSGFORM_VMT_RVA, MSGFORM_MESSAGE), 'TdlgPictureMessage': (PICMSG_VMT_RVA, PICMSG_MESSAGE)}
 PATH_RE = re.compile(r'[A-Za-z]:[\\/]')  # a file path in a chat line
 _psapi = ctypes.WinDLL('psapi', use_last_error=True)
@@ -3003,8 +3138,9 @@ def exe_base(pid):
 
 def box_text(top):
     """The message of a game box (TMessageForm) or picture message (TdlgPictureMessage) read from the copy's memory
-    (see above), '' if it can't be read."""
-    spec = _BOX_LABEL.get(e2e_test.class_name(top))
+    (see above), '' if it can't be read. A research result (0.8.2): "<caption>, <tech>  <effect>"."""
+    k = e2e_test.class_name(top)
+    spec = _BOX_LABEL.get(k)
     if spec is None:
         return ''
     try:
@@ -3020,15 +3156,22 @@ def box_text(top):
         h = _k32.OpenProcess(0x0010, False, pid.value)  # PROCESS_VM_READ
         if not h:
             return ''
+
+        def label(off):
+            p = _rd32(h, _rd32(h, obj + off) + CONTROL_FTEXT)
+            raw = _rpm(h, p, 2048) or b''
+            t = raw.decode('utf-16-le', errors='replace')
+            return t.split('\x00', 1)[0].replace('\r', ' ').replace('\n', ' ').strip()
         try:
             if _rd32(h, obj) != base + spec[0]:
                 return ''
-            p = _rd32(h, _rd32(h, obj + spec[1]) + CONTROL_FTEXT)
-            raw = _rpm(h, p, 2048) or b''
+            txt = label(spec[1])
+            if not txt and k == 'TdlgPictureMessage':
+                cap, eff = label(PICMSG_RESEARCH_CAPTION), label(PICMSG_RESEARCH_EFFECT)
+                txt = f'{cap}, {eff}' if cap or eff else ''
         finally:
             _k32.CloseHandle(h)
-        txt = raw.decode('utf-16-le', errors='replace')
-        return txt.split('\x00', 1)[0].replace('\r', ' ').replace('\n', ' ').strip()
+        return txt
     except Exception:  # noqa: BLE001
         return ''
 
@@ -8441,6 +8584,490 @@ def scenario_battle_simul(ctx):
         k2_stop(ctx)
         shutil.rmtree(SIMUL_KEEP, ignore_errors=True)
     log(f'  battle_simul: host log lines {len(log_since(H, marks0[H]).splitlines())}')
+
+
+# ---------------------------------------------------------------- unsubmit (0.9.0)
+
+UNSUB_CHAT = '* Captain withdrew the turn'  # (CLIENT_NAME's line; the host sends its "* " lines to every player)
+UNSUB_REFUSE_RE = r"unsubmit: (\S+)'s request \(month seq (\d+); this month (\d+)\) refused: (.*?)\r?$"
+UNSUB_TOOK_RE = r'unsubmit: the host took the turn back \(month seq (\d+), turn (\d+), request (\d+)\): not submitted'
+
+
+def unsub_state(port):
+    """`unsubmit state` as a dict ({} on an error). A joined player's copy: host (the welcome's `unsub`), submitted,
+    pending, timeup, sub (its turns of the month), req, seq, last (none, ok, refused:<why>, stale, superseded). The
+    host: seq, phase, wants (its Turn waits), forced (the time limit ran out), starting (a start decided), remaining,
+    players {name: (nation, submitted, turn held, hello unsub)}, last."""
+    r = scmd(port, 'unsubmit state')
+    if not r.startswith('ok '):
+        return {}
+    body, _, last = r[3:].partition(' last=')
+    d = dict(w.split('=', 1) for w in body.split() if '=' in w)
+    d['last'] = last.strip()
+    if 'players' in d:
+        ps = {}
+        for e in d['players'].split(','):
+            f = e.rsplit(':', 4)
+            if len(f) == 5 and all(x.lstrip('-').isdigit() for x in f[1:]):
+                ps[f[0]] = tuple(int(x) for x in f[1:])
+        d['players'] = ps
+    return d
+
+
+def unsub_player(st, name):
+    """(nation, submitted, turn held, hello unsub) of a player in the host's `unsubmit state`, or None."""
+    return (st or {}).get('players', {}).get(name)
+
+
+def unsub_button(pid):
+    """The Unsubmit turn button of a copy's Multiplayer window: dict(exists, shown (its own WS_VISIBLE: the window
+    itself may be hidden), enabled, caption), or None without the window."""
+    w = mp_window(pid)
+    if not w:
+        return None
+    h = u.GetDlgItem(w, IDS['unsubmit'])
+    if not h:
+        return dict(exists=False, shown=False, enabled=False, caption='')
+    return dict(exists=True, shown=bool(u.GetWindowLongW(h, -16) & 0x10000000), enabled=bool(u.IsWindowEnabled(h)),
+                caption=text(h))
+
+
+def unsub_click(pid):
+    """The Unsubmit turn button pressed (a posted BM_CLICK, as a click)."""
+    w = mp_window(pid)
+    h = u.GetDlgItem(w, IDS['unsubmit']) if w else None
+    if h:
+        u.PostMessageW(h, 0x00F5, 0, 0)
+    return bool(h)
+
+
+def strategic_turn_caption(pid):
+    """The caption of a copy's strategic-screen Turn button (Turn, Submit, Submitted, Waiting) or None."""
+    for w in top_windows(pid):
+        if e2e_test.class_name(w) == 'TfrmBuildCamp':
+            for h in children(w):
+                if e2e_test.class_name(h) not in ('TButton', 'TBitBtn') or not u.IsWindowVisible(h):
+                    continue
+                t = text(h).replace('&', '').strip()
+                if t in ('Turn', 'Submit', 'Submitted', 'Waiting'):
+                    return t
+    return None
+
+
+def mp_status_text(pid):
+    w = mp_window(pid)
+    return text(u.GetDlgItem(w, IDS['status'])).replace('\r\n', ' | ') if w else ''
+
+
+def mp_player_rows(pid):
+    """The player list of a copy's Multiplayer window: {player: status} (ready, planning, connected, disconnected)."""
+    w = mp_window(pid)
+    if not w:
+        return {}
+    return {t[0].replace(' (host)', ''): t[2] for _, _, t in lv_rows(pid, u.GetDlgItem(w, IDS['players']), 4)}
+
+
+def host_box(pid, timeout=10):
+    """The host's "Still waiting for: ..." box after its Turn (#32770 "Multiplayer"), left open: (hwnd, its text) or
+    (None, None)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for d in windows_of(pid, '#32770'):
+            if text(d) == 'Multiplayer' and u.IsWindowVisible(d):
+                return d, ' '.join(text(c) for c in children(d) if e2e_test.class_name(c) == 'Static' and text(c))
+        time.sleep(0.3)
+    return None, None
+
+
+def answer_box(d, answer):
+    """A "Multiplayer" box answered `answer` ('yes': advance now; 'no': wait)."""
+    u.PostMessageW(u.GetDlgItem(d, 6 if answer == 'yes' else 7), 0x00F5, 0, 0)  # IDYES / IDNO
+    time.sleep(1.0)
+
+
+def host_wait_box(pid, answer, timeout=10):
+    """The host's "Still waiting for: ..." box after its Turn: its text, answered `answer` ('yes': advance now; 'no':
+    wait, the turn starts by itself when everyone has submitted); None if it did not show."""
+    d, st = host_box(pid, timeout)
+    if d is None:
+        return None
+    answer_box(d, answer)
+    log(f'  the host\'s waiting box answered {answer}: {st!r}')
+    return st
+
+
+def unsub_submit(ctx, port, who, host_pid=True):
+    """`submit` on a joined player's copy, its Turn questions answered, until it counts as submitted and the host holds
+    its turn (the host's `unsubmit state`). host_pid=False: the host's dialogs are left alone (its modal screen stays)."""
+    pid = pid_of(ctx, port)
+    cmd(port, 'submit')
+    wait(port, lambda s: s.get('submitted') == '1' and s.get('submitting', '0') == '0', 30, f'{who} submitted',
+         pids=((ctx.hp,) if host_pid else ()) + (pid,))
+    name = {C: CLIENT_NAME, K2: K2_NAME}[port]
+    return wait_until(lambda: unsub_state(H), lambda d: (unsub_player(d, name) or (0, 0, 0))[2] == 1, 10)
+
+
+def unsub_ask(port, raw=False, timeout=10):
+    """`unsubmit` (raw: TEST, without the copy's own checks) on a joined player's copy: (reply, its state once the
+    host's answer is in)."""
+    r = cmd(port, 'unsubmit raw' if raw else 'unsubmit')
+    if not r.startswith('ok'):
+        return r, unsub_state(port)
+    return r, wait_until(lambda: unsub_state(port), lambda d: d.get('pending') == '0', timeout)
+
+
+def unsub_pre_month(ctx, label):
+    """run_month's start for a month the scenario sets going itself (the last submit while the host waits, Advance, the
+    time limit): the pre-month hooks, the per-month checks' baselines (war counters, nation 1's relations), the host's
+    prestige. Returns the log marks {port: size} and the client's date."""
+    for hook in list(ctx.pre_month_hooks):
+        hook(ctx, label, len(ctx.months) + 1)
+    ctx.kwar_before = kwar_counters(H)
+    relrules_pre_month(ctx)
+    keep_host_prestige()
+    marks = {p: log_mark(p) for p in (H, C, K2)}
+    ctx.month_marks = (marks[H], marks[C])
+    return marks, ctl.status(C).get('date')
+
+
+def unsub_month(ctx, label, date0, marks, k2=False, client_hook=None, timeout=MONTH_TIMEOUT):
+    """A month the host started without its bridge (it is busy with the month): every copy's dialogs answered (a battle
+    nobody planned declined, as in run_month) until the client (and the third copy) plan the next month; then the
+    client's event roll and relation turn, the third copy's relation turn, run_month's per-month checks and the month
+    hooks. client_hook(): called once per pass while the month runs (h): the client's requests during the month).
+    Returns the client's new date."""
+    t0, end, ev_seen, k2rec, st = time.time(), time.time() + timeout, [], dict(answers=[]), {}
+    while True:
+        assert_alive()
+        answer_dialogs(ctx.hp, 'host')
+        if battle_up(ctx.cp):
+            battle_dialogs(ctx.cp, 'decline', UNPLANNED)
+            unplanned_fight_poll(ctx.cp)
+        else:
+            ev_seen += [i for i in select_first_answer(ctx.cp) if i not in ev_seen]
+            answer_dialogs(ctx.cp, 'client')
+        kp = k2_pid() if k2 else None
+        if kp:
+            if battle_up(kp):
+                battle_dialogs(kp, 'decline', k2rec)
+            else:
+                answer_dialogs(kp, 'k2')
+        if client_hook:
+            client_hook()
+        st = sstatus(C)
+        done = st.get('phase') == 'planning' and st.get('date') not in (None, '', date0) and \
+            st.get('slot') == str(CLIENT_SLOT)
+        if done and kp:
+            s2 = sstatus(K2)
+            done = s2.get('phase') == 'planning' and s2.get('date') == st.get('date') and s2.get('slot') == str(K2_SLOT)
+        if done:
+            break
+        if time.time() > end:
+            raise RuntimeError(f'the month did not advance within {timeout} s ({label}); host windows: '
+                               f'{describe_windows(ctx.hp)}; client windows: {describe_windows(ctx.cp)}')
+        time.sleep(1.0)
+    time.sleep(2)
+    dt = time.time() - t0
+    ctx.months.append((label, date0, st.get('date'), dt))
+    log(f'month processed ({label}): {date0} -> {st.get("date")} in {dt:.0f} s')
+    wait_event_roll(ctx, marks[C], ev_seen)
+    wait_relations_turn(ctx, marks[C])
+    if k2 and k2_pid():
+        wait_relations_turn(ctx, marks[K2], port=K2, pid=k2_pid(), nation=STANDIN, who='k2')
+    month_checks(ctx, label, marks[H], marks[C])
+    for hook in list(ctx.month_hooks):
+        hook(ctx, label)
+    return st.get('date')
+
+
+def scenario_unsubmit(ctx):
+    """0.9.0: a joined player takes a submitted turn back (asked for by players on 0.8.1). a) the capability: the host
+    logs Captain's hello `unsub` ("Captain: unsubmit 1 (this host: 1)"), the player the welcome's; the Unsubmit turn
+    button shown on the player's window (disabled before a submit), none on the host's; `unsubmit` refused before a
+    submit. b) Captain submits (the host holds the turn; its invasion order, here none, replaces nation 1's plan set by
+    TEST `inv target`/`inv plan`), then presses the window's button: the host drops the turn (`unsubmit state`: not
+    submitted, no turn held; its log), nation 1's plan back as the month began, the chat "* Captain withdrew the turn",
+    the lobby "planning", the host's status "Waiting for: Captain", the game's Turn button "Submit". c) M1: the host's
+    Turn (its box: No = wait) while Captain's turn is withdrawn: no start for 6 s; Captain changes orders (research %)
+    and submits again: the month starts by itself and uses the new orders; h) during that month an `unsubmit` is refused
+    on the player's PC and (`unsubmit raw`) by the host, the player stays submitted. d) M2 with a third copy (Bot,
+    nation 2): Captain submits, the host's Turn ("Still waiting for: Bot"), Captain unsubmits while the box is open: the
+    host's Yes asks again naming Captain (No: wait); Bot submits: no start (the other player and the host ready; Bot's
+    window shows Captain planning and the chat line); Captain submits again: the month with the new orders. e) M3:
+    Captain's turn withdrawn, Bot's submitted; the host busy (its Research screen) presses Advance: the start waits, Bot's
+    `unsubmit` is refused ("the host is already starting the month with it"); the month uses Bot's turn and not
+    Captain's withdrawn one (nation 1 keeps last month's orders). f) M4: Captain submits and unsubmits, leaves and joins
+    again (not submitted on both sides, its window's button disabled), changes orders without submitting; the host busy,
+    the time limit runs out (TEST `unsubmit timeup`): both PCs submit what they have, Captain's `unsubmit` refused on its
+    PC and (raw) by the host ("the time limit has run out"); the month uses Captain's orders as they were then. Research
+    % of nations 1 and 2 put back afterwards."""
+    K = 1
+    for p in (H, C):
+        cmd(p, 'mpwindow')
+    time.sleep(1)
+    wars = {n: [j for j in range(9) if j != n and rel(n, j).get('war') == '1'] for n in (0, K, STANDIN)}
+    if any(wars.values()):
+        log(f'  WARNING: wars at the start {wars}: a month may bring battles (declined, as run_month does)')
+    # a) the capability and the button before a submit
+    hl = [x.split('] ', 1)[-1] for x in log_lines(log_since(H), rf'{CLIENT_NAME}: unsubmit -?\d+ \(this host: 1\)')]
+    cl = [x.split('] ', 1)[-1] for x in log_lines(log_since(C), r'joined \S+: unsubmit: the host -?\d+, this PC 1')]
+    hs, cs = unsub_state(H), unsub_state(C)
+    check(f'a) the capability: the host logged Captain\'s hello ("{CLIENT_NAME}: unsubmit 1 (this host: 1)"), the player '
+          f'the welcome ("joined {HOST_NAME}: unsubmit: the host 1, this PC 1"); `unsubmit state`: the host lists Captain '
+          f'with unsub 1, the client host=1, not submitted', hl and hl[-1].endswith(': unsubmit 1 (this host: 1)') and cl
+          and cl[-1].endswith('unsubmit: the host 1, this PC 1') and (unsub_player(hs, CLIENT_NAME) or (0,) * 4)[3] == 1
+          and cs.get('host') == '1' and cs.get('submitted') == '0', dict(host=hl[-1:], client=cl[-1:], hs=hs, cs=cs))
+    b0, hb, r0 = unsub_button(ctx.cp), unsub_button(ctx.hp), cmd(C, 'unsubmit')
+    check('a) the player\'s Multiplayer window shows "Unsubmit turn", disabled before a submit; the host\'s window does '
+          'not show it; the player\'s `unsubmit` refused: "your turn is not submitted"', b0 and b0['shown'] and
+          not b0['enabled'] and b0['caption'] == 'Unsubmit turn' and hb and not hb['shown'] and
+          r0 == 'error your turn is not submitted', dict(client=b0, host=hb, reply=r0))
+    r0 = nint(C, K, 'ResearchPct')
+    pool = [v for v in (11, 4, 9, 6, 10, 5, 8, 7, 3, 12) if v != r0]
+    A1, B1, A2, B2, A3, A4, B4 = pool[:7]
+    log(f'  nation {K}\'s research % now {r0}; the turns use {dict(A1=A1, B1=B1, A2=A2, B2=B2, A3=A3, A4=A4, B4=B4)}')
+    # b) submit, then the window's button: the host drops the turn (and the turn's invasion order)
+    poss = poss_list(H, f'possessions {AI_NATION}') or []
+    X = poss[0]['name'] if poss else None
+    plan_re = re.compile(r' target=(.*?) count=(-?\d+) ')
+    inv_on = bool(X) and cmd(H, f'inv state {K}').startswith('ok')
+    if inv_on:
+        cmd(H, f'inv target {K} {X.replace(" ", "_")}')
+        cmd(H, f'inv plan {K} 2 - -1')
+    plan0 = plan_re.search(cmd(H, f'inv state {K}') + ' ')
+    cmd(C, f'nfield {K} ResearchPct {A1}')
+    hm, cm, chat0 = log_mark(H), log_mark(C), chat(ctx.cp)
+    hs1 = unsub_submit(ctx, C, 'client')
+    time.sleep(1.5)
+    b1, cap1, rows1 = unsub_button(ctx.cp), strategic_turn_caption(ctx.cp), mp_player_rows(ctx.cp)
+    plan1 = plan_re.search(cmd(H, f'inv state {K}') + ' ')
+    check('b) Captain submits: the host holds the turn (Captain submitted, turn held), the player\'s button enabled, the '
+          'game\'s Turn button "Submitted", the lobby "ready"', unsub_player(hs1, CLIENT_NAME) == (K, 1, 1, 1) and b1 and
+          b1['enabled'] and cap1 == 'Submitted' and rows1.get(CLIENT_NAME) == 'ready',
+          dict(host=unsub_player(hs1, CLIENT_NAME), button=b1, turn=cap1, rows=rows1))
+    if inv_on:
+        check(f'b) the turn\'s invasion order taken when it arrived: nation {K}\'s plan {X} for 2 months (TEST `inv '
+              f'target`/`inv plan`) replaced by the turn\'s (none)', plan0 and plan0.groups() == (X, '2') and plan1 and
+              plan1.groups() == ('', '0'), dict(before=plan0 and plan0.groups(), after=plan1 and plan1.groups()))
+    clicked = unsub_click(ctx.cp)
+    cs2 = wait_until(lambda: unsub_state(C), lambda d: d.get('submitted') == '0' and d.get('pending') == '0', 10)
+    time.sleep(2)
+    hs2 = unsub_state(H)
+    b2, cap2, rows2, mps2 = unsub_button(ctx.cp), strategic_turn_caption(ctx.cp), mp_player_rows(ctx.cp), \
+        mp_status_text(ctx.cp)
+    plan2 = plan_re.search(cmd(H, f'inv state {K}') + ' ')
+    hlog, clog, chat2 = log_since(H, hm), log_since(C, cm), chat(ctx.cp)
+    took = log_lines(hlog, rf'unsubmit: {CLIENT_NAME} withdrew the turn of month seq \d+ \(nation {K}: the turn dropped\)')
+    asked = log_lines(clog, r'unsubmit: asked the host to take back turn 1 of month seq \d+ \(request \d+\)')
+    back = log_lines(clog, UNSUB_TOOK_RE)
+    check('b) the window\'s button pressed: the host drops the turn ("unsubmit: Captain withdrew the turn of month seq N '
+          '(nation 1: the turn dropped)"; Captain not submitted, no turn held), the player\'s PC counts as not submitted '
+          'only with the host\'s answer ("asked the host to take back turn 1 ...", then "the host took the turn back")',
+          clicked and cs2.get('submitted') == '0' and cs2.get('last') == 'ok' and
+          unsub_player(hs2, CLIENT_NAME) == (K, 0, 0, 1) and hs2.get('last') == f'ok:{CLIENT_NAME}' and took and asked and
+          back, dict(client=cs2, host=hs2, host_log=took[-1:], client_log=asked[-1:] + back[-1:]))
+    host_status = ctl.status(H).get('status', '')
+    check('b) what the players see: the chat "* Captain withdrew the turn", the lobby "planning", the host\'s status '
+          '"Waiting for: Captain", the window\'s "(turn submitted)" gone and the button disabled again, the game\'s Turn '
+          'button "Submit"', chat2.count(UNSUB_CHAT) > chat0.count(UNSUB_CHAT) and rows2.get(CLIENT_NAME) == 'planning'
+          and host_status.startswith(f'Waiting for: {CLIENT_NAME}') and '(turn submitted)' not in mps2 and b2 and
+          b2['shown'] and not b2['enabled'] and b2['caption'] == 'Unsubmit turn' and cap2 == 'Submit',
+          dict(chat=[x for x in chat2.splitlines() if 'withdrew' in x][-1:], rows=rows2, host_status=host_status,
+               window=mps2, button=b2, turn=cap2))
+    if inv_on:
+        pl = [x.split('] ', 1)[-1] for x in took]
+        check(f'b) nation {K}\'s invasion plan back as the month began ({X}, 2 months): "...; its invasion plan back to '
+              f'{X} (2 month(s)) from none, as the month began"', plan2 and plan2.groups() == (X, '2') and pl and
+              pl[-1].endswith(f'; its invasion plan back to {X} (2 month(s)) from none, as the month began'),
+              dict(plan=plan2 and plan2.groups(), log=pl[-1:]))
+        cmd(H, f'inv target {K} -')
+    r1 = cmd(C, 'unsubmit')
+    check('b) `unsubmit` again: refused on the player\'s PC ("your turn is not submitted")',
+          r1 == 'error your turn is not submitted', r1)
+    # c) M1: the host's Turn waits (No); no start while Captain's turn is withdrawn; the new orders start the month
+    marks, date0 = unsub_pre_month(ctx, 'unsubmit c')
+    cmd(H, 'turn')
+    box = host_wait_box(ctx.hp, 'no')
+    hs3 = wait_until(lambda: unsub_state(H), lambda d: d.get('wants') == '1', 8)
+    check(f'c) the host\'s Turn: "Still waiting for: {CLIENT_NAME}" (No: wait), the host ready (`unsubmit state` '
+          f'wants=1)', box and f'Still waiting for: {CLIENT_NAME}' in box and hs3.get('wants') == '1',
+          dict(box=box, state=hs3))
+    time.sleep(6)
+    hs4, st4 = unsub_state(H), sstatus(C)
+    started = log_lines(log_since(H, marks[H]), r'host turn: \d+ submissions merged')
+    hstat = ctl.status(H).get('status', '')
+    check(f'c) no start while Captain\'s turn is withdrawn and the host is ready: 6 s later the host still plans (no '
+          f'"host turn:" line), its status "Host is ready. Waiting for: {CLIENT_NAME}"', hs4.get('phase') == 'planning'
+          and not started and st4.get('date') == date0 and hstat.startswith(f'Host is ready. Waiting for: {CLIENT_NAME}'),
+          dict(state=hs4, client=st4.get('date'), status=hstat, started=started))
+    cmd(C, f'nfield {K} ResearchPct {B1}')
+    hreq = {}
+
+    def during(hreq=hreq):  # h) the player's requests once its PC sees the month processed
+        if hreq or sstatus(C).get('phase') != 'processing':
+            return
+        hreq['local'] = cmd(C, 'unsubmit')
+        hreq['raw'] = cmd(C, 'unsubmit raw')
+        hreq['state'] = unsub_state(C)
+        log(f'  h) during the month: {hreq}')
+    cmd(C, 'submit')
+    date1 = unsub_month(ctx, 'unsubmit c', date0, marks, client_hook=during)
+    hv, cv = nint(H, K, 'ResearchPct'), nint(C, K, 'ResearchPct')
+    hlog, clog = log_since(H, marks[H]), log_since(C, marks[C])
+    check(f'c) Captain changed orders (research % {B1}) and submitted again: the month started by itself (the host '
+          f'waited) and used them ({date0} -> {date1}; the host\'s nation {K} research % {hv}, the client\'s {cv}; the '
+          f'withdrawn turn had {A1})', date1 and date1 != date0 and hv == B1 and cv == B1 and
+          log_lines(hlog, r'host turn: 1 submissions merged'), dict(host=hv, client=cv))
+    ref = [m for m in re.finditer(UNSUB_REFUSE_RE, hlog, re.M) if m[1] == CLIENT_NAME]
+    seen = log_lines(clog, r'unsubmit: (refused by the host|an answer for an earlier month ignored)')
+    check('h) an unsubmit once the month started: refused on the player\'s PC ("the host has already started the month '
+          'with your turn") and, sent anyway (TEST `unsubmit raw`), by the host ("the host has already started the month '
+          'with it", or "that month is over" when it reads it after the month); the player\'s PC stayed submitted and '
+          'never counted itself out (no "took the turn back" in that month)', hreq.get('local') ==
+          'error the host has already started the month with your turn' and hreq.get('raw') == 'ok sent' and
+          (hreq.get('state') or {}).get('submitted') == '1' and ref and ref[-1][4] in (
+              'the host has already started the month with it', 'that month is over') and seen and
+          not log_lines(clog, UNSUB_TOOK_RE), dict(requests=hreq, host=[m[0] for m in ref[-1:]], client=seen[-1:]))
+    # d) M2 with a third copy (Bot, nation 2): the other player and the host ready, Captain's turn withdrawn: no start
+    k2_start(ctx)
+    kp = k2_pid()
+    bl = [x.split('] ', 1)[-1] for x in log_lines(log_since(H), rf'{K2_NAME}: unsubmit -?\d+ \(this host: 1\)')]
+    kb = unsub_button(kp)
+    check(f'd) the third copy joined as {K2_NAME} (nation {STANDIN}): "{K2_NAME}: unsubmit 1 (this host: 1)", its window '
+          f'shows the button', bl and bl[-1].endswith(': unsubmit 1 (this host: 1)') and kb and kb['shown'],
+          dict(log=bl[-1:], button=kb))
+    marks, date0 = unsub_pre_month(ctx, 'unsubmit d')
+    cmd(C, f'nfield {K} ResearchPct {A2}')
+    unsub_submit(ctx, C, 'client')
+    kchat0 = chat(kp)
+    cmd(H, 'turn')
+    d1, box1 = host_box(ctx.hp)
+    r, cs = unsub_ask(C)  # (while the host's box is open: no start decided yet)
+    if d1:
+        answer_box(d1, 'yes')
+    box2 = host_wait_box(ctx.hp, 'no')
+    asked = log_lines(log_since(H, marks[H]), r"turn: not ready any more while the host's box was open \(now waiting "
+                                              r"for .*\): asked again")
+    hs5 = unsub_submit(ctx, K2, 'k2', host_pid=False)
+    time.sleep(6)
+    hs6, kchat, krows = unsub_state(H), chat(kp), mp_player_rows(kp)
+    started = log_lines(log_since(H, marks[H]), r'host turn: \d+ submissions merged')
+    hstat = ctl.status(H).get('status', '')
+    check(f'd) Captain submitted, the host\'s Turn: "Still waiting for: {K2_NAME}"; Captain unsubmits while the box is '
+          f'open ({r}); the host\'s Yes asks again ("Still waiting for: ..." naming {CLIENT_NAME} and {K2_NAME}; its log '
+          f'"turn: not ready any more while the host\'s box was open ...: asked again"), No: the host waits',
+          box1 and f'Still waiting for: {K2_NAME}\n' in box1 + '\n' and CLIENT_NAME not in box1.split('\n')[0] and
+          r == 'ok sent' and cs.get('last') == 'ok' and box2 and 'Still waiting for: ' in box2 and
+          CLIENT_NAME in box2.split('\n')[0] and K2_NAME in box2.split('\n')[0] and asked,
+          dict(box1=box1, client=cs, box2=box2, log=[x.split('] ', 1)[-1] for x in asked[-1:]]))
+    check(f'd) {K2_NAME} submits: 6 s later no start (the host and {K2_NAME} ready, Captain\'s turn withdrawn: the host '
+          f'still plans, "Host is ready. Waiting for: {CLIENT_NAME}"); {K2_NAME}\'s window: the chat "{UNSUB_CHAT}", '
+          f'Captain "planning", {K2_NAME} and the host "ready"',
+          unsub_player(hs5, K2_NAME) == (STANDIN, 1, 1, 1) and unsub_player(hs6, CLIENT_NAME) == (K, 0, 0, 1) and
+          hs6.get('wants') == '1' and hs6.get('phase') == 'planning' and not started and
+          hstat.startswith(f'Host is ready. Waiting for: {CLIENT_NAME}') and kchat.count(UNSUB_CHAT) > kchat0.count(UNSUB_CHAT)
+          and krows.get(CLIENT_NAME) == 'planning' and krows.get(K2_NAME) == 'ready' and krows.get(HOST_NAME) == 'ready',
+          dict(host=hs6, status=hstat, rows=krows, started=started))
+    cmd(C, f'nfield {K} ResearchPct {B2}')
+    cmd(C, 'submit')
+    date2 = unsub_month(ctx, 'unsubmit d', date0, marks, k2=True)
+    hv, cv = nint(H, K, 'ResearchPct'), nint(C, K, 'ResearchPct')
+    check(f'd) Captain submitted again with research % {B2}: the month started by itself with both turns ({date0} -> '
+          f'{date2}; "host turn: 2 submissions merged"; the host\'s nation {K} research % {hv}, the client\'s {cv})',
+          date2 and date2 != date0 and hv == B2 and cv == B2 and
+          log_lines(log_since(H, marks[H]), r'host turn: 2 submissions merged'), dict(host=hv, client=cv))
+    # e) M3: Captain's turn withdrawn, Bot's submitted; the host busy presses Advance: the start waits, Bot's unsubmit
+    #    refused; the month uses Bot's turn, not Captain's withdrawn one
+    z0 = nint(K2, STANDIN, 'ResearchPct')
+    Z = next(v for v in (3, 12, 4, 11) if v != z0)
+    marks, date0 = unsub_pre_month(ctx, 'unsubmit e')
+    cmd(C, f'nfield {K} ResearchPct {A3}')
+    unsub_submit(ctx, C, 'client')
+    r, cs = unsub_ask(C)
+    cmd(K2, f'nfield {STANDIN} ResearchPct {Z}')
+    unsub_submit(ctx, K2, 'k2')
+    ro, rc = open_research(H, ctx.hp)
+    ra = cmd(H, 'advance')
+    hs7 = wait_until(lambda: unsub_state(H), lambda d: d.get('starting') == '1', 8)
+    rk, ks = unsub_ask(K2)
+    hs8 = unsub_state(H)
+    check(f'e) the host busy (its Research screen, {ro}) presses Advance ({ra}): the start waits (`unsubmit state` '
+          f'starting=1, still planning); {K2_NAME}\'s unsubmit ({rk}) refused by the host ("the host is already starting '
+          f'the month with it"): its PC stays submitted, the host holds its turn', rc and hs7.get('starting') == '1' and
+          hs7.get('phase') == 'planning' and rk == 'ok sent' and ks.get('submitted') == '1' and
+          ks.get('last') == 'refused:the host is already starting the month with it' and
+          unsub_player(hs8, K2_NAME) == (STANDIN, 1, 1, 1) and unsub_player(hs8, CLIENT_NAME) == (K, 0, 0, 1),
+          dict(state=hs7, k2=ks, host=hs8))
+    if rc:
+        close_research(ctx.hp, rc)
+    date3 = unsub_month(ctx, 'unsubmit e', date0, marks, k2=True)
+    hv, cv, hz = nint(H, K, 'ResearchPct'), nint(C, K, 'ResearchPct'), nint(H, STANDIN, 'ResearchPct')
+    check(f'e) the month ({date0} -> {date3}) used {K2_NAME}\'s turn (nation {STANDIN} research % {hz}, sent {Z}) and not '
+          f'Captain\'s withdrawn one ({A3}): nation {K} kept last month\'s orders (the host {hv}, the client {cv}, '
+          f'{B2} before); "host turn: 1 submissions merged"', date3 and date3 != date0 and hz == Z and hv == B2 and
+          cv == B2 and log_lines(log_since(H, marks[H]), r'host turn: 1 submissions merged'),
+          dict(nation2=hz, host=hv, client=cv))
+    # f) M4: Captain submits, unsubmits, leaves and joins again, changes orders; the time limit runs out while the host
+    #    is busy: both PCs submit what they have; Captain's unsubmit refused; the month uses its orders as they were
+    cmd(C, f'nfield {K} ResearchPct {A4}')
+    unsub_submit(ctx, C, 'client')
+    r, cs = unsub_ask(C)
+    cmd(C, 'leave')
+    wait_until(lambda: unsub_state(H), lambda d: CLIENT_NAME not in d.get('players', {CLIENT_NAME: 0}), 15)
+    hm, cm = log_mark(H), log_mark(C)
+    rj = cmd(C, f'join {CLIENT_NAME} 127.0.0.1 {MP_PORT}')
+    sent = wait_log(H, hm, rf'state seq \d+ -> {CLIENT_NAME} \(nation {K},', 30)
+    wait(C, lambda s: s.get('phase') == 'planning' and s.get('myNation') == str(K) and s.get('playerIdx') == str(K)
+         and s.get('slot') == str(CLIENT_SLOT), 60, 'the returning player plans its nation', pids=(ctx.hp,))
+    time.sleep(2)
+    cmd(C, 'mpwindow')
+    wait_event_roll(ctx, cm)
+    time.sleep(1)
+    hs9, cs9, b9, rv = unsub_state(H), unsub_state(C), unsub_button(ctx.cp), nint(C, K, 'ResearchPct')
+    check(f'f) Captain unsubmitted ({r}) and joined again ({rj}): the host sent the month again, holds no turn of '
+          f'Captain\'s (not submitted), the player\'s PC not submitted (host=1, sub=0), its button shown and disabled, '
+          f'its game the month as the host has it (research % {rv}: {B2}, not the withdrawn {A4})', r == 'ok sent' and
+          cs.get('last') == 'ok' and rj == 'ok' and sent and unsub_player(hs9, CLIENT_NAME) == (K, 0, 0, 1) and
+          cs9.get('host') == '1' and cs9.get('submitted') == '0' and cs9.get('sub') == '0' and b9 and b9['shown'] and
+          not b9['enabled'] and rv == B2, dict(host=hs9, client=cs9, button=b9))
+    cmd(C, f'nfield {K} ResearchPct {B4}')
+    marks, date0 = unsub_pre_month(ctx, 'unsubmit f')
+    ro, rc = open_research(H, ctx.hp)
+    rt = cmd(H, 'unsubmit timeup 2')
+    hs10 = wait_until(lambda: unsub_state(H), lambda d: d.get('forced') == '1' and
+                      (unsub_player(d, CLIENT_NAME) or (0, 0, 0))[2] == 1 and (unsub_player(d, K2_NAME) or (0, 0, 0))[2] == 1,
+                      30)
+    cs10, b10 = unsub_state(C), unsub_button(ctx.cp)
+    r1 = cmd(C, 'unsubmit')
+    r2, cs11 = unsub_ask(C, raw=True)
+    hs11 = unsub_state(H)
+    clog = log_since(C, marks[C])
+    check(f'f) the time limit runs out (TEST `unsubmit timeup 2`: {rt}) while the host is busy ({ro}): both PCs submitted '
+          f'what they had ("Time is up: submitting your turn now."), the start waits (forced=1, starting=1)',
+          rc and hs10.get('forced') == '1' and hs10.get('starting') == '1' and hs10.get('phase') == 'planning' and
+          unsub_player(hs10, CLIENT_NAME) == (K, 1, 1, 1) and unsub_player(hs10, K2_NAME) == (STANDIN, 1, 1, 1) and
+          cs10.get('timeup') == '1' and cs10.get('submitted') == '1' and
+          log_lines(clog, r'notice: Time is up: submitting your turn now\.'), dict(host=hs10, client=cs10))
+    check('f) Captain\'s unsubmit after the time limit: refused on its PC ("the time limit has run out: the month starts '
+          'with your turn"; the button disabled) and, sent anyway (TEST `unsubmit raw`), by the host ("the time limit has '
+          'run out and the month starts with it"): the PC stays submitted, the host holds the turn',
+          r1 == 'error the time limit has run out: the month starts with your turn' and b10 and not b10['enabled'] and
+          r2 == 'ok sent' and cs11.get('submitted') == '1' and
+          cs11.get('last') == 'refused:the time limit has run out and the month starts with it' and
+          unsub_player(hs11, CLIENT_NAME) == (K, 1, 1, 1), dict(local=r1, button=b10, raw=r2, client=cs11, host=hs11))
+    if rc:
+        close_research(ctx.hp, rc)
+    date4 = unsub_month(ctx, 'unsubmit f', date0, marks, k2=True)
+    hv, cv = nint(H, K, 'ResearchPct'), nint(C, K, 'ResearchPct')
+    check(f'f) the month ({date0} -> {date4}) used Captain\'s orders as they were when the time ran out (research % '
+          f'{B4}; the host {hv}, the client {cv}; the withdrawn turn had {A4}); "host turn: 2 submissions merged"',
+          date4 and date4 != date0 and hv == B4 and cv == B4 and
+          log_lines(log_since(H, marks[H]), r'host turn: 2 submissions merged'), dict(host=hv, client=cv))
+    # the third copy leaves; nation 1's research % back with its next turn, nation 2's on the host
+    k2_stop(ctx)
+    cmd(C, f'nfield {K} ResearchPct {r0}')
+    if z0 is not None:
+        cmd(H, f'nfield {STANDIN} ResearchPct {z0}')
 
 
 def scenario_relations_peace(ctx):
@@ -22711,7 +23338,8 @@ def scenario_lockstep_missiles(ctx):
 AIR_SLOT = 49  # air_units' throwaway copy of the 1935 campaign (must not exist before the run; deleted after it); a host's
 #   campaign must be in slots 1-49 (the mod's CampaignLoaded: from 50 on the slots are joined players' own)
 AIR_MONTHS = (2, 3)  # air_units' real months with a merged turn: the default run, --stress
-OWN_CAMPAIGN = ('air_units',)  # their months are another campaign's: never shared with the slot 1 session's month hooks
+OWN_CAMPAIGN = ('air_units', 'aircraft')  # their months are another campaign's: never shared with the slot 1 session's
+#   month hooks (0.9.0 integration: aircraft's months on its 1935 copy, run_month checks=False, too)
 AIR_LOAD_RE = r"air units: (\d+) from before the load dropped; the campaign's (\d+) kept"
 AIR_REPAIR_RE = r'air units: (\d+) repeated units of the save dropped \((\d+) -> (\d+); a save of an earlier version\)'
 AIR_BAD_RE = (r'WARNING: air unit list not found|WARNING: air units: the list changed during the load|'
@@ -22924,6 +23552,507 @@ def scenario_air_units(ctx):
     bad = {who_of(p): ls_lines(p, m, AIR_BAD_RE) for p, m in marks0.items()}
     check('f) no air-unit WARNING or failure in either log ("air unit list not found", "the list changed during the '
           'load", "exception dropping the air units", "the load failed")', not any(bad.values()), bad)
+
+
+# ---------------------------------------------------------------- 0.9.0: each joined player's own aircraft (the 1935
+# campaign)
+AC_SLOT = 45  # aircraft's throwaway copy of the 1935 campaign (must not exist before the run; deleted after it)
+AC_MONTH_RE = r"aircraft: the month's routines of nation (\d+): (.*)"
+AC_VIEW_RE = r"aircraft: (.*) in nation (\d+)'s view"
+AC_MERGE_RE = r'merge nation (\d+): .*?(aircraft types \d+ -> \d+, air units \d+ -> \d+[^,]*|its aircraft NOT taken[^,]*|no ' \
+              r'aircraft in the turn)'
+AC_PROTO_CAPTION = 'Select one of the prototypes'
+AC_BAD_RE = r'aircraft: UNAVAILABLE|the view is unavailable|aircraft: NOT in the turn|its aircraft NOT taken|the game raised'
+
+
+AC_PICK = dict(on=False, picks=[])  # aircraft d): answer_dialogs picks the month's prototype; [(time, who, rows, picked)]
+
+
+def ac_answer_prototype(pid, who, top):
+    """The month's prototype choice (ResolveAircraftRequest's Aircraft types screen captioned "Select one of the
+    prototypes"), answered by answer_dialogs while AC_PICK['on']: row 0 of its list selected and focused (lv_select; its
+    OK needs a selected row), OK. Once per window and 3 s."""
+    last = AC_PICK['picks'][-1] if AC_PICK['picks'] else None
+    if last and last[4] == top and time.time() - last[0] < 3:
+        return
+    kids = []
+
+    def ccb(h, l):
+        kids.append(h)
+        return True
+
+    u.EnumChildWindows(top, e2e_test.EnumProc(ccb), 0)
+    lv = next((h for h in kids if e2e_test.class_name(h) == 'TListView'), None)
+    ok = next((h for h in kids if e2e_test.class_name(h) == 'TButton' and u.IsWindowVisible(h) and u.IsWindowEnabled(h)
+               and e2e_test.window_text(h).replace('&', '').strip() == 'OK'), None)
+    rows = lv_rows(pid, lv, cols=2) if lv and ok else []
+    if not rows:
+        return
+    lv_select(pid, lv, 0)
+    time.sleep(0.4)
+    u.PostMessageW(ok, 0x00F5, 0, 0)  # BM_CLICK
+    names = [r[2][0] for r in rows]
+    AC_PICK['picks'].append((time.time(), who, names, names[0], top))
+    ANSWERED.append((time.time(), who, f'TfrmAircraftTypes:"{AC_PROTO_CAPTION}"->{names[0]}'))
+    log(f'  {who} dialog answered: TfrmAircraftTypes:"{AC_PROTO_CAPTION}"->OK with {names[0]!r} (rows {names})')
+    time.sleep(0.5)
+
+
+def ac_copy(src, dst, src_dir=None):
+    """Save slot `src` (or `src_dir`, the run's backup of it) copied as it is to slot `dst` (the slot number in the file
+    names changed)."""
+    s, d = src_dir or slot_dir(src), slot_dir(dst)
+    os.makedirs(d)
+    for fn in os.listdir(s):
+        m = re.fullmatch(rf'(RTWGame|MapData){src}(\.\w+)', fn)
+        shutil.copyfile(os.path.join(s, fn), os.path.join(d, f'{m[1]}{dst}{m[2]}' if m else fn))
+
+
+def ac_info(port, nation=-1):
+    """`aircraft [nation]` -> dict (nation, view, client, active, host, month, req 'role:months', types, dev, units,
+    reserve, unitIds 'a-b', ignored, list [(id, name, dev)]); {} on an error."""
+    r = scmd(port, f'aircraft {nation}')
+    d = kvs(r.split(' list=')[0])
+    if d:
+        lst = r.split(' list=', 1)[1] if ' list=' in r else ''
+        d['list'] = [tuple(x.split('~')) for x in lst.split(',') if x.count('~') == 2]
+    return d
+
+
+def ac_saved(slot):
+    """The [AircraftTypes] and [AirUnits] of a slot's .bcs: dict(types {id: {field: value}}, units {id: {...}},
+    general {ACRequestRole, ACRequest, IDNo}); None if unreadable."""
+    try:
+        with open(save_path(slot), 'rb') as f:
+            txt = f.read().decode('utf-8-sig', errors='replace')
+    except OSError:
+        return None
+    out = dict(types={}, units={}, general={})
+    for sec, pfx, key in (('AircraftTypes', 'AT', 'types'), ('AirUnits', 'AU', 'units')):
+        m = re.search(rf'^\[{sec}\][^\n]*\n(.*?)(?=^\[|\Z)', txt, re.S | re.M)
+        rows = {}
+        for i, k, v in re.findall(rf'^{pfx}(\d+)([A-Z][A-Za-z0-9]*)=(.*?)\r?$', m[1] if m else '', re.M):
+            rows.setdefault(i, {})[k] = v
+        out[key] = {r.get('Id'): r for r in rows.values()}
+    g = re.search(r'^\[General\][^\n]*\n(.*?)(?=^\[|\Z)', txt, re.S | re.M)
+    for k in ('ACRequestRole', 'ACRequest', 'IDNo'):
+        mm = re.search(rf'^{k}=(.*?)\r?$', g[1] if g else '', re.M)
+        out['general'][k] = mm[1] if mm else None
+    return out
+
+
+def ac_of(sv, kind, nation):
+    """{id: fields} of one nation's types or units of an ac_saved result."""
+    return {i: f for i, f in (sv or {}).get(kind, {}).items() if f.get('Nation') == str(nation)}
+
+
+def ac_full(f):
+    """A type's name as the game's lists show it (TAircraftType.GetCompleteName: the name alone when it starts with the
+    manufacturer's, else "<manufacturer> <name>")."""
+    mk, nm = f.get('Manufacturer', ''), f.get('Name', '')
+    return nm if mk and nm.startswith(mk) else f'{mk} {nm}'
+
+
+def ac_vcl(port, form, field='-'):
+    return kvs(scmd(port, f'vcl {form} {field}'))
+
+
+def ac_click(port, form, field):
+    h = int(ac_vcl(port, form, field).get('hwnd', '0') or 0)
+    if h:
+        u.PostMessageW(h, 0x00F5, 0, 0)  # BM_CLICK
+    return h
+
+
+def ac_idle(port, pid, who, timeout=30):
+    """The copy's strategic screen enabled (no modal dialog over it: a turn report, a relation turn's question), the
+    dialogs answered meanwhile; True when it is."""
+    end = time.time() + timeout
+    while time.time() < end:
+        h = int(ac_vcl(port, 'TfrmBuildCamp', '-').get('hwnd', '0') or 0)
+        if h and u.IsWindowEnabled(h):
+            return True
+        answer_dialogs(pid, who)
+        time.sleep(0.7)
+    return False
+
+
+def ac_types_screen(ctx, port, pid, who):
+    """Open the strategic screen's Aircraft types screen (its button, posted) and read it: dict(open, rows [names], view
+    (`aircraft` while open), request button enabled). Left open."""
+    idle = ac_idle(port, pid, who)
+    ac_click(port, 'TfrmBuildCamp', 'btbnAircraftTypes')
+    w = wait_window(pid, 'TfrmAircraftTypes', 15)
+    res = dict(open=bool(w), rows=[], view=None, req=None, hwnd=w)
+    if not w:
+        res['windows'] = f'idle {idle}; {describe_windows(pid)}'
+        return res
+    time.sleep(0.5)
+    lv = int(ac_vcl(port, 'TfrmAircraftTypes', 'lvAircraftTypes').get('hwnd', '0') or 0)
+    res['rows'] = [r[2][0] for r in lv_rows(pid, lv, cols=2)] if lv else []
+    res['view'] = ac_info(port).get('view')
+    res['req'] = ac_vcl(port, 'TfrmAircraftTypes', 'bnRequest').get('enabled')
+    return res
+
+
+def ac_close(port, pid, form, field='bnOK'):
+    if not wait_window(pid, form, 1):
+        return True
+    ac_click(port, form, field)
+    if wait_window(pid, form, 8, gone=True):
+        return True
+    for w in windows_of(pid, form):
+        u.PostMessageW(w, 0x0010, 0, 0)  # WM_CLOSE
+    return bool(wait_window(pid, form, 5, gone=True))
+
+
+def ac_request(ctx, port, pid, row=0):
+    """The Aircraft types screen's Request (open): the request dialog, role row `row` of its list (LB_SETCURSEL), OK.
+    Returns (dialog shown, the roles listed, boxes after OK)."""
+    ac_click(port, 'TfrmAircraftTypes', 'bnRequest')
+    d = wait_window(pid, 'TdlgAircraftRequest', 10)
+    if not d:
+        return False, 0, box_texts(pid)
+    lb = int(ac_vcl(port, 'TdlgAircraftRequest', 'lbAircraftRole').get('hwnd', '0') or 0)
+    n = _u32.SendMessageW(lb, 0x018B, 0, 0) if lb else 0  # LB_GETCOUNT
+    if lb and n > row:
+        _u32.SendMessageW(lb, 0x0186, row, 0)  # LB_SETCURSEL
+    ac_click(port, 'TdlgAircraftRequest', 'bnOK')
+    gone = wait_window(pid, 'TdlgAircraftRequest', 8, gone=True)
+    boxes = box_texts(pid)
+    if not gone:
+        answer_confirmations(pid, 2)
+        ac_close(port, pid, 'TdlgAircraftRequest', 'bnCancel')
+    return True, n, boxes
+
+
+def ac_cag(ctx, port, pid):
+    """Open the air group screen (the strategic screen's button): dict(open, rows, bases, lb (the bases' list box))."""
+    idle = ac_idle(port, pid, 'client')
+    ac_click(port, 'TfrmBuildCamp', 'btbnAirGroups')
+    w = wait_window(pid, 'TdlgCAG', 15)
+    res = dict(open=bool(w), rows=0, bases=0, lb=0)
+    if not w:
+        res['windows'] = f'idle {idle}; {describe_windows(pid)}'
+        return res
+    time.sleep(0.5)
+    lv = int(ac_vcl(port, 'TdlgCAG', 'lvAirUnits').get('hwnd', '0') or 0)
+    lb = int(ac_vcl(port, 'TdlgCAG', 'lbAirbases').get('hwnd', '0') or 0)
+    res.update(rows=len(lv_rows(pid, lv, cols=3)) if lv else 0, lb=lb,
+               bases=_u32.SendMessageW(lb, 0x018B, 0, 0) if lb else 0)
+    return res
+
+
+def ac_cag_base(pid, port, lb, i):
+    """Select base row i alone of the air group screen's base list (a MultiSelect list box, whose ItemIndex is the caret:
+    LB_SETSEL off for all, on for i, LB_SETCARETINDEX i) and send the LBN_SELCHANGE its click sends."""
+    _u32.SendMessageW(lb, 0x0185, 0, -1)  # LB_SETSEL off, every row
+    _u32.SendMessageW(lb, 0x0185, 1, i)  # LB_SETSEL on, row i
+    _u32.SendMessageW(lb, 0x019E, i, 0)  # LB_SETCARETINDEX
+    parent = int(ac_vcl(port, 'TdlgCAG', 'lbAirbases').get('parent', '0') or 0)
+    ctrl = u.GetDlgCtrlID(lb)
+    u.PostMessageW(parent, 0x0111, (1 << 16) | (ctrl & 0xFFFF), lb)  # WM_COMMAND LBN_SELCHANGE
+    time.sleep(0.6)
+
+
+def ac_pick_prototype(ctx, port, pid, timeout=40):
+    """The month's prototype choice on this copy (ResolveAircraftRequest: the picture message, then the Aircraft types
+    screen captioned "Select one of the prototypes"): the first row selected and focused (lv_select), OK. Returns
+    (seen, rows [names], picked name)."""
+    end, w = time.time() + timeout, None
+    while time.time() < end and not w:
+        answer_dialogs(pid, 'client')  # (the picture message "New ... prototypes are ready for evaluation")
+        w = next((h for h in windows_of(pid, 'TfrmAircraftTypes') if u.IsWindowVisible(h)
+                  and e2e_test.window_text(h) == AC_PROTO_CAPTION), None)
+        time.sleep(0.5)
+    if not w:
+        return False, [], None
+    time.sleep(0.5)
+    lv = int(ac_vcl(port, 'TfrmAircraftTypes', 'lvAircraftTypes').get('hwnd', '0') or 0)
+    rows = lv_rows(pid, lv, cols=2) if lv else []
+    lv_select(pid, lv, 0)
+    time.sleep(0.4)
+    ac_click(port, 'TfrmAircraftTypes', 'bnOK')
+    gone = wait_window(pid, 'TfrmAircraftTypes', 10, gone=True)
+    if not gone:
+        log(f'  NOTE the prototype choice did not close: {box_texts(pid)}')
+        answer_confirmations(pid, 2)
+        ac_close(port, pid, 'TfrmAircraftTypes', 'bnCancel')
+    return True, [r[2][0] for r in rows], rows[0][2][0] if rows else None
+
+
+def scenario_aircraft(ctx):
+    """0.9.0: each joined player's own aircraft, on the 1935 test campaign (slot 9; skipped without it) copied to the
+    throwaway slot 45, the client playing France (nation 2). a) the session moves there; both announce `acft`; the
+    client's first month runs the month's aircraft routines (before the event roll; after each month the scenario also
+    waits for nation 2's relation turn, whose turn report would block the screens' buttons). b) TEST `acset req 0 0` on
+    the client (a request of the month's old-type reminder disables the Request button), the client's Aircraft types
+    screen (the strategic screen's button) lists France's types, not the host's, in France's view (`aircraft` view=1
+    while it is open); the Request through the game's dialog (a role, OK): the form's request (n months), the button
+    disabled, the host's own request untouched. c) the air group screen lists France's units; "Move all to reserve" on a
+    base (popup) and "Auto add aircraft" on it: France's units (new ids in its id range, nation 2), no unit of the
+    host's. d) TEST `acset req 1`, Submit (the Turn's air checks), month M1: the host merges the turn's aircraft (log),
+    keeps the request record (`acstore 2`), its own [General] untouched; France's reserve units are not disbanded and
+    get no computer changes; the client's month: the prototypes dialog on its PC, one picked: a type of nation 2 in
+    development (id in its range). d0) (the 0.9.0 integration, before d)'s Submit) a turn with other aircraft (TEST `acset
+    dev <id> 4` on an in-service type of France's, `acset req 6`) submitted and taken back (`unsubmit`), the type put
+    back: M1 merges the re-submitted turn only (the type's DevelopmentTime 0 in the host's save, the request record
+    r:1); when the withdrawn turn's Submit asked the Turn's air question (a carrier without air units, answered No),
+    the Unsubmit still went through and the re-submit asked it again. e) month M2: the host's save holds the new type
+    (nation 2, developing, not the
+    host's), ids unique over all types and units; TEST `acset dev <id> 1` on the client (the merge takes its types), M3:
+    in service, the client's turn report names it ("Our new ... is ready for operational service."). f) the computer
+    developed nothing for France (TEST `acset aidev 2` on the host: the game's AIDevelopAircraftType through its hook,
+    types unchanged, "AI suppressed: ..."; no new type but its player's, improved models and its ventures). g) the
+    client's reload of its month (`load 77 2 mod`) keeps France's units. h) mixed versions: the host's `acset host 0`
+    (as 0.8.1: no `acft` in the month, nothing merged, the host's request in France's month) and the client's `acset cap
+    0` (hello acft=0: as 0.8.1), then both on again. j) last (no month follows: the war it needs stays): a live battle
+    (`pocbattle 2 0`) with France's units: the same air formations on both copies at the start and after 4 minutes, no
+    DESYNC. i) no aircraft warning; the run's error-box check."""
+    ok, why = fixture1935()
+    if not ok:
+        SKIPPED['aircraft'] = why
+        log(f'SKIP aircraft: {why}. Make the 1935 test campaign as docs/TESTING.md describes ("The 1935 test campaign") '
+            f'and run again.')
+        return
+    K, nameK = F1935_NATION, F1935_NAME
+    marks0 = {H: log_mark(H), C: log_mark(C)}
+
+    def settle(cm):  # the client's event roll and its relation turn (nation K: run_month waits for nation 1's only)
+        wait_event_roll(ctx, cm)
+        wait_relations_turn(ctx, cm, nation=K)
+
+    ac_copy(F1935_SLOT, AC_SLOT, F1935_BACKUP if os.path.isdir(F1935_BACKUP) else None)
+    sv0 = ac_saved(AC_SLOT)
+    hm, cm = log_mark(H), log_mark(C)
+    ok, detail = move_session(ctx, 'aircraft', AC_SLOT, K, nameK)
+    if not check(f'a) the session moves to the 1935 test campaign (copied to slot {AC_SLOT}); the client plans {nameK}',
+                 ok, detail):
+        return
+    settle(cm)
+    hello = ls_lines(H, hm, r"Captain: the nation's own aircraft (\d) \(this host: (\d)\)")
+    cmon = ls_lines(C, cm, r'aircraft: month of nation \d+: .*')
+    crun = ls_lines(C, cm, AC_MONTH_RE)
+    check('a) both announce the aircraft (host log "Captain: the nation\'s own aircraft 1 (this host: 1)"), France\'s '
+          'month package says the host keeps them, and its month\'s aircraft routines ran before the event roll',
+          any(x.endswith('aircraft 1 (this host: 1)') for x in hello) and any('the host keeps' in x for x in cmon)
+          and crun and ctx.roll.get('rolls'), f'{hello}; {cmon[-1:]}; {crun[-1:]} (a request "0:0 -> r:n": the old types\' '
+          f'reminder, an event dialog on this PC, answered "Yes." and its request dialog OK)')
+    fr0 = ac_of(sv0, 'types', K)
+    gb0 = ac_of(sv0, 'types', 0)
+    names_fr = {ac_full(f) for f in fr0.values() if f.get('Obsolete') == '0'}
+    names_gb = {ac_full(f) for f in gb0.values()}
+    # b) the Aircraft types screen and the request
+    h_req0 = scmd(H, 'ffield ACRequest')
+    scmd(C, 'acset req 0 0')  # (TEST: a request the month's old-type reminder made disables the Request button)
+    sc = ac_types_screen(ctx, C, ctx.cp, 'client')
+    rows = set(sc['rows'])
+    check(f'b) the client\'s Aircraft types screen (its button) lists France\'s {len(names_fr)} types and none of the '
+          f'host\'s, open in France\'s view (`aircraft` view=1)', sc['open'] and rows == names_fr and not rows & names_gb
+          and sc['view'] == '1', f'rows {sorted(rows)}; France {sorted(names_fr)}; view {sc["view"]}; '
+          f'{sc.get("windows", "")}')
+    shown, nroles, boxes = ac_request(ctx, C, ctx.cp, 0) if sc['open'] and sc['req'] == '1' else (False, 0, [])
+    req_btn = ac_vcl(C, 'TfrmAircraftTypes', 'bnRequest').get('enabled')
+    closed = ac_close(C, ctx.cp, 'TfrmAircraftTypes')
+    ci = ac_info(C, K)
+    req = ci.get('req', '0:0').split(':')
+    check(f'b) Request through the game\'s dialog ({nroles} roles, the first, OK): France\'s request in the form '
+          f'({ci.get("req")}), the Request button disabled, the screen closed and the view put back; the host\'s own '
+          f'request untouched ({h_req0} -> {scmd(H, "ffield ACRequest")})', shown and int(req[1]) > 0
+          and req_btn == '0' and closed and ci.get('view') == '0' and scmd(H, 'ffield ACRequest') == h_req0,
+          f'boxes {boxes}; {ci}')
+    # c) the air group screen: Move all to reserve on a base, then Auto
+    cu0 = ac_info(C, K)
+    cg = ac_cag(ctx, C, ctx.cp)
+    picks, base = [], None
+    if cg['open'] and cg['bases'] > 2:
+        lv = int(ac_vcl(C, 'TdlgCAG', 'lvAirUnits').get('hwnd', '0') or 0)
+        for i in range(2, min(cg['bases'], 10)):  # (rows 0 and 1: "All", "Unassigned pool")
+            ac_cag_base(ctx.cp, C, cg['lb'], i)
+            if lv and _u32.SendMessageW(lv, LVM_GETITEMCOUNT, 0, 0) > 0:
+                base = i
+                break
+    if base is not None:
+        picks.append(popup_pick(ctx.cp, cg['lb'], 'Move all to reserve'))
+        answer_confirmations(ctx.cp, 2)
+        ac_cag_base(ctx.cp, C, cg['lb'], base)  # (the handler rewrites the row's text: the row's selection is gone)
+        picks.append(popup_pick(ctx.cp, cg['lb'], 'Auto add aircraft'))
+        answer_confirmations(ctx.cp, 2)
+    cview = ac_info(C).get('view')
+    ac_close(C, ctx.cp, 'TdlgCAG', 'Button1')
+    cu1 = ac_info(C, K)
+    hid = int((sv0 or {}).get('general', {}).get('IDNo') or 0)
+    lo, hi = (int(x) for x in cu1.get('unitIds', '0-0').split('-'))
+    check(f'c) the air group screen lists France\'s units ({cg["rows"]} rows, {cg["bases"]} bases) in its view; '
+          f'"Move all to reserve" and "Auto add aircraft" on base row {base}: France\'s reserve {cu0.get("reserve")} '
+          f'-> {cu1.get("reserve")}, units {cu0.get("units")} -> {cu1.get("units")} (new ids from its own range, above '
+          f'{hid + 20000 * K}); the host\'s '
+          f'nation\'s units on this copy unchanged', cg['open'] and cview == '1' and base is not None and len(picks) == 2
+          and all('picked' in p for p in picks)
+          and int(cu1.get('reserve', 0)) > int(cu0.get('reserve', 0)) and hi > hid + 20000 * K
+          and ac_info(C, 0).get('units') == str(len(ac_of(sv0, 'units', 0))), f'{picks}; {cu0}; {cu1}; '
+          f'{cg.get("windows", "")}')
+    # d0) the 0.9.0 integration: Unsubmit turn with the aircraft. A turn whose aircraft differ (TEST: an in-service type
+    # of France's "in development" 4 months, the request 6 months) submitted, then taken back; the changes undone and
+    # d)'s turn submitted (by run_month): M1 merges that one only.
+    tw = next((i for i, f in sorted(fr0.items(), key=lambda e: int(e[0])) if f.get('DevelopmentTime') == '0'
+               and f.get('Obsolete') == '0'), None)
+    role0 = (ac_info(C, K).get('req') or '0:0').split(':')[0]
+    hmw, cmw = log_mark(H), log_mark(C)
+    dv = scmd(C, f'acset dev {tw} 4') if tw else 'no type'
+    rq = scmd(C, f'acset req 6 {role0}')
+    t_w0 = time.time()
+    held = unsub_player(unsub_submit(ctx, C, 'client'), CLIENT_NAME)
+    t_w1 = time.time()
+    tw_sub = ((ac_saved(CLIENT_SLOT) or {}).get('types', {}).get(tw) or {}).get('DevelopmentTime')
+    ur, ust = unsub_ask(C)
+    gone = unsub_player(unsub_state(H), CLIENT_NAME)
+    dv0 = scmd(C, f'acset dev {tw} 0') if tw else 'no type'
+    log(f'  d0) withdrawn turn: {dv}, {rq}; held {held}; its file: type {tw} DevelopmentTime {tw_sub}; unsubmit {ur!r} '
+        f'-> client {ust}; host {gone}; undone: {dv0}')
+    # d) M1: the request resolves on the client's PC next month (TEST: one month left)
+    scmd(C, 'acset req 1')
+    cu_sub = ac_info(C, K)
+    hm, cm = log_mark(H), log_mark(C)
+    t_r0 = time.time()
+    AC_PICK.update(on=True, picks=[])  # (the choice comes before the client's event roll, which run_month awaits)
+    try:
+        run_month(ctx, 'aircraft M1', slot=AC_SLOT, checks=False)
+        pk = [x for x in AC_PICK['picks'] if x[1] == 'client']
+        seen, prow, picked = (True, pk[-1][2], pk[-1][3]) if pk else ac_pick_prototype(ctx, C, ctx.cp, timeout=20)
+    finally:
+        AC_PICK['on'] = False
+    settle(cm)
+    merged = ls_lines(H, hm, AC_MERGE_RE)
+    store = kvs(scmd(H, f'acstore {K}'))
+    sv1 = ac_saved(AC_SLOT)
+    fr1u = ac_of(sv1, 'units', K)
+    check(f'd) M1: the host merged France\'s turn with its aircraft ({merged[-1:]}), France\'s units in the host\'s save '
+          f'= the client\'s at Submit ({len(fr1u)} = {cu_sub.get("units")}), its reserve units kept (not disbanded), '
+          f'the request record (`acstore`: ACRequest=1 {store.get("ACRequest")}), the host\'s own request untouched',
+          merged and 'aircraft types' in merged[-1] and str(len(fr1u)) == cu_sub.get('units')
+          and store.get('stored') == '1' and store.get('ACRequest') == '1'
+          and (sv1 or {}).get('general', {}).get('ACRequest') == (sv0 or {}).get('general', {}).get('ACRequest'),
+          f'{store}')
+    cmn = ls_lines(C, cm, AC_MONTH_RE)
+    ci1 = ac_info(C, K)
+    new = [x for x in ci1.get('list', []) if x[0] not in fr0 and x[2] != '0']
+    fm = re.search(r'funds (-?\d+) -> (-?\d+)', cmn[-1] if cmn else '')
+    check(f'd) M1 on the client: the month\'s routines resolved the request ({cmn[-1:]}), the prototypes dialog on its '
+          f'PC ({len(prow)} rows), one picked ({picked}): a France type in development ({new}) with an id of its range, '
+          f'its development paid from France\'s funds', seen and cmn and 'prototypes resolved' in cmn[-1]
+          and len(new) == 1 and int(new[0][0]) > hid + 20000 * K and fm and int(fm[2]) < int(fm[1]),
+          f'{ci1.get("list")}')
+    carried = [re.search(r'request (\d+:\d+)', x) for x in ls_lines(C, cmw, r'aircraft: the turn carries .*')]
+    carried = [x[1] for x in carried if x]
+    took = ls_lines(H, hmw, rf'unsubmit: {CLIENT_NAME} withdrew the turn of month seq \d+ \(nation {K}: the turn dropped\)')
+    tw1 = ((sv1 or {}).get('types', {}).get(tw) or {}).get('DevelopmentTime')
+    check(f'd0) Unsubmit with the aircraft: the withdrawn turn carried type {tw} "in development" ({tw_sub} months in its '
+          f'file) and the request {role0}:6 (the turns\' requests {carried}); the host dropped it ({took[-1:]}; held '
+          f'{held} -> {gone}); M1 merged the re-submitted turn only: type {tw} DevelopmentTime {tw1} in the host\'s save '
+          f'(0), the request record {store.get("ACRequestRole")}:{store.get("ACRequest")} ({role0}:1)',
+          tw is not None and tw_sub == '4' and carried[:1] == [f'{role0}:6'] and carried[-1:] == [f'{role0}:1']
+          and len(carried) == 2 and took and (held or (0, 0, 0))[1:3] == (1, 1) and (gone or (0, 1, 1))[1:3] == (0, 0)
+          and ust.get('submitted') == '0' and tw1 == '0' and store.get('ACRequest') == '1'
+          and store.get('ACRequestRole') == role0, f'{ur!r}; {ust}')
+    aqw = [t for ts, w, k, t in BOX_SEEN if w == 'client' and AIR_GROUP_PROMPT in t and t_w0 <= ts <= t_w1]
+    aqr = [t for ts, w, k, t in BOX_SEEN if w == 'client' and AIR_GROUP_PROMPT in t and ts >= t_r0]
+    if aqw:
+        check(f'd0) the Turn\'s air question at the withdrawn turn\'s Submit ({aqw[0][:70]!r}..., answered No) left an '
+              f'Unsubmit as for any turn, and the re-submit asked it again ({len(aqr)})', aqr and took
+              and ust.get('submitted') == '0', dict(withdrawn=len(aqw), resubmit=len(aqr)))
+    else:
+        log('  SKIP-note d0): no Turn air question at the withdrawn turn\'s Submit (no carrier of France\'s without air '
+            'units): Unsubmit after the air checks not seen')
+    # e) M2: the host's save holds it; M3: in service
+    hm, cm = log_mark(H), log_mark(C)
+    run_month(ctx, 'aircraft M2', slot=AC_SLOT, checks=False)
+    settle(cm)
+    sv2 = ac_saved(AC_SLOT)
+    nt = new[0][0] if new else None
+    t2 = (sv2 or {}).get('types', {}).get(nt, {})
+    all_ids = [i for i in (sv2 or {}).get('types', {})] + [i for i in (sv2 or {}).get('units', {})]
+    gb2 = [i for i, f in ac_of(sv2, 'types', 0).items() if f.get('Name') == t2.get('Name')]
+    check(f'e) M2: the host\'s save holds France\'s new type {nt} (Nation 2, DevelopmentTime {t2.get("DevelopmentTime")}),'
+          f' the host\'s nation has no such type ({gb2}); every type and unit id once ({len(all_ids)})',
+          t2.get('Nation') == '2' and int(t2.get('DevelopmentTime', '0') or 0) > 0 and not gb2
+          and len(all_ids) == len(set(all_ids)), f'{t2}')
+    if nt:  # (on the player's PC: the merge takes its types as its turn has them)
+        scmd(C, f'acset dev {nt} 1')
+    hm, cm = log_mark(H), log_mark(C)
+    n0 = len(BOX_SEEN)
+    run_month(ctx, 'aircraft M3', slot=AC_SLOT, checks=False)
+    settle(cm)
+    sv3 = ac_saved(AC_SLOT)
+    t3 = (sv3 or {}).get('types', {}).get(nt, {})
+    news = [t for ts, w, k, t in BOX_SEEN[n0:] if w == 'client' and 'ready for operational service' in t]
+    check(f'e) M3 (TEST `acset dev {nt} 1` on the client): France\'s type in service in the host\'s save (DevelopmentTime '
+          f'{t3.get("DevelopmentTime")}) and the client\'s turn report says "Our new ... is ready for operational '
+          f'service." ({news[:1]})', t3.get('Nation') == '2' and t3.get('DevelopmentTime') == '0' and news,
+          ls_lines(H, hm, r'aircraft: .*news'))
+    # f) the computer developed nothing for France
+    hm = log_mark(H)
+    aid = kvs(scmd(H, f'acset aidev {K}'))
+    sup = ls_lines(H, marks0[H], rf'AI suppressed: AIDevelopAircraftType for nation {K}\b')
+    fr3 = ac_of(sv3, 'types', K)
+    extra = sorted(set(fr3) - set(fr0) - {nt})
+    improved = [i for i in extra if fr3[i].get('Version', '0') != '0']  # (the shared type loop's improved models)
+    ventures = sum('private venture offered' in x for x in ls_lines(C, marks0[C], AC_MONTH_RE))
+    check(f'f) the computer developed no type for France: TEST `acset aidev {K}` on the host (the game\'s '
+          f'AIDevelopAircraftType through its hook) types {aid.get("types")}, its "AI suppressed: AIDevelopAircraftType '
+          f'for nation {K}" ({len(sup)} in the run); France\'s types the fixture\'s {len(fr0)}, its player\'s {nt}, '
+          f'improved models {improved}, {ventures} private venture(s) of its PC',
+          aid.get('types', '').split('->')[0] == aid.get('types', '-').split('->')[-1]
+          and ls_lines(H, hm, rf'AI suppressed: AIDevelopAircraftType for nation {K}\b')
+          and len([i for i in extra if i not in improved]) <= ventures, f'{aid}; extra {extra}')
+    # g) a reload of the client's month and a live battle keep France's units
+    u3 = set(ac_of(sv3, 'units', K))
+    cm = log_mark(C)
+    rl = cmd(C, f'load {CLIENT_SLOT} {K} mod')
+    wait(C, lambda s: s.get('slot') == str(CLIENT_SLOT) and s.get('playerIdx') == str(K), 120, 'the client reloads',
+         pids=(ctx.cp,))
+    ci4 = ac_info(C, K)
+    check(f'g) the client\'s reload of its month ({rl}): France\'s {len(u3)} units as the host saved them',
+          rl == 'ok' and ci4.get('units') == str(len(u3)), f'{ci4}')
+    # h) mixed versions: an older host, then an older client
+    scmd(H, 'acset host 0')
+    hm, cm = log_mark(H), log_mark(C)
+    run_month(ctx, 'aircraft M4 (host as 0.8.1)', slot=AC_SLOT, checks=False)
+    settle(cm)
+    mm = ls_lines(H, hm, r'merge nation 2: .*')
+    cmon = ls_lines(C, cm, r'aircraft: month of nation \d+: .*')
+    check('h) the host as 0.8.1 (`acset host 0`): no aircraft merged ("merge nation 2" without them), France\'s month says '
+          'the host decides its aircraft, no month routine on the client', mm and 'aircraft' not in mm[-1]
+          and any('host decides' in x for x in cmon) and not ls_lines(C, cm, AC_MONTH_RE), f'{mm[-1:]}; {cmon[-1:]}')
+    scmd(H, 'acset host 1')
+    scmd(C, 'acset cap 0')
+    ok2, d2 = move_session(ctx, 'aircraft', AC_SLOT, K, nameK)
+    hm, cm = log_mark(H), log_mark(C)
+    run_month(ctx, 'aircraft M5 (client as 0.8.1)', slot=AC_SLOT, checks=False)
+    settle(cm)
+    mm = ls_lines(H, hm, r'merge nation 2: .*')
+    hello = ls_lines(H, marks0[H], r"Captain: the nation's own aircraft (\d) \(this host: (\d)\)")
+    check('h) the client as 0.8.1 (`acset cap 0`, joined again): hello acft 0, nothing merged, no month routine',
+          ok2 and hello and hello[-1].endswith('aircraft 0 (this host: 1)') and mm and 'aircraft' not in mm[-1]
+          and not ls_lines(C, cm, AC_MONTH_RE), f'{d2}; {hello[-1:]}; {mm[-1:]}')
+    scmd(C, 'acset cap 1')
+    # j) last (no month follows it: the war it needs stays): a live battle with France's units
+    scmd(H, f'settension 0 {K} 50')
+    s = start_battle(ctx, K, F1935_MISSION)
+    if s['res'] == 'running':
+        same, ha, hb = airlist_same()
+        ls_run_total(H, C, 4, H)
+        same2, _, _ = airlist_same()
+        desync = ls_lines(H, s['hm'], r'DESYNC') + ls_lines(C, s['cm'], r'DESYNC')
+        check('j) a live battle with France\'s units (`pocbattle 2 0`): the same air formations on both copies at the '
+              'start and after 4 minutes, no DESYNC', same and same2 and not desync, f'{ha}; {hb}; {desync[:2]}')
+        ls_drive_endsoon(H, C, until=6)
+        ls_wait(lambda: ls_back(C, ctx.cp, CLIENT_SLOT, K), 120, 'the client back in slot 77')
+    else:
+        check('j) a live battle with France\'s units started', False, s)
+    bad = {who_of(p): ls_lines(p, m, AC_BAD_RE) for p, m in marks0.items()}
+    check('i) no aircraft warning in either log (UNAVAILABLE, the view unavailable, not in the turn, not taken, the game '
+          'raised)', not any(bad.values()), bad)
 
 
 LEGACY_SLOT = 46  # legacy_fleet's throwaway copy of the legacy test campaign (a host hosts slots 1-49; air_units has 49,
@@ -24018,6 +25147,15 @@ SCENARIOS = [  # name, months processed, what it guards, function
                         'and host (`battles simul 0`); the host at war with nation 1: its request waits for the end of '
                         'the host\'s battle search, and for the battle phase when that battle is a live one against it',
      scenario_battle_simul),
+    ('unsubmit', 4, '0.9.0: a joined player takes a submitted turn back (the Unsubmit turn button; a third copy joins as '
+                    '"Bot"; after battle_simul, which gives nation 2 a PC first): the capability (hello and welcome '
+                    '`unsub`), the button (shown under a host that takes it, enabled after a submit); the host drops the '
+                    'turn (not ready, its invasion order put back, the chat and the lobby), the player\'s PC counts as '
+                    'not submitted only with the host\'s answer; the host\'s Turn (No) and the other player ready: no '
+                    'start until the player submits again, then the month with the new orders; refused once the month '
+                    'started, while a start waits (Advance while the host is busy) and after the time limit (TEST '
+                    '`unsubmit timeup`); Advance after a withdrawal: the nation keeps last month\'s orders; the time '
+                    'limit: the orders as they are then; a rejoin after an unsubmit', scenario_unsubmit),
     ('relations_war', 1, '0.6.1: the tension bar above the war line: nation 1 at tension 15 with a computer nation -> its '
                          'war from nation 1\'s relation turn (CheckForWar after the tension routines, once, as the game\'s '
                          'month); the players at tension 25 -> the other player\'s bar hint on both PCs (relview: wars '
@@ -24151,6 +25289,13 @@ SCENARIOS = [  # name, months processed, what it guards, function
                                  '(--stress: 3): the host\'s merge reload and the client\'s new month keep the count '
                                  '(`airunits` = the saves\' [AirUnits]), no "aircraft capacity exceeded!" at the host\'s '
                                  'Turn; every live battle load is checked by lockstep_air', scenario_air_units),
+    ('aircraft', 5, '0.9.0: each joined player\'s own aircraft (groups aircraft and air; the 1935 test campaign copied '
+                    'to the throwaway slot 45; skipped without the fixture): the Aircraft types screen and the air group '
+                    'screen on the joined player\'s PC in its nation\'s view (its types and units, not the host\'s), '
+                    'a request through the game\'s dialog, the prototypes chosen on its PC, the new type developing on '
+                    'the host and in service (the player told), air unit changes (to the reserve, Auto) merged and '
+                    'kept through months, a reload and a live battle (the same formations, no DESYNC), ids unique, '
+                    'the computer\'s development left out; an older host or client: as 0.8.1', scenario_aircraft),
     ('lockstep_air', 0, 'live battles with aircraft, the 1935 test campaign (save slot 9, outside the repo; skipped '
                         'without it; runs after the slot-1 scenarios: the session moves to it): a live battle with '
                         'carriers and air stations on both sides (the host option "Computer flies carrier strikes" off); '
@@ -24203,8 +25348,9 @@ STRESS_ONLY = ('lockstep_stress', 'lockstep_rejoin', 'lockstep_resume', 'lockste
 GROUPS = {  # --group <name>[,<name>]: these scenarios (session always first), in the suite's order
     'limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_data', 'lockstep_air'),
     'rejoin': ('lockstep_rejoin', 'lockstep_resume'),
-    'air': ('air_units', 'lockstep_air', 'lockstep_strike'),
+    'air': ('air_units', 'aircraft', 'lockstep_air', 'lockstep_strike'),
     'airunits': ('air_units',),
+    'aircraft': ('aircraft',),
     'torpedo': ('lockstep_torpedo',),
     'missiles': ('lockstep_missiles',),
     'live-limits': ('lockstep_ui', 'lockstep_limits', 'lockstep_data', 'lockstep_rejoin', 'lockstep_resume',
@@ -24226,7 +25372,9 @@ EST = dict(session=14, intel_reports=1, file_lock=4, events=4, merge=17, researc
            lockstep_torpedo=470, lockstep_stress=1310, lockstep_air=265, air_units=65, lockstep_strike=420,
            lockstep_missiles=330, twopc=175, relations_peace=40, war_effects=220, arms_treaty=150,
            battle_generator=340, battle_surprise=60, battle_raider=300, battle_invasion=600, battle_simul=900, relations_war=40, lockstep_data=15, divisions=90,
-           legacy_fleet=420, disk_growth=330, disk_full=230, ship_status=180, ai_escorts=60, ai_war=60, officers=240)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s), + f)'s month (dist_sf7_2, 2026-10-28: 91-104 s with c) fought in its first month), + g) to i) (dist_bs2, 2026-11-01: 336 s in all, two battles fought, one try again);
+           legacy_fleet=420, disk_growth=330, disk_full=230, ship_status=180, ai_escorts=60, ai_war=60, officers=240,
+           unsubmit=100, aircraft=480)  # relations_peace: dist_rv_7, 2026-10-22 (39 s); battle_generator: dist_b6_1 (~150 s), + f)'s month (dist_sf7_2, 2026-10-28: 91-104 s with c) fought in its first month), + g) to i) (dist_bs2, 2026-11-01: 336 s in all, two battles fought, one try again);
+# unsubmit: dist_us90_2 (0.9.0-dev), 2026-11-15 (97-99 s, four months and the third copy)
 # ship_status: dist_rc070_2 (0.7.0), 2026-10-28 (167-175 s, four months, one with a fought battle)
 # ai_escorts: dist_fix4 (0.7.2-dev), 2026-11-01 (about 55 s, two months)
 # divisions: dist_fd_2, 2026-10-25 (90 s, two months)
@@ -24513,8 +25661,8 @@ def dry_run(names, a, problems, plan, prefs_note):
             + ('backed up, put back and verified afterwards' if os.path.exists(PREFS_FILE) else
                'MISSING: SKIP twopc') + f'); the delay proxy on 127.0.0.1:{TWOPC_PROXY_PORT} -> {MP_PORT} (delay '
             f'{net["delay"]} ms, jitter +-{net["jitter"]} ms, {net["kbps"]} kbit/s)')
-    slots = [CLIENT_SLOT, BATTLE_SLOT] + ([K2_SLOT, K2_SLOT + 10] if {'lockstep_pvp', 'lockstep_rejoin'} & set(names)
-                                          else [])
+    slots = [CLIENT_SLOT, BATTLE_SLOT] + ([K2_SLOT, K2_SLOT + 10] if {'lockstep_pvp', 'lockstep_rejoin', 'unsubmit'} &
+                                          set(names) else [])
     log(f'  slots the run writes and deletes afterwards: {slots}' + (f' and player_copy\'s {list(COPY_SLOTS)} + one of '
                                                                     f'{list(BUTTON_SLOTS)}' if 'player_copy' in names
                                                                     else ''))
@@ -24782,10 +25930,13 @@ def main(argv=None):
         _button_slot[0] = next((s for s in BUTTON_SLOTS if not os.path.exists(slot_dir(s))
                                 and s != (plan.get('copy') or (None, None))[1]), None)
         copy_slots = COPY_SLOTS + ((_button_slot[0],) if _button_slot[0] else ())
-    k2_slots = (K2_SLOT, K2_SLOT + 10) if {'lockstep_pvp', 'lockstep_rejoin', 'battle_simul'} & set(names) else ()
+    k2_slots = (K2_SLOT, K2_SLOT + 10) if {'lockstep_pvp', 'lockstep_rejoin', 'battle_simul', 'unsubmit'} & set(names) \
+        else ()
     torpedo = 'lockstep_torpedo' in names
     twopc = 'twopc' in names
     air_slots = (AIR_SLOT,) if 'air_units' in names else ()
+    if 'aircraft' in names:  # 0.9.0: its throwaway copy of the 1935 campaign: must not exist, deleted after
+        air_slots += (AC_SLOT,)
     if 'legacy_fleet' in names and legacy_fixture(a.legacy_fixture)[0]:  # its throwaway copy: must not exist, deleted after
         global LEGACY_FIXTURE
         LEGACY_FIXTURE = a.legacy_fixture
@@ -24818,8 +25969,8 @@ def main(argv=None):
             os.remove(os.path.join(LOG_DIR, fn))
     shutil.copytree(g1, BACKUP)
     log('backed up save slot', HOST_SLOT, '| scenarios:', ', '.join(names))
-    g9 = slot_dir(F1935_SLOT) if {'lockstep_air', 'air_units', 'lockstep_strike'} & set(names) and fixture1935()[0] \
-        else None
+    g9 = slot_dir(F1935_SLOT) if {'lockstep_air', 'air_units', 'aircraft', 'lockstep_strike'} & set(names) and \
+        fixture1935()[0] else None
     if g9:  # the 1935 test campaign: the session start, the battle and its resyncs write it
         shutil.copytree(g9, F1935_BACKUP)
         log('backed up save slot', F1935_SLOT, '(the 1935 test campaign)')

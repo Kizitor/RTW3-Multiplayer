@@ -7,6 +7,7 @@
 #include "invasion.h"
 #include "lockstep.h"
 #include "net.h"
+#include "research.h"
 #include "session.h"
 #include "ui.h"
 #include <intrin.h>
@@ -331,6 +332,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     economy::Install();
     warfx::Install();
     inv::Install();
+    research::Install();
     g_msgHook = SetWindowsHookExW(WH_GETMESSAGE, GetMsgProc, g_inst, g_mainTid);
     PostThreadMessageW(g_mainTid, WM_NULL, 0, 0);
     Log("init done: build %s, main thread %lu, msg hook %p", game::BuildFingerprint().c_str(), g_mainTid, g_msgHook);

@@ -29,6 +29,9 @@ enum : uint16_t {
     // Relations v2 (a number of its own, away from the sequence other branches extend; older peers ignore it):
     MSG_RELATIONS = 40,  // player -> host: what the player's relation routines changed for its nation this month
     MSG_LEGACY = 41,     // player -> host: the player's legacy build started / ended (0.7.0; a notice; older hosts ignore it)
+    // 0.9.0 (a number away from the sequence other branches extend): player -> host, take my submitted turn back (sent
+    // only to a host whose welcome has `unsub`); host -> that player, the answer (taken back, or why not)
+    MSG_UNSUBMIT = 45,
     EV_CONNECTED = 0xFF00,
     EV_DISCONNECTED = 0xFF01,
 };

@@ -1,9 +1,11 @@
 #include "game.h"
+#include "aircraft.h"
 #include "economy.h"
 #include "invasion.h"
 #include "nationplay.h"
 #include "lockstep.h"
 #include "officers.h"
+#include "research.h"
 #include "../../third_party/minhook/include/MinHook.h"
 #include <algorithm>
 #include <climits>
@@ -589,6 +591,7 @@ bool Resolve() {
     ResolvePeace();
     nplay::Resolve();
     ofc::Resolve();
+    acft::Resolve();  // 0.9.0: the joined players' aircraft (aircraft.cpp)
     Log("Resolve: %s (slotVar=%p aiMoves=%p)", ok ? "ok" : "FAILED", A.slotVar, A.mAIMoves);
     return ok;
 }
@@ -797,7 +800,7 @@ static void DedupIntelReports(void* form) {
 // formations name aircraft types, the air group dialog clears its copy pointer when it opens).
 static std::vector<void*> g_airBefore;
 
-static void* AirUnitList() {
+void* AirUnitList() {
     if (!A.airUnitsCell) return nullptr;
     void* var = *(void**)(uintptr_t)A.airUnitsCell;
     void* l = var ? *(void**)var : nullptr;
@@ -1536,6 +1539,21 @@ ClientEventResult RunClientOfficers(int K, std::vector<std::wstring>& messages, 
         if (!ml[i].empty()) messages.push_back(ml[i]);
     return res;
 }
+
+// 0.9.0: the events' view without an event (aircraft.cpp: the player's aircraft screens and the month's aircraft
+// routines on a joined player's PC). Nothing is reported back: the caller reads what it needs before PlayerViewLeave.
+static EvView g_pvView;
+
+bool PlayerViewEnter(int K) {
+    void* f = BuildCamp();
+    void* list = NationList();
+    if (!EventsAvailable() || !f || !list || K < 1 || K > 8 || PlayerNation() != Nation(K) || EventActive()) return false;
+    EvBegin(f, list, K, nullptr, g_pvView);
+    g_evActive = false;  // (the event roll's likelihood veto: no event is rolled in this view)
+    return true;
+}
+
+void PlayerViewLeave() { EvRestore(); }
 
 bool AdjustNationField(int nationIdx, const std::string& field, int value, bool isDelta) {
     void* n = Nation(nationIdx);
@@ -6281,9 +6299,19 @@ extern "C" __declspec(naked) void d_UpdateUI() {  // UpdateUIValues(Self, ReFill
 // DoResearch(Self, aNationIdx, NoNonGunmessages), register arguments only: the monthly research of one nation. For
 // every nation above 0 it also runs the game's AI research choices: some priorities are set to High by chance, and with a
 // 5 % chance a month every priority is re-rolled (mostly Medium). A joined player's own priorities are put back.
+// 0.8.2 (fix-research): first research::HostRun: a joined nation's month runs as the game runs it for its player (in its
+// view, DoResearch(0) with its dialogs going to its player); then the call is done.
 extern "C" void* o_DoResearch = nullptr;
 static int g_resPrio[25];
 static int g_resNation = -1;
+
+extern "C" int __stdcall CB_DoResearchPlayer(void* form, int idx, int noMsg) {
+    try {
+        return research::HostRun(form, idx, (noMsg & 0xFF) != 0) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
 
 extern "C" void __stdcall CB_BeforeResearch(int idx) {
     g_resNation = -1;
@@ -6319,6 +6347,18 @@ extern "C" __declspec(naked) void d_DoResearch() {
         push eax
         push ecx
         push edx
+        push ecx  // NoNonGunmessages (CL)
+        push edx  // aNationIdx
+        push eax  // Self
+        call CB_DoResearchPlayer
+        test eax, eax
+        pop edx
+        pop ecx
+        pop eax
+        jnz done
+        push eax
+        push ecx
+        push edx
         push edx  // aNationIdx
         call CB_BeforeResearch
         pop edx
@@ -6328,6 +6368,7 @@ extern "C" __declspec(naked) void d_DoResearch() {
         push eax
         call CB_AfterResearch
         pop eax
+    done:
         ret
     }
 }
@@ -7459,6 +7500,69 @@ void HostViewLeave() {
     PvLeave();
 }
 
+// 0.8.2 (fix-research): DoResearch(0) in a joined nation's view (RunPlayerResearch).
+static int CallDoResearch0(void* f) {  // 1 = done, 0 = a game exception unwound through it
+    __try {
+        dl::Call(o_DoResearch, (uint32_t)(uintptr_t)f, 0, 0);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+void TurnMessageAdd(const std::wstring& line) {
+    void* f = BuildCamp();
+    void* msgs = f && A.fTurnMessages >= 0 && A.mSLAdd ? dl::At<void*>(f, A.fTurnMessages) : nullptr;
+    if (msgs) StringListAdd(msgs, line);
+}
+
+bool RunPlayerResearch(const PlayerResearchIn& in, PlayerResearchOut& out) {
+    out = PlayerResearchOut();
+    static const int fTS = dl::Field("TBuilderNation", "TechSharing"), fIE = dl::Field("TBuilderNation", "IntelEffort"),
+                     fAB = dl::Field("TfrmBuildCamp", "AirbaseSize");
+    void* f = BuildCamp();
+    const int K = in.K;
+    if (!o_DoResearch || !f || K < 1 || K > 8 || NationCount() < 9 || fTS < 0 || fIE < 0 || fAB < 0 ||
+        A.fTurnMessages < 0 || A.fIntelReports < 0 || !A.mSLCreate || !A.mFree || !A.mSLAdd || A.fSLList < 0 ||
+        A.fSLCount < 0 || g_pvOn || EventActive())
+        return false;
+    void* rec[9];
+    int ie0[9];
+    for (int r = 0; r < 9; r++) {  // the records by their real index (a view only moves them in the list)
+        rec[r] = Nation(r);
+        if (!rec[r]) return false;
+        ie0[r] = dl::At<int>(rec[r], fIE);
+    }
+    const bool human[9] = {};  // no nation masked: K's research sees its real relations
+    void* lists[2] = {StringListCreate(), StringListCreate()};
+    if (!lists[0] || !lists[1] || !HostViewEnter(K, in.war, human)) {
+        for (void* l : lists)
+            if (l) dl::Call(A.mFree, (uint32_t)(uintptr_t)l);
+        return false;
+    }
+    void* keep[2] = {dl::At<void*>(f, A.fTurnMessages), dl::At<void*>(f, A.fIntelReports)};
+    const int ab0 = dl::At<int>(f, fAB);
+    for (int r = 0; r < 9; r++) {  // K's deals and efforts (PvLeave puts the raw TechSharing back, IntelEffort below)
+        dl::At<int>(rec[r], fTS) = r == K ? 0 : in.techSharing[r];
+        dl::At<int>(rec[r], fIE) = r == K ? 0 : in.intelEffort[r];
+    }
+    dl::At<void*>(f, A.fTurnMessages) = lists[0];
+    dl::At<void*>(f, A.fIntelReports) = lists[1];
+    dl::At<int>(f, fAB) = in.airbaseSize;
+    out.fault = !CallDoResearch0(f);
+    for (int r = 0; r < 9; r++) out.techSharing[r] = r == K ? 0 : dl::At<int>(rec[r], fTS);
+    out.airbaseSize = dl::At<int>(f, fAB);
+    dl::At<int>(f, fAB) = ab0;
+    dl::At<void*>(f, A.fTurnMessages) = keep[0];
+    dl::At<void*>(f, A.fIntelReports) = keep[1];
+    HostViewLeave();
+    for (int r = 0; r < 9; r++) dl::At<int>(rec[r], fIE) = ie0[r];
+    out.turnLines = ReadStringList(lists[0]);
+    out.intelLines = ReadStringList(lists[1]);
+    for (void* l : lists) dl::Call(A.mFree, (uint32_t)(uintptr_t)l);
+    return true;
+}
+
 bool RunBattleGenerator(int K, int war, const bool human[9], std::vector<BattleAttempt>& out, std::string& err,
                         bool raiders, bool invasions) {
     out.clear();
@@ -7966,6 +8070,7 @@ struct SkipSpec {
     void* orig;
     bool view = false;
     bool keepHuman = false;
+    bool aircraft = false;  // 0.9.0: skipped only for a nation whose player plays its aircraft (hookcb::AircraftByPlayer)
 };
 static SkipSpec g_skips[] = {
     {"TfrmBuildCamp", "AIMonthlyBuild", 1, false, 0, nullptr, true},
@@ -7996,6 +8101,13 @@ static SkipSpec g_skips[] = {
     // ships under construction, and give the copy's officers (the host's) to K's new ships. All skipped while active.
     {"TfrmBuildCamp", "AIBuildInitialFleet", 2, false, 0, nullptr},
     {"TBuilderNation", "AssignOfficersToUncommandedShips", 0, false, 0, nullptr},
+    // 0.9.0: the computer's aircraft decisions for a joined nation whose player develops its aircraft and manages its air
+    // groups on the player's PC: new types (prototypes, licences; also from CheckOldAircraftTypes) and the air group
+    // a carrier gets at its launch (AdjustShipValuesUponLaunch: never PlayerNation's; the monthly growth,
+    // CheckOneShipsOrBaseHasAircraft, is skipped above). On a joined player's PC the month's aircraft routines run the
+    // game's CheckOldAircraftTypes, whose branch for the other nations is the computer's development: muted meanwhile.
+    {"TfrmBuildCamp", "AIDevelopAircraftType", 1, true, 0, nullptr, false, false, true},
+    {"TCampaignShip", "AIAddAirGroupToShip", 1, true, 0, nullptr, false, false, true},
 };
 
 extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
@@ -8014,6 +8126,15 @@ extern "C" int __stdcall SkipDecider(int idx, uint32_t arg) {
         }
         if (!strcmp(s.method, "AIBuildInitialFleet") || !strcmp(s.method, "AssignOfficersToUncommandedShips"))
             return 0;  // (only for the legacy build)
+        if (s.aircraft) {
+            int nation = (int)arg;
+            if (acft::ClientMonthRunning() && !strcmp(s.method, "AIDevelopAircraftType")) return 1;
+            if (nation >= 1 && nation <= 8 && hookcb::AircraftByPlayer(nation)) {
+                Log("AI suppressed: %s for nation %d (its player's aircraft)", s.method, nation);
+                return 1;
+            }
+            return 0;
+        }
         int nation = s.isIndex ? (int)arg : NationIndex((void*)(uintptr_t)arg);
         if (nation > 0 && !s.keepHuman && hookcb::IsHumanRemoteNation(nation)) {
             Log("AI suppressed: %s for nation %d", s.method, nation);
@@ -9109,6 +9230,7 @@ bool InstallHooks() {
     lockstep::InstallEmptyDivisionGuards();
     nplay::InstallHooks();
     ofc::InstallHooks();  // 0.8.0: the joined players' officers (officers.cpp)
+    acft::InstallHooks();  // 0.9.0: the joined players' aircraft (aircraft.cpp)
     if (lockstep::TestPrefsWanted()) {  // TEST ONLY
         Hook(dl::Method("TdlgPrefs", "LoadPrefs"), (void*)&d_LoadPrefs, &o_LoadPrefs, "TdlgPrefs.LoadPrefs (TEST)");
         Hook(dl::Method("TdlgPrefs", "SavePrefs"), (void*)&d_SavePrefs, &o_SavePrefs, "TdlgPrefs.SavePrefs (TEST)");

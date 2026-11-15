@@ -2076,8 +2076,9 @@ int __stdcall LS_StartMinuteAllowed(void* self);
 void __stdcall LS_AfterEOTP(void* self);
 int __stdcall LS_StartRun(void* self, int n);
 int __stdcall LS_MsgDlg(const wchar_t* msg, int type, int buttons, const uint32_t* entryEsp, uint32_t callerEbp);
-int __stdcall LS_ShowPic(const wchar_t* text, const wchar_t* pic);
-int __stdcall LS_ExecGeneral(const wchar_t* prompt, int preselect);
+int __stdcall LS_ShowPic(const wchar_t* text, const wchar_t* pic, int copyToLog);
+int __stdcall LS_ExecGeneral(const wchar_t* prompt, int preselect, const wchar_t* a1, const wchar_t* a2,
+                             const wchar_t* a3);
 int __stdcall LS_Block(int idx, void* self, void* sender, uint32_t arg3);
 void __stdcall LS_AirStrike(void* self, int side);
 void __stdcall LS_SearchPlan(void* self, int include);
@@ -2327,6 +2328,8 @@ extern "C" __declspec(naked) void LS_dShowPic() {
         push eax
         push ecx
         push edx
+        movzx eax, byte ptr [esp + 16]  // CopyMessageToLog
+        push eax
         push ecx
         push edx
         call LS_ShowPic
@@ -2347,8 +2350,12 @@ extern "C" __declspec(naked) void LS_dExecGeneral() {
         push eax
         push ecx
         push edx
-        push dword ptr [esp + 16]  // aPreselect
-        push edx
+        mov eax, esp               // [eax+16] aPreselect, [eax+20] answer3, [eax+24] answer2
+        push dword ptr [eax + 20]  // answer3
+        push dword ptr [eax + 24]  // answer2
+        push ecx                   // answer1
+        push dword ptr [eax + 16]  // aPreselect
+        push edx                   // aPrompt
         call LS_ExecGeneral
         cmp eax, -1
         je show
@@ -2463,6 +2470,12 @@ static bool g_hooksTried = false, g_hooksOk = false;
 static bool g_showPicHooked = false;  // ShowPicMessage: also hooked alone for a text capture (BeginTextCapture)
 static int g_capture = 0;             // BeginTextCapture depth: picture messages are recorded, not shown
 static std::vector<std::wstring> g_captured;
+// 0.8.2 (fix-research): the capture's sink, if one is set: it gets each picture message (text, picture file, the call's
+// CopyMessageToLog) instead of the text list.
+static PictureSink g_picSink = nullptr;
+static bool g_execGeneralHooked = false;  // ExecuteGeneral: also hooked alone for a question capture
+static int g_qCapture = 0;                // BeginQuestionCapture depth: the questions go to the sink, not shown
+static QuestionSink g_qSink = nullptr;
 // The live-battle rules' hooks that are in place (each one optional: without it that rule is off, as in 0.3.x).
 static bool g_ruleAir = false, g_rulePlan = false, g_ruleMissile = false, g_rulePanel = false, g_ruleLandCap = false,
             g_ruleScout = false;
@@ -2500,6 +2513,36 @@ std::vector<std::wstring> EndTextCapture() {
     std::vector<std::wstring> out;
     if (g_capture == 0) out.swap(g_captured);
     return out;
+}
+
+bool BeginPictureCapture(PictureSink sink) {
+    if (!sink || g_picSink || !BeginTextCapture()) return false;
+    g_picSink = sink;
+    return true;
+}
+
+void EndPictureCapture() {
+    if (!g_picSink) return;
+    g_picSink = nullptr;
+    EndTextCapture();
+}
+
+bool BeginQuestionCapture(QuestionSink sink) {
+    if (!sink || g_qSink) return false;
+    if (!g_execGeneralHooked) {
+        if (!Resolve() || !E.mExecGeneral) return false;
+        g_execGeneralHooked = HookOne(E.mExecGeneral, (void*)&LS_dExecGeneral, &g_lsOrigExecGeneral, "ExecuteGeneral");
+        if (!g_execGeneralHooked) return false;
+    }
+    g_qSink = sink;
+    g_qCapture++;
+    return true;
+}
+
+void EndQuestionCapture() {
+    if (!g_qSink) return;
+    g_qSink = nullptr;
+    if (g_qCapture > 0) g_qCapture--;
 }
 
 bool EnsureHooks() {
@@ -2572,7 +2615,9 @@ bool EnsureHooks() {
     ok &= HookOne(E.msgDlg, (void*)&LS_dMsgDlg, &g_lsOrigMsgDlg, "MessageDlgPosHelp");
     if (!g_showPicHooked) g_showPicHooked = HookOne(E.mShowPic, (void*)&LS_dShowPic, &g_lsOrigShowPic, "ShowPicMessage");
     ok &= g_showPicHooked;
-    ok &= HookOne(E.mExecGeneral, (void*)&LS_dExecGeneral, &g_lsOrigExecGeneral, "ExecuteGeneral");
+    if (!g_execGeneralHooked)  // (0.8.2: a question capture may have hooked it already)
+        g_execGeneralHooked = HookOne(E.mExecGeneral, (void*)&LS_dExecGeneral, &g_lsOrigExecGeneral, "ExecuteGeneral");
+    ok &= g_execGeneralHooked;
     // The live-battle rules for human sides: optional (a routine that was not found keeps 0.3.x's behaviour).
     g_ruleAir = HookOne(E.aiAirstrike, (void*)&LS_dAirStrike, &g_lsOrigAirstrike, "CheckAIAirstrike");
     g_rulePlan = HookOne(E.searchPlan, (void*)&LS_dSearchPlan, &g_lsOrigSearchPlan, "SetAIAirSearchPlan");
@@ -7123,9 +7168,13 @@ extern "C" int __stdcall LS_MsgDlg(const wchar_t* msg, int type, int buttons, co
     return r;
 }
 
-extern "C" int __stdcall LS_ShowPic(const wchar_t* text, const wchar_t* pic) {
+extern "C" int __stdcall LS_ShowPic(const wchar_t* text, const wchar_t* pic, int copyToLog) {
     if (g_capture > 0) {  // BeginTextCapture: recorded for the caller instead of a dialog on this PC
         std::wstring t = text ? dl::ReadUStr(text) : L"";
+        if (g_picSink) {  // BeginPictureCapture: the caller's sink gets the whole call
+            g_picSink(t, pic ? dl::ReadUStr(pic) : L"", copyToLog != 0);
+            return 1;
+        }
         g_captured.push_back(t);
         Log("picture message captured: '%s'", W2U(t).c_str());
         return 1;
@@ -7142,7 +7191,12 @@ extern "C" int __stdcall LS_ShowPic(const wchar_t* text, const wchar_t* pic) {
     return 1;
 }
 
-extern "C" int __stdcall LS_ExecGeneral(const wchar_t* prompt, int preselect) {
+extern "C" int __stdcall LS_ExecGeneral(const wchar_t* prompt, int preselect, const wchar_t* a1, const wchar_t* a2,
+                                        const wchar_t* a3) {
+    if (g_qCapture > 0 && g_qSink) {  // BeginQuestionCapture: answered by the caller's sink, no dialog on this PC
+        auto rd = [](const wchar_t* s) { return s ? dl::ReadUStr(s) : std::wstring(); };
+        return g_qSink(rd(prompt), rd(a1), rd(a2), rd(a3), preselect);
+    }
     bool sim = S.on && g_sim > 0 && g_results == 0;
     if (!sim && !g_quiet && g_testAutostart > 0) {  // tests: the host's own load of a battle in progress (phase 5b)
         std::wstring t = prompt ? dl::ReadUStr(prompt) : L"";

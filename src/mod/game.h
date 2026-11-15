@@ -115,6 +115,13 @@ void SetDesignReadyForBuild(int nationIdx, int i, int months);
 int IntelReportCount(int* unique = nullptr);
 // Air units in the game's global list (all nations); -1 if the list was not found. A load drops the units from before it.
 int AirUnitCount();
+// 0.9.0: the game's global air unit list (a TList of TAirUnit), or nullptr.
+void* AirUnitList();
+// 0.9.0 (aircraft.cpp): the events' view for the player's own screens and routines on a joined player's PC: nation K at
+// index 0 of the nation list, every nation's relation fields holding its relation with K, K's war counter. False when
+// unavailable or another view is in place (EventActive). PlayerViewLeave puts everything back.
+bool PlayerViewEnter(int K);
+void PlayerViewLeave();
 // Campaign divisions (the Fleet organization tab; TfrmBuildCamp.CampaignDivisions, the player's list). A load replaces
 // the list (the game's own load appends to it) and drops repeated divisions and ships the nation doesn't have; a joined
 // player's own slot (LoadCampaign with playerIdx > 0) loads them against the player's nation. False if unavailable.
@@ -343,6 +350,24 @@ std::wstring LastBattleArea();     // the sea area of the last battle the game s
 std::string DebugResearch(int idx);
 void OpenResearch();
 void DebugDoResearch(int idx, int count);  // tests: the game's monthly research of a nation, `count` times (logged)
+// 0.8.2 (fix-research), host: joined nation K's monthly research as the game runs it for its player: DoResearch(0) in
+// K's view (HostViewEnter, no nation masked; War := `war`), with K's own tech-sharing deals and intelligence effort
+// (real indices) in the nation records, K's airbase size in the form's AirbaseSize and fresh TurnMessages and
+// IntelReports lists. The caller captures the routine's dialogs (research.cpp). False: not available here (nothing
+// changed). `out`: the lists' lines, the deals and the airbase size afterwards, a game exception that unwound (fault).
+struct PlayerResearchIn {
+    int K = 0, war = 0, airbaseSize = 0;
+    int techSharing[9] = {}, intelEffort[9] = {};
+};
+struct PlayerResearchOut {
+    bool fault = false;
+    int airbaseSize = 0;
+    int techSharing[9] = {};
+    std::vector<std::wstring> turnLines, intelLines;
+};
+bool RunPlayerResearch(const PlayerResearchIn& in, PlayerResearchOut& out);
+// A line added to the strategic screen's TurnMessages as the game adds one (in RunPlayerResearch: its fresh list).
+void TurnMessageAdd(const std::wstring& line);
 // Test hook: the game's end-of-battle routine against `opp`, as after a tactical battle (VP before the log scale).
 std::string DebugBattleAftermath(int opp, int vp0, int vp1, const std::string& level);
 std::vector<PossessionInfo> Possessions(int ownerIdx);
@@ -594,6 +619,10 @@ bool PlayerRulesNation(int idx);
 // Host (relations v2): a joined nation's own war counter, as the game's War for the host's nation (months at war > 0,
 // at peace < 0; stepped after the month). The player's economy rules for that nation read it (economy.cpp).
 int KWarCounter(int idx);
+// Host (0.9.0, aircraft.cpp): joined nation idx develops its aircraft and manages its air groups on its player's PC (the
+// player's hello `acft`, or a record of its aircraft while the player is away): the computer's aircraft decisions for
+// it are left out, its turn's aircraft are merged.
+bool AircraftByPlayer(int idx);
 // Host (relations v2, B5: warfx.cpp): `vp` victory points of a war effect (a blockade, ...) for `gainer` in its war with
 // `loser`: the nation's VP and the pair's war score (the B4 ledger of a nation under the player's rules with a computer
 // nation, or a war between two players).
@@ -638,4 +667,11 @@ bool PeoplesNation(int idx);
 // 0.7.2: a joined player's PC in a session: 1 its host takes the nation's invasion orders (welcome `gen` 4), 0 it
 // doesn't (an older host: the nation has no invasions); -1 not a joined player's PC in a session.
 int JoinedInvasionOrders();
+// 0.8.2 (fix-research), host: joined nation K's own tech-sharing deals (relations v2, B3: kept by the host for K; real
+// indices, 0 = none; false: none kept) and the end of one by the research's war rule (CheckTechSharing in K's view).
+bool KTechSharing(int K, int ts[9]);
+void KEndTechSharing(int K, int j);
+// 0.8.2, host: K's player is connected with a mod that shows the research dialogs and answers the research question
+// on its PC (hello `res`).
+bool ResearchDialogsShown(int K);
 }  // namespace hookcb

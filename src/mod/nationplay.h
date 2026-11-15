@@ -24,6 +24,11 @@ void HostDetach();
 void HostTransformState(Bundle& b, int K);          // K's month package: K's own intelligence instead of the host's
 void HostTakeSubmission(const Bundle& sub, int K);  // K's intelligence from its turn
 void HostTakeIntelEvent(const KV& kv, int K, std::string& applied);  // K's spying results (sent right away)
+// 0.8.2 (fix-research): K's own intelligence effort against each nation (real indices; K's own 0) for the game's routines
+// that run in K's view on the host (false: no record, all 0), and reports of such a routine ("<Mon yyyy> <nation> -
+// <text>", as the game's list holds them) added to K's list (sent with its next month). Returns the reports added.
+bool HostIntelEffort(int K, int effort[9]);
+int HostAddIntelReports(int K, const std::vector<std::wstring>& reports);
 // Campaign divisions (0.6.1; the strategic screen's Fleet organization). The game keeps one division list, its
 // player's, saved in the slot's .off and loaded against the player's nation. The host keeps each joined nation's own
 // list (from the nation's turns, "divisions.ini") in its records and puts it into the nation's packages instead of
@@ -65,6 +70,13 @@ void HostOfficersFromMemory(const char* why);
 // (a turn without officers.ini: an older mod) puts the host's previous ids back first. Returns the ids reset.
 int HostFixShipCommanders(const std::wstring& bcsPath, int K, const std::map<std::string, int>* keep);
 std::string HostOfficersInfo(int K);  // bridge `ofstore`: "ok n=<n> active=<a> areas=<m> ids=<min>-<max> first=..."
+// Aircraft (0.9.0; aircraft.h). K's request (the game's [General] ACRequestRole, ACRequest, OAR0..16 of its player) from
+// K's turns ([Nation<K>Aircraft]); K's types and units are merged into the host's save (saveio::MergeAircraft).
+bool HostHasAircraft(int K);
+void HostTakeAircraft(int K, const std::vector<std::string>& request);  // validated lines (empty: nothing taken)
+// The package's .bcs [General] request keys := K's record (none yet: 0). Returns 1 stored, 0 none, -1 no .bcs.
+int HostPutAircraft(Bundle& b, int K);
+std::string HostAircraftInfo(int K);  // bridge `acstore`: "ok stored=<0|1> ACRequestRole=.. ACRequest=.. OAR0=.."
 int FleetSizeValue();  // [General] FleetSize of the open campaign (-1 unknown)
 void SetNewsSink(std::function<void(int nation, const std::string& line)> fn);  // the month's news for a player
 std::string HostDebug();

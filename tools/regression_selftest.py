@@ -1100,6 +1100,45 @@ def lscmd_samples():
           t1 == (gained, {'Liaotung Peninsula'}, {}) and t2 == (gained, set(), {'Liaotung Peninsula': 'Italy'}), (t1, t2))
 
 
+def research_samples():
+    """0.8.2 (fix-research): research f)'s parsers: TEST `resforce`'s reply (research.cpp Force: a tech name, area name
+    and effect with spaces; `as`), the research result dialog's text (box_text: "<caption>, <tech>  <effect>") and the
+    turn report's line among the seen dialogs (research_news), and war_effects' host box filter leaving a research
+    result dialog alone (sea_war_box_lines: one line, "Research breakthrough: ...")."""
+    r1 = ('ok area=0 level=3 tech=Improved surface condenser areaName=Machinery development picture=Boiler.jpg '
+          'effect=1% weight saving on machinery year=1900 cost=120000 points=53358->120001 others=1 as=1 (tech 1717: '
+          'yes, AirSeaRescue 0, AskAS 0)')
+    r0 = ('ok area=5 level=4 tech=Power rammers areaName=Turrets and gun mountings picture=Turret.jpg effect=Gradual '
+          'national ROF improvement year=1901 cost=140000 points=12->140001 others=0')
+    p1, p0, bad = R.resforce_parse(r1), R.resforce_parse(r0), R.resforce_parse('error no area with a tech to complete now')
+    check('resforce_parse: names and effects with spaces, `others`, `as` (tech 1717 given); an error reply not ok',
+          p1['ok'] and p1['tech'] == 'Improved surface condenser' and p1['areaName'] == 'Machinery development' and
+          p1['picture'] == 'Boiler.jpg' and p1['effect'] == '1% weight saving on machinery' and p1['others'] and
+          p1['as_'] is True and p0['ok'] and p0['as_'] is None and not p0['others'] and p0['area'] == 5 and
+          not bad['ok'], (p1, p0, bad))
+    seen = [('client', 'TdlgPictureMessage', 'Research breakthrough: Machinery development, Improved surface condenser  '
+             '1% weight saving on machinery'),
+            ('client', 'TdlgCampTurnRep', 'Research breakthrough: Machinery development, Improved surface condenser, 1% '
+             'weight saving on machinery | Research breakthrough: Hull construction, Hydraulic riveting, 1% weight '
+             'saving on hull'),
+            ('host', 'TdlgCampTurnRep', 'DD Boyne has finished her working up! | Research breakthrough: Turrets and gun '
+             'mountings, Power rammers, Gradual national ROF improvement'),
+            ('host', 'TdlgPictureMessage', 'Research breakthrough: Turrets and gun mountings, Power rammers  Gradual '
+             'national ROF improvement')]
+    cd, cr = R.research_news(seen, 'client', p1)
+    hd, hr = R.research_news(seen, 'host', p1)
+    h0 = R.research_news(seen, 'host', p0)
+    c0 = R.research_news(seen, 'client', p0)
+    check('research_news: the research result dialog and the turn report line of the tech, per copy (the client has '
+          'nation 1\'s, the host its own, not the other)', len(cd) == 1 and len(cr) == 1 and not hd and not hr and
+          len(h0[0]) == 1 and len(h0[1]) == 1 and not c0[0] and not c0[1], (cd, cr, hd, hr, h0, c0))
+    check('sea_war_box_lines: a research result dialog\'s text ("Research breakthrough: Submarines, Early coastal '
+          'submarine  Enables coastal submarines", one line) is the host\'s research, not a sea-war box',
+          R.sea_war_box_lines('Research breakthrough: Submarines, Early coastal submarine  Enables coastal submarines')
+          == [], R.sea_war_box_lines('Research breakthrough: Submarines, Early coastal submarine  Enables coastal '
+                                     'submarines'))
+
+
 def battlegen_samples():
     """battle_generator's pick of J (0.7.3 regression): `attack_order` takes battle_pairs' candidates where J has a
     possession worth MAJOR_POSS or more in the area first and keeps battle_pairs' order otherwise."""
@@ -1557,6 +1596,7 @@ def main():
     simul_samples()
     battlegen_samples()
     lscmd_samples()
+    research_samples()
     sandbox = os.path.abspath('regression_selftest_sandbox')
     if os.path.exists(sandbox):
         shutil.rmtree(sandbox)

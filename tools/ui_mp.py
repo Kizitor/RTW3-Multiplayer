@@ -4,6 +4,7 @@
   python ui_mp.py <pid> show                     dump the window state (status, players, nation list, buttons)
   python ui_mp.py <pid> set <field> <text>       field: name ip port pw limit chat
   python ui_mp.py <pid> click <button>           button: host join find leave claim release setlimit start advance send
+                                                 unsubmit (a joined player's Unsubmit turn, 0.9.0)
   python ui_mp.py <pid> pick <text>              select the nation-list entry containing <text>
 """
 import ctypes, ctypes.wintypes as wt, sys, time
@@ -14,7 +15,7 @@ u.GetDlgItem.restype = wt.HWND
 u.GetDlgItem.argtypes = [wt.HWND, ctypes.c_int]
 IDS = dict(name=1001, ip=1002, port=1003, pw=1004, host=1010, join=1011, find=1012, leave=1013, addrs=1020,
            status=1021, players=1030, nation=1040, claim=1041, limit=1050, setlimit=1051, start=1060,
-           advance=1061, release=1062, chatlog=1070, chat=1071, send=1072)
+           advance=1061, release=1062, unsubmit=1063, chatlog=1070, chat=1071, send=1072)
 
 
 def cls(h):

@@ -45,8 +45,10 @@ bool ApplyStateBundle(const Bundle& b, const std::wstring& slotDir, int slot, st
 bool BuildSubmission(const std::wstring& slotDir, int slot, int nationIdx, long long idStart, Bundle& out,
                      std::string& err, bool legacy = false);
 // Host: merge a client's submission into the host slot files. A legacy turn also drops the nation's air units based on
-// ships its new ship list no longer holds.
-bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const Bundle& sub, std::string& err);
+// ships its new ship list no longer holds. 0.9.0: acRequest (non-null: the host keeps the nation's aircraft) takes the
+// turn's aircraft.ini (MergeAircraft) and gets its [Request] lines (empty: none taken).
+bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const Bundle& sub, std::string& err,
+                     std::vector<std::string>* acRequest = nullptr);
 bool IsLegacySubmission(const Bundle& sub);
 
 // The legacy fleet of a joined player (0.7.0): in the campaign's first month the player builds the nation's starting
@@ -265,5 +267,37 @@ std::vector<OfficerRec> MergeOfficers(const std::vector<OfficerRec>& sent, const
 // battle's list.
 std::vector<OfficerRec> BattleOnlyOfficers(const std::vector<OfficerRec>& sent, const std::vector<OfficerRec>& battle,
                                            int* changed = nullptr);
+
+// Aircraft (0.9.0): the global [AircraftTypes] (ACTypesNo, AT<i><Field>: 40 fields, Nation and Id among them) and
+// [AirUnits] (AirUnitNo, AU<i><Field>: 19 fields, Nation, Id, AircraftTypeId and HomeBase among them) of a .bcs, and the
+// player's request in [General] (ACRequestRole, ACRequest, OAR0..OAR16: the old-type reminders' counters).
+struct AirEntry {
+    std::vector<std::pair<std::string, std::string>> fields;  // in file order, without "AT<i>"/"AU<i>"
+    std::string Get(const std::string& field, const std::string& def = "") const;
+    void Set(const std::string& field, const std::string& value);
+};
+// The section's lines -> entries 0..count-1 (units: [AirUnits], else [AircraftTypes]); other lines (the count) go to
+// `other`. strict (a player's file): only the game's fields, every field of each entry, integers but the names (at most
+// 200 bytes), no key twice, the count matching; anything else fails (err) and nothing is taken.
+bool ParseAirSection(const std::vector<std::string>& lines, bool units, std::vector<AirEntry>& out,
+                     std::vector<std::string>* other, bool strict, std::string& err);
+// The section's lines: `other` (the count set to the entries'), then the entries renumbered 0..n-1.
+std::vector<std::string> AirSectionLines(const std::vector<AirEntry>& entries, bool units,
+                                         const std::vector<std::string>& other);
+// [General]'s request keys of a .bcs as lines (missing keys: 0).
+std::vector<std::string> AircraftRequestLines(const IniDoc& bcs);
+// A [Request] section checked (ACRequestRole 0-15, ACRequest 0-60, OAR0..16 >= 0, nothing else).
+bool ParseAircraftRequest(const std::vector<std::string>& lines, std::vector<std::string>& out, std::string& err);
+// A package's .bcs gets these request lines in [General] (nullptr: none, all 0).
+void PutAircraftRequest(IniDoc& bcs, const std::vector<std::string>* lines);
+// A joined player's turn: "aircraft.ini" = [Request] (the slot's [General]), [AircraftTypes] and [AirUnits] with nation
+// K's entries of the .bcs bytes, renumbered.
+bool BuildAircraftFile(const std::string& bcs, int K, std::string& out, std::string& summary, std::string& err);
+// Host: K's types and units of aircraft.ini replace K's in `host` (other nations' entries keep their order, K's follow).
+// Refused (host unchanged, err): not strict, an entry not K's, an id < 1, repeated or another nation's, a unit's type
+// neither one of the merged list nor -1, a negative count. A unit whose base (HomeBase: Ship<n>Id of [NationKShips] or
+// [NationKCoastalArtillery]) K no longer has goes to the reserve (-1). request: the [Request] lines for the record.
+bool MergeAircraft(IniDoc& host, int K, const std::string& file, std::vector<std::string>& request,
+                   std::string& summary, std::string& err);
 
 }  // namespace saveio

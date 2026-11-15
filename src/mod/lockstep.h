@@ -87,6 +87,18 @@ bool Available();       // the engine resolved (live battles possible with this 
 // returns them (host, 0.6.0: the game's resolution of a joined player's battle). False: not available (shown as usual).
 bool BeginTextCapture();
 std::vector<std::wstring> EndTextCapture();
+// 0.8.2 (fix-research): a capture whose picture messages go to `sink` (text, picture file, the call's CopyMessageToLog),
+// nothing shown on this PC, until EndPictureCapture. False: not available or a sink is set already (shown as usual).
+typedef void (*PictureSink)(const std::wstring& text, const std::wstring& picture, bool copyToLog);
+bool BeginPictureCapture(PictureSink sink);
+void EndPictureCapture();
+// 0.8.2: the game's questions (TdlgEventAnswer.ExecuteGeneral: prompt, up to three answers, the preselected one) go to
+// `sink`, whose result is the answer (1..3), nothing shown on this PC, until EndQuestionCapture. False: not available or
+// a sink is set already.
+typedef int (*QuestionSink)(const std::wstring& prompt, const std::wstring& a1, const std::wstring& a2,
+                            const std::wstring& a3, int preselect);
+bool BeginQuestionCapture(QuestionSink sink);
+void EndQuestionCapture();
 bool Prepare();         // resolves the engine when a session starts (hooks are installed with the first live battle)
 bool Active();          // a lockstep battle runs on this PC (A or B), including its start
 bool Busy();            // don't load a month or touch the open save now

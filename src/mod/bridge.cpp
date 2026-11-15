@@ -2,6 +2,7 @@
 // variable RTW3MP_BRIDGE_PORT is set (and RTW3MP_BRIDGE_TOKEN, if set, must be the first line sent).
 // Lets automated tests drive the mod without touching the user's mouse or keyboard.
 #include "common.h"
+#include "aircraft.h"
 #include "delphi.h"
 #include "economy.h"
 #include "game.h"
@@ -10,6 +11,7 @@
 #include "net.h"
 #include "officers.h"
 #include "poc_battle.h"
+#include "research.h"
 #include "session.h"
 #include "ui.h"
 #include "warfx.h"
@@ -209,9 +211,11 @@ static std::string ExecuteOnMain(const std::string& line) {
     auto args = Split(Trim(line), ' ');
     const std::string& cmd = args[0];
     auto arg = [&](size_t i, const std::string& def = "") { return i < args.size() ? args[i] : def; };
-    // While a joined player's event dialog is open the nation list is reordered: only read-only commands.
+    // While a joined player's event dialog is open the nation list is reordered: only read-only commands (0.9.0: also
+    // while its aircraft screens are open in its view: `vcl` finds their controls, `aircraft` and `ffield` read).
     static const std::set<std::string> kReadOnly = {"status", "eventlast", "eventlist", "windows", "diploview", "relview",
-                                                    "rellast", "peacelast", "kwarvp", "battleptrs", "pocheapcheck"};
+                                                    "rellast", "peacelast", "kwarvp", "battleptrs", "pocheapcheck",
+                                                    "vcl", "aircraft", "ffield"};
     if (game::EventActive() && !kReadOnly.count(cmd)) return "error an event dialog is open";
     // pocheapcheck (diagnosis, read only): the campaign's objects through RTTI (strings, object references)
     if (cmd == "pocheapcheck") return "ok " + game::PocHeapCheck("bridge");
@@ -259,6 +263,16 @@ static std::string ExecuteOnMain(const std::string& line) {
         if (cmd == "leave") return mp::Leave(), "ok";
         if (cmd == "start") return mp::StartSession(), "ok";
         if (cmd == "advance") return mp::AdvanceNow(), "ok";
+        // 0.9.0: unsubmit (client): the Unsubmit turn button (the host answers: `unsubmit state`); unsubmit raw (TEST
+        // ONLY, client): the request without this PC's own checks (the host's refusals); unsubmit state (both, read
+        // only); unsubmit timeup <s> (TEST ONLY, host): this month's time limit runs out in s seconds
+        if (cmd == "unsubmit") {
+            if (arg(1).empty() || arg(1) == "raw") {
+                std::string why = mp::UnsubmitTurn(arg(1) == "raw");
+                return why.empty() ? "ok sent" : "error " + why;
+            }
+            return mp::DebugUnsubmit(args);
+        }
         if (cmd == "claim") {  // claim <nation name or campaign index>
             std::string a = line.size() > 6 ? Trim(line.substr(6)) : "";
             if (!a.empty() && isdigit((unsigned char)a[0]))
@@ -425,6 +439,11 @@ static std::string ExecuteOnMain(const std::string& line) {
             int count = game::AirUnitCount();
             return count < 0 ? "error unavailable" : "ok count=" + std::to_string(count);
         }
+        // 0.9.0, a joined player's own aircraft (read only): aircraft [nation]: the nation's types and units in memory and
+        // this PC's state; acstore <K> (host): nation K's request record; TEST ONLY acset (aircraft.h)
+        if (cmd == "aircraft") return acft::Info(atoi(arg(1, "-1").c_str()));
+        if (cmd == "acstore") return nplay::HostAircraftInfo(atoi(arg(1, "0").c_str()));
+        if (cmd == "acset") return acft::TestSet(args);
         // Campaign divisions (0.6.1, read only): divs: the in-memory list (Fleet organization) with PlayerNation's index;
         // divstore <K> (host): nation K's list the host keeps from its turns
         if (cmd == "divs") return game::CampaignDivisionsInfo();
@@ -581,6 +600,8 @@ static std::string ExecuteOnMain(const std::string& line) {
                    " status=" + std::to_string(dl::At<uint8_t>(ship, dl::Field("TCampaignShip", "Status")));
         }
         if (cmd == "econ") return economy::BridgeCommand(args);  // econ <K>: the player's economy rules (economy.cpp)
+        // 0.8.2: a joined nation's research as its player's (research.cpp): resinfo [K]; TEST ONLY resforce, resplayer
+        if (cmd == "resinfo" || cmd == "resforce" || cmd == "resplayer") return research::BridgeCommand(cmd, args);
         if (cmd == "shipdata") return game::DebugShipData();    // the last View data window's ship and design (0.7.1)
         // TEST ONLY: econrand <v>: the player's economy rules for joined nations draw min(v, n - 1) for Random(n); -1 off
         if (cmd == "econrand") return economy::TestRandom(args);

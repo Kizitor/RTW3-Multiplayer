@@ -671,11 +671,165 @@ static void OfficerBattleOnly() {
     Check("battle only + merge: every officer of the record kept (6)", m.size() == 6, std::to_string(m.size()));
 }
 
+// 0.9.0: a joined player's aircraft (saveio::BuildAircraftFile, MergeAircraft): K's types and units replace K's on the
+// host, the other nations' stay in their order, the request lines; refusals.
+static std::string AirType(int i, int nation, int id, const std::string& name, int dev = 0) {
+    static const char* f[] = {"Manufacturer", "Year", "BaseModelYear", "MaxSpeed", "CruiseSpeed", "CruiseAltitude", "MaxFuel",
+                              "Ceiling", "Climb", "LtEndurance", "MedEndurance", "HvyEndurance", "Firepower", "Maneuver",
+                              "Toughness", "Reliability", "LtBombLoadSize", "LtBombLoadNumber", "MedBombLoadSize",
+                              "MedBombLoadNumber", "HvyBombLoadSize", "HvyBombLoadNumber", "Torpedo1", "Torpedo2", "Missile2",
+                              "Radar", "Special", "Bombing", "Purpose", "Floatplane", "Carrier", "Version", "Obsolete",
+                              "ReliabilityKnown", "ValuesKnown", "AvailableAircraft"};
+    std::string p = "AT" + std::to_string(i), s = p + "Name=" + name + "\n";
+    for (const char* k : f) s += p + k + "=" + (std::string(k) == "Manufacturer" ? "Maker" : "3") + "\n";
+    s += p + "DevelopmentTime=" + std::to_string(dev) + "\n" + p + "Nation=" + std::to_string(nation) + "\n" + p + "Id=" +
+         std::to_string(id) + "\n";
+    return s;
+}
+
+static std::string AirUnit(int i, int nation, int id, int type, int base, int desired = 6) {
+    std::string p = "AU" + std::to_string(i);
+    return p + "AircraftType=T" + std::to_string(type) + "\n" + p + "AircraftTypeId=" + std::to_string(type) + "\n" + p +
+           "Id=" + std::to_string(id) + "\n" + p + "AircraftNumber=4\n" + p + "DesiredAircraftNumber=" +
+           std::to_string(desired) + "\n" + p + "Role=0\n" + p + "Nation=" + std::to_string(nation) + "\n" + p +
+           "Experience=-12\n" + p + "Name=" + std::to_string(id) + " Squadron\n" + p + "CarrierCapable=0\n" + p +
+           "NightCapable=0\n" + p + "AirKills=0\n" + p + "BombHits=0\n" + p + "TorpedoHits=0\n" + p + "MissileHits=0\n" +
+           p + "Elite=0\n" + p + "AutoUpgrade=1\n" + p + "Recon=0\n" + p + "HomeBase=" +
+           (base < 0 ? std::string("-") : std::to_string(base)) + "\n";  // (the game saves "-" for the reserve)
+}
+
+static std::string AirBcs(const std::string& types, int nTypes, const std::string& units, int nUnits, int req = 0) {
+    std::string s = "[General]\nYear=1935\nMonth=3\nIDNo=900\nACRequestRole=3\nACRequest=" + std::to_string(req) + "\n";
+    for (int i = 0; i < 17; i++) s += "OAR" + std::to_string(i) + "=" + (i == 4 ? "36" : "0") + "\n";
+    s += "[Nation2Ships]\nShip0Id=300\nShip1Id=301\n[Nation2CoastalArtillery]\nShip0Id=310\n[Nation0Ships]\nShip0Id=58\n";
+    s += "[AircraftTypes]\nACTypesNo=" + std::to_string(nTypes) + "\n" + types;
+    s += "[AirUnits]\nAirUnitNo=" + std::to_string(nUnits) + "\n" + units + "[EUT]\nX=1\n";
+    return s;
+}
+
+static void AircraftMerge() {
+    // the host: types 1, 2 (nation 0), 13, 14 (nation 2), 20 (nation 1); units 59 (0), 136, 137 (2), 140 (1)
+    std::string host = AirBcs(AirType(0, 0, 1, "Swordfish") + AirType(1, 0, 2, "Bulldog") + AirType(2, 2, 13, "Loire 40") +
+                                  AirType(3, 2, 14, "PL.41") + AirType(4, 1, 20, "He 51"),
+                              5,
+                              AirUnit(0, 0, 59, 1, 58) + AirUnit(1, 2, 136, 13, 300) + AirUnit(2, 2, 137, 14, 310) +
+                                  AirUnit(3, 1, 140, 20, -1),
+                              4);
+    // the player's copy: a new prototype 40901 (K's id range), unit 137 resized and moved to the reserve, unit 136 gone,
+    // a new unit 40902 on ship 301 with type 13, a unit 40903 on a base K no longer has (999)
+    std::string cli = AirBcs(AirType(0, 0, 1, "Swordfish") + AirType(1, 0, 2, "Bulldog") + AirType(2, 2, 13, "Loire 40") +
+                                 AirType(3, 2, 14, "PL.41") + AirType(4, 1, 20, "He 51") + AirType(5, 2, 40901, "XF-1", 7),
+                             6,
+                             AirUnit(0, 0, 59, 1, 58) + AirUnit(1, 2, 137, 14, -1, 9) + AirUnit(2, 1, 140, 20, -1) +
+                                 AirUnit(3, 2, 40902, 13, 301) + AirUnit(4, 2, 40903, 40901, 999),
+                             5, 7);
+    std::string file, sum, err;
+    bool built = saveio::BuildAircraftFile(cli, 2, file, sum, err);
+    IniDoc fd = ParseIni(file);
+    Check("aircraft: the turn's file holds nation 2's 3 types and 3 units and the request", built &&
+              fd.Get("AircraftTypes", "ACTypesNo") == "3" && fd.Get("AirUnits", "AirUnitNo") == "3" &&
+              fd.Get("AircraftTypes", "AT2Id") == "40901" && fd.Get("Request", "ACRequest") == "7" &&
+              fd.Get("Request", "OAR4") == "36",
+          sum + " " + err);
+    IniDoc h = ParseIni(host);
+    std::vector<std::string> req;
+    bool ok = saveio::MergeAircraft(h, 2, file, req, sum, err);
+    std::vector<saveio::AirEntry> t, u;
+    std::string e2;
+    saveio::ParseAirSection(h.Find("AircraftTypes")->lines, false, t, nullptr, true, e2);
+    saveio::ParseAirSection(h.Find("AirUnits")->lines, true, u, nullptr, true, e2);
+    std::string order;
+    for (auto& x : t) order += x.Get("Id") + ",";
+    std::string uorder;
+    for (auto& x : u) uorder += x.Get("Id") + ":" + x.Get("HomeBase") + ",";
+    Check("aircraft: merged (the other nations' types first in their order, then nation 2's)",
+          ok && order == "1,2,20,13,14,40901," && h.Get("AircraftTypes", "ACTypesNo") == "6", order + " " + sum + " " + err);
+    Check("aircraft: units: 136 gone, 137 resized in the reserve, 40902 on ship 301, 40903's base gone -> reserve",
+          uorder == "59:58,140:-,137:-,40902:301,40903:-," && h.Get("AirUnits", "AirUnitNo") == "5" &&
+              u.size() == 5 && u[2].Get("DesiredAircraftNumber") == "9",
+          uorder + " " + sum);
+    Check("aircraft: the request lines (19) for the record", req.size() == 19 && req[1] == "ACRequest=7", req.empty() ? "" : req[1]);
+    Check("aircraft: other sections untouched", h.Get("EUT", "X") == "1" && h.Get("General", "ACRequest") == "0");
+    // the merged save is stable: the same file again changes nothing
+    std::string once = WriteIni(h);
+    saveio::MergeAircraft(h, 2, file, req, sum, err);
+    Check("aircraft: merging the same turn again changes nothing", WriteIni(h) == once);
+    // refusals (the host unchanged)
+    auto refused = [&](const char* what, const std::string& f) {
+        IniDoc hh = ParseIni(host);
+        std::string before = WriteIni(hh), s, e;
+        std::vector<std::string> r;
+        bool took = saveio::MergeAircraft(hh, 2, f, r, s, e);
+        Check((std::string("aircraft: refused: ") + what).c_str(), !took && WriteIni(hh) == before && r.empty(), e);
+    };
+    auto withTypes = [&](const std::string& types, int n) {
+        return "[Request]\n" + std::string("ACRequestRole=0\nACRequest=0\n") + [] {
+            std::string s;
+            for (int i = 0; i < 17; i++) s += "OAR" + std::to_string(i) + "=0\n";
+            return s;
+        }() + "[AircraftTypes]\nACTypesNo=" + std::to_string(n) + "\n" + types + "[AirUnits]\nAirUnitNo=0\n";
+    };
+    refused("a type of another nation", withTypes(AirType(0, 1, 40901, "X"), 1));
+    refused("a type id of another nation's type", withTypes(AirType(0, 2, 20, "X"), 1));
+    refused("a type id twice", withTypes(AirType(0, 2, 40901, "X") + AirType(1, 2, 40901, "Y"), 2));
+    refused("a type without all fields", withTypes("AT0Name=X\nAT0Nation=2\nAT0Id=40901\n", 1));
+    refused("a count that does not match", withTypes(AirType(0, 2, 40901, "X"), 2));
+    refused("a unit with an unknown type",
+            withTypes("", 0).replace(withTypes("", 0).find("AirUnitNo=0"), 11, "AirUnitNo=1\n" + AirUnit(0, 2, 40902, 77, 300)));
+    refused("a unit id of another nation's unit",
+            withTypes("", 0).replace(withTypes("", 0).find("AirUnitNo=0"), 11, "AirUnitNo=1\n" + AirUnit(0, 2, 140, -1, 300)));
+    std::string badBase = AirUnit(0, 2, 40902, -1, 300);
+    badBase.replace(badBase.find("HomeBase=300"), 12, "HomeBase=CV X");
+    refused("a unit's base neither \"-\" nor an id",
+            withTypes("", 0).replace(withTypes("", 0).find("AirUnitNo=0"), 11, "AirUnitNo=1\n" + badBase));
+    std::string badReq = withTypes("", 0);
+    badReq.replace(badReq.find("ACRequest=0"), 11, "ACRequest=99");
+    refused("a request beyond the game's months", badReq);
+    refused("no file sections", "[Request]\nACRequest=1\n");
+}
+
+// A real save: nation K's file built from it and merged back into it keeps every type and unit (K's move to the end).
+static void AircraftRealFile(const char* path, int K) {
+    std::string bytes;
+    if (!ReadFileBytes(U2W(path), bytes)) {
+        Check("aircraft (real file): readable", false, path);
+        return;
+    }
+    std::string file, sum, err;
+    bool built = saveio::BuildAircraftFile(bytes, K, file, sum, err);
+    IniDoc h = ParseIni(bytes);
+    auto all = [](const IniDoc& d, bool units) {
+        std::vector<saveio::AirEntry> e;
+        std::string er;
+        saveio::ParseAirSection(d.Find(units ? "AirUnits" : "AircraftTypes")->lines, units, e, nullptr, false, er);
+        std::map<std::string, std::string> m;
+        for (auto& x : e) {
+            std::string s;
+            for (auto& f : x.fields) s += f.first + "=" + f.second + ";";
+            m[x.Get("Id")] = s;
+        }
+        return m;
+    };
+    auto t0 = all(h, false), u0 = all(h, true);
+    std::vector<std::string> req;
+    std::string msum, merr;
+    bool ok = built && saveio::MergeAircraft(h, K, file, req, msum, merr);
+    Check("aircraft (real file): nation K's file built and merged back", ok, sum + " | " + msum + " " + err + merr);
+    Check("aircraft (real file): every type and unit kept with its fields", all(h, false) == t0 && all(h, true) == u0,
+          std::to_string(t0.size()) + " types, " + std::to_string(u0.size()) + " units");
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && std::string(argv[1]) == "--aircraft") {
+        AircraftRealFile(argv[2], argc > 3 ? atoi(argv[3]) : 2);
+        printf("%d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
     Synthetic();
     OfficerMerge();
     SunkTwice();
     OfficerBattleOnly();
+    AircraftMerge();
     if (argc >= 3) RealFiles(argv[1], argv[2], argc > 3 ? atoi(argv[3]) : 1, argc > 4 ? atoi(argv[4]) : 7);
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -324,6 +324,8 @@ struct Rec {
     bool hasOfficers = false;            // 0.8.0: the nation's officer corps (its turns, its battles, the host's month)
     std::vector<std::string> officers;   // ... as [Officers] lines (validated, renumbered)
     std::vector<std::string> areaCmd;    // ... its area commands, "MapArea<i>Commander=<id>"
+    bool hasAircraft = false;            // 0.9.0: the nation's aircraft request from its last turn that sent its aircraft
+    std::vector<std::string> aircraft;   // ... ACRequestRole, ACRequest, OAR0..OAR16 (validated)
 };
 static std::map<int, Rec> g_recs;
 static std::wstring g_file;
@@ -382,6 +384,7 @@ static void HostSave() {
             d.sections.push_back({sec + "Officers", r.second.officers});
             d.sections.push_back({sec + "AreaCmd", r.second.areaCmd});
         }
+        if (r.second.hasAircraft) d.sections.push_back({sec + "Aircraft", r.second.aircraft});
     }
     if (!WriteFileBytes(g_file, WriteIni(d))) Log("nations file: write FAILED (%s)", W2U(g_file).c_str());
 }
@@ -420,6 +423,10 @@ void HostAttach(const std::wstring& slotDir, const std::string& campaignKey) {
             if (const IniSection* as = d.Find(sec + "AreaCmd"))
                 for (auto& l : as->lines)
                     if (!l.empty()) r.areaCmd.push_back(l);
+        }
+        if (const IniSection* ac = d.Find(sec + "Aircraft")) {
+            std::string err;
+            r.hasAircraft = saveio::ParseAircraftRequest(ac->lines, r.aircraft, err);
         }
     }
     Log("nations file: %d joined nations' records loaded", (int)g_recs.size());
@@ -494,6 +501,28 @@ void HostTakeIntelEvent(const KV& kv, int K, std::string& applied) {
     }
     HostSave();
     applied += " intel: " + std::to_string(added) + " reports, effort " + Join(r.effort);
+}
+
+bool HostIntelEffort(int K, int effort[9]) {
+    for (int j = 0; j < 9; j++) effort[j] = 0;
+    if (!A.intel || !g_attached || K < 1 || K > 8 || !g_recs.count(K)) return false;
+    const Rec& r = g_recs[K];
+    for (int j = 0; j < 9 && j < kNations; j++) effort[j] = j == K ? 0 : std::max(0, std::min(3, r.effort[j]));
+    return true;
+}
+
+int HostAddIntelReports(int K, const std::vector<std::wstring>& reports) {
+    if (!A.intel || !g_attached || K < 1 || K > 8) return 0;
+    Rec& r = RecOf(K);
+    int added = 0;
+    for (const std::wstring& w : reports) {
+        std::string l = OneLine(W2U(w));
+        if (l.empty() || std::find(r.reports.begin(), r.reports.end(), l) != r.reports.end()) continue;
+        r.reports.push_back(l);
+        added++;
+    }
+    if (added) HostSave();
+    return added;
 }
 
 // Campaign divisions. A joined player's game loads the divisions of its slot against its nation (game.cpp,
@@ -573,6 +602,49 @@ std::string HostDivisionsInfo(int K) {
     std::string err;
     if (it != g_recs.end() && it->second.hasDivisions) saveio::ParseDivisions(it->second.divisions, divs, false, err);
     return "ok n=" + std::to_string(divs.size()) + " list=" + DivisionListText(divs);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Aircraft (0.9.0): the request the nation's player keeps on its PC (the form's ACRequestRole/ACRequest and the
+// old-type reminders' OAR0..16, which the game keeps in [General] for its player). The nation's types and air units
+// themselves are in the host's save (saveio::MergeAircraft).
+
+bool HostHasAircraft(int K) {
+    auto it = g_recs.find(K);
+    return g_attached && it != g_recs.end() && it->second.hasAircraft;
+}
+
+void HostTakeAircraft(int K, const std::vector<std::string>& request) {
+    if (!g_attached || K < 1 || K > 8 || request.empty()) return;
+    Rec& r = RecOf(K);
+    r.hasAircraft = true;
+    r.aircraft = request;
+    HostSave();
+}
+
+int HostPutAircraft(Bundle& b, int K) {
+    if (!g_attached || K < 1 || K > 8) return -1;
+    for (auto& f : b.files) {
+        if (f.first != "RTWGame{S}.bcs") continue;
+        IniDoc d = ParseIni(f.second);
+        auto it = g_recs.find(K);
+        bool stored = it != g_recs.end() && it->second.hasAircraft;
+        saveio::PutAircraftRequest(d, stored ? &it->second.aircraft : nullptr);
+        f.second = WriteIni(d);
+        Log("aircraft: nation %d's own request in its month (%s: role %s, %s month(s))", K, stored ? "its record" : "none yet",
+            d.Get("General", "ACRequestRole").c_str(), d.Get("General", "ACRequest").c_str());
+        return stored ? 1 : 0;
+    }
+    return -1;
+}
+
+std::string HostAircraftInfo(int K) {
+    if (!g_attached) return "error the joined nations' records are not loaded (host only)";
+    auto it = g_recs.find(K);
+    if (it == g_recs.end() || !it->second.hasAircraft) return "ok stored=0";
+    std::string s = "ok stored=1";
+    for (auto& l : it->second.aircraft) s += " " + l;
+    return s;
 }
 
 // ---------------------------------------------------------------------------------------------

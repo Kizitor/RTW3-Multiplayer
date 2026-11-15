@@ -1,4 +1,5 @@
 #include "session.h"
+#include "aircraft.h"
 #include "datafiles.h"
 #include "economy.h"
 #include "game.h"
@@ -6,6 +7,7 @@
 #include "nationplay.h"
 #include "net.h"
 #include "officers.h"
+#include "research.h"
 #include "saveio.h"
 #include "warfx.h"
 #include "invasion.h"
@@ -43,6 +45,9 @@ struct Player {
     bool simb = false;       // 0.8.0: its PC fights its battles during the host's month (hello `simb`; older: no)
     int offLevel = 0;        // 0.8.0: its PC plays the nation's own officers (hello `off`; 0 = no)
     int lsofLevel = 0;       // 0.8.1: its PC's live battles carry both sides' commanders (hello `lsof`; 0 = no)
+    int resLevel = 0;        // 0.8.2: its PC shows the nation's research dialogs and answers its question (hello `res`)
+    int unsubLevel = 0;      // 0.9.0: its PC can take a submitted turn back (hello `unsub`; 0 = no)
+    int acftLevel = 0;       // 0.9.0: its PC plays the nation's own aircraft (hello `acft`; 0 = no)
 };
 
 // The ten nations of the game, offered for lobby picks before the host has a campaign.
@@ -69,6 +74,13 @@ static bool g_hostWantsTurn = false;
 static bool g_turnRunning = false;
 static bool g_afterTurnPending = false;
 static bool g_runTurnWhenIdle = false;
+// 0.9.0: TryStartHostTurn has posted RunHostTurn: the month's start is decided (a turn is no longer taken back)
+static bool g_turnQueued = false;
+// 0.9.0: each joined nation's invasion plan (target, months) as the month began, kept at its first turn of the month
+// (g_invTurnSeq = g_seq): a turn's `kinvt` is taken when the turn arrives, so a withdrawn turn's order is put back
+static std::map<int, std::pair<std::wstring, int>> g_invTurnStart;
+static int g_invTurnSeq = -1;
+static std::string g_lastHostUnsub = "none";  // the last withdrawal answered (bridge `unsubmit state`)
 static DWORD g_turnStartTick = 0;
 static DWORD g_idleSinceTick = 0;
 static int g_hostSlot = -1;
@@ -189,6 +201,15 @@ static bool g_haveState = false;
 static bool g_submitted = false;
 static bool g_forceSubmitPending = false;
 static bool g_submitForcedByHost = false;  // the host's time limit ran out: submit without the Turn's questions
+// 0.9.0 (client): the host takes a submitted turn back (welcome `unsub`); this month's turns sent (the request carries
+// the count: an answer to an older turn leaves a turn sent since standing); the requests sent (the answer names its own)
+// and one awaited; the host's time limit ran out this month (MSG_FORCE_SUBMIT: the turn stays); the last answer
+static int g_hostUnsub = 0;
+static int g_submitNo = 0;
+static int g_unsubReq = 0;
+static bool g_unsubPending = false;
+static bool g_timeUp = false;
+static std::string g_lastUnsub = "none";
 static std::string g_pendingState;
 static int g_remoteRemaining = -1;
 static Phase g_remotePhase = Phase::Lobby;
@@ -455,6 +476,7 @@ static struct {
 
 // Random events of the joined player's nation (rolled on this PC when a new month arrives).
 static int g_eventRollSeq = -1;        // month (seq) whose event roll is still due
+static int g_acMonthSeq = -1;          // 0.9.0: month (seq) whose aircraft routines are still due (before the roll)
 static int g_evUsed[100] = {};         // this nation's event cooldowns (months), like the game's own
 static std::string g_evUsedKey;        // campaign + nation the cooldowns belong to
 static int g_evUsedMonth = 0;          // Year*12+Month the cooldowns were last counted down to
@@ -1078,6 +1100,7 @@ static void ClearQueuedNews(const char* why) {
         n += g_invNews[K].size() + warfx::TakeNews(K).size() + economy::TakeNews(K).size();
         g_invNews[K].clear();
     }
+    research::ClearNews();  // 0.8.2 (logs its own count)
     for (auto* m : {&g_playerNews, &g_treatyNews})
         for (auto& e : *m) n += e.second.size();
     for (auto& e : g_kTreatyNews) n += e.second.size();
@@ -2514,6 +2537,10 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
     // the corps on its PC (`offgen`).
     bool ownOfficers = nplay::HostPutOfficers(b, p.nation, p.offLevel >= 1, "month");
     NoteOffRules(p);  // 0.8.1: (the month's rule for its ships without a commander while the player is away)
+    // 0.9.0: the nation's own aircraft request (the form's ACRequestRole/ACRequest and the old types' reminders, [General])
+    // instead of the host's; its types and air units are in the save already (merged from its turns)
+    bool ownAircraft = hookcb::AircraftByPlayer(p.nation);
+    if (ownAircraft) nplay::HostPutAircraft(b, p.nation);
     KV h;
     h["seq"] = std::to_string(g_seq);
     h["nation"] = std::to_string(p.nation);
@@ -2585,18 +2612,30 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
         h["offs"] = "1";
         if (!ownOfficers) h["offgen"] = "1";
     }
+    if (ownAircraft) h["acft"] = "1";  // 0.9.0: ... and its own aircraft (its turn carries them; older clients ignore it)
     {
         // The player's economy rules the host ran for this nation (economy.cpp; older clients ignore the keys): their
         // messages since the last state (sent once) and the nation's army offensive months (its budget's x 0.9).
         std::vector<std::wstring> econ = economy::TakeNews(p.nation);
         std::string news;
         for (auto& l : econ) news += SafeText(W2U(l)) + kSepRec;
+        // 0.8.2: the nation's research month as its player's (research.cpp): its turn report lines go the same way (older
+        // clients show them too); its dialogs go to a PC that shows them (hello `res`)
+        std::vector<std::wstring> res = research::TakeLines(p.nation);
+        for (auto& l : res) news += SafeText(W2U(l)) + kSepRec;
+        std::string resDialogs = research::TakeDialogs(p.nation);
+        if (!resDialogs.empty() && p.resLevel >= 1) h["kres"] = resDialogs;
         // The player's war effects the host ran for this nation (warfx.cpp, B5): their messages go the same way (0.5.0
         // clients show them too).
         std::vector<std::wstring> war = warfx::TakeNews(p.nation);
     for (auto& l : g_invNews[p.nation]) war.push_back(l);  // 0.7.0: the nation's invasions (CheckRebellionAndInvasions)
     g_invNews[p.nation].clear();
         for (auto& l : war) news += SafeText(W2U(l)) + kSepRec;
+        // 0.9.0: the month's news of the nation's own aircraft types and air units (aircraft.cpp), once
+        std::vector<std::wstring> air = acft::HostTakeNews(p.nation);
+        for (auto& l : air) news += SafeText(W2U(l)) + kSepRec;
+        if (!air.empty())
+            Log("aircraft: %d message(s) of nation %d's aircraft go with state seq %d", (int)air.size(), p.nation, g_seq);
         // 0.6.0: the disarmament treaty ended by this nation's war (HostArmsTreatyCheck), the game's line, once
         auto tn = g_kTreatyNews.find(p.nation);
         if (tn != g_kTreatyNews.end()) {
@@ -2613,6 +2652,12 @@ static void SendStateTo(Player& p, const std::wstring& dir, int y, int m) {
         }
         if (!econ.empty())
             Log("economy: %d message(s) of nation %d's rules go with state seq %d", (int)econ.size(), p.nation, g_seq);
+        if (!res.empty() || !resDialogs.empty())
+            Log("research: %d turn report line(s) and %s of nation %d's research go with state seq %d", (int)res.size(),
+                resDialogs.empty() ? "no dialog"
+                : p.resLevel >= 1 ? "its dialogs"
+                                  : "NOT its dialogs (the player's mod does not show them)",
+                p.nation, g_seq);
         if (!war.empty())
             Log("warfx: %d message(s) of nation %d's war effects go with state seq %d", (int)war.size(), p.nation, g_seq);
         // B5: the nations blockaded now (the host's check and the joined nations' own), for this player's screen (older
@@ -2897,6 +2942,9 @@ static void BroadcastState() {
     g_deadline = g_turnLimitSec > 0 ? GetTickCount() + g_turnLimitSec * 1000 : 0;
     g_forced = false;
     g_hostWantsTurn = false;
+    g_turnQueued = false;  // 0.9.0
+    g_invTurnStart.clear();
+    g_invTurnSeq = -1;
     for (auto& kv : g_players) {
         Player& p = kv.second;
         p.submitted = false;
@@ -2963,6 +3011,26 @@ static bool AllSubmitted(std::string* missing) {
         }
     }
     return all;
+}
+
+// Host: the planning status line ("All players are ready." / "Waiting for: ..."; "Host is ready. " first while the
+// host's Turn waits for the players).
+static std::string HostReadyText() {
+    std::string missing;
+    AllSubmitted(&missing);
+    std::string text = missing.empty() ? "All players are ready." : "Waiting for: " + missing;
+    return g_hostWantsTurn ? "Host is ready. " + text : text;
+}
+
+// Host: the players the month waits for, as AllSubmitted counts them (0.9.0: the host's Turn box asks again when one of
+// them is new, a player who took the turn back while it was open).
+static std::set<std::string> MissingNames() {
+    std::set<std::string> s;
+    for (auto& kv : g_players) {
+        const Player& p = kv.second;
+        if (p.connected && p.nation > 0 && p.hasState && !p.submitted) s.insert(p.name);
+    }
+    return s;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4428,10 +4496,12 @@ static void TryStartHostTurn() {
         g_runTurnWhenIdle = true;
         return;
     }
+    g_turnQueued = true;  // 0.9.0: from here on a turn is not taken back (HostOnUnsubmit)
     RunOnMainThread(RunHostTurn);
 }
 
 static void RunHostTurn() {
+    g_turnQueued = false;
     if (g_role != Role::Host || g_phase != Phase::Planning) return;
     if (game::IsBusy()) {
         g_runTurnWhenIdle = true;
@@ -4472,8 +4542,11 @@ static void RunHostTurn() {
             std::string hb;
             if (ReadFileBytes(HostBcsPath(), hb)) keepCmd = saveio::ShipCommanderIds(ParseIni(hb), K);
         }
-        if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err)) {
+        std::vector<std::string> acReq;  // 0.9.0: the nation's own aircraft (a player whose PC plays them)
+        bool acK = K >= 1 && K <= 8 && hookcb::AircraftByPlayer(K);
+        if (saveio::MergeSubmission(dir, g_hostSlot, it->second.nation, s.second, err, acK ? &acReq : nullptr)) {
             merged++;
+            if (!acReq.empty()) nplay::HostTakeAircraft(K, acReq);
             nplay::HostTakeSubmission(s.second, it->second.nation);  // its own intelligence spending and reports
             bool legacy = saveio::IsLegacySubmission(s.second) && it->second.nation >= 1 && it->second.nation <= 8;
             // 0.6.1: its own campaign divisions; 0.7.0: after a legacy turn only those of the new fleet (or none)
@@ -4526,6 +4599,7 @@ static void RunHostTurn() {
         g_ofKillArm = {};
     }
     Log("host turn: %d submissions merged, running turn", merged);
+    acft::HostMonthStart();  // 0.9.0: the joined nations' aircraft before the month (for its news)
     if (g_enemyVPSeen < 0) g_enemyVPSeen = game::EnemyVP();  // the points before this month (see ShareEnemyVP)
     HostPackSurprises();  // 0.8.0: the month's start, for the surprise attacks fought during the month
     game::RunOriginalTurn();
@@ -4778,6 +4852,7 @@ static void AdoptMonthInProgress(const lockstep::RejoinInfo& ri) {
     g_forced = false;
     g_deadline = 0;
     g_runTurnWhenIdle = false;
+    g_turnQueued = false;
     g_phase = Phase::Processing;
     g_turnRunning = true;
     g_afterTurnPending = false;
@@ -4846,6 +4921,67 @@ static void OnLiveBattleResumed(const lockstep::RejoinInfo& ri) {
     if (g_onReveal) g_onReveal();
 }
 
+// 0.9.0: a joined player takes the submitted turn back (MSG_UNSUBMIT, sent only to a host whose welcome has `unsub`).
+// Taken back only while the month is planned and its start is not decided: not once the time limit has run out
+// (MSG_FORCE_SUBMIT went out), not while a start waits to run (RunHostTurn posted, or waiting for the game to be idle or
+// for a save that works) and not during the month. The turn is then dropped as if it had never come (the nation's
+// invasion plan, which a turn sets when it arrives, back as the month began) and the player counts as not submitted: the
+// Turn waits for them again, the time limit submits their PC's orders as they are then, and the host's Advance (or Yes
+// at its Turn) leaves the nation last month's orders. The answer echoes the request; the player's PC counts as not
+// submitted only when the host's answer says the turn is dropped.
+static void HostOnUnsubmit(Player& p, const KV& kv) {
+    int seq = KVInt(kv, "seq", -1);
+    std::string why;
+    if (p.nation <= 0)
+        why = "you command no nation";
+    else if (g_phase == Phase::Processing)
+        why = "the host has already started the month with it";
+    else if (g_phase != Phase::Planning)
+        why = "there is no month to plan";
+    else if (seq != g_seq)
+        why = "that month is over";
+    else if (g_forced)
+        why = "the time limit has run out and the month starts with it";
+    else if (g_turnQueued || g_runTurnWhenIdle || g_saveStop == SaveStep::Turn)
+        why = "the host is already starting the month with it";
+    KV a;
+    a["seq"] = std::to_string(seq);
+    a["sub"] = KVStr(kv, "sub");
+    a["req"] = KVStr(kv, "req");
+    a["ok"] = why.empty() ? "1" : "0";
+    if (!why.empty()) {
+        a["why"] = why;
+        net::Send(p.peer, net::MSG_UNSUBMIT, KVEncode(a));
+        g_lastHostUnsub = "refused:" + p.name + ":" + why;
+        Log("unsubmit: %s's request (month seq %d; this month %d) refused: %s", p.name.c_str(), seq, g_seq,
+            why.c_str());
+        return;
+    }
+    bool had = g_submissions.erase(p.peer) > 0, was = p.submitted;
+    p.submitted = false;
+    std::string plan;
+    auto it = g_invTurnSeq == g_seq ? g_invTurnStart.find(p.nation) : g_invTurnStart.end();
+    if (it != g_invTurnStart.end()) {
+        inv::KState& st = inv::State(p.nation);
+        if (st.target != it->second.first || st.count != it->second.second) {
+            plan = "; its invasion plan back to " + (it->second.first.empty() ? std::string("none") : W2U(it->second.first)) +
+                   " (" + std::to_string(it->second.second) + " month(s)) from " +
+                   (st.target.empty() ? std::string("none") : W2U(st.target)) + ", as the month began";
+            st.target = it->second.first;
+            st.count = it->second.second;
+            SaveReservations();
+        }
+    }
+    net::Send(p.peer, net::MSG_UNSUBMIT, KVEncode(a));
+    g_lastHostUnsub = "ok:" + p.name;
+    Log("unsubmit: %s withdrew the turn of month seq %d (nation %d: %s)%s", p.name.c_str(), seq, p.nation,
+        had ? "the turn dropped" : was ? "no turn stored" : "not submitted", plan.c_str());
+    if (was || had) AddChat("* " + p.name + " withdrew the turn");
+    BroadcastLobby();
+    g_lastStatusTick = GetTickCount();
+    BroadcastStatus(HostReadyText());
+}
+
 static void HostOnMessage(net::Msg& m) {
     Player* p = PlayerByPeer(m.peer);
     switch (m.type) {
@@ -4907,12 +5043,20 @@ static void HostOnMessage(net::Msg& m) {
             p->simb = KVInt(kv, "simb") != 0;              // 0.8.0: battles during the host's month (older clients: no)
             p->offLevel = std::max(0, KVInt(kv, "off"));  // 0.8.0: the nation's own officers (older clients: none)
             p->lsofLevel = std::max(0, KVInt(kv, "lsof"));  // 0.8.1: both sides' commanders (older clients: none)
+            p->resLevel = std::max(0, KVInt(kv, "res"));    // 0.8.2: the research dialogs (older clients: none)
+            p->unsubLevel = std::max(0, KVInt(kv, "unsub"));  // 0.9.0: takes a submitted turn back (older clients: no)
+            p->acftLevel = std::max(0, KVInt(kv, "acft"));  // 0.9.0: the nation's own aircraft (older clients: none)
             Log("%s: mod %s, live-battle engine %d (this host: %d), player's relation rules %d, battle generator %d, "
                 "campaign divisions %d, battles during the host's month %d (this host: %d), officers %d",
                 name.c_str(), p->mod.c_str(), p->lsLevel, MP_LS_LEVEL, p->relLevel, p->genLevel, p->divLevel,
                 p->simb ? 1 : 0, g_simulOn ? 1 : 0, p->offLevel);
             Log("%s: both sides' commanders in live battles %d (this host: %d)", name.c_str(), p->lsofLevel,
                 LiveOfficers() ? 1 : 0);
+            Log("%s: research dialogs %d (this host's joined nations' research as the player's: %d)", name.c_str(),
+                p->resLevel, research::Available() ? 1 : 0);
+            Log("%s: unsubmit %d (this host: 1)", name.c_str(), p->unsubLevel);
+            Log("%s: the nation's own aircraft %d (this host: %d)", name.c_str(), p->acftLevel,
+                acft::HostAvailable() && !acft::TestHostOff() ? 1 : 0);
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -4947,6 +5091,10 @@ static void HostOnMessage(net::Msg& m) {
             w["simb"] = g_simulOn ? "1" : "0";
             // 0.8.1: this host's live battles carry both sides' commanders (with a player announcing hello `lsof`)
             w["lsof"] = LiveOfficers() ? "1" : "0";
+            // 0.8.2: this host runs the joined nations' research as the player's and sends their dialogs (`kres`)
+            w["res"] = research::Available() ? "1" : "0";
+            // 0.9.0: this host takes a joined player's submitted turn back (MSG_UNSUBMIT; the player's button)
+            w["unsub"] = "1";
             net::Send(m.peer, net::MSG_WELCOME, KVEncode(w));
             AddChat("* " + name + " joined" + (p->nation > 0 ? " as " + CampaignNationName(p->nation) : ""));
             {  // 0.8.0: a battle of this player fought during a month that a restart of the host's game lost
@@ -5047,8 +5195,15 @@ static void HostOnMessage(net::Msg& m) {
                 break;
             }
             if (KVInt(h, "nation") != p->nation) break;
-            if (p->genLevel >= 4 && h.find("kinvt") != h.end() && p->nation >= 1 && p->nation <= 8)
+            if (p->genLevel >= 4 && h.find("kinvt") != h.end() && p->nation >= 1 && p->nation <= 8) {
+                if (g_invTurnSeq != g_seq) {  // 0.9.0: the plans as the month began (a withdrawn turn's order goes back)
+                    g_invTurnStart.clear();
+                    g_invTurnSeq = g_seq;
+                }
+                if (!g_invTurnStart.count(p->nation))
+                    g_invTurnStart[p->nation] = {inv::State(p->nation).target, inv::State(p->nation).count};
                 HostTakeInvasionOrder(p->name, p->nation, U2W(KVStr(h, "kinvt")));
+            }
             Bundle b;
             if (!b.Unpack(body)) break;
             g_submissions[m.peer] = b;
@@ -5094,6 +5249,9 @@ static void HostOnMessage(net::Msg& m) {
             break;
         case net::MSG_BATTLE_RESULT:
             if (p && p->welcomed) HostOnBattleResult(*p, m.data);
+            break;
+        case net::MSG_UNSUBMIT:  // 0.9.0: a joined player takes the submitted turn back
+            if (p && p->welcomed) HostOnUnsubmit(*p, KVDecode(m.data));
             break;
         case net::MSG_LOCKSTEP:
             if (p && p->welcomed) HostOnLockstep(*p, m.data);
@@ -5351,14 +5509,22 @@ static void ClientApplyPendingState() {
     for (auto& l : Split(KVStr(h, "econnews"), kSepRec))
         if (!l.empty()) g_econNews.push_back(U2W(l));
     g_econNewsSeq = g_econNews.empty() ? -1 : seq;
+    research::ClientSetMonth(seq, KVStr(h, "kres"));  // 0.8.2: the nation's research dialogs (older hosts: none)
     g_myNation = nation;
     g_clientSeq = seq;
     g_haveState = true;
     g_submitted = false;
     g_forceSubmitPending = false;
     g_submitForcedByHost = false;
+    g_submitNo = 0;  // 0.9.0
+    g_unsubPending = false;
+    g_timeUp = false;
     // A host with per-player intelligence sent this nation's own spending and reports (the header's `intel`).
     nplay::ClientSetMonth(nation, KVInt(h, "intel") != 0, g_clientSlot);
+    // 0.9.0: a host that keeps this nation's aircraft (`acft`): its screens in its own view and, before the month's event
+    // roll, the month's aircraft routines (the request, the private venture, the old types' reminders)
+    acft::ClientSetMonth(nation, KVInt(h, "acft", 0) == 1 && nation >= 1 && nation <= 8);
+    g_acMonthSeq = acft::ClientActive() ? seq : -1;
     g_remoteRemaining = KVInt(h, "remaining", -1);
     g_date = DateStr(KVInt(h, "year"), KVInt(h, "month"));
     game::SetTurnButtonCaption(legacyNow ? L"Continue" : L"Submit");
@@ -6735,10 +6901,57 @@ static void ParseLobby(const KV& kv) {
     g_cSnap = DecodeDipSnap(kv);
 }
 
+// 0.9.0 (client): the host's answer to this PC's Unsubmit turn. The PC counts as not submitted only when the host dropped
+// this month's turn and no turn was sent after the request (one sent since came after the withdrawal: it stands).
+static void ClientOnUnsubmitAnswer(const KV& kv) {
+    int seq = KVInt(kv, "seq", -1), sub = KVInt(kv, "sub", -1), req = KVInt(kv, "req", -1);
+    bool ok = KVInt(kv, "ok") == 1;
+    std::string why = KVStr(kv, "why");
+    if (req == g_unsubReq) g_unsubPending = false;
+    if (seq != g_clientSeq) {
+        g_lastUnsub = "stale";
+        Log("unsubmit: an answer for an earlier month ignored (month seq %d, now %d): %s", seq, g_clientSeq,
+            ok ? "taken back" : why.c_str());
+        Changed();
+        return;
+    }
+    if (!ok) {
+        g_lastUnsub = "refused:" + why;
+        Log("unsubmit: refused by the host (month seq %d, request %d): %s", seq, req, why.c_str());
+        Notice("Your turn was not unsubmitted: " + why + ".");
+        return;
+    }
+    if (sub != g_submitNo) {
+        g_lastUnsub = "superseded";
+        Log("unsubmit: the host took back turn %d of month seq %d; turn %d, sent since, stands", sub, seq, g_submitNo);
+        Changed();
+        return;
+    }
+    g_lastUnsub = "ok";
+    if (!g_submitted) {
+        Log("unsubmit: the host has no turn of this PC (month seq %d, request %d): not submitted", seq, req);
+        Changed();
+        return;
+    }
+    g_submitted = false;
+    g_forceSubmitPending = false;  // (a Submit waiting for a dialog to close would send the turn again at once)
+    g_submitForcedByHost = false;
+    if (g_saveStop == SaveStep::Submit) {  // (likewise a Submit waiting for a save that works)
+        Log("disk: %s no longer waits (the turn was taken back)", SaveStepName(g_saveStop));
+        g_saveStop = SaveStep::None;
+        g_saveRetryAt = 0;
+    }
+    if (g_haveState && g_phase == Phase::Planning) game::SetTurnButtonCaption(L"Submit");
+    Log("unsubmit: the host took the turn back (month seq %d, turn %d, request %d): not submitted", seq, sub, req);
+    Notice("Turn unsubmitted: the host will not use it. Change your orders and press Submit again. Until then you are not "
+           "ready; if the time limit runs out, your orders are submitted as they are then.");
+}
+
 static void ClientOnMessage(net::Msg& m) {
     switch (m.type) {
         case net::EV_CONNECTED: {
             g_hostGen = 0;
+            g_hostUnsub = 0;
             KV kv;
             kv["proto"] = std::to_string(MP_PROTOCOL);
             kv["mod"] = MP_MOD_VERSION;
@@ -6764,6 +6977,12 @@ static void ClientOnMessage(net::Msg& m) {
             kv["off"] = ofc::Available() && ofc::MonthAvailable() ? "1" : "0";
             // 0.8.1: this PC's live battles carry both sides' commanders (officers.cpp: the battle's officer lists)
             kv["lsof"] = LiveOfficers() ? "1" : "0";
+            // 0.8.2: this PC shows its nation's research dialogs (the state's `kres`) and answers the research question
+            kv["res"] = research::Available() ? "1" : "0";
+            kv["unsub"] = "1";  // 0.9.0: this PC can take a submitted turn back (the host logs it)
+            // 0.9.0: this PC plays its nation's own aircraft (aircraft.cpp: the screens in its view, the month's routines)
+            // and sends them with its turns; the host then leaves the computer's aircraft decisions for it out
+            kv["acft"] = acft::Available() && !acft::TestCapOff() ? "1" : "0";
             kv["cpu"] = x87::CpuVendor();  // (logged by both sides: a live battle's diagnostics name differing vendors)
             if (datafiles::Ready()) kv["dh"] = datafiles::Combined();  // the game data files (logged; checked at a start)
             net::Send(0, net::MSG_HELLO, KVEncode(kv));
@@ -6776,8 +6995,12 @@ static void ClientOnMessage(net::Msg& m) {
             g_role = Role::None;
             g_phase = Phase::Lobby;
             g_haveState = false;
+            g_hostUnsub = 0;  // 0.9.0
+            g_unsubPending = false;
             nplay::ClientReset();
             ofc::ClientReset();
+            research::ClientReset();
+            acft::ClientReset();
             game::SetTurnButtonCaption(L"Turn");
             net::Shutdown();
             lockstep::OnPeerLost("the connection to the host was lost");
@@ -6799,6 +7022,10 @@ static void ClientOnMessage(net::Msg& m) {
             g_hostSimb = KVInt(kv, "simb");              // 0.8.0 (older hosts: none)
             Log("joined %s: both sides' commanders in live battles: the host %d, this PC %d", KVStr(kv, "host").c_str(),
                 KVInt(kv, "lsof"), LiveOfficers() ? 1 : 0);  // 0.8.1 (older hosts: none)
+            Log("joined %s: the nation's research as the player's with its dialogs: the host %d, this PC %d",
+                KVStr(kv, "host").c_str(), KVInt(kv, "res"), research::Available() ? 1 : 0);  // 0.8.2 (older hosts: none)
+            g_hostUnsub = std::max(0, KVInt(kv, "unsub"));  // 0.9.0 (older hosts: none: no Unsubmit turn button)
+            Log("joined %s: unsubmit: the host %d, this PC 1", KVStr(kv, "host").c_str(), g_hostUnsub);
             {
                 std::string cpu = KVStr(kv, "cpu").substr(0, 16), dh = KVStr(kv, "dh").substr(0, 16);
                 std::string mine = datafiles::Ready() ? datafiles::Combined() : "";
@@ -6877,12 +7104,16 @@ static void ClientOnMessage(net::Msg& m) {
             break;
         }
         case net::MSG_FORCE_SUBMIT:
+            g_timeUp = true;  // 0.9.0: the month starts with this PC's turn (no Unsubmit any more)
             if (g_haveState && !g_submitted) {
                 g_forceSubmitPending = true;
                 g_submitForcedByHost = true;
                 Notice("Time is up: submitting your turn now.");
                 SubmitTurn();
             }
+            break;
+        case net::MSG_UNSUBMIT:  // 0.9.0: the host's answer to this PC's Unsubmit turn
+            ClientOnUnsubmitAnswer(KVDecode(m.data));
             break;
         default:
             break;
@@ -7551,6 +7782,7 @@ bool Join(const std::string& name, const std::string& ip, int port, const std::s
     g_phase = Phase::Lobby;
     g_myNation = -1;
     g_haveState = g_submitted = false;
+    g_hostUnsub = 0;  // 0.9.0 (the welcome tells)
     g_pendingState.clear();
     Notice("Connecting to " + ip + ":" + std::to_string(port) + "...");
     return true;
@@ -7616,12 +7848,20 @@ void Leave() {
     g_peaceRows.clear();
     g_enemyVPSeen = -1;
     g_eventRollSeq = -1;
+    g_acMonthSeq = -1;
     g_submissions.clear();
     g_haveState = g_submitted = false;
     g_submitForcedByHost = false;
+    g_hostUnsub = g_submitNo = 0;  // 0.9.0
+    g_unsubPending = g_timeUp = false;
+    g_turnQueued = g_runTurnWhenIdle = false;
+    g_invTurnStart.clear();
+    g_invTurnSeq = -1;
     nplay::HostDetach();
     nplay::ClientReset();
     ofc::ClientReset();
+    research::ClientReset();
+    acft::ClientReset();
     g_pendingState.clear();
     g_saveStop = SaveStep::None;  // 0.7.1
     g_saveRetryAt = 0;
@@ -7900,6 +8140,17 @@ void SubmitTurn() {
         Log("submit: cancelled at a Turn warning");
         return;
     }
+    // 0.9.0: the nation's own aircraft (a host that keeps them): the Turn's air checks (a carrier or base over its
+    // capacity stops the Turn; a carrier without air units: the game's question, Yes opens the air group screen)
+    if (!g_submitForcedByHost && acft::ClientActive()) {
+        std::string why;
+        if (!acft::ClientSubmitChecks(why)) {
+            g_forceSubmitPending = false;
+            Notice("Not submitted: " + why + ". Press Submit when your orders are ready.");
+            Log("submit: cancelled at the Turn's air check (%s)", why.c_str());
+            return;
+        }
+    }
     // 0.8.0: the nation's own officers (a host that keeps them): the Turn's question about ships and divisions without a
     // commander (No goes back, as in the game; not when the host's time limit submits), then the game's assignments of
     // the Turn (DoTurn2: areas, divisions, ships).
@@ -7940,6 +8191,16 @@ void SubmitTurn() {
             Log("officers: NOT in the turn: %s", oerr.c_str());
         }
     }
+    if (acft::ClientActive()) {  // 0.9.0: the nation's aircraft types, air units and request as its game saved them
+        std::string bcs, ac, sum, aerr;
+        if (ReadFileBytes(game::SaveDir(g_clientSlot) + L"RTWGame" + std::to_wstring(g_clientSlot) + L".bcs", bcs) &&
+            saveio::BuildAircraftFile(bcs, g_myNation, ac, sum, aerr)) {
+            b.Add("aircraft.ini", ac);
+            Log("aircraft: the turn carries %s", sum.c_str());
+        } else {
+            Log("aircraft: NOT in the turn: %s", aerr.empty() ? "the slot's campaign file is unreadable" : aerr.c_str());
+        }
+    }
     KV h;
     h["seq"] = std::to_string(g_clientSeq);
     if (g_hostGen >= 4) {  // 0.7.0: the nation's invasion target ("" none)
@@ -7955,9 +8216,73 @@ void SubmitTurn() {
     h["nation"] = std::to_string(g_myNation);
     net::Send(0, net::MSG_SUBMIT, PackHB(KVEncode(h), b.Pack()));
     g_submitted = true;
+    g_submitNo++;  // 0.9.0: an Unsubmit asked before this turn does not take it back
     g_forceSubmitPending = false;
     game::SetTurnButtonCaption(L"Submitted");
-    Notice("Turn submitted. You can still change orders and press Submit again until the host processes the turn.");
+    Notice(g_hostUnsub >= 1 ? "Turn submitted. You can still change orders and press Submit again until the host "
+                              "processes the turn, or take it back with Unsubmit turn in the Multiplayer window."
+                            : "Turn submitted. You can still change orders and press Submit again until the host "
+                              "processes the turn.");
+}
+
+// 0.9.0: the Unsubmit turn button (see HostOnUnsubmit). Not optimistic: this PC stays submitted until the host's answer
+// says the turn is dropped (ClientOnUnsubmitAnswer), so it never counts itself out of a month the host already started
+// with its turn.
+std::string UnsubmitTurn(bool raw) {
+    if (g_role != Role::Client) return "only a joined player submits turns";
+    if (g_hostUnsub < 1) return "the host's mod is older: it cannot take a submitted turn back";
+    if (!raw) {
+        if (g_phase == Phase::Processing) return "the host has already started the month with your turn";
+        if (g_phase != Phase::Planning || !g_haveState) return "there is no month to plan";
+        if (!g_submitted) return "your turn is not submitted";
+        if (g_timeUp) return "the time limit has run out: the month starts with your turn";
+        if (g_unsubPending) return "already asked: waiting for the host's answer";
+    }
+    KV k;
+    k["seq"] = std::to_string(g_clientSeq);
+    k["sub"] = std::to_string(g_submitNo);
+    k["req"] = std::to_string(++g_unsubReq);
+    net::Send(0, net::MSG_UNSUBMIT, KVEncode(k));
+    g_unsubPending = true;
+    Log("unsubmit: asked the host to take back turn %d of month seq %d (request %d%s)", g_submitNo, g_clientSeq,
+        g_unsubReq, raw ? ", TEST: without this PC's checks" : "");
+    Notice("Unsubmitting your turn: waiting for the host...");
+    return "";
+}
+
+std::string DebugUnsubmit(const std::vector<std::string>& a) {
+    std::string cmd = a.size() > 1 ? a[1] : "state";
+    if (cmd == "state") {
+        if (g_role == Role::Client)
+            return "ok host=" + std::to_string(g_hostUnsub) + " submitted=" + (g_submitted ? "1" : "0") +
+                   " pending=" + (g_unsubPending ? "1" : "0") + " timeup=" + (g_timeUp ? "1" : "0") +
+                   " sub=" + std::to_string(g_submitNo) + " req=" + std::to_string(g_unsubReq) +
+                   " seq=" + std::to_string(g_clientSeq) + " last=" + g_lastUnsub;
+        if (g_role != Role::Host) return "error no session";
+        std::string players;
+        for (auto& kv : g_players) {
+            const Player& p = kv.second;
+            if (!p.welcomed) continue;
+            players += (players.empty() ? "" : ",") + p.name + ":" + std::to_string(p.nation) + ":" +
+                       (p.submitted ? "1" : "0") + ":" + (g_submissions.count(kv.first) ? "1" : "0") + ":" +
+                       std::to_string(p.unsubLevel);
+        }
+        return "ok seq=" + std::to_string(g_seq) + " phase=" + PhaseName(g_phase) + " wants=" +
+               (g_hostWantsTurn ? "1" : "0") + " forced=" + (g_forced ? "1" : "0") + " starting=" +
+               (g_turnQueued || g_runTurnWhenIdle || g_saveStop == SaveStep::Turn ? "1" : "0") +
+               " remaining=" + std::to_string(RemainingSec()) + " players=" + players + " last=" + g_lastHostUnsub;
+    }
+    if (cmd == "timeup") {  // TEST ONLY (host): this month's time limit runs out in s seconds
+        if (g_role != Role::Host || g_phase != Phase::Planning) return "error not a host planning a month";
+        int s = std::max(1, a.size() > 2 ? atoi(a[2].c_str()) : 1);
+        g_deadline = GetTickCount() + (DWORD)s * 1000;
+        if (!g_deadline) g_deadline = 1;
+        Log("TEST: unsubmit: this month's time limit runs out in %d s (the turn time limit stays %d min)", s,
+            g_turnLimitSec / 60);
+        BroadcastLobby();
+        return "ok remaining=" + std::to_string(RemainingSec());
+    }
+    return "error unsubmit [state|raw|timeup <s>]";
 }
 
 // Relations v2, B4 (client): the Diplomacy list's rows of the computer's nations this PC's nation is at war with, while
@@ -8519,11 +8844,7 @@ void Tick() {
         }
         if (g_phase == Phase::Planning && now - g_lastStatusTick > 3000) {
             g_lastStatusTick = now;
-            std::string missing;
-            AllSubmitted(&missing);
-            std::string text = missing.empty() ? "All players are ready." : "Waiting for: " + missing;
-            if (g_hostWantsTurn) text = "Host is ready. " + text;
-            BroadcastStatus(text);
+            BroadcastStatus(HostReadyText());
         }
         if (!g_pendingTreaty.empty() && g_phase == Phase::Planning && !g_turnRunning && !game::IsBusy() &&
             !game::BattleActive() && !game::EventActive()) {
@@ -8542,9 +8863,14 @@ void Tick() {
         else if (g_saveStop == SaveStep::Submit && !SaveStopWaiting(SaveStep::Submit) && g_haveState && !g_submitted &&
                  g_phase == Phase::Planning && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive())
             SubmitTurn();  // 0.7.1: the turn a failed save stopped, once a save works
+        // 0.8.2: the nation's research dialogs of the month (the game's own, as single player shows them during the
+        // month), before the turn report that lists them.
+        if (research::ClientDue(g_clientSeq) && g_haveState && g_pendingState.empty() && !game::IsBusy() &&
+            !game::BattleActive() && !game::EventActive())
+            research::ClientShow(g_clientSeq);
         // The messages of the player's economy rules the host ran for this nation, in the game's turn report, first.
         if (g_econNewsSeq >= 0 && g_econNewsSeq == g_clientSeq && g_haveState && g_pendingState.empty() &&
-            !game::IsBusy() && !game::BattleActive() && !game::EventActive()) {
+            !game::IsBusy() && !game::BattleActive() && !game::EventActive() && !research::ClientDue(g_clientSeq)) {
             std::vector<std::wstring> lines;
             lines.swap(g_econNews);
             g_econNewsSeq = -1;
@@ -8561,10 +8887,21 @@ void Tick() {
             int ships = 0, funds = 0;
             if (game::LegacyActive() && game::LegacyCheckDone(&ships, &funds)) ClientLegacyFinished(ships, funds, false);
         }
+        // 0.9.0: the month's aircraft routines of this nation (a host that keeps its aircraft), once per month package,
+        // before the event roll: their dialogs come first, as in the game's month
+        if (g_acMonthSeq >= 0 && g_acMonthSeq == g_clientSeq && g_haveState && g_phase == Phase::Planning &&
+            !g_submitted && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive() && !game::EventActive() &&
+            !game::LegacyActive() && !g_legacyMsgDue) {
+            g_acMonthSeq = -1;
+            std::string s = acft::ClientMonth(g_myNation);
+            if (!s.empty()) Log("aircraft: the month's routines of nation %d: %s", g_myNation, s.c_str());
+            game::RefreshUI();
+        }
         // This month's event roll (once per calendar month, see ClientRunEvent).
         if (g_eventRollSeq >= 0 && g_eventRollSeq == g_clientSeq && g_haveState && g_phase == Phase::Planning &&
             !g_submitted && g_pendingState.empty() && !game::IsBusy() && !game::BattleActive() &&
-            !game::LegacyActive() && !g_legacyMsgDue) {
+            !game::LegacyActive() && !g_legacyMsgDue && !research::ClientDue(g_clientSeq) &&
+            (g_acMonthSeq < 0 || g_acMonthSeq != g_clientSeq)) {
             g_eventRollSeq = -1;
             ClientRunEvent(-1);
         }
@@ -8607,6 +8944,12 @@ View GetView() {
     v.turnLimitMin = g_turnLimitSec / 60;
     v.remainingSec = RemainingSec();
     v.submitted = g_submitted;
+    if (g_role == Role::Client) {  // 0.9.0: the Unsubmit turn button
+        v.unsubAvail = g_hostUnsub >= 1;
+        v.unsubPending = g_unsubPending;
+        v.canUnsubmit = v.unsubAvail && g_phase == Phase::Planning && g_haveState && g_submitted && !g_unsubPending &&
+                        !g_timeUp;
+    }
     if (g_role == Role::Host) {
         v.hostName = g_myName;
         v.campaignLoaded = CampaignLoaded();
@@ -8722,11 +9065,28 @@ bool OnTurnClick(void* self, void* sender) {
         }
         g_hostWantsTurn = true;
         BroadcastLobby();
-        std::wstring msg = L"Still waiting for: " + U2W(missing) +
-                           L"\n\nYes = advance now (their nations keep last month's orders)\nNo = wait; the turn "
-                           L"starts automatically when everyone has submitted.";
-        int r = MessageBoxW(game::FormHwnd(self), msg.c_str(), L"Multiplayer", MB_YESNO | MB_ICONQUESTION);
-        if (r == IDYES) TryStartHostTurn();
+        // 0.9.0: a player may take the turn back while this box is open: Yes then asks again, naming them
+        std::set<std::string> asked = MissingNames();
+        for (;;) {
+            std::wstring msg = L"Still waiting for: " + U2W(missing) +
+                               L"\n\nYes = advance now (their nations keep last month's orders)\nNo = wait; the turn "
+                               L"starts automatically when everyone has submitted.";
+            int r = MessageBoxW(game::FormHwnd(self), msg.c_str(), L"Multiplayer", MB_YESNO | MB_ICONQUESTION);
+            if (r != IDYES) break;
+            std::set<std::string> now = MissingNames();
+            bool newly = false;
+            for (auto& n : now) newly |= !asked.count(n);
+            if (g_role == Role::Host && g_phase == Phase::Planning && newly) {
+                missing.clear();
+                AllSubmitted(&missing);
+                Log("turn: not ready any more while the host's box was open (now waiting for %s): asked again",
+                    missing.c_str());
+                asked = now;
+                continue;
+            }
+            TryStartHostTurn();
+            break;
+        }
         return true;
     }
     if (g_role == Role::Client) {
@@ -8756,6 +9116,9 @@ void OnAfterEndOfTurn(void* self) {
         mp::g_afterTurnPending = true;
         Log("DoEndOfTurn finished");
         nplay::HostOfficersFromMemory("the month");  // 0.8.0: what the month did to the joined nations' officers
+        acft::HostMonthEnd();                        // 0.9.0: the month's news of the joined nations' aircraft
+        std::string air = acft::HostTakeAirMonth();
+        if (!air.empty()) Log("aircraft: the air month for the joined nations' units (their player's):%s", air.c_str());
     }
 }
 
@@ -8780,6 +9143,16 @@ bool PlayerRulesNation(int idx) {
 int KWarCounter(int idx) {
     if (idx < 1 || idx > 8 || !IsHumanRemoteNation(idx)) return game::WarCounter();
     return mp::KWar(idx);
+}
+
+bool AircraftByPlayer(int idx) {
+    using namespace mp;
+    if (g_role != Role::Host || g_phase == Phase::Lobby || idx < 1 || idx > 8 || !acft::HostAvailable() ||
+        acft::TestHostOff() || !IsHumanRemoteNation(idx))
+        return false;
+    for (auto& p : g_players)
+        if (p.second.connected && p.second.welcomed && p.second.nation == idx) return p.second.acftLevel >= 1;
+    return nplay::HostHasAircraft(idx);  // the player away: its aircraft stay the player's once its turns sent them
 }
 
 bool WarOnlyByPlayers(int idx) {
@@ -9084,5 +9457,30 @@ void OnStrategicTurnRuns() {
     }
 }
 void OnCampaignLoading() { lockstep::OnCampaignLoading(); }
+
+bool KTechSharing(int K, int ts[9]) {
+    using namespace mp;
+    for (int j = 0; j < 9; j++) ts[j] = 0;
+    auto it = g_kTs.find(K);
+    if (g_role != Role::Host || K < 1 || K > 8 || it == g_kTs.end()) return false;
+    for (int j = 0; j < 9 && j < (int)it->second.size(); j++) ts[j] = j == K ? 0 : std::max(0, it->second[j]);
+    return true;
+}
+
+void KEndTechSharing(int K, int j) {
+    using namespace mp;
+    auto it = g_kTs.find(K);
+    if (g_role != Role::Host || it == g_kTs.end() || j < 0 || j >= (int)it->second.size()) return;
+    Log("research: nation %d's tech-sharing deal with nation %d ended (at war)", K, j);
+    it->second[j] = 0;
+}
+
+bool ResearchDialogsShown(int K) {
+    using namespace mp;
+    if (g_role != Role::Host) return false;
+    for (auto& p : g_players)
+        if (p.second.connected && p.second.welcomed && p.second.nation == K) return p.second.resLevel >= 1;
+    return false;
+}
 
 }  // namespace hookcb

@@ -273,6 +273,15 @@ belong to 0.4.0.
     [live battles with both sides' commanders](#fix-2026-11-03-live-battles-with-both-sides-commanders-v081-dev)
   - Testing:
     [the 0.8.1 release candidate dist_rc081_1](#testing-2026-11-04-the-081-release-candidate-dist_rc081_1-v081)
+- **0.8.2** (in development: fixes of bugs reported on 0.8.1)
+  - Fix:
+    [joined players saw no research messages](#fix-2026-11-15-joined-players-saw-no-research-messages-v082-dev)
+- **0.9.0** (in development: features asked for by players on 0.8.1)
+  - Feature:
+    [a joined player can take a submitted turn back (Unsubmit turn)](#feature-2026-11-15-a-joined-player-can-take-a-submitted-turn-back-unsubmit-turn-v090-dev);
+    [aircraft for joined players](#feature-2026-11-15-aircraft-for-joined-players-v090-dev)
+  - Investigation:
+    [aircraft for joined players](#investigation-2026-11-15-aircraft-for-joined-players-v090-dev)
 
 ## Investigation 2026-10-04: game facts (v0.1.0)
 - Game: Rule the Waves 3, Steam app 2008100, install `F:\SteamLibrary\steamapps\common\Rule the Waves 3`.
@@ -10058,3 +10067,327 @@ left, the game lock released. The logs of every run are kept with the developers
   both ways (the older side keeps 0.8.0's behaviour: live battles without the second side's commanders, no crew rule
   under a 0.8.0 host, no per-ship points from a 0.8.0 player), with the held results, the live battles' officers and
   the merges.
+
+## Fix 2026-11-15: joined players saw no research messages (v0.8.2-dev)
+A report from players on 0.8.1 (the host and one joined player on two PCs): "No research pop ups for non host player."
+
+**What single player shows its player** (static reading of 1.01.44; [GAME-INTERNALS](docs/GAME-INTERNALS.md#research-messages-the-players-and-the-others)):
+- `DoStrategicTurn` runs `TfrmBuildCamp.DoResearch(i, False)` for the nations 0 to 8 (0xce1e5a). For nation 0 (or the
+  nation that is `PlayerNation`) the routine shows, during the month: the "Research breakthrough" dialog of every tech
+  completed (`ShowResearchResult`: the caption "Research breakthrough: <area>", the tech, its effect, the area's
+  picture), of the special techs it hands out and of a new research area ("New research area discovered!"); picture
+  messages (`ShowPicMessage`, Scientists.jpg and others): the scientists' hints before a completion ("Our scientists
+  report that they are within a cat's whisker of comprehending / tantalizingly close to inventing / well on their way
+  to understanding / happy to report that they are close to mastering X!"), setbacks and "unexpected advances", the
+  submarine and shipboard aircraft rules, tech sharing ("Our technology sharing agreement with X has been of great
+  benefit ..."), the war's studies of enemy munitions and ships, a new gun calibre and improved guns ("Naval gun
+  research: Improved N inch guns researched! (Quality Q)", Guns.jpg), "We can now build airbases with capacity N
+  aircraft!" (NAS.jpg); and one question, the air/sea rescue service. Each dialog also goes into the month's turn
+  report (`TurnMessages`), which the game shows at the month's end and the **Messages** button shows again.
+- A reachability walk of the routine (`reach.py` in the developers' session files `rs82`: conditional jumps after
+  `cmp [aNationIdx],0`, `cmp ebx,[form+PlayerNation]` and `cmp NoNonGunmessages,0` resolved) reaches all 19
+  `ShowPicMessage`, all 29 `ShowResearchResult`, `ExecuteGeneral` and `CheckTechSharing` with nation 0 and none of
+  them with a nation above 0 that is not `PlayerNation`; `SetResearchID`'s, `ShowGunImprovementMessage`'s,
+  `DoGunResearch`'s and `CheckOldTechs`' messages test `PlayerNation` themselves. For another nation the same events
+  are the player's intelligence about it (`AddIntelReport`, gated by the player's `IntelEffort` on it).
+- The routine also runs different research rules for the player and the computer: the computer's AI priorities, a 5 %
+  chance per area and month of a doubled gain (0xc92d8f), milder and rarer setbacks, a second chance of a catch-up gift
+  and `CheckNewResearchEffectsForAI`; the player's submarine rule, tech sharing (`CheckTechSharing`, the deals of
+  nation 0) with the war's studies of the enemy, and the question.
+
+**Live before** (the released 0.8.1, dist_rc081_1; `resprobe.py --old` in the developers' session files `rs82`: the
+suite's session and research scenarios plus one processed month on the slot 1 fixture, whose [Nation1] got
+ResearchPoints 2000000 in four started areas before the copies started, after the runner's own backup, which put it
+back): nation 1 (Germany) completed four techs in the host's month (the client's slot 77 before and after: Improved
+surface condenser, Hydraulic riveting, Double bottom, Power rammers). The host showed only its own nation's research
+("Our scientists report that they are working on the problems of Double bottom, but success has so far eluded them!",
+"Research breakthrough: Turrets and gun mountings, Hydraulic recoil, ..."), none of nation 1's; the joined player's PC
+showed no research dialog, its turn report held only its relation turn's tension lines, its chat no research line; the
+host log had "AI suppressed: CheckNewResearchEffectsForAI for nation 1" four times (the computer's rules ran for it).
+54/54, 56 s with the game open.
+
+**Design.** The messages exist only in the player's branch of the game's routine, so the host now runs a joined
+nation's research month as the game runs its player's, in that nation's view, and sends what it showed to the nation's
+player. Rejected: rebuilding the texts from the computer's branch by comparing the nation's research before and after
+(only completions and guns could be found; the hints, setbacks, tech sharing, the airbase message and the question
+would still be missing, and the research tables would have to be found by pattern). The player's branch also gives the
+joined nation the player's research rules: what the game does for single player's human player.
+
+**Fix** (`research.cpp`/`research.h` new; `game.cpp`, `lockstep.cpp`/`lockstep.h`, `nationplay.cpp`/`nationplay.h`,
+`session.cpp`, `bridge.cpp`, `main.cpp`, `build.bat`; protocol 3 and the live-battle engine 18 unchanged;
+[ARCHITECTURE](docs/ARCHITECTURE.md#each-joined-nations-research-082)):
+- `DoResearch`'s hook first asks `research::HostRun`: for a joined or reserved nation K, the month's call (not
+  NoNonGunmessages: the bridge's `researchrun` keeps the old path), outside a view and a battle slot, the routine runs
+  as `DoResearch(0)` in K's view (`game::RunPlayerResearch`: `HostViewEnter(K, K's war counter)` with no nation masked;
+  in the records K's own tech-sharing deals (relations v2's `kts`) and K's intelligence effort (the nations file); in
+  the form K's airbase size, the largest `AirbaseSizeOK` allowed before the month, and fresh `TurnMessages` and
+  `IntelReports` lists; all put back afterwards, the routine under `__try`).
+- Nothing shows on the host: `lockstep::BeginPictureCapture` gets each picture message with its picture and
+  CopyMessageToLog (the hook's detour now passes it), the new hook of `TdlgPictureMessage.ShowResearchResult` each
+  research result, `lockstep::BeginQuestionCapture` the question (the hook's detour now passes the three answers; it
+  answers 2, "No"; the hook is shared with the live battles', which now skip it when it is in place); each one's turn
+  report line goes into the fresh list where the game adds it; boxes are recorded (`SetBoxCapture`).
+- The month's dialogs and turn report lines wait for K's next month; K's intelligence reports from the routine join
+  K's own list (`nplay::HostAddIntelReports`); a deal the war rule ended leaves `kts`. The host keeps its own
+  intelligence on K: "There are reports that <adj> scientists have invented <tech>." per breakthrough (Random(100) <
+  18 x its effort on K), the gun reports by K's guns before and after.
+- The question (K researched "Air/Sea rescue", never asked): to a connected player whose PC answers it (hello `res`)
+  it goes with the dialogs, and the answer sets `AirSeaRescue` there (the next turn's merge brings it to the host);
+  otherwise the computer's rule as before.
+- The new month: the turn report lines join the nation's `econnews` (its player's PC shows them in the game's turn
+  report, an older mod's too); to a player with hello `res` the dialogs go as `kres`. Its PC shows them with the
+  game's own dialogs once the month is loaded and the game idle, before the turn report and the event roll
+  (`research::ClientShow`).
+- If something is missing ("research: UNAVAILABLE", a view that can't be entered that month): the computer's research
+  as before, priorities kept. TEST `resplayer 0` does that on purpose; TEST `resforce` (below).
+
+**What the joined player sees now:** with the new month, the game's "Research breakthrough" dialogs of its nation
+(caption, tech, effect, the area's picture), its picture messages and the air/sea rescue question, one after another,
+then the game's turn report listing them (with the economy's and war's lines), as single player shows them during and
+after its month; the **Messages** button shows them too. The host's screen shows nothing of it, and nothing of the
+host's research goes to the player.
+
+**Research effects (the coordinator's question).**
+- Fixed with it: the air/sea rescue question was never asked (the computer decided with 20 %, TechnicalExcellence
+  always); a joined nation's research ran the computer's rules (its bonuses: a doubled gain in 5 % of the area-months,
+  milder setbacks, the extra catch-up gift; and none of the player's: the submarine rule, tech sharing with its own
+  partners, the war's studies of the enemy); the airbase message.
+- Nothing else missing in the routine: a completion sets the nation's own known flags for every nation (so K's new
+  components and ship types are its own); besides the messages, the player's branch writes only the form's
+  `AirbaseSize` (the message's tracker) and `AirSeaRescue`, and calls `CheckTechSharing`. Doctrine:
+  `CheckNewResearchEffectsForAI` is the computer's own choice (the mod's AI skips keep it away from K); the player sets
+  it in the
+  Doctrine dialog. Airbase sizes: the screens ask `AirbaseSizeOK(PlayerNation)`, K's own research on its PC.
+- Listed, another mechanism: `BuyTechnology` (CheckTurnEvents' event slot, nation 0 only: a nation's offer to sell a
+  tech, another's request to buy one) never reaches a joined player; the player's event roll on its PC rolls only
+  `Data\Events.dat`'s events. (`CheckMissedResearch`, nation 0's "Our scientists have figured out the principles of
+  ...", has no caller in 1.01.44.)
+
+**Mixed versions** (the host's month decides): a 0.8.2 host runs every joined nation's research as its player's; a
+0.8.1 player gets the month's research lines in its turn report (`econnews`) but no dialogs, and its nation's question
+goes by the computer's rule. A 0.8.1 host keeps 0.8.1's research: a 0.8.2 player sees no research messages, as before.
+So the host needs the fix; the player needs it for the dialogs and the question.
+
+**Suite** (`research` f), [TESTING](docs/TESTING.md); bridge `resinfo`, TEST `resforce`, `resplayer`; `box_text` reads
+the research dialog's labels): TEST `resforce 1 -1 as` on the client (the merge takes [Nation1] from its turn) and
+`resforce 0` on the host make each side's research of the next month complete a tech the other side's nation can't
+complete that month (`others=1`) and give nation 1 the tech that asks the air/sea rescue question; after the month the
+host's log names nation 1's breakthrough (no game exception), the client showed the game's "Research breakthrough"
+dialog of it with its turn report line, the host showed nothing of it, the host's own breakthrough showed on the host
+and nowhere on the client, the question was asked on the client (the runner answers Yes: `AirSeaRescue` 1 there) and
+not on the host, and after the next month the answer is on the host. `tools/regression_selftest.py` 176/176 (3 new
+samples of the research dialog's text).
+
+**Runs** (the game lock; slots 1/9 and Preferences backed up before and identical after each run, v0.8.1 put back
+after each; the developers' session files `rs82`):
+- After (dist_a1, `resprobe.py`, the same slot patch, 10:44): 54/54, 57 s with the game open. The host's log: "research:
+  nation 1's month as its player's (its view, war counter -68, its tech-sharing deals, its intelligence effort): 4
+  research result(s) ..."; the client showed four "Research breakthrough" dialogs (Boiler.jpg, Hull.jpg,
+  Subdivision.jpg, Turret.jpg: "Research breakthrough: Machinery development / Improved surface condenser / 1% weight
+  saving on machinery" ...) and its turn report listed them ("Research breakthrough: Machinery development, Improved
+  surface condenser, 1% weight saving on machinery | ..."); the host showed none of them, only its own research.
+- dist_a2 (`--only session,research,design_study`, 10:53): 84/87, 76 s: the mechanism worked (the client's dialog and
+  turn report line, the question asked there and answered, `AirSeaRescue` 1 on the host after the next month); the
+  three failures were the check's (`resforce` gave both nations the same tech, so each screen showed it once): since
+  then `resforce` prefers a tech the other side can't complete, and a joined nation's research is forced on its
+  player's PC.
+- dist_a3: `--only session,research,design_study` 86/86 (79 s) and with `lockstep` 123/123 (180 s), `--only
+  session,research,events,officers` 145/145 (127 s); `resforce` found no such tech yet (`others=0`: each side's
+  screen showed only its own breakthrough, the negative checks skipped with a note). `--group relations` 575/576 (1326
+  s): `ai_war` a2) failed on its setup: TEST `aiwar status 3 0 1` found no capital ship of Russia in active service
+  (`put=0`; M2's setup found three, 260, 261, 270), after `ai_escorts`' M2 in 0.7.2's mode (`aiwar 0`) and the
+  computer's strategic moves at M1's start (36 orders or statuses changed): the scenario's precondition, not
+  research; the group's research months ran as the players' without a fault (nation 1 and the stand-in nation 2 each
+  month). The "Access violation ... CheckForBattles" line in its log is `battle_generator`'s deliberate `battles gen 1
+  fault`.
+- dist_a4 (the final build; only TEST `resforce` changed: a tech up to two years ahead, twice its cost + 2, the other
+  side's nations): `--only session,research,design_study` twice: 87/87 (74 s) and 87/87 (76 s); `--only
+  session,research,events,officers` 151/151 (128 s); `--group relations` 529/531 (1331 s): `ai_war` M2's two
+  intelligence checks found one repeated report in the host's list and save (26 reports, 25 distinct; the game's own
+  spying, the flaky class of TESTING's Known traps: the research months added no report to the host's list, "the
+  host's intelligence: 0 report(s)" every month), everything else passed, `ai_war` a2) too (one ship). Every f) check
+  ran (`others=1`): nation 1's "Power rammers" (1901, Turret.jpg) on the client only, the host's "Hydraulic recoil" on
+  the host only, the client also showed nation 1's scientists' hint "Our scientists report that they are well on their
+  way to understanding Improved hydrostatic valve!" (Scientists.jpg) and the next month's "Research breakthrough:
+  Torpedo technology, Improved hydrostatic valve, Torpedoes now have range@speed 800@25/2000@15" (Torpedo.jpg). No
+  game error box in any run.
+- Mixed versions (`rs82\mixed.ps1`: the 0.8.2 host, dist_a4, from the Steam folder and the released 0.8.1
+  player from the folder copy `r721\game_a`; `resprobe.py` with the same slot patch, 12:19): 53/54, 51 s (the one
+  failure: the session's version check, 0.8.1 on the client, as expected). The join line "Captain: research dialogs 0
+  (this host's joined nations' research as the player's: 1)"; nation 1 completed the same four techs, the host ran
+  them as its player's and showed none of them ("research: 4 turn report line(s) and NOT its dialogs (the player's mod
+  does not show them) of nation 1's research go with state seq 2"); the 0.8.1 player's PC showed no research dialog,
+  and its turn report listed the four "Research breakthrough: ..." lines. A 0.8.1 host with a 0.8.2 player is the
+  before run's case (0.8.1's research): not run.
+
+## Feature 2026-11-15: a joined player can take a submitted turn back (Unsubmit turn) (v0.9.0-dev)
+Asked for by players on 0.8.1: "Allow unsubmitting a turn, if a player wants it undone before the other players
+submit." Until now a joined player could only submit again: once the host waited at its Turn (No) or its time limit had
+run out, the month started with the submitted turn as soon as the last other player submitted. Branch `feat-unsubmit`
+(from dev-082 cb11494, the version string stays 0.8.2-dev); **protocol 3 and live-battle engine 18 stay**
+([ARCHITECTURE](docs/ARCHITECTURE.md#taking-a-submitted-turn-back-090)).
+- **Found** (the code paths, `session.cpp`):
+  - The client's `SubmitTurn` saves slot 77 and sends `MSG_SUBMIT`; the host stores it per peer (`g_submissions`),
+    marks the player submitted and takes the turn's invasion order (`kinvt`, `HostTakeInvasionOrder`) **when the turn
+    arrives**, not at the merge. `RunHostTurn` merges whatever `g_submissions` holds when it runs; a nation without a
+    submission keeps last month's orders.
+  - `AllSubmitted` counts the connected players with a nation and the month. The month starts by itself only when the
+    host waits (its Turn's box answered No: `g_hostWantsTurn`) or the time limit ran out (`g_forced`), at the
+    `MSG_SUBMIT` that makes everyone ready; the host's Turn with everyone ready, its Yes and **Advance turn now** start
+    it at once.
+  - `TryStartHostTurn` posts `RunHostTurn` (`RunOnMainThread` always queues), so network messages can be handled between
+    the decision and the merge; a busy host (a modal screen or box) sets `g_runTurnWhenIdle` and the Tick starts the
+    month once it is idle; a failed save stops the month (`SaveStep::Turn`) and it goes on by itself once a save works.
+  - The time limit sends `MSG_FORCE_SUBMIT`; a PC submits then only when it is not submitted, and the month starts when
+    everyone has submitted or 30 s later. A disconnect erases the player and its stored turn; a player who joins again
+    in planning gets the month again (a fresh copy, not submitted).
+  - The host's Turn box ("Still waiting for: ...") lists the missing players when it opens: a player who becomes not
+    ready while it is open was not named.
+- **The semantics chosen** (why: the month must never use a turn its player withdrew, and the player's PC must never
+  believe it is out of a month the host already started with its turn):
+  - **Unsubmit turn** (the Multiplayer window of a joined player, in the place of the host's Start session; shown only
+    under a host that announced it) sends `MSG_UNSUBMIT` (45: `seq`, `sub` = the turns the PC sent this month, `req`).
+    **The PC changes nothing until the host's answer**: it counts as not submitted only on `ok=1` for this month with
+    no turn sent since the request (`sub` equal: a later turn reached the host after the withdrawal, TCP keeping the
+    order, and stands); then the Turn button reads Submit again, a Submit waiting for a dialog or for a save is
+    dropped (either would send the turn again at once), and the game keeps the player's orders as they are.
+  - **The host takes a turn back only while it plans that month and its start is not decided**: refused during the
+    month ("the host has already started the month with it"), for an earlier month ("that month is over"), after the
+    time limit's `MSG_FORCE_SUBMIT` ("the time limit has run out and the month starts with it": the forced submit is
+    the last call, and a PC that withdrew then would hold the month 30 s and lose its turn) and while a start waits to
+    run (`RunHostTurn` posted, `g_turnQueued`; `g_runTurnWhenIdle`; a stopped save: "the host is already starting the
+    month with it"). Otherwise it drops the stored turn, marks the player not ready, puts the nation's invasion plan back
+    as the month began (kept per nation at its first turn of the month), sends the chat line "* <name> withdrew the
+    turn", the lobby and the status ("Waiting for: <name>") at once. A request without a stored turn is answered ok.
+  - **A withdrawn turn is never used.** The player counts as one who has not submitted: the host's waiting Turn and the
+    auto-start wait for them; the time limit submits their PC's orders as they are then (no answer within 30 s: last
+    month's orders); Advance turn now (or Yes at the Turn) leaves their nation last month's orders, as for anyone who
+    has not submitted. The host's Turn box, when a player became not ready while it was open, asks again on Yes, naming
+    them (`MissingNames`; log "turn: not ready any more while the host's box was open (now waiting for ...): asked
+    again").
+  - The PC refuses the button itself outside planning, while an answer is awaited and after the month's
+    `MSG_FORCE_SUBMIT`. A disconnect drops the turn as before; a rejoin gets the month again, not submitted. Battles
+    (0.8.0's during the host's month, the battle phase after it) all come after the month's start: no battle path
+    changes. **The host has no Unsubmit**: its turn is its game as it is when the month starts, which it starts itself
+    (its Turn's No waits, Yes or Advance go on).
+- **What players see:** the button **Unsubmit turn** (disabled until a submit; "Unsubmitting..." while the host
+  answers); the notices "Turn submitted. You can still change orders and press Submit again until the host processes
+  the turn, or take it back with Unsubmit turn in the Multiplayer window.", "Turn unsubmitted: the host will not use it.
+  Change your orders and press Submit again. Until then you are not ready; if the time limit runs out, your orders are
+  submitted as they are then." or "Your turn was not unsubmitted: <why>."; everyone's chat "* Captain withdrew the
+  turn", the player list "planning" instead of "ready", the host's status "Waiting for: Captain".
+- **Mixed versions** (hello and welcome `unsub`; the host logs `<name>: unsubmit <n> (this host: 1)`, the player
+  `joined <host>: unsubmit: the host <h>, this PC 1`): an older host never gets the message (the player's PC sends it
+  only to a welcome-`unsub` host and hides the button; `unsubmit` is refused on the PC); an older player under a 0.9.0
+  host has no button, its turns are taken as before.
+- **Tests** ([TESTING](docs/TESTING.md)): bridge `unsubmit` (the button), TEST `unsubmit raw`, `unsubmit state`, TEST
+  `unsubmit timeup <s>`; the suite's new scenario `unsubmit` (4 months; after `battle_simul` in the catalog, which gives
+  nation 2 a PC first, so a default run changes nothing for later scenarios): the capability, the button, the host
+  dropping the turn (and the invasion plan put back), no start with the host or another player ready while the turn is
+  withdrawn, the month with the new orders, the refusals (during the month, while a start waits, after the time limit),
+  Advance after a withdrawal (last month's orders), the time limit (the orders as they are then), a rejoin after an
+  unsubmit, the host's Turn box asking again. Runs (2026-11-15, each under the game lock, v0.8.1 put back after each,
+  slots 1/9 and the Preferences identical to the pre-run backup): `--only unsubmit` 86/86 (dist_us90_1, game open
+  129 s), then with the Turn box's loop (dist_us90_2) 87/87 (123 s) and 87/87 (120 s); the mixed versions
+  (`mixed_us.py`, both cases) 40/40 (72 s); `--only session,merge,diplomacy,battles` 205/205 (310 s);
+  `--group relations` 530/530 (1246 s; `battle_generator` d)'s `SKIP-note`, the game's draws: no battle declined);
+  no game error box in any run (the game open about 33 minutes in all).
+- **Files:** `src/mod/net.h` (`MSG_UNSUBMIT`), `session.cpp`/`session.h` (`UnsubmitTurn`, `HostOnUnsubmit`,
+  `ClientOnUnsubmitAnswer`, `DebugUnsubmit`, `HostReadyText`, `MissingNames`, the Turn box's loop, the hello and
+  welcome keys), `ui.cpp` (`IDC_UNSUBMIT` 1063), `bridge.cpp` (`unsubmit`), `tools/regression.py` (the scenario and
+  its helpers), `tools/ui_mp.py` (`IDS['unsubmit']`).
+
+## Investigation 2026-11-15: aircraft for joined players (v0.9.0-dev)
+- **Report (0.8.1):** "The non-host player can't design planes or request planes." Each joined player should play its
+  nation's aircraft as the player does in single player. Static reading of 1.01.44 (rdis, RTTI, form layouts) and one
+  live probe on the released 0.8.1; the facts are in GAME-INTERNALS, [Aircraft](docs/GAME-INTERNALS.md#aircraft).
+- **The model.** Two global lists: the aircraft types (`TAircraftType`: `Nation` +0x88, `Id` +0x99, `DevelopmentTime`
+  +0x84, `AvailableAircraft` +0x9d, ...) and the air units (`TAirUnit`: `Nation` +0x1c, `AirUnitId` +4,
+  `AircraftTypeId` +0x10, `HomeBase` +0x22, ...), all nations in each; both ids from IDNo (0xd79de4). Saved as
+  `[AircraftTypes]` (40 fields per type) and `[AirUnits]` (19 per unit); the player's request in `[General]`
+  (`ACRequestRole`, `ACRequest`, `OAR0..OAR16`). Aircraft are produced automatically per type in the month (no orders):
+  "request planes" is the Aircraft types screen's Request.
+- **Nation 0 everywhere.** The Aircraft types screen lists nation 0's types (`TfrmAircraftTypes.Execute` ->
+  `FillAircraftTypeList(.., 0, ..)`; types under development only for nation 0); the Request writes the form's fields
+  and nation 0's priorities (`TdlgAircraftRequest.bnOKClick`); Buy copies a type for nation 0 (0xea9a98); the air group
+  screen's Add air unit and Auto make nation 0's units (0xea4518(0, ...), `AIAddAirGroupToShip(0)`); the month's
+  `ResolveAircraftRequest`, private venture (0xea17d8) and old-type reminders (`CheckOldAircraftTypes`' nested 0xd2b1d4)
+  run for nation 0 only, nations 1-8 get `AIDevelopAircraftType` (0xd1f670, the computer's only development, licences
+  included). The month's air routine (0xeaa6ec, "Error in AircraftExperienceAndReplacement procedure!") disbands 30 % of
+  the reserve units without a base and changes roles, jets and night capability for nations > 0 only (two tests of the
+  unit's nation, 0xeaac34 and 0xeaae5b). A launched carrier gets the computer's air group unless its nation is
+  PlayerNation (`AdjustShipValuesUponLaunch` 0xcd7444).
+- **Probe (run probe1, 0.8.1, the 1935 test campaign copied to slot 49 by `air_units`, the client playing France;
+  28/28, game open about 2 minutes):** the client's Aircraft types screen (its button, posted) listed Great Britain's 7
+  types (Swordfish, Bulldog, Hurricane, ...), not France's (Loire 40, PL.41, ...); its Request dialog (6 roles, the
+  first, OK) set the client's form `ACRequest` 7 and disabled the button; slot 77 saved `ACRequest=7`. After the host's
+  month slot 77 held `ACRequest=6`: the host's own request (the probe made one there too), the client's was lost, and
+  the host's request in progress showed (and blocked the button) on the client. The client's air group screen listed
+  France's 43 units and 12 bases (it uses PlayerNation); its changes never reach the host (the merge takes no
+  `[AirUnits]`). IDNo 40865 on the host, 80865 on the client (+20,000 K).
+- **Hard no-gos:** none. Everything the player decides happens in the game's own routines and dialogs, which can run on
+  the player's PC in the nation's view; the host keeps the shared rules (development, production, training).
+- **Design** (FILES `ac90\aircraft-design.md` in the developers' session folder, implemented as proposed:
+  [the feature](#feature-2026-11-15-aircraft-for-joined-players-v090-dev)): the screens and the month's player routines
+  in K's view on its PC (the events' view plus every type's and unit's nation 0 <-> K), `aircraft.ini` with the turn,
+  a strict merge, the request in the host's record, the computer's aircraft decisions left out for K, the air month's
+  two tests answered "player" for K's units, the month's news; hello and header `acft`; protocol 3, engine 18.
+
+## Feature 2026-11-15: aircraft for joined players (v0.9.0-dev)
+- **Report (0.8.1):** "The non-host player can't design planes or request planes." Since 0.9.0 each joined player plays
+  its nation's aircraft as the game's player does in single player: the Aircraft types screen (Request, licences,
+  obsolete, rename), the month's prototype choice, private ventures and old-type reminders, the air group screen (new
+  squadrons, Auto, the reserve, transfers, disbanding), the Turn's air checks. The design of the investigation
+  ([above](#investigation-2026-11-15-aircraft-for-joined-players-v090-dev)), implemented as proposed (about 1,470 lines
+  of C++ in the mod, 150 in the offline test); ARCHITECTURE:
+  [Each joined player's aircraft](docs/ARCHITECTURE.md#each-joined-players-aircraft-090); the game facts in
+  GAME-INTERNALS, [Aircraft](docs/GAME-INTERNALS.md#aircraft).
+- **The player's PC** (`aircraft.cpp`): the two screens (`TfrmAircraftTypes.Execute`, `TdlgCAG.Execute`) run in the
+  nation's view (the events' view plus every type's and unit's nation 0 <-> K), so the game's own code lists K's types,
+  makes K's request and licences and K's squadrons; the month's player routines (the request's countdown and
+  `ResolveAircraftRequest`, the private venture, `CheckOldAircraftTypes`) run once per month package before the event
+  roll, in the same view; Submit asks the Turn's two air checks; the turn carries `aircraft.ini` (K's request, types
+  and units).
+- **Host:** `MergeAircraft` (strict; in the turn's all-or-nothing write) replaces K's types and units; the request goes
+  into the record (`[Nation<K>Aircraft]`) and K's month package; `AIDevelopAircraftType(K)` and `AIAddAirGroupToShip(K)`
+  are skipped, the air month's two tests of a unit's nation take the player's branch for K's units (no disbanding of
+  reserve units, no computer changes); the month's messages about K's types and squadrons go to K's turn report.
+- **Ids:** both from IDNo, the player's in its range (+20,000 x K), as officers and divisions: unique over the host's
+  and the players' PCs (the scenario finds every type and unit id once in the host's save).
+- **Battles:** unchanged (engine 18): a live battle loads the merged campaign; both PCs list the same air formations.
+- **Mixed versions** (protocol 3): hello and header `acft`, the turn's file ignored by older peers; a 0.8.1 player of a
+  0.9.0 host and a 0.9.0 player of a 0.8.1 host keep 0.8.1's behaviour (the computer develops the nation's aircraft,
+  nothing merged).
+- **Tests:** suite scenario `aircraft` (groups `aircraft` and `air`, default run; the 1935 test campaign); offline
+  `tools/merge_test.cpp` (the merge: 73 synthetic checks, the 1935 (K 1, 2, 5) and 1958 (K 3) fixtures round-trip).
+- **Runs** (the developers' session folder `ac90\run_<tag>.txt`; game open in parentheses). Before the feature, on
+  0.8.1: `probe1` 28/28 (about 2 min). On the feature's builds, `--only session,aircraft`: `ac1` (2ea2ee6) 28/32 (234
+  s: the suite's clicks under the relation turn's turn report, a TEST change the merge overwrote), `ac2` (46773db)
+  31/32 (214 s: the base list is MultiSelect), `ac3` 26/32 (224 s: found a real bug, the merge refused the reserve's
+  `HomeBase=-`, fixed in 51bd63c); with 51bd63c's build (`dist_ac_3`): `ac4` 32/32 (205 s), `ac5` 32/32 (206 s);
+  `--only session,air_units,lockstep_air,lockstep_strike` `ac6` 89/89 (790 s); `--group relations` `ac7` 536/536
+  (1191 s). No game error box in any run.
+- **What the runs showed on the player's PC** (France, the 1935 campaign): its Aircraft types screen listed France's 7
+  types (Loire 40, PL.41, ...) and none of Great Britain's; Request (6 roles) set France's request; the old types'
+  reminder came as an event dialog and its "Yes." opened the request dialog; the month's "New Fighter prototypes are
+  ready for evaluation" and "Select one of the prototypes" (Loire 49, Breguet 49, ...) came on its PC, the development
+  paid from France's funds (11,822 -> 11,182); a private venture ("The Dewoitine company has developed a Fighter as a
+  private venture. They want to know if we are interested in buying it?") and its question; "Move all to reserve" and
+  "Auto add aircraft" on CV Bearn (5 squadrons to the reserve, 5 new with ids of France's range); the reminder "CV Bearn
+  has no air units assigned!" at Submit; on the host "merge nation 2: ..., aircraft types 7 -> 8, air units 43 -> 48",
+  "nation 2: 5 reserve unit(s) kept"; France's turn report "Our new Fighter Loire 49 is ready for operational service."
+  and "Our Fighter aircraft type Loire 40 seems to have good reliability!".
+- **Gotchas.**
+  - The game saves a unit without a base as `HomeBase=-` (`TAirUnit.SaveMe`; on load a non-number is looked up as
+    "<type> <name>"): the merge's first strict check refused it (the fixtures have no reserve units).
+  - The old types' reminder is an event dialog on the player's PC; its "Yes." opens the request dialog, so the suite's
+    first answer makes a request in some months (the scenario clears it with TEST before it checks the button).
+  - `run_month` waits for nation 1's relation turn only; with nation 2 the relation turn's turn report came after the
+    event roll and its modal window swallowed the screens' posted button clicks: the scenario waits for nation 2's.
+  - The merge takes K's types as its turn has them: a TEST change on the host between the package and the merge is
+    lost (the scenario shortens the development on the player's PC).
+  - The air group screen's base list is MultiSelect (its ItemIndex is the caret; LB_SETCURSEL fails), and "Move all to
+    reserve" rewrites the row (its selection is gone); `popup_pick` needs the item's exact caption ("Auto add
+    aircraft"); the lists show a type by `GetCompleteName` (the name alone when it starts with the maker's: "Loire 40").
+  - `AIDevelopAircraftType` is called by chance (about one month in four for a nation): the scenario calls it once by
+    TEST (`acset aidev`) to prove the skip.

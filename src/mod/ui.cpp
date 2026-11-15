@@ -15,7 +15,7 @@ enum {
     IDC_PLAYERS = 1030,
     IDC_NATION = 1040, IDC_CLAIM,
     IDC_LIMIT = 1050, IDC_SETLIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE, IDC_LEGACYALLOW, IDC_LEGACYBUILD,
-    IDC_START = 1060, IDC_ADVANCE, IDC_RELEASE,
+    IDC_START = 1060, IDC_ADVANCE, IDC_RELEASE, IDC_UNSUBMIT,
     IDC_CHATLOG = 1070, IDC_CHATIN, IDC_SEND,
     IDC_DIPLOLBL = 1080, IDC_DIPLO, IDC_DWAR, IDC_DALLY, IDC_DPEACE, IDC_DLEAVE, IDC_DCANCEL,
     IDC_CLAIMLBL = 1090, IDC_CLAIMLIST, IDC_CLAIMSUM, IDC_CLAIMOK, IDC_CLAIMAUTO, IDC_CLAIMCANCEL,
@@ -467,6 +467,12 @@ static void OnCommand(int id) {
                             MB_YESNO | MB_ICONQUESTION) == IDYES)
                 mp::AdvanceNow();
             break;
+        case IDC_UNSUBMIT: {  // 0.9.0, a joined player: take the submitted turn back (the host answers)
+            std::string why = mp::UnsubmitTurn();
+            if (!why.empty())
+                MessageBoxW(g_wnd, U2W("Your turn cannot be unsubmitted: " + why + ".").c_str(), L"Multiplayer", MB_OK);
+            break;
+        }
         case IDC_SEND:
             mp::SendChat(GetText(IDC_CHATIN));
             SetText(IDC_CHATIN, "");
@@ -597,6 +603,8 @@ static void CreateMpWindow() {
     y += 28;
     Ctl(L"BUTTON", L"Start session", WS_TABSTOP, 10, y, 150, 30, IDC_START);
     Ctl(L"BUTTON", L"Advance turn now", WS_TABSTOP, 170, y, 150, 30, IDC_ADVANCE);
+    // 0.9.0: a joined player's PC, in the place of the host's Start session (shown only under a host that takes it)
+    Ctl(L"BUTTON", L"Unsubmit turn", WS_TABSTOP, 10, y, 150, 30, IDC_UNSUBMIT);
     y += 40;
     Ctl(L"STATIC", L"Diplomacy with the other players", SS_LEFT | SS_ENDELLIPSIS, 10, y, 480, 18, IDC_DIPLOLBL);
     y += 20;
@@ -721,6 +729,9 @@ static void RefreshInner() {
     for (int id : {IDC_START, IDC_ADVANCE, IDC_RELEASE, IDC_SETLIMIT, IDC_LIMIT, IDC_LIMITLBL, IDC_AUTOSTRIKE,
                    IDC_LEGACYALLOW})  // host-only controls
         ShowWindow(GetDlgItem(g_wnd, id), client ? SW_HIDE : SW_SHOWNA);
+    ShowWindow(GetDlgItem(g_wnd, IDC_UNSUBMIT), client && v.unsubAvail ? SW_SHOWNA : SW_HIDE);  // 0.9.0
+    EnableWindow(GetDlgItem(g_wnd, IDC_UNSUBMIT), client && v.canUnsubmit);
+    SetText(IDC_UNSUBMIT, v.unsubPending ? "Unsubmitting..." : "Unsubmit turn");
     EnableWindow(GetDlgItem(g_wnd, IDC_SEND), !none);
 
     std::string role = none ? "Not connected" : host ? "Hosting" : "Joined " + v.hostName + "'s game";

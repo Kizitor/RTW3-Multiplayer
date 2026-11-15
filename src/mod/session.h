@@ -67,6 +67,10 @@ struct View {
     bool campaignLoaded = false;
     bool campaignReady = false;
     bool submitted = false;
+    // 0.9.0, a joined player's PC: the host takes a submitted turn back (welcome `unsub`: the Unsubmit turn button is
+    // shown), and whether it can be asked now (planning, the turn submitted, no answer awaited, the time limit not run
+    // out); unsubPending: asked, the host's answer not in yet
+    bool unsubAvail = false, canUnsubmit = false, unsubPending = false;
     std::vector<DiploRow> diplo;
     bool diploOpen = false;  // diplomatic requests are possible now
     std::string diploNote;
@@ -91,6 +95,13 @@ std::string ReleaseNationByName(const std::string& name);
 void SetTurnLimit(int minutes);
 void SendChat(const std::string& text);
 void SubmitTurn();
+// 0.9.0, a joined player: ask the host to take the submitted turn back (the Unsubmit turn button). The PC counts as not
+// submitted only once the host has answered that it dropped the turn. Returns "" (asked) or why not. raw (TEST ONLY):
+// sent without this PC's own checks (but never to a host without welcome `unsub`), to see the host's refusals.
+std::string UnsubmitTurn(bool raw = false);
+// Bridge `unsubmit state` (both: the state of the withdrawals, read only) and, TEST ONLY on the host, `unsubmit timeup
+// <s>` (this month's time limit runs out in s seconds; the turn time limit itself unchanged).
+std::string DebugUnsubmit(const std::vector<std::string>& args);
 
 // Diplomacy with another player's nation (campaign index): "war", "ally" (offer or accept), "peace" (offer or
 // accept), "leave" (the alliance), "cancel" (withdraw my request or decline theirs), "claim" (the winner of an agreed

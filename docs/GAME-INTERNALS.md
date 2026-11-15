@@ -11,12 +11,14 @@ evidence for each fact (disassembly excerpts, log lines, measurements) and the f
 - [The game and the mod: facts you can rely on](#the-game-and-the-mod-facts-you-can-rely-on)
 - [Relations, wars and battles: nation 0's and the others'](#relations-wars-and-battles-nation-0s-and-the-others)
 - [Research speed and the missile era](#research-speed-and-the-missile-era)
+- [Research messages: the player's and the others'](#research-messages-the-players-and-the-others)
 - [Intelligence, trade protection and foreign stations](#intelligence-trade-protection-and-foreign-stations)
 - [The computer's escorts against the player's submarines](#the-computers-escorts-against-the-players-submarines)
 - [The computer's war against its player](#the-computers-war-against-its-player)
 - [Campaign divisions (the Fleet organization tab)](#campaign-divisions-the-fleet-organization-tab)
 - [The legacy fleet: the manual build of the starting fleet](#the-legacy-fleet-the-manual-build-of-the-starting-fleet)
 - [Officers](#officers)
+- [Aircraft](#aircraft)
 - [Tactical battles](#tactical-battles)
   - [Battle commands](#battle-commands)
 
@@ -870,7 +872,8 @@ Static reading of 1.01.44 and live runs of 2026-10-23 ([MODLOG](../MODLOG.md#fix
     doctrine on new research (`CheckNewResearchEffectsForAI`), ammunition each January (`SetAmmoLoadoutAndUsage`), ships
     sent home from colonies, ASW patrols and escorts with their cost in `CheckSubmarineActivity` (only nations at war
     with nation 0), air groups on carriers and bases (`CheckOneShipsOrBaseHasAircraft`), aircraft prototypes and
-    licences (`AIDevelopAircraftType`; the player's own development is a request resolved for nation 0 only), the
+    licences (`AIDevelopAircraftType`; the player's own development is a request resolved for nation 0 only; since 0.9.0
+    kept away from a nation whose player plays its aircraft, [Aircraft](#aircraft)), the
     automatic scrapping of armed merchant cruisers after a peace (`ScrapShipsAfterPeace`; the player is asked), the
     purchase of another nation's scrapped ship. `AINationAdjustBudget` is the only source of "... is said to have
     increased the naval budget".
@@ -1054,6 +1057,71 @@ What is known as of 2026-10-17 (static reading of 1.01.44, and a single-player t
   - Many events are built into the game, not in `Data\Events.dat` (for example "We should issue an ultimatum,
     demanding that they back down!" or "We should increase our cooperation with France."). Answering them with the
     first radio led a passive player's nation into a war.
+
+## Research messages: the player's and the others'
+Static reading of 1.01.44 (2026-11-15), confirmed live on 0.8.1 and 0.8.2-dev
+([MODLOG](../MODLOG.md#fix-2026-11-15-joined-players-saw-no-research-messages-v082-dev)).
+- **`TfrmBuildCamp.DoResearch(aNationIdx, NoNonGunmessages)`** (0xc9225c; register arguments, plain `ret`) is a
+  nation's research month. `DoStrategicTurn` calls it for the nations 0 to 8 in turn (0xce1e5a, NoNonGunmessages
+  False; in January also `SetAmmoLoadoutAndUsage` with Random(5) = 1); `DoTurn` (unused) and the debug menu's
+  `TestResearch5years1Click` call it too.
+- **Its messages are the player's only.** Every message of the routine runs only for `aNationIdx` 0 or for the nation
+  that is `PlayerNation` (form +0x3204): its 19 `TdlgPictureMessage.ShowPicMessage` (the scientists' progress hints
+  "Our scientists report that they are within a cat's whisker of comprehending / tantalizingly close to inventing /
+  well on their way to understanding / happy to report that they are close to mastering X!", the setbacks and
+  "unexpected advances", "Our submarine research is hampered by us having few operational submarines! ...", "You
+  cannot continue with high research priority for shipboard aircraft operation ...", the turret and torpedo studies,
+  "We can now build airbases with capacity N aircraft!"), its 29 `ShowResearchResult` (a tech completed, the special
+  techs it hands out, "New research area discovered!"), the air/sea rescue question and `CheckTechSharing`; so do the
+  messages of the routines it calls: `TBuilderNation.SetResearchID(id, DoMessage)` (0xc5a00c: the dialog only for
+  PlayerNation), `ShowGunImprovementMessage` (0xc91fec: "Naval gun research: #13Improved N inch guns researched!
+  (Quality Q)", Guns.jpg), `DoGunResearch` (0xccc970: a new calibre), `CheckOldTechs` (0xd26a88). A reachability walk
+  of the routine with `aNationIdx` > 0 and the nation not PlayerNation reaches none of them.
+- **For any other nation the same events are the player's intelligence** (`AddIntelReport`, gated by the player's
+  `IntelEffort` on that nation): "There are reports that <Name2> scientists have invented <tech>." (a completion,
+  Random(100) < 18 x effort, 0xc93ad1), "<Name2> gun manufacturers are now advertising N inch guns!" (a new calibre,
+  Random(100) < 10 x effort + 40, the player at peace), "<nation> is reported to have invented improved N inch guns
+  (Quality Q)" (Random(20) < effort + 2), rumours of its setbacks; and `CheckNewResearchEffectsForAI` (0xd11840: the
+  computer's doctrine for a few techs: AP shell priority, oxygen torpedoes, diving missiles).
+- **The dialogs.** `ShowResearchResult(aCaption, aMessage, anEffect, PictureFileName)` (0xadb5d0) shows the modal
+  "Research breakthrough" dialog (`lbResearchCaption` +0x448 = aCaption, "Research breakthrough: <area>";
+  `lbResearchEffect` +0x444 = aMessage #13#13 anEffect; `lbMessage` +0x43c empty; the picture from
+  `<game>\Images\`) and adds "aCaption, aMessage, anEffect" to `TurnMessages`. `ShowPicMessage(MessageText,
+  PictureFileName, CopyMessageToLog)` (0xadb1d0) shows its dialog and adds the text when CopyMessageToLog is set. The
+  dialogs are the globals dlgPictureMessage and dlgEventAnswer (DoResearch: `mov eax,[cell]; mov eax,[eax]; call ...`).
+  `TurnMessages` is not saved; the strategic screen's **Messages** button (`bnTurnMessagesClick`) shows it again.
+- **The player's research rules differ from the computer's** in the same routine. For `aNationIdx` > 0: the AI
+  priorities (some areas High by chance; with Random(20) = 1 every priority re-rolled), a 5 % chance per area and
+  month of a doubled gain (not with PoorEducation; another 5 % with TechnicalExcellence; 0xc92d8f), setbacks only in
+  40 % of the player's cases and milder (progress / 2 and the month's gain / 2, with a rumour for the player; the
+  player's: progress / 2, the gain / 4, none for a tech ahead of its year, 0xc9310b), a second chance (Random(4) = 1
+  besides Random(10) = 1) of the catch-up gift "Improved power training and elevation" (0xc96a69). For the player: few
+  operational submarines cut the submarine area's gain to 2/3 (0xc92b70), and
+  `CheckTechSharing(area)` (0xcb3d08) runs for every area: the deals of nation 0 on the other nations' records
+  (`TechSharing` +0x29e, ended at war, `Tension` > 40) raise the progress of the side that is behind, with a picture
+  or a turn report line; with `TechLeakRisk` the computer's nations gain from leaks (and the player's intelligence
+  says so); at war (War > 6) studies of enemy munitions and ships raise the player's progress and give intelligence.
+  The war bonus of the monthly points reads `War` (nation 0's war counter) for every nation.
+- **The air/sea rescue question** (0xc96db3): a nation with the tech 1717 "Air/Sea rescue" whose `AirSeaRescue`
+  (+0x99) and `AskAS` (+0x9a) are False: `AskAS` := True; for PlayerNation `TdlgEventAnswer.ExecuteGeneral("Do you want
+  to institute an air/sea rescue service? This will improve pilot survival ...", "Yes, the lives of our pilots are
+  important!", a random "No, ..." (the Kamikaze nations' own one in 10 %), -, -1)`: answer 1 -> `AirSeaRescue` := True;
+  for another nation TechnicalExcellence or Random(100) < 20 -> True. Both are saved per nation (`[Nation<i>]
+  AirSeaRescue`, `AskAS`).
+- **The airbase size** (form `AirbaseSize` +0xa0d, saved in `[General]`) only tracks that message: each month the
+  player's research adds 20 while `TBuilderNation.AirbaseSizeOK(PlayerNation, AirbaseSize + 20)` (0xc64cb0: area 17's
+  levels, the era's cap, `GameMaxAirbaseSize`, `HasAircraftCapability`). The airbase screens (build, expand) ask
+  `AirbaseSizeOK` of `PlayerNation`, so a joined player's airbases follow its own research.
+- **Outside `DoResearch`.** `BuyTechnology` (0xce3c64; `CheckTurnEvents`' event slot, the player's nation only): a
+  government offers to sell the player a tech or guns ("The <adj> Government is offering to sell us the rights to ...",
+  bought: "Our scientists now have a grasp of ..." and a "Research breakthrough: " result) or asks to buy one ("... is
+  interested in buying the rights to ..."), each through `ExecuteGeneral`. `CheckMissedResearch(aNationIdx)` (0xcd3a50:
+  a tech another nation has, two years old, learnt by chance; "Our scientists have figured out the principles of X"
+  for nation 0) has no caller in 1.01.44 (only its RTTI entry).
+- **A joined player's nation before 0.8.2** ran the computer's research rules on the host (its priorities put back
+  since 0.3.0), its player saw none of the messages and was never asked the question (the computer's 20 % decided),
+  and the host's player got the intelligence on it. Since 0.8.2 the host runs it as the game runs its player's
+  ([ARCHITECTURE](ARCHITECTURE.md#each-joined-nations-research-082)).
 
 ## Intelligence, trade protection and foreign stations
 Static reading of 1.01.44 (2026-10-20), confirmed live on the 0.4.0 release and on 0.4.1
@@ -1621,6 +1689,78 @@ Static reading of 1.01.44 and live runs of 2026-11-01 on 0.7.1 (MODLOG
     `CurrentFloatPoints` (+0xb0a) 0 and `Sinking` 10. A sunk ship leaves the battle's all-ships list and her division's
     ship list in the minute she sinks (live: 47 ships, 31 of side 1, then 45 and 29 after two sinkings; the state hash's
     ship count drops); the battle's end still transfers her damage (her commander's fate: above).
+
+## Aircraft
+Static reading of 1.01.44 and live runs of 2026-11-15 on 0.8.1 and 0.9.0-dev (MODLOG
+[aircraft for joined players](../MODLOG.md#investigation-2026-11-15-aircraft-for-joined-players-v090-dev)).
+
+- **Two global lists.** The aircraft types (`TAircraftType`, 172 bytes; the list's variable at `[0xf27048]` =
+  0xfb0110) and the air units (`TAirUnit`, 72 bytes; `[0xf27a88]` = 0xfb0104), all nations in each. A type's `Nation`
+  (+0x88) and a unit's `Nation` (+0x1c) are nation indices; a unit names its type by `AircraftTypeId` (+0x10, and the
+  pointer +0xc) and its base by `HomeBase` (+0x22, a `TCampaignShip`: a ship or an air base of the nation's coastal
+  list; saved as its `CShipId`, nil = the reserve, saved as "-"; on load a non-number is looked up as "<type> <name>"
+  by `FindCShipWithNameAndType`). Type `Id` (+0x99) and `AirUnitId` (+4) come from the campaign's
+  IDNo counter (0xd79de4), as officers and divisions do (the 1935 fixture: types 1-51, units 59-705, IDNo 823).
+- **The save.** `[AircraftTypes]` `ACTypesNo`, `AT<i><Field>` (40 fields: Name, Manufacturer, Year, BaseModelYear, the
+  performance values, DevelopmentTime, Nation, Version, Obsolete, ReliabilityKnown, ValuesKnown, AvailableAircraft, Id;
+  `ProductionThisTurn` is not saved); `[AirUnits]` `AirUnitNo`, `AU<i><Field>` (19 fields: AircraftType (the name),
+  AircraftTypeId, Id, AircraftNumber, DesiredAircraftNumber, Role, Nation, Experience, Name, CarrierCapable,
+  NightCapable, AirKills, BombHits, TorpedoHits, MissileHits, Elite, AutoUpgrade, Recon, HomeBase). The player's request
+  is the form's: `[General] ACRequestRole` (+0x4aa8, a byte), `ACRequest` (+0x4aa9, months left) and `OAR0`..`OAR16`
+  (+0xa1e, the old types' reminders' counters: 36 or 12 months after "No", 0x7fffffff after "Don't remind me again";
+  `CheckOldAircraftTypes` takes 1 off each every month). Nation fields `AicraftPriority1/2` (+0x212/+0x216, the
+  request's two priorities, in `[Nation<i>]`).
+- **The player's routines (nation 0 only).**
+  - The Aircraft types screen: `btbnAircraftTypesClick` -> `TfrmAircraftTypes.Execute(list, nil, True, 15)` ->
+    `FillAircraftTypeList(list, nation 0, ...)` (types under development only for nation 0; obsolete ones with the check
+    box). Request (`bnRequestClick`): without an industry of its own "Your nation does not have a domestic aircraft
+    industry. ..."; else `TdlgAircraftRequest`: a role and two priorities; OK sets the form's request (5 months before
+    1921, 6 to 1929, 7 to 1939, 8 to 1945, 9 to 1955, 10 to 1960, 12 later) and nation 0's priorities; the button is
+    disabled while `ACRequest` > 0 ("<role> request in progress (n)"). Buy (popup): "You cannot buy your own aircraft!"
+    for nation 0's; sellers allied or tension <= 4; a licence for RoleCost x 100 + 100 (+100 after 1930); the copy is
+    made for nation 0 (0xea9a98).
+  - The air group screen `TdlgCAG.Execute(base)`: `DisplayNation` := PlayerNation (its bases and units by
+    `IndexOf(DisplayNation)` = unit.Nation); Add air unit -> CreateAirUnit 0xea4518(nation 0, number, role, base) (an id
+    from IDNo, `AutoUpgrade` 1, experience -20); Auto (a base row, not "All"/"Unassigned pool") ->
+    `AIAddAirGroupToShip(0)` on an empty base, `AIAddAircraftToAirGroup(0)` on a partly filled one.
+  - The month's `CheckAircraftDevelopment` (0xd1bf40, from `DoStrategicTurn`): the request's countdown and
+    `ResolveAircraftRequest` at 0 (2 to 4 prototypes by `CreateAircraftPrototype(role, year, 0, True)`, "New <role>
+    prototypes are ready for evaluation", `ExecuteSelectPrototype` "Select one of the prototypes": the selected one is
+    developed for RoleCost x 80, `DevelopmentTime` from `GetAircraftDevelopmentTime` (-1 at war)); then the loop over
+    every type of every nation (below); then the private venture for PlayerNation: Random(n) = 1 with n = 20, -4 when
+    the most tense nation's tension is above 7, -4 at war, +5/+10/+15 in 1940-45/46-49/50-55, +25/+40/+80 in
+    1956-60/61-80/81-99, -2 x (PlayerNation +0x6ab - 1), with aircraft capability and an industry: 0xea17d8 (a random
+    researched role, a prototype, "The <maker> company has developed a <role> as a private venture. They want to know
+    if we are interested in buying it?", `ExecuteVenture`); then `CheckOldAircraftTypes` (nations 0-8 with research
+    0x6a4, per role: nation 0 the questions "Our most modern <role> is N years old! ... Should we request tenders for a
+    new prototype?" or "... we could now develop <role>s ...", which open the request dialog; nations 1-8
+    `AIDevelopAircraftType`); then nations 1-8 with aircraft capability `AIDevelopAircraftType` by chance.
+    `AIDevelopAircraftType` (0xd1f670) is the computer's only development (prototypes and licences:
+    `AIBuyAircraftFromOtherNation` only from it).
+  - The type loop (all nations): `DevelopmentTime` -1 a month, 1 % +2 ("Unexpected problems have delayed the
+    development of our new ..." for nation 0); at 0 `AdjustValuesFinal`, `Year`, `AvailableAircraft` Random(FleetSize)+2,
+    "Our new <role> <name> is ready for operational service. <AdjustValuesFinal's text>" (nation 0) or "A new <nation>
+    <role> called <name> is entering service!" (+ rumours, the host's picture message); a type's name in these texts and
+    the lists is `TAircraftType.GetCompleteName` (0xe9c900): the name alone when it starts with the maker's ("Loire
+    40"), else "<maker> <name>"; improved models (`DoImprovedModel` 0xe9bc18: a new type,
+    `Version` +1, its base `Version` 99 and obsolete; nation 0 a picture message and a display, others an intel report);
+    obsolescence by age; reliability known after a while (nation 0: turn report lines by `Reliability` 1 or 3).
+  - The Turn (`PlayerChecksBeforeTurn`): `CheckPlayerCarriersHaveAircraft` (PlayerNation's carriers in play without air
+    units: "... has no air units assigned! Do you want to go to the air groups screen?" Yes opens `TdlgCAG` and returns
+    False, Ignore sets `DoNotRemindOfAirGroup` (+0xf7, not saved)) and `CheckAirBaseCapacity(PlayerNation)` ("CV <name>
+    aircraft capacity exceeded!" stops the Turn).
+- **The computer's air routines.** A new carrier at its launch gets `AIAddAirGroupToShip(nation)` unless its nation is
+  PlayerNation (`AdjustShipValuesUponLaunch` 0xcd7444); `CheckShipsAndBasesHaveAircraft` -> `CheckOneShipsOrBaseHasAircraft`
+  (nations 1-8: growth and cuts). The month's air routine `AircraftExperienceAndReplacement` (0xeaa6ec, named by its
+  error text) produces aircraft per type (no orders: production is automatic), then per unit: nation > 0 and no base:
+  30 % a month disbanded (0xeaac34 `cmp dword ptr [eax+0x1c],0; jle`), training, nation > 0: role, jet and night
+  changes (0xeaae5b `... jle 0xeab16e`), re-equipping (`TAirUnit.CheckAircraftType`; nation 0's turn line "... squadron
+  ... has reequipped with ..."), replacements.
+- **A joined player's PC (K at index K) before 0.9.0:** the Aircraft types screen listed nation 0's types (the host's;
+  live: France's PC showed Great Britain's 7), Request wrote the copy's `[General]` (replaced by the host's next month,
+  whose own request then showed and blocked the button), Add air unit and Auto made units of nation 0; the turn carried
+  no `[AirUnits]` or `[AircraftTypes]`. Since 0.9.0 the mod runs these in K's view
+  ([ARCHITECTURE](ARCHITECTURE.md#each-joined-players-aircraft-090)).
 
 ## Tactical battles
 The battle facts, gathered since the battle investigation of 2026-10-14; the later findings carry their dates.

@@ -16,6 +16,7 @@ is in [TESTING.md](TESTING.md).
 - [Threads and the main-thread dispatcher](#threads-and-the-main-thread-dispatcher)
 - [The session: roles, phases, players](#the-session-roles-phases-players)
 - [The monthly flow](#the-monthly-flow)
+  - [Taking a submitted turn back (0.9.0)](#taking-a-submitted-turn-back-090)
 - [Save slots and files](#save-slots-and-files)
 - [The disk (0.7.1)](#the-disk-071)
 - [The save merge](#the-save-merge)
@@ -23,6 +24,8 @@ is in [TESTING.md](TESTING.md).
 - [Each joined player's campaign divisions (0.6.1)](#each-joined-players-campaign-divisions-061)
 - [The legacy fleet of joined players (0.7.0)](#the-legacy-fleet-of-joined-players-070)
 - [Each joined player's officers (0.8.0)](#each-joined-players-officers-080)
+- [Each joined nation's research (0.8.2)](#each-joined-nations-research-082)
+- [Each joined player's aircraft (0.9.0)](#each-joined-players-aircraft-090)
 - [Network protocol](#network-protocol)
 - [User interface](#user-interface)
 - [Joined players' battles against AI nations (the battle phase)](#joined-players-battles-against-ai-nations-the-battle-phase)
@@ -60,6 +63,8 @@ RTW3.exe (Delphi/VCL, Steam DRM stub)
     economy, warfx ....... the player's money rules and war effects for joined nations, on the host
     invasion ............. joined nations' invasions (0.7.0)
     officers ............. each joined nation's own officer corps (0.8.0)
+    research ............. a joined nation's research month as its player's, its messages on its PC (0.8.2)
+    aircraft ............. each joined nation's own aircraft types, requests and air units (0.9.0)
     ui ................... Multiplayer window, title-screen button, Claim land window
     bridge ............... test commands on 127.0.0.1 (only with RTW3MP_BRIDGE_PORT)
 ```
@@ -86,6 +91,8 @@ RTW3.exe (Delphi/VCL, Steam DRM stub)
 | `src/mod/bridge.cpp` | The test bridge. |
 | `src/mod/officers.cpp`, `officers.h` | Each joined nation's own officer corps (0.8.0): a nation's list loaded into and read from memory with the game's own loader and writer, the hook of `ConnectOfficersToShips` that trades the lists of nation 0 and K at a joined player's month, the new campaign's corps, the Turn's commander question and assignments, the free promotion, the host's guards (`AdjustCrewQuality`'s messages, the ship sheet) ([below](#each-joined-players-officers-080)). 0.8.1: the game's rule for its player's ships without a commander applied to the joined nations ([below](#each-joined-players-officers-080)), the other nations' lists in a live battle's loads and the battle aftermath's guard ([both sides' commanders](#both-sides-commanders-081)). |
 | `src/mod/poc_battle.cpp`, `poc_battle.h` | The `poc*` research commands of the battle investigation (inactive unless used). |
+| `src/mod/research.cpp`, `research.h` | 0.8.2: a joined nation's research month as the game runs its player's, on the host (`DoResearch(0)` in its view, its dialogs recorded, the hook of `ShowResearchResult`), and its research dialogs and question on its player's PC ([below](#each-joined-nations-research-082)); TEST `resforce`. |
+| `src/mod/aircraft.cpp`, `aircraft.h` | Each joined nation's own aircraft (0.9.0): the Aircraft types and air group screens on a joined player's PC in the nation's view (the events' view plus every aircraft type's and air unit's nation 0 <-> K), the month's aircraft routines there (the request's countdown and prototypes, the private venture, the old types' reminders), the Turn's air checks at Submit; on the host the air month's two unit tests for the joined nations' units and the month's aircraft news ([below](#each-joined-players-aircraft-090)). |
 | `third_party/minhook/` | MinHook (BSD 2-Clause); `build.bat` compiles its core (`buffer.c`, `hook.c`, `trampoline.c`) with the 32-bit disassembler `hde32.c`. |
 | `build.bat` | Builds both DLLs into `dist\` with the Visual Studio C++ x86 tools (`/Zc:threadSafeInit-`, `/PDBALTPATH`). |
 
@@ -142,8 +149,10 @@ outside a session. The callbacks are in `session.cpp` (`hookcb::*`).
 | four loops of the battle AI over divisions (unnamed, found by their code: `ConvoyEscortCheck`'s loop over the other side's force right after `TList.Get`, `RearDivisionHasNoSightedEnemy`'s loop, the end-of-minute walk's core-follower check, `MoveDivisionShips`' scout lead) and `AIDetermineTacticalStance2` (`lockstep::InstallEmptyDivisionGuards`) | 0.7.3: a bug of the game's battle AI (single player too): a division whose ships are gone (a detached division after its reattach in the end-of-minute walk, a player's Detach of every ship, the minute's sunk divisions until the walk reaches them) stays in its force's list until the next walk, and these loops read its flagship unchecked: "Error in ConvoyEscortCheck procedure! Access violation ... Read of address 000009D3" in the host's battle after a drop. Such a division is passed over as the loop passes over one of no interest (the scout's lead: as no lead), as it reads after the walk; no draw is added or skipped where the game goes on, so a live battle stays equal on both PCs. The 0.7.0 guard before `AIDetermineTacticalStance2` (`LS_StanceGuard`: a `LeadDivision` or `TargetDiv` without ships) is hooked here too, so every battle has it (before 0.7.3: with the lockstep hooks only). Any PC, every battle. TEST `ls testconvoy` hooks the course routine's escort test, `GetConvoyDivision` and `ConvoyEscortCheck`'s look at a force on first use; `RTW3MP_DIAG` adds a note at each reattach that empties a division ([GAME-INTERNALS](GAME-INTERNALS.md#tactical-battles)). |
 | `AdvanceDesignStudies` | Counts down the joined players' design studies, once per month. |
 | `ReduceTimeLimits` | Counts down the joined players' pending doctrine changes, once per month. Relations v2: runs with the pairs of nations under the player's rules masked (its "separate peace" of a computer nation, B2). |
-| `DoResearch` | Puts a joined nation's research priorities back after the game's AI branch. |
+| `DoResearch` | 0.8.2: a joined nation's research month runs as the game runs its player's, in its view, its dialogs recorded for its player ([below](#each-joined-nations-research-082)). Otherwise (unavailable, the bridge's `researchrun`) puts a joined nation's research priorities back after the game's AI branch. |
 | `TfrmResearch.Execute` | On a joined player's PC, opens the Research screen for the player's nation instead of nation 0. |
+| `TdlgPictureMessage.ShowResearchResult` | 0.8.2: the "Research breakthrough" dialog, recorded with its turn report line instead of shown while a joined nation's research month runs on the host ([below](#each-joined-nations-research-082)). |
+| `TdlgPictureMessage.ShowPicMessage`, `TdlgEventAnswer.ExecuteGeneral` (lockstep.cpp; with the live battles' hooks, or at the first capture) | Live battles: the game's pictures and questions handled for both PCs ([below](#live-battles-between-players-lockstep)). Captures: a picture message recorded instead of shown (`BeginTextCapture`: the host's resolution of a joined player's battle, its invasions, war effects and officers); 0.8.2 `BeginPictureCapture` (text, picture, CopyMessageToLog) and `BeginQuestionCapture` (prompt, answers): a joined nation's research month on the host. |
 | `TfrmBuildCamp.ShowShipData` | 0.7.1: the ship data window ("View data" of the ship lists, a double click, the move-ships and area dialogs). Its callers pass nation 0 for the player's own ships, and it looks the design up in that nation's design list (ids are per nation); on a joined player's PC a ship of the player's nation K asked for as nation 0's is shown as nation K's (before, the host's design with the same id or nothing). A no-op where nation 0 is the player (the host, single player, the battle slot). The client's fix alone: any host version. Bridge `shipdata`. |
 | `EventLikelihoodCheck` | Vetoes events that need the host while a joined player's event is rolled. |
 | `LoadBuildCampaign` | Clears the intel report list before a load and drops empty or repeated entries after it. Drops (and frees) the air units the global list held before the load once the load succeeded, and repeated air units of the save (the same `AirUnitId`): the game's `LoadAircraftData` appends without clearing, and the mod reloads in the same process every month and at every live battle load (0.3.3). Clears the last battle's area and possession (`BattleArea`, `BattlePossession`) before every load: the load frees every map area and possession but sets the two again only for a save with a battle in progress, and the next save wrote their names from freed memory (the joined player's "Error in SaveBuildCampaign procedure! ..." box, 0.6.0; [GAME-INTERNALS](GAME-INTERNALS.md#the-game-and-the-mod-facts-you-can-rely-on)). Takes the campaign divisions out of their list before every load and frees them after a successful one (the *Fleet organization* list view, whose rows point at them, filled again first when it has rows; a failed load that left the list empty gets them back): the game's `LoadCampaignDivisions` appends too, and the next save wrote every copy (0.6.1, [below](#each-joined-players-campaign-divisions-061)). |
@@ -248,10 +257,12 @@ the game's 11 x87 transcendental routines in `x87.cpp`) with the first live batt
    nation's legacy fleet by hand, before the event roll (0.7.0, [below](#the-legacy-fleet-of-joined-players-070)).
 4. **Plan.** Everyone plans at the same time. Diplomacy requests (`MSG_DIPLO`) and event results (`MSG_EVENT`) go to
    the host at once. **Submit** saves the client's game and sends its part (`MSG_SUBMIT`, see
-   [the save merge](#the-save-merge)); a player can submit again until the month starts.
-5. **Start the month.** The host presses **Turn** (a dialog offers to wait for missing players or to go on),
-   **Advance turn now**, or the time limit runs out: then every client submits what it has (`MSG_FORCE_SUBMIT`), and
-   the month starts when all have submitted or 30 s later. The host saves, merges every submission into its slot
+   [the save merge](#the-save-merge)); a player can submit again until the month starts, or (0.9.0) take the turn back
+   with **Unsubmit turn** until the month's start is decided ([below](#taking-a-submitted-turn-back-090)).
+5. **Start the month.** The host presses **Turn** (a dialog offers to wait for missing players or to go on; since 0.9.0
+   its Yes asks again when a player took the turn back while it was open), **Advance turn now**, or the time limit runs
+   out: then every client submits what it has (`MSG_FORCE_SUBMIT`), and the month starts when all have submitted or
+   30 s later. The host saves, merges every submission into its slot
    (0.8.0: each nation's officers into its record, [below](#each-joined-players-officers-080)), reloads the campaign
    (since 0.7.0 keeping the possessions' `InvadedThisTurn` marks, which the save doesn't hold, as the battle phase's
    reload does; since 0.8.0 putting each joined nation's officers into its own list) and runs the game's own Turn
@@ -283,6 +294,45 @@ the game's 11 x87 transcendental routines in `x87.cpp`) with the first live batt
    resumes the battle; if it is a live battle against a joined player's nation that can be rejoined, a host in the
    lobby takes the month up where it is (processing, as after the Turn; reservations from `rtw3mp_session.ini`), and
    the rest of the month and the new month follow as usual ([resume](#live-battles-between-players-lockstep)).
+
+### Taking a submitted turn back (0.9.0)
+Asked for by players on 0.8.1: until then a submitted turn could only be replaced, and the month could start with it as
+soon as the last other player submitted. A joined player's **Unsubmit turn** (the Multiplayer window, shown only under
+a host that takes it) asks the host to drop the submitted turn (`session.cpp`: `UnsubmitTurn`, `HostOnUnsubmit`,
+`ClientOnUnsubmitAnswer`; protocol 3 and live-battle engine 18 stay).
+- **The capability.** Hello `unsub=1` (the host logs `<name>: unsubmit <n> (this host: 1)`), welcome `unsub=1` (the
+  player logs `joined <host>: unsubmit: the host <h>, this PC 1`). A player's PC sends `MSG_UNSUBMIT` (45) only to a
+  welcome-`unsub` host and shows the button only then: an older host never gets the message, and an older player under
+  a 0.9.0 host has no button (its turns are taken as before).
+- **The request** carries the month (`seq`), the number of turns the PC sent this month (`sub`) and a request number
+  (`req`); the host's answer (`MSG_UNSUBMIT` back, to that player) echoes them with `ok=1` or `ok=0` and `why`.
+- **The host takes a turn back** only while it plans that month (phase planning, `seq` the current one) and its start is
+  not decided: not once the time limit ran out (`MSG_FORCE_SUBMIT` sent: "the time limit has run out and the month starts
+  with it"), not while a start waits to run (`TryStartHostTurn` posted `RunHostTurn`, `g_turnQueued`; or it waits for the
+  game to be idle, `g_runTurnWhenIdle`, or for a save that works after a failed one: "the host is already starting the
+  month with it"), not during the month ("the host has already started the month with it") and not for an earlier month
+  ("that month is over"). Then it drops the stored submission, marks the player not submitted, puts the nation's
+  invasion plan back as the month began (a turn's `kinvt` is taken when the turn arrives; the plan of each nation is kept
+  at its first turn of the month), says "* <name> withdrew the turn" in the chat and sends the lobby and the status
+  ("Waiting for: <name>") at once. A request of a player without a stored turn is answered `ok=1` too (nothing to drop).
+- **The player's PC counts as not submitted only when the host's answer says the turn is dropped** and no turn was sent
+  after the request (`sub` equal to the PC's count; a turn sent since came after the withdrawal at the host, TCP keeping
+  the order, and stands). It never counts itself out of a month the host already started with its turn. It then also
+  drops a Submit waiting for a dialog or for a save that works (either would send the turn again at once), sets the
+  Turn button back to **Submit** and tells the player. The PC refuses the button itself after the month's
+  `MSG_FORCE_SUBMIT`, while an answer is awaited and outside planning. The game keeps the player's orders as they are:
+  the next Submit sends them.
+- **A withdrawn turn is never used.** The player counts as not submitted: the host's Turn and the auto-start wait for
+  them again (the host's Turn box, when a player took the turn back while it was open, asks again naming them); the time
+  limit's `MSG_FORCE_SUBMIT` submits their PC's orders as they are then (as for any player who has not submitted; no
+  answer within 30 s: the nation keeps last month's orders); **Advance turn now** (or Yes at the Turn) leaves the nation
+  last month's orders, as for any player who has not submitted.
+- **A disconnect** drops the player's turn as before (the host drops a disconnected player's turn); a player who joins
+  again gets the month again and is not submitted (an answer its PC still awaited no longer matters). **Battles** are
+  fought only once the month started, so no battle path changes. **The host** has no Unsubmit: its turn is its game as
+  it is when the month starts, and it starts the month itself (its Turn's No waits, Yes or Advance go on).
+- Tests: bridge `unsubmit` (the button), TEST `unsubmit raw` (the request without the PC's own checks), `unsubmit state`,
+  TEST `unsubmit timeup <s>`; the suite's `unsubmit` scenario ([TESTING](TESTING.md#scenario-catalog)).
 
 ## Save slots and files
 | Where | Who | What |
@@ -382,7 +432,8 @@ files for the month's package, a turn and the merge, and loads them again.
   NOT applied: <why>`) and shown to the host. Relations v2 (B4): a ship of the player's section that another nation's
   ships section on the host holds too (the same `Ship<n>Id`: a ship handed over twice) is dropped from the player's
   section and its `ShipCount` follows (`DropForeignShips`, logged).
-- **Not transferred** from joined players: air units and aircraft types. Their campaign divisions travel since 0.6.1
+- **Not transferred** from joined players: air units and aircraft types, before 0.9.0 (since 0.9.0 a turn under an
+  `acft` host carries them, `aircraft.ini`, [below](#each-joined-players-aircraft-090)). Their campaign divisions travel since 0.6.1
   and their officers (`officers.ini`) since 0.8.0, but never enter the host's save
   ([divisions](#each-joined-players-campaign-divisions-061), [officers](#each-joined-players-officers-080); the
   officers go into the nation's own list in the host's memory). A legacy
@@ -713,6 +764,130 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
   TEST `ofquiet`, `ofkill`, `ofset`, `ofcrew`, `ofuncmd` (0.8.1); `ls commanders`
   ([TESTING](TESTING.md#bridge-command-reference)).
 
+## Each joined nation's research (0.8.2)
+The game's research month (`TfrmBuildCamp.DoResearch`) shows its messages (picture messages, the "Research
+breakthrough" dialogs, the air/sea rescue question) and applies its player's research rules only for nation 0 /
+`PlayerNation`; for a joined nation the host ran the computer's rules and its player saw nothing of its research
+([GAME-INTERNALS](GAME-INTERNALS.md#research-messages-the-players-and-the-others),
+[MODLOG](../MODLOG.md#fix-2026-11-15-joined-players-saw-no-research-messages-v082-dev)).
+- **The host's month** (`research::HostRun` from `DoResearch`'s hook: a joined or reserved nation K, the month's call,
+  not in a view or a battle slot): K's research month runs as the game runs its player's. `game::RunPlayerResearch`
+  calls `DoResearch(0)` in K's view (`HostViewEnter` with K's war counter, no nation masked: K at index 0 and as
+  `PlayerNation`), with K's own tech-sharing deals (relations v2's `kts`) and K's intelligence effort (the nations
+  file) in the other nations' records, K's airbase size (the largest `AirbaseSizeOK` allows before the month) in the
+  form's `AirbaseSize` and fresh `TurnMessages`/`IntelReports` lists; everything is put back afterwards. Nothing shows on
+  the host: the routine's picture messages (`lockstep::BeginPictureCapture`: text, picture, CopyMessageToLog), its
+  research results (the `ShowResearchResult` hook: caption, tech, effect, picture) and its question
+  (`lockstep::BeginQuestionCapture`: prompt, answers; answered with the second, "No", for now) are recorded, each one's
+  turn report line goes into the fresh list where the game adds it, and its boxes are recorded (`SetBoxCapture`). So K
+  gets the player's rules (none of the computer's bonuses; the player's setbacks and submarine rule, tech sharing with
+  its own partners, the war's studies of the enemy) and every message single player shows its player.
+- **What goes where.** K's dialogs (in order) and turn report lines wait for K's next month (at most 40 dialogs and 200
+  lines while its player is away); the intelligence reports the routine gives K join K's own list (sent with its
+  month); a deal the war rule ended leaves K's `kts`. The host keeps its own intelligence on K's research as the
+  computer's rules gave it: "There are reports that <adj> scientists have invented <tech>." for each of K's
+  breakthroughs (Random(100) < 18 x the host's effort on K) and the game's two reports of K's new and improved guns.
+- **The air/sea rescue question** (K has "Air/Sea rescue" and was never asked; the game set `AskAS`): to a connected
+  player whose PC answers it (hello `res`) it goes with K's dialogs, and the player's answer sets `AirSeaRescue` on its
+  PC, which the next turn's merge brings to the host; otherwise (an older mod, nobody connected) the computer's rule
+  decides as before (TechnicalExcellence or 20 %).
+- **The new month** (`SendStateTo`): K's turn report lines join K's `econnews` (after the economy's, before the war
+  effects'), which K's player's PC shows in the game's turn report (an older mod's too); to a player with hello `res`
+  K's dialogs go as `kres` (`P`/`R`/`Q` records with their fields). Only K's player gets them.
+- **K's PC** (`research::ClientShow` from the client's tick: the month loaded, the game idle, before the turn report
+  and the event roll): each dialog with the game's own: `ShowPicMessage` (with its CopyMessageToLog) and
+  `ShowResearchResult`, which add their lines to the form's `TurnMessages` as the game does (the **Messages** button
+  shows that list), the question with `TdlgEventAnswer.ExecuteGeneral` (answer 1: `PlayerNation`'s `AirSeaRescue` :=
+  True); then the turn report lists the month's lines. Dialogs not shown yet wait when the month is sent again.
+- Logs: host "research: nation K's month as its player's (its view, war counter W, ...): R research result(s), P
+  picture message(s), Q question(s); ... breakthroughs: <area>: <tech>; question: ...; airbase size a -> b; guns ...;
+  tech-sharing deals ended: ...; the host's intelligence: n report(s) (effort e)", one line per dialog, and "research: N
+  turn report line(s) and its dialogs of nation K's research go with state seq S"; client "research: the month (seq S)
+  brings N research message(s) of this nation", one line per dialog shown and "research: question '...' answered n
+  (AirSeaRescue := 1)".
+- Unavailable (a routine, field or dialog not found, the hook failed: "research: UNAVAILABLE" at the start; or K's view
+  can't be entered that month, logged): the computer's research for the joined nation as in 0.8.1 (its priorities
+  kept), no dialogs. TEST `resplayer 0` does it on purpose; the bridge's `researchrun` (NoNonGunmessages) keeps that path.
+- **Mixed versions** (the host's month decides): a 0.8.2 host runs every joined nation's research as its player's; a
+  0.8.1 player then gets the month's research lines in its turn report (`econnews`) but no dialogs, and its nation's
+  question goes by the computer's rule. A 0.8.1 host keeps 0.8.1's research for every joined nation (no `kres`): a
+  0.8.2 player sees no research messages, as before.
+- Bridge: `resinfo [K]` (host: K's last research month as its player's; client: the month's dialogs), TEST `resforce`,
+  `resplayer` ([TESTING](TESTING.md#bridge-command-reference)).
+
+## Each joined player's aircraft (0.9.0)
+The game gives its player, nation 0, the aircraft decisions: the Aircraft types screen (the Request, licences), the
+month's prototypes, private ventures and old-type reminders, the air group screen, the Turn's air checks; the computer
+decides them for nations 1-8 ([GAME-INTERNALS](GAME-INTERNALS.md#aircraft)). Up to 0.8.1 a joined player's screens
+showed or changed the host's nation's (its types, its request, new units "for nation 0"), nothing of it reached the host,
+and the computer developed the joined nation's aircraft and gave its new carriers air groups (`aircraft.cpp`,
+`saveio.cpp`, `nationplay.cpp`; evidence: MODLOG
+[aircraft for joined players](../MODLOG.md#feature-2026-11-15-aircraft-for-joined-players-v090-dev)).
+- **The view on the player's PC.** `TfrmAircraftTypes.Execute` and `TdlgCAG.Execute` are hooked; on a joined player's
+  PC whose host keeps the nation's aircraft (header `acft`), outside a battle and any other view, they run in the
+  aircraft view: the events' view (`game::PlayerViewEnter`: entries 0 and K of the nation list, the relations and war
+  counter K's) plus every `TAircraftType.Nation` and `TAirUnit.Nation` 0 <-> K (an involution: what the game makes "for
+  nation 0" meanwhile is K's afterwards). Put back after the screen, also when the game raises; `EventActive` is true
+  meanwhile (the bridge answers only read-only commands; `vcl`, `aircraft` and `ffield` are among them). The game's own
+  screens then list K's types, make K's request (the form's `ACRequestRole`/`ACRequest`, K's priorities), buy licences
+  for K (relations with K) and make K's units (Add air unit, Auto, paste). Log: "aircraft: <screen> in nation K's view".
+- **The month's routines on the player's PC.** Once per month package with `acft`, before the event roll (Tick, when
+  idle), in the view: the request's countdown (`ACRequest` -1; at 0 the game's `ResolveAircraftRequest`: its picture
+  message and the prototype choice, the cost from K's funds), the private venture (its chance as `CheckAircraftDevelopment`
+  computes it for its player, reproduced; the game's venture routine, found as `Privateventure1Click`'s call, then asks)
+  and `CheckOldAircraftTypes` (the reminders; its branch for the other nations, `AIDevelopAircraftType`, is muted by the
+  skip thunk while the routines run). The package holds K's request as of its last merged turn, so a month sent again
+  repeats the countdown from the same base (its dice roll again). Log: "aircraft: the month's routines of nation K:
+  request r:n -> r:m (prototypes resolved); private venture ...; types a -> b (c -> d in development); funds e -> f".
+- **Submit.** Before the officers' question: `CheckAirBaseCapacity(PlayerNation)` (a carrier or base over its capacity:
+  not submitted) and `CheckPlayerCarriersHaveAircraft` (the game's question; Yes opens the air group screen: not
+  submitted); the carriers whose reminder the player ignored are remembered across the month's loads (the game keeps
+  `DoNotRemindOfAirGroup` in memory only). Not when the host's time limit submits. The turn carries `aircraft.ini`
+  (`saveio::BuildAircraftFile` from the slot's `.bcs` as the game saved it): `[Request]` (`ACRequestRole`, `ACRequest`,
+  `OAR0`..`OAR16`), `[AircraftTypes]` and `[AirUnits]` with K's entries, renumbered.
+- **The merge** (`MergeSubmission(..., acRequest)`, in the same all-or-nothing write as the turn): `MergeAircraft`
+  checks the file strictly (the game's 40 type and 19 unit fields, every field, integers but the names of at most 200
+  bytes and a unit's `HomeBase` "-" (the reserve, as the game saves it), no key twice, the counts; every entry nation K;
+  ids positive, once, and none of another nation's types or units; a unit's type one of the merged list or -1; no
+  negative counts) and replaces K's types and units of the host's save with them (the other nations' keep their order,
+  K's follow); a unit whose base K no longer has goes to the reserve ("-"). A refused file keeps the host's K entries
+  (log "its aircraft NOT taken (<why>)"). The request goes into the record `rtw3mp_nations.ini` `[Nation<K>Aircraft]`.
+  Log: "merge nation K: ..., aircraft types a -> b, air units c -> d".
+- **The month package:** K's `[General]` `ACRequestRole`, `ACRequest` and `OAR0`..`OAR16` from the record (0 without
+  one) instead of the host's; header `acft=1`.
+- **The host's month** for a nation whose player plays its aircraft (`hookcb::AircraftByPlayer`: the connected player's
+  hello `acft`, or a record while the player is away): the skip thunks leave out `AIDevelopAircraftType(K)` (new types,
+  licences; also `CheckOldAircraftTypes`' computer branch) and `AIAddAirGroupToShip(K)` (a launched carrier's air group:
+  the game gives the player's none; the monthly growth `CheckOneShipsOrBaseHasAircraft` is skipped since 0.5.0); log
+  "AI suppressed: <routine> for nation K (its player's aircraft)". The air month (`AircraftExperienceAndReplacement`,
+  found by its error text among `DoStrategicTurn`'s calls) is hooked at its two tests of a unit's nation (`mov eax,[esi];
+  cmp dword ptr [eax+Nation],0`, found by bytes): K's units take nation 0's branch, so its reserve units without a base
+  are not disbanded (30 % a month) and the computer changes no role, jet or night capability; log after `DoEndOfTurn`
+  "aircraft: the air month for the joined nations' units (their player's): nation K: n reserve unit(s) kept, m unit(s)
+  without the computer's changes". The shared rules stay: production, development (the type loop: delays, entering
+  service, improved models, obsolescence, reliability), training, replacements, re-equipping.
+- **News.** The host compares K's types and units after the month's reload with those after `DoEndOfTurn` and sends the
+  game's texts with the next month (`econnews`: the game's turn report on the player's PC): "Our new <role> <type> is
+  ready for operational service." (the type's name as `GetCompleteName` gives it: the name alone when it starts with
+  the maker's, else both), "Unexpected problems have delayed the development of our new ...", "The
+  <maker> company has developed an improved model: the ...", the reliability lines (poor, good), "<role> squadron
+  <name> has reequipped with ...". The game shows its player some of them as picture messages.
+- **Ids:** type ids and `AirUnitId` come from IDNo; each package raises it by 20,000 x K (0.8.0), the merge moves the
+  host's counter forward and refuses ids of other nations.
+- **Battles.** A live battle loads A's files made from the host's campaign after the merge: both PCs see K's squadrons
+  as the player left them; no lockstep change (engine 18). K's battles against the computer (the battle slot) use the
+  merged units; their air losses still don't reach the host (battle results carry no air units, as before).
+- **Mixed versions** (protocol 3; the hello's `acft`, the header's `acft` and the turn's `aircraft.ini` are ignored by
+  older peers): a 0.8.1 player of a 0.9.0 host keeps 0.8.1's behaviour (the computer's development and launch air
+  groups, the host's request in its month, nothing merged); a 0.9.0 player of a 0.8.1 host too (no view, no month
+  routines, no file). TEST: `acset cap 0` (the player's next hello announces 0), `acset host 0` (the host keeps no
+  nation's aircraft).
+- **What differs from single player:** the month's prototypes, venture and reminders come at the start of the player's
+  month (the game's at the Turn); the messages about the nation's types come in the turn report; the battle losses of
+  the player's own battles against the computer stay on its PC.
+- Bridge: `aircraft [nation]`, `acstore <K>`, TEST `acset req|dev|aidev|cap|host`
+  ([TESTING](TESTING.md#bridge-command-reference)).
+
 ## Network protocol
 - **Transport:** TCP; the host listens on the port (default 47624), clients connect. One background thread does all
   socket I/O with `TCP_NODELAY`. A frame is `[u32 length][u16 type][payload]`; the receiver drops frames above 96 MB
@@ -733,13 +908,23 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
   `battles during the host's month <s> (this host: <h>)`) and `off` (1: the PC plays its nation's own officers,
   [above](#each-joined-players-officers-080); the host logs it as `officers <o>`), since 0.8.1 `lsof` (1: the PC's
   live battles carry both sides' commanders, [below](#both-sides-commanders-081); the host logs
-  `<name>: both sides' commanders in live battles <l> (this host: <h>)`). The host answers `MSG_WELCOME` (the final
+  `<name>: both sides' commanders in live battles <l> (this host: <h>)`), since 0.8.2 `res` (1: the PC shows its
+  nation's research dialogs and answers its research question, [above](#each-joined-nations-research-082); the host
+  logs `<name>: research dialogs <r> (this host's joined nations' research as the player's: <h>)`) and since 0.9.0
+  `unsub` (1: the PC can take a submitted turn back, [above](#taking-a-submitted-turn-back-090); the host logs
+  `<name>: unsubmit <u> (this host: 1)`) and `acft` (1: the PC plays its nation's own aircraft,
+  [above](#each-joined-players-aircraft-090); the host logs `<name>: the nation's own aircraft <a> (this host: <h>)`).
+  The host answers `MSG_WELCOME` (the final
   name; since 0.6.0 `gen`: the host's battle requests, 1 = it merges a declined battle's result, 2 = it also takes
   surprise attacks and takeovers, 3 = raider checks and their news, 0.7.0; 4 = the invasions of joined nations,
   0.7.0; 5 = a result of several encounters, `enc`, each one's points to its own opponent, 0.7.2; since 0.8.0
   `simb` = 1: it sends a `simb` player's battles during its month; since 0.8.1 `lsof` = 1: its live battles carry
   both sides' commanders, logged by the player as
-  `joined <host>: both sides' commanders in live battles: the host <h>, this PC <l>`) or `MSG_REJECT` with the
+  `joined <host>: both sides' commanders in live battles: the host <h>, this PC <l>`; since 0.8.2 `res` = 1: it runs
+  the joined nations' research as the player's and sends their dialogs, logged by the player as `joined <host>: the
+  nation's research as the player's with its dialogs: the host <h>, this PC <r>`; since 0.9.0 `unsub` = 1: it takes a
+  joined player's submitted turn back, logged by the player as `joined <host>: unsubmit: the host <h>, this PC 1`) or
+  `MSG_REJECT` with the
   reason: "protocol mismatch (host mod X)", "different game version than the host" or "wrong password".
 
 | Message | Direction | Content |
@@ -749,10 +934,11 @@ nation K has its own corps in K's own `OfficerList`, on the host and on the play
 | `MSG_PICK` | client -> host | A nation pick by name. |
 | `MSG_STATUS` | host -> all | Phase, remaining time, status text. |
 | `MSG_CHAT` | both | Chat lines; `notice=1` flashes the window; `treaty` carries a peace treaty for the player's dialog. |
-| `MSG_STATE` | host -> client | The month: header (seq, nation, date, remaining time; `intel=1` from 0.4.1: the package holds the player's own intelligence; relations v2: `kwar`, the nation's war counter, and for a nation under the player's rules `rel=1`, `kwill`, `kts`, `khist`, `humans`; B4: `kvp`, `kevp`, `kpairs`, `kpeace`; 0.5.0: `kao`, the nation's army-offensive months, and `econnews`, the texts of the player's money rules for its player; 0.6.0: `econnews` also carries the war effects' texts, `kblk` the nations blockaded, and with `rel=1` `khelp` (the host applies the allies' war help), `kbuild` (... and the ship seizures of a war) and `klend`; 0.6.1: `divs=1`, the package's `.off` holds the nation's own campaign divisions; 0.7.0: `legacy=1`, the nation may build its legacy fleet by hand this month; 0.8.0, to a player with hello `off`: `offs=1`, the package's `.off` holds the nation's own officers and its map data the nation's area commands, with `offgen=1` while the host keeps none for the nation: its PC forms the corps) and the slot's files. |
+| `MSG_STATE` | host -> client | The month: header (seq, nation, date, remaining time; `intel=1` from 0.4.1: the package holds the player's own intelligence; relations v2: `kwar`, the nation's war counter, and for a nation under the player's rules `rel=1`, `kwill`, `kts`, `khist`, `humans`; B4: `kvp`, `kevp`, `kpairs`, `kpeace`; 0.5.0: `kao`, the nation's army-offensive months, and `econnews`, the texts of the player's money rules for its player; 0.6.0: `econnews` also carries the war effects' texts, `kblk` the nations blockaded, and with `rel=1` `khelp` (the host applies the allies' war help), `kbuild` (... and the ship seizures of a war) and `klend`; 0.6.1: `divs=1`, the package's `.off` holds the nation's own campaign divisions; 0.7.0: `legacy=1`, the nation may build its legacy fleet by hand this month; 0.8.0, to a player with hello `off`: `offs=1`, the package's `.off` holds the nation's own officers and its map data the nation's area commands, with `offgen=1` while the host keeps none for the nation: its PC forms the corps; 0.8.2: `econnews` also carries the turn report lines of the nation's research month, and to a player with hello `res` `kres` its research dialogs; 0.9.0, to a player with hello `acft`: `acft=1`, the host keeps the nation's aircraft, the package's `[General]` holds its request) and the slot's files. |
 | `MSG_ACK` | client -> host | The month was loaded. |
-| `MSG_SUBMIT` | client -> host | The player's turn (header and the submission bundle; from 0.4.1 with `[MPIntel]` and `[IntelReports]`; from 0.6.1 with `divisions.ini`, the nation's campaign divisions; 0.7.0: `[General] MPLegacy=1` for a turn that holds a hand-built legacy fleet; 0.8.0: `officers.ini`, the nation's officers and area commands, under an `offs` host). |
+| `MSG_SUBMIT` | client -> host | The player's turn (header and the submission bundle; from 0.4.1 with `[MPIntel]` and `[IntelReports]`; from 0.6.1 with `divisions.ini`, the nation's campaign divisions; 0.7.0: `[General] MPLegacy=1` for a turn that holds a hand-built legacy fleet; 0.8.0: `officers.ini`, the nation's officers and area commands, under an `offs` host; 0.9.0: `aircraft.ini`, the nation's aircraft types, air units and request, under an `acft` host). |
 | `MSG_FORCE_SUBMIT` | host -> all | The time limit ran out: submit now. |
+| `MSG_UNSUBMIT` (45) | client -> host, host -> that client | 0.9.0: take my submitted turn back (`seq`, `sub`: the turns the PC sent this month, `req`), sent only to a welcome-`unsub` host; the host's answer echoes them with `ok` (1: the turn dropped, 0: refused) and `why` ([taking a submitted turn back](#taking-a-submitted-turn-back-090)). |
 | `MSG_DIPLO` | client -> host | A diplomacy request (war, ally, peace, leave, cancel, claim). |
 | `MSG_EVENT` | client -> host | The result of the player's random event (relation changes, own fields), or (0.4.1, `intel=1`) of its monthly spying check, or (0.8.0, `event=-2`, `caption=Officers`) of an officer event of the month's officer routine. |
 | `MSG_RELATIONS` (40) | client -> host | Relations v2: what the player's relation routines changed for its nation this month (pairs before/after, alliances, per-relation state, other nations' budget changes, VP, war counter); B4: the peace with the computer's nations (`peace`, `pcode`, `pevent`, `pargs`, `paccepted`, `pwinner`, `penemies`, `pland`, `pships`, `ptaken`, `pdelta`, `plost`, `ptreaty`; 0.5.0: `self`, the nation's own BudgetModifier/Prestige/BaseResources/UnrestLevel changes; 0.6.0: `ally`, `allyvp`, `afunds`, `aships`, `lend`, the allies' war help; `bwar`, `bships`, the ship seizures of a war), also alone for a proposal (`kind=peace`; `test=1` from `peacetest`). 0.6.0 (to a `gen=2` host): `ksa` (the surprise attacks "a,b;") and `sland` (the takeovers of unowned possessions, pland's layout). |
@@ -772,11 +958,14 @@ New `KV` keys must be ignorable by older peers of the same protocol; anything el
   (**Claim nation**, **Give to AI**), the turn time limit, the host's live-battle option **Computer flies carrier
   strikes in live battles** (engine level 7, off by default), the host's **Manual legacy fleets** (0.7.0, on by
   default) and in its place on a joined player's PC **Build my legacy fleet by hand** (off by default),
-  **Start session**, **Advance turn now**, the Diplomacy
+  **Start session**, **Advance turn now**, in their place on a joined player's PC **Unsubmit turn** (0.9.0, shown only
+  under a host that takes a turn back, enabled while the player's turn is submitted and the month's start is not
+  decided; [above](#taking-a-submitted-turn-back-090)), the Diplomacy
   list with its buttons, and the chat. Host-only controls are hidden on a joined player's PC. Settings are kept in
   `config.ini`. Notices flash the window.
 - **The Claim land window** (`RTW3MP_Claim`) lets the winner of an agreed peace tick the loser's possessions.
-- **The Turn button** reads **Submit**, **Submitted** or **Waiting** on a joined player's PC.
+- **The Turn button** reads **Submit**, **Submitted** or **Waiting** on a joined player's PC (**Submit** again after the
+  host took the turn back, 0.9.0).
 - **The relations view (0.4.1).** The game shows relations from nation 0's point of view (every nation's
   `Tension`/`Allied` is its relation with nation 0), so a joined player's strategic screen showed the host's tension
   bars, wars and alliances. `game::ShownNationIndex()` is K when the PC plays nation K > 0 (PlayerNation =
@@ -2064,7 +2253,13 @@ stay**, and a battle with any 0.6.1-0.8.0 PC is the 0.8.0 battle (MODLOG
   keeps 3: the hello's and the welcome's `lsof`, the battle's and the result's `of2` with their officer files, the
   live start's `of2`/`ofn` with its files, the ready's `of2`/`ofl` and the relayed rejoin's `lsof`, sent only to
   peers that announce `lsof`, and the battle result's `deltas` keys `vp0`, `vp1` and `sunk`, which older hosts
-  ignore). Within a protocol, versions can play together, but features may need both sides (see
+  ignore; 0.8.2 keeps 3: the hello's and the welcome's `res` and the month's `kres`, sent only to a player that
+  announces `res`, while the research turn report lines go in `econnews`, which older players show too; 0.9.0, in
+  development, keeps 3: the hello's and the welcome's `unsub` and the message `MSG_UNSUBMIT` (45), which a player's PC
+  sends only to a host that announced `unsub`, so an older host never gets it and an older player under a 0.9.0 host
+  has no Unsubmit turn button, and the hello's `acft`, the month's `acft`, sent only to a player that announces `acft`,
+  and the turn's `aircraft.ini`, sent only under a month with `acft`). Within a protocol, versions can play together,
+  but features may need both sides (see
   [CHANGELOG.md](../CHANGELOG.md)). The hello's mod version (`mod=`) is not checked; the notices about another
   live-battle level quote it.
 - Live battles have their own version, the live-battle engine level `MP_LS_LEVEL` (`src/mod/common.h`): 1 = 0.3.0 to
@@ -2151,6 +2346,7 @@ stay**, and a battle with any 0.6.1-0.8.0 PC is the 0.8.0 battle (MODLOG
   both PCs: the first player's commanders only, no new key on the wire, the same state hash. Its other two fixes
   change no live-battle path: a ship lost twice counted once is the host's merge (the result's `deltas` keys
   `vp0`/`vp1`/`sunk`, which older hosts ignore: a 0.8.0 host merges as before), and the rule for a joined nation's
-  ships without a commander is the host's month only.
+  ships without a commander is the host's month only. 0.9.0 (in development) keeps level 18: taking a submitted turn
+  back happens only while the month is planned, before any battle of it, and changes no live-battle path.
 - Releases are tagged `vX.Y.Z`; the release zip is built by `tools/package_release.ps1` (see the docs agent's
   release checklist in `.github/agents/rtw3-docs.agent.md`).

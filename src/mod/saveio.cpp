@@ -341,7 +341,8 @@ static int DropForeignShips(IniDoc& host, int nationIdx);
 static bool ShipKey(const std::string& line, int& n, std::string& field);
 static std::set<std::string> ShipIdsOf(const IniDoc& d, int K);
 
-bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const Bundle& sub, std::string& err) {
+bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const Bundle& sub, std::string& err,
+                     std::vector<std::string>* acRequest) {
     std::wstring s = SlotStr(slot);
     std::wstring bcsPath = slotDir + L"RTWGame" + s + L".bcs";
     std::string hostBytes;
@@ -398,6 +399,23 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
         legacyNote = ", legacy fleet: " + std::to_string(oldIds.size()) + " ship(s) -> " + std::to_string(now.size()) +
                      ", " + std::to_string(au) + " air unit(s) of removed ships dropped";
     }
+    // 0.9.0: the nation's own aircraft types, air units and request (a host that keeps them, a turn that carries them)
+    std::string acNote;
+    if (acRequest) {
+        acRequest->clear();
+        if (const std::string* ac = sub.Get("aircraft.ini")) {
+            std::string sum, aerr;
+            std::vector<std::string> req;
+            if (MergeAircraft(host, nationIdx, *ac, req, sum, aerr)) {
+                *acRequest = req;
+                acNote = ", " + sum;
+            } else {
+                acNote = ", its aircraft NOT taken (" + aerr + ")";
+            }
+        } else {
+            acNote = ", no aircraft in the turn";
+        }
+    }
     long long hostId = atoll(host.Get("General", "IDNo", "0").c_str());
     long long cliId = atoll(cli.Get("General", "IDNo", "0").c_str());
     long long cliStart = atoll(cli.Get("General", "IDNoStart", "0").c_str());
@@ -443,9 +461,9 @@ bool MergeSubmission(const std::wstring& slotDir, int slot, int nationIdx, const
         Log("merge nation %d rejected: %s", nationIdx, err.c_str());
         return false;
     }
-    Log("merge nation %d: %d sections, %d possession fields, IDNo %lld/%lld%s%s", nationIdx, replaced, poss, hostId,
+    Log("merge nation %d: %d sections, %d possession fields, IDNo %lld/%lld%s%s%s", nationIdx, replaced, poss, hostId,
         cliId, dropped ? (", " + std::to_string(dropped) + " ship(s) of other nations dropped").c_str() : "",
-        legacyNote.c_str());
+        legacyNote.c_str(), acNote.c_str());
     return replaced > 0;
 }
 
@@ -2179,6 +2197,323 @@ std::vector<OfficerRec> BattleOnlyOfficers(const std::vector<OfficerRec>& sent, 
     }
     if (changed) *changed = n;
     return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Aircraft (saveio.h, 0.9.0). The game's SaveAircraftData writes [AircraftTypes] (ACTypesNo, then AT<i><Field> for every
+// type of the global list) and [AirUnits] (AirUnitNo, AU<i><Field> for every unit), all fields of each entry.
+
+static const char* kTypeFields[] = {
+    "Name", "Manufacturer", "Year", "BaseModelYear", "MaxSpeed", "CruiseSpeed", "CruiseAltitude", "MaxFuel", "Ceiling",
+    "Climb", "LtEndurance", "MedEndurance", "HvyEndurance", "Firepower", "Maneuver", "Toughness", "Reliability",
+    "LtBombLoadSize", "LtBombLoadNumber", "MedBombLoadSize", "MedBombLoadNumber", "HvyBombLoadSize", "HvyBombLoadNumber",
+    "Torpedo1", "Torpedo2", "Missile2", "Radar", "Special", "Bombing", "Purpose", "Floatplane", "Carrier",
+    "DevelopmentTime", "Nation", "Version", "Obsolete", "ReliabilityKnown", "ValuesKnown", "AvailableAircraft", "Id"};
+static const char* kUnitFields[] = {"AircraftType", "AircraftTypeId", "Id",          "AircraftNumber", "DesiredAircraftNumber",
+                                    "Role",         "Nation",         "Experience",  "Name",           "CarrierCapable",
+                                    "NightCapable", "AirKills",       "BombHits",    "TorpedoHits",    "MissileHits",
+                                    "Elite",        "AutoUpgrade",    "Recon",       "HomeBase"};
+constexpr int kMaxNationTypes = 1000, kMaxNationUnits = 3000;
+
+std::string AirEntry::Get(const std::string& field, const std::string& def) const {
+    for (auto& f : fields)
+        if (f.first == field) return f.second;
+    return def;
+}
+
+void AirEntry::Set(const std::string& field, const std::string& value) {
+    for (auto& f : fields)
+        if (f.first == field) {
+            f.second = value;
+            return;
+        }
+    fields.push_back({field, value});
+}
+
+// "<pfx><i><Field>" -> i and Field (i as the game writes it: no leading zero).
+static bool AirKey(const std::string& k, const char* pfx, int& i, std::string& field) {
+    size_t p = 2;
+    if (k.compare(0, 2, pfx) != 0) return false;
+    while (p < k.size() && isdigit((unsigned char)k[p])) p++;
+    if (p == 2 || p > 8 || p >= k.size() || (p > 3 && k[2] == '0') || !isupper((unsigned char)k[p])) return false;
+    i = atoi(k.c_str() + 2);
+    field = k.substr(p);
+    return true;
+}
+
+bool ParseAirSection(const std::vector<std::string>& lines, bool units, std::vector<AirEntry>& out,
+                     std::vector<std::string>* other, bool strict, std::string& err) {
+    out.clear();
+    if (other) other->clear();
+    const char* pfx = units ? "AU" : "AT";
+    const char* countKey = units ? "AirUnitNo" : "ACTypesNo";
+    auto fail = [&](const std::string& why) {
+        err = why;
+        out.clear();
+        return false;
+    };
+    std::set<std::string> known;
+    if (units)
+        for (const char* f : kUnitFields) known.insert(f);
+    else
+        for (const char* f : kTypeFields) known.insert(f);
+    int count = -1;
+    std::map<int, AirEntry> byNo;
+    std::set<std::string> keys;
+    for (auto& l : lines) {
+        if (l.empty()) continue;
+        std::string k, v, field;
+        int i = -1;
+        if (!SplitKV(l, k, v)) {
+            if (strict) return fail("a line without a key");
+            if (other) other->push_back(l);
+            continue;
+        }
+        if (strict && !keys.insert(k).second) return fail("key " + k.substr(0, 40) + " twice");
+        if (k == countKey) {
+            int n = atoi(v.c_str());
+            bool ok = IsInt(v) && v.size() <= 6 && n >= 0;
+            if (!ok && strict) return fail(k + "=" + v.substr(0, 20));
+            if (count < 0) count = ok ? n : 0;
+            if (other) other->push_back(l);
+            continue;
+        }
+        if (!AirKey(k, pfx, i, field) || !known.count(field)) {
+            if (strict) return fail("unknown key " + k.substr(0, 40));
+            if (other) other->push_back(l);
+            continue;
+        }
+        bool text = field == "Name" || field == "Manufacturer" || field == "AircraftType";
+        bool reserve = units && field == "HomeBase" && v == "-";  // (TAirUnit.SaveMe: "-" for no base, else its CShipId)
+        if (strict && !reserve &&
+            (text ? v.size() > 200 || v.find_first_of(std::string("\r\n\0", 3)) != std::string::npos
+                  : !IsInt(v) || v.size() > 11 || atoll(v.c_str()) > INT_MAX || atoll(v.c_str()) < INT_MIN))
+            return fail("bad value of " + k.substr(0, 40));
+        byNo[i].fields.push_back({field, v});
+    }
+    if (count < 0) count = 0;
+    if (strict && (int)byNo.size() != count) return fail(std::string(countKey) + " does not match the entries");
+    for (auto& e : byNo) {
+        if (e.first >= count) {
+            if (strict) return fail("an entry beyond " + std::string(countKey));
+            continue;
+        }
+        if (strict && e.second.fields.size() != known.size()) return fail("an entry without all of the game's fields");
+        out.push_back(e.second);
+    }
+    return true;
+}
+
+std::vector<std::string> AirSectionLines(const std::vector<AirEntry>& entries, bool units,
+                                         const std::vector<std::string>& other) {
+    const char* pfx = units ? "AU" : "AT";
+    const char* countKey = units ? "AirUnitNo" : "ACTypesNo";
+    std::vector<std::string> out;
+    bool counted = false;
+    for (auto& l : other) {
+        if (KeyIs(l, countKey)) {
+            if (counted) continue;
+            out.push_back(std::string(countKey) + "=" + std::to_string(entries.size()));
+            counted = true;
+            continue;
+        }
+        out.push_back(l);
+    }
+    if (!counted) out.insert(out.begin(), std::string(countKey) + "=" + std::to_string(entries.size()));
+    for (size_t i = 0; i < entries.size(); i++)
+        for (auto& f : entries[i].fields) out.push_back(pfx + std::to_string(i) + f.first + "=" + f.second);
+    return out;
+}
+
+static std::vector<AirEntry> AirOf(const IniDoc& d, bool units, std::vector<std::string>* other = nullptr) {
+    std::vector<AirEntry> e;
+    std::string err;
+    if (const IniSection* s = d.Find(units ? "AirUnits" : "AircraftTypes")) ParseAirSection(s->lines, units, e, other, false, err);
+    return e;
+}
+
+// Ship<n>Id of nation K's ships and of its coastal list (air bases and batteries: TCampaignShip too).
+static std::set<std::string> AirBaseIds(const IniDoc& d, int K) {
+    std::set<std::string> ids = NationShipIds(d, K);
+    if (const IniSection* s = d.Find("Nation" + std::to_string(K) + "CoastalArtillery"))
+        for (auto& l : s->lines) {
+            std::string k, v;
+            if (SplitKV(l, k, v) && KeyShape(k, "Ship", "Id")) ids.insert(v);
+        }
+    return ids;
+}
+
+static const char* kRequestKeys[] = {"ACRequestRole", "ACRequest"};
+constexpr int kOldAircraftRoles = 17;  // OAR0..OAR16 (the form's OldAircraftRole counters)
+
+std::vector<std::string> AircraftRequestLines(const IniDoc& bcs) {
+    std::vector<std::string> out;
+    for (const char* k : kRequestKeys) out.push_back(std::string(k) + "=" + bcs.Get("General", k, "0"));
+    for (int i = 0; i < kOldAircraftRoles; i++)
+        out.push_back("OAR" + std::to_string(i) + "=" + bcs.Get("General", "OAR" + std::to_string(i), "0"));
+    return out;
+}
+
+bool ParseAircraftRequest(const std::vector<std::string>& lines, std::vector<std::string>& out, std::string& err) {
+    std::map<std::string, std::string> v;
+    for (auto& l : lines) {
+        if (l.empty()) continue;
+        std::string k, val;
+        if (!SplitKV(l, k, val) || !v.insert({k, val}).second) {
+            err = "a bad or repeated line of [Request]";
+            return false;
+        }
+    }
+    out.clear();
+    auto take = [&](const std::string& k, long long lo, long long hi) {
+        auto it = v.find(k);
+        if (it == v.end() || !IsInt(it->second) || it->second.size() > 11) return false;
+        long long n = atoll(it->second.c_str());
+        if (n < lo || n > hi) return false;
+        out.push_back(k + "=" + std::to_string(n));
+        return true;
+    };
+    bool ok = take("ACRequestRole", 0, 15) && take("ACRequest", 0, 60);
+    for (int i = 0; ok && i < kOldAircraftRoles; i++) ok = take("OAR" + std::to_string(i), 0, INT_MAX);
+    if (!ok || v.size() != 2 + kOldAircraftRoles) {
+        err = "[Request] without the game's values";
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+void PutAircraftRequest(IniDoc& bcs, const std::vector<std::string>* lines) {
+    std::map<std::string, std::string> v;
+    if (lines)
+        for (auto& l : *lines) {
+            std::string k, val;
+            if (SplitKV(l, k, val)) v[k] = val;
+        }
+    auto get = [&](const std::string& k) {
+        auto it = v.find(k);
+        return it == v.end() ? std::string("0") : it->second;
+    };
+    for (const char* k : kRequestKeys) bcs.Set("General", k, get(k));
+    for (int i = 0; i < kOldAircraftRoles; i++) bcs.Set("General", "OAR" + std::to_string(i), get("OAR" + std::to_string(i)));
+}
+
+bool BuildAircraftFile(const std::string& bcs, int K, std::string& out, std::string& summary, std::string& err) {
+    IniDoc d = ParseIni(bcs);
+    if (!d.Find("General") || K < 1 || K > 8) {
+        err = "no campaign";
+        return false;
+    }
+    std::vector<AirEntry> types, units, myTypes, myUnits;
+    types = AirOf(d, false);
+    units = AirOf(d, true);
+    std::string ks = std::to_string(K);
+    for (auto& t : types)
+        if (t.Get("Nation") == ks) myTypes.push_back(t);
+    for (auto& u : units)
+        if (u.Get("Nation") == ks) myUnits.push_back(u);
+    IniDoc f;
+    f.bom = d.bom;
+    f.sections.push_back({"Request", AircraftRequestLines(d)});
+    f.sections.push_back({"AircraftTypes", AirSectionLines(myTypes, false, {})});
+    f.sections.push_back({"AirUnits", AirSectionLines(myUnits, true, {})});
+    out = WriteIni(f);
+    summary = std::to_string(myTypes.size()) + " aircraft type(s) and " + std::to_string(myUnits.size()) +
+              " air unit(s) of nation " + ks + ", request " + d.Get("General", "ACRequestRole", "0") + ":" +
+              d.Get("General", "ACRequest", "0");
+    return true;
+}
+
+bool MergeAircraft(IniDoc& host, int K, const std::string& file, std::vector<std::string>& request,
+                   std::string& summary, std::string& err) {
+    IniDoc f = ParseIni(file);
+    const IniSection* fr = f.Find("Request");
+    const IniSection* ft = f.Find("AircraftTypes");
+    const IniSection* fu = f.Find("AirUnits");
+    IniSection* ht = host.Find("AircraftTypes");
+    IniSection* hu = host.Find("AirUnits");
+    if (!fr || !ft || !fu || !ht || !hu || K < 1 || K > 8) {
+        err = !fr || !ft || !fu ? "aircraft.ini without its three sections" : "the host's save has no aircraft sections";
+        return false;
+    }
+    std::vector<std::string> req;
+    std::vector<AirEntry> kt, ku;
+    if (!ParseAircraftRequest(fr->lines, req, err) || !ParseAirSection(ft->lines, false, kt, nullptr, true, err) ||
+        !ParseAirSection(fu->lines, true, ku, nullptr, true, err))
+        return false;
+    if ((int)kt.size() > kMaxNationTypes || (int)ku.size() > kMaxNationUnits) {
+        err = "too many aircraft types or air units";
+        return false;
+    }
+    std::vector<std::string> otherT, otherU;
+    std::vector<AirEntry> ht0 = AirOf(host, false, &otherT), hu0 = AirOf(host, true, &otherU);
+    std::string ks = std::to_string(K);
+    // ids of the other nations' types and units (K's own are replaced)
+    std::set<std::string> foreignT, foreignU, typeIds;
+    int hostKT = 0, hostKU = 0;
+    for (auto& t : ht0) {
+        if (t.Get("Nation") == ks)
+            hostKT++;
+        else
+            foreignT.insert(t.Get("Id"));
+    }
+    for (auto& u : hu0) {
+        if (u.Get("Nation") == ks)
+            hostKU++;
+        else
+            foreignU.insert(u.Get("Id"));
+    }
+    typeIds = foreignT;
+    std::set<std::string> seen;
+    for (auto& t : kt) {
+        std::string id = t.Get("Id");
+        if (t.Get("Nation") != ks || atoll(id.c_str()) < 1 || foreignT.count(id) || !seen.insert(id).second) {
+            err = "aircraft type " + id.substr(0, 12) + " is not nation " + ks + "'s or its id is taken";
+            return false;
+        }
+        if (atoll(t.Get("DevelopmentTime").c_str()) < 0 || atoll(t.Get("AvailableAircraft").c_str()) < 0) {
+            err = "aircraft type " + id.substr(0, 12) + " with a negative count";
+            return false;
+        }
+        typeIds.insert(id);
+    }
+    std::set<std::string> bases = AirBaseIds(host, K);
+    int baseReset = 0;
+    seen.clear();
+    for (auto& u : ku) {
+        std::string id = u.Get("Id"), tid = u.Get("AircraftTypeId"), hb = u.Get("HomeBase");
+        if (u.Get("Nation") != ks || atoll(id.c_str()) < 1 || foreignU.count(id) || !seen.insert(id).second) {
+            err = "air unit " + id.substr(0, 12) + " is not nation " + ks + "'s or its id is taken";
+            return false;
+        }
+        if (tid != "-1" && !typeIds.count(tid)) {
+            err = "air unit " + id.substr(0, 12) + " has an unknown aircraft type " + tid.substr(0, 12);
+            return false;
+        }
+        if (atoll(u.Get("AircraftNumber").c_str()) < 0 || atoll(u.Get("DesiredAircraftNumber").c_str()) < 0) {
+            err = "air unit " + id.substr(0, 12) + " with a negative count";
+            return false;
+        }
+        // a base the nation no longer has (e.g. a ship the merge dropped): the reserve, as the game saves it ("-")
+        if (hb != "-" && hb != "-1" && !bases.count(hb)) {
+            u.Set("HomeBase", "-");
+            baseReset++;
+        }
+    }
+    std::vector<AirEntry> nt, nu;
+    for (auto& t : ht0)
+        if (t.Get("Nation") != ks) nt.push_back(t);
+    for (auto& t : kt) nt.push_back(t);
+    for (auto& u : hu0)
+        if (u.Get("Nation") != ks) nu.push_back(u);
+    for (auto& u : ku) nu.push_back(u);
+    ht->lines = AirSectionLines(nt, false, otherT);
+    hu->lines = AirSectionLines(nu, true, otherU);
+    request = req;
+    summary = "aircraft types " + std::to_string(hostKT) + " -> " + std::to_string(kt.size()) + ", air units " +
+              std::to_string(hostKU) + " -> " + std::to_string(ku.size()) +
+              (baseReset ? " (" + std::to_string(baseReset) + " to the reserve: their base is gone)" : "");
+    return true;
 }
 
 }  // namespace saveio
